@@ -1419,8 +1419,9 @@ class PsychloBridgeStore:
             "idempotencyKey": request.get("idempotencyKey"),
             "question": request.get("question"),
             "resultProvenanceId": request.get("resultProvenanceId"),
+            "continuationMode": request.get("continuationMode"),
         }
-        if not isinstance(workflow_id, str) or not workflow_id.strip() or any(not isinstance(value, str) or not value for value in required.values()):
+        if not isinstance(workflow_id, str) or not workflow_id.strip() or any(not isinstance(value, str) or not value for value in required.values()) or request.get("continuationMode") != "successor-plan-required":
             raise ValueError("external decision identity conflict")
         with self.connection:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -1437,6 +1438,7 @@ class PsychloBridgeStore:
                 "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}",
                 "question": envelope["explicitGate"],
                 "resultProvenanceId": envelope["digest"],
+                "continuationMode": "successor-plan-required",
             }
             if set(request) != set(expected) | {"workflowId"}:
                 raise ValueError("external decision identity conflict")
@@ -1457,6 +1459,33 @@ class PsychloBridgeStore:
     def decision(self, decision_id: str):
         row = self.connection.execute("SELECT request_json,receipt_json,status FROM decisions WHERE decision_id=?", (decision_id,)).fetchone()
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), str(row[2]))
+
+    def decision_record(self, decision_id: str) -> dict[str, Any] | None:
+        """Return the immutable decision projection, including outcome metadata.
+
+        ``decision`` predates the reconciliation protocol and intentionally
+        exposes only the request, receipt, and storage status.  Polling needs
+        the complete authoritative record so a caller can bind the response
+        to the exact staged request and distinguish a pending decision from a
+        requested revision.  Keep this as a projection read; it never mutates
+        or promotes a generic crew review into an authority decision.
+        """
+        row = self.connection.execute(
+            "SELECT request_json,receipt_json,status,decided_by,decided_at,reason FROM decisions WHERE decision_id=?",
+            (decision_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        status = "pending" if row[2] == "staged" else str(row[2])
+        return {
+            "decisionId": decision_id,
+            "request": json.loads(row[0]),
+            "receipt": json.loads(row[1]),
+            "status": status,
+            "decidedBy": row[3],
+            "decidedAt": row[4],
+            "reason": row[5],
+        }
 
     def list_staged_decisions(self) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT request_json,receipt_json,status FROM decisions WHERE status='staged' ORDER BY rowid").fetchall()
@@ -1484,6 +1513,48 @@ class PsychloBridgeStore:
                 raise ValueError("external decision conflict")
             return existing
         self.connection.execute("INSERT INTO decision_intents VALUES (?,?,?,?,?,?,?,?)", (decision_id, _dump(request), _dump(outcome), "pending", decided_by, decided_at, reason, self._now()))
+        return self.decision_intent(decision_id)
+
+    def record_terminal_decision_intent(self, request: Mapping[str, Any], outcome: Mapping[str, Any], decided_by: str, decided_at: str, reason: str) -> dict[str, Any]:
+        """Atomically commit a direct decision and its retryable push intent."""
+        decision_id = str(request["decisionId"])
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            row = self.connection.execute(
+                "SELECT request_json,status,decided_by,decided_at,reason FROM decisions WHERE decision_id=?",
+                (decision_id,),
+            ).fetchone()
+            if row is None or json.loads(row[0]) != dict(request):
+                raise ValueError("decision identity conflict")
+            existing = self.decision_intent(decision_id)
+            if existing is not None:
+                if existing["request"] != dict(request) or existing["outcome"] != dict(outcome) or existing["decidedBy"] != decided_by or existing["decidedAt"] != decided_at or existing["reason"] != reason:
+                    raise ValueError("decision conflict")
+                if row[1] != str(outcome.get("status")) or row[2] != decided_by or row[3] != decided_at or row[4] != reason:
+                    raise ValueError("decision conflict")
+                return existing
+            if row[1] == "staged":
+                self.connection.execute(
+                    "UPDATE decisions SET status=?,decided_by=?,decided_at=?,reason=? WHERE decision_id=? AND status='staged'",
+                    (outcome["status"], decided_by, decided_at, reason, decision_id),
+                )
+            elif row[1] != outcome.get("status") or row[2] != decided_by or row[3] != decided_at or row[4] != reason:
+                raise ValueError("decision conflict")
+            self.connection.execute(
+                "INSERT INTO decision_intents VALUES (?,?,?,?,?,?,?,?)",
+                (decision_id, _dump(request), _dump(outcome), "pending", decided_by, decided_at, reason, self._now()),
+            )
+        return self.decision_intent(decision_id)
+
+    def settle_decision_intent(self, decision_id: str, status: str) -> dict[str, Any]:
+        """Mark a direct decision push settled after the peer accepts it."""
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            decision = self.connection.execute("SELECT status FROM decisions WHERE decision_id=?", (decision_id,)).fetchone()
+            intent = self.decision_intent(decision_id)
+            if decision is None or intent is None or decision[0] != status or intent["outcome"].get("status") != status:
+                raise ValueError("decision intent conflict")
+            self.connection.execute("UPDATE decision_intents SET status='settled',updated_at=? WHERE decision_id=? AND status='pending'", (self._now(), decision_id))
         return self.decision_intent(decision_id)
 
     def settle_external_decision(self, decision_id: str, status: str, decided_by: str, decided_at: str, reason: str, reconciliation_id: str) -> dict[str, Any]:

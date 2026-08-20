@@ -70,6 +70,37 @@ class ProcessAttestationError(ValueError):
     pass
 
 
+def _resolve_observation_conversation(
+    bridge: Any,
+    request: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    default_conversation_id: str,
+) -> str:
+    """Resolve the process conversation without trusting a caller or registry row.
+
+    The protected lead binding remains authoritative for ordinary rounds.  A
+    different immutable delivery conversation is admitted only when the
+    bridge's completed, approved successor validator returns that exact
+    conversation.  The validator owns plan, version, thread, lead, approval,
+    digest, and lifecycle checks.
+    """
+    selected = binding.get("conversationId") if isinstance(binding, Mapping) else None
+    if not isinstance(selected, str) or not selected.strip() or not isinstance(default_conversation_id, str) or not default_conversation_id.strip():
+        raise ProcessAttestationError("observation conversation binding is invalid")
+    if selected == default_conversation_id:
+        return default_conversation_id
+    validator = getattr(bridge, "_authorized_successor_conversation", None)
+    if not callable(validator):
+        raise ProcessAttestationError("successor observation authority is unavailable")
+    try:
+        authorized = validator(request)
+    except Exception as error:
+        raise ProcessAttestationError("approved successor authority is invalid") from error
+    if authorized != selected:
+        raise ProcessAttestationError("successor conversation is not authorized")
+    return selected
+
+
 class TrustedEvidenceCollector:
     """Removed compatibility shim for the unsafe callback collector.
 
@@ -777,6 +808,7 @@ class AuthoritativeProcessEvidenceCollector:
         row = registry.get(lead_id)
         if not isinstance(row, Mapping) or set(row) != {"conversationId"} or not isinstance(row.get("conversationId"), str) or not row["conversationId"].strip():
             raise ProcessAttestationError("exact protected binding row identity is invalid")
+        process_conversation_id = _resolve_observation_conversation(self.bridge, request, binding, row["conversationId"])
         canonical = getattr(self.bridge.dispatcher, "process_binding_provenance", None)
         if not callable(canonical):
             raise ProcessAttestationError("canonical project registry process identity is required")
@@ -785,13 +817,13 @@ class AuthoritativeProcessEvidenceCollector:
             # this historical observation.  The request's threadId may be a
             # stale successor/producer identity and must never select the
             # process or rollout inspected here.
-            process_binding = canonical(lead_id, conversation_id=binding["conversationId"])
+            process_binding = canonical(lead_id, conversation_id=process_conversation_id)
         except Exception as error:
             raise ProcessAttestationError("canonical project registry process identity is unavailable") from error
         required_process = {"conversationId", "sessionId", "workspace", "command", "launcher", "workspaceDev", "workspaceIno", "launcherDev", "launcherIno", "launcherDigest", "registryPath"}
         if not isinstance(process_binding, Mapping) or set(process_binding) != required_process or any(not isinstance(process_binding[key], str) or not process_binding[key].strip() for key in required_process):
             raise ProcessAttestationError("canonical project registry process identity is invalid")
-        if binding.get("conversationId") != row["conversationId"] or process_binding["conversationId"] != row["conversationId"] or process_binding["sessionId"] != binding.get("sessionId"):
+        if binding.get("conversationId") != process_conversation_id or process_binding["conversationId"] != process_conversation_id or process_binding["sessionId"] != binding.get("sessionId"):
             raise ProcessAttestationError("registry and round binding conversation identity differ")
         if Path(process_binding["workspace"]).name.casefold() != str(request.get("projectId", "")).casefold():
             raise ProcessAttestationError("canonical workspace is not bound to the round project")

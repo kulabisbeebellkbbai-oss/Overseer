@@ -13,10 +13,74 @@ import pytest
 from overseer.admin import approve_admin_change_plan
 from overseer.psychlo_process_attestation import (
     SCHEMA,
+    ProcessAttestationError,
+    _resolve_observation_conversation,
     record_process_observation,
     manifest_digest,
     stage_process_observation,
 )
+
+
+class _SuccessorAuthority:
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+
+    def _authorized_successor_conversation(self, _request):
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def test_successor_observation_uses_only_exact_approved_conversation():
+    request = {"projectId": "arcade", "planId": "successor-plan", "planVersion": "v2", "threadId": "successor-thread", "projectLeadId": "hermione"}
+    binding = {"conversationId": "successor-conversation"}
+
+    assert _resolve_observation_conversation(
+        _SuccessorAuthority("successor-conversation"), request, binding, "predecessor-conversation"
+    ) == "successor-conversation"
+
+
+@pytest.mark.parametrize("authority", [
+    _SuccessorAuthority(None),
+    _SuccessorAuthority(None, ValueError("approved successor authority is invalid")),
+])
+def test_successor_observation_rejects_unproven_authority(authority):
+    request = {"projectId": "arcade", "planId": "successor-plan", "planVersion": "v2", "threadId": "successor-thread", "projectLeadId": "hermione"}
+    with pytest.raises(ProcessAttestationError, match="successor|authority"):
+        _resolve_observation_conversation(authority, request, {"conversationId": "successor-conversation"}, "predecessor-conversation")
+
+
+@pytest.mark.parametrize("wrong_conversation", ["another-successor", "predecessor-conversation"])
+def test_successor_observation_rejects_nonexact_authorized_conversation(wrong_conversation):
+    request = {"projectId": "arcade", "planId": "successor-plan", "planVersion": "v2", "threadId": "successor-thread", "projectLeadId": "hermione"}
+
+    with pytest.raises(ProcessAttestationError, match="successor|authority"):
+        _resolve_observation_conversation(
+            _SuccessorAuthority(wrong_conversation), request,
+            {"conversationId": "successor-conversation"}, "predecessor-conversation",
+        )
+
+
+def test_observation_keeps_exact_static_default_binding_for_non_successor():
+    request = {"projectId": "arcade", "planId": "predecessor-plan", "planVersion": "v1", "projectLeadId": "hermione"}
+
+    assert _resolve_observation_conversation(
+        _SuccessorAuthority(None, ValueError("successor authority must not be consulted")), request,
+        {"conversationId": "predecessor-conversation"}, "predecessor-conversation"
+    ) == "predecessor-conversation"
+
+
+@pytest.mark.parametrize("authority_error", [
+    "wrong plan", "wrong version", "wrong thread", "wrong conversation", "wrong lead",
+    "revoked", "canceled", "noncompleted", "unapproved plan",
+])
+def test_observation_rejects_each_nonexact_successor_authority(authority_error):
+    request = {"projectId": "arcade", "planId": "successor-plan", "planVersion": "v2", "threadId": "successor-thread", "projectLeadId": "hermione"}
+    authority = _SuccessorAuthority(None, ValueError(authority_error))
+
+    with pytest.raises(ProcessAttestationError, match="successor|authority"):
+        _resolve_observation_conversation(authority, request, {"conversationId": "successor-conversation"}, "predecessor-conversation")
 from overseer.psychlo_store import PsychloBridgeStore
 from overseer.store import SQLiteStore
 

@@ -520,6 +520,31 @@ def test_canary_result_rejects_real_completed_noncanary_rounds(tmp_path: Path):
     assert store.protocol_record("concurrency-canary-result", canary["resultId"]) is None
 
 
+def test_staged_decision_blocks_only_its_exact_current_plan(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    decision = {
+        "decisionId": "decision-old-plan",
+        "projectId": "arcade",
+        "planId": "plan-v5",
+    }
+    store.record_decision(decision, {**decision, "status": "staged"})
+    bridge = PsychloBridge(
+        store=store,
+        dispatcher=lambda *_: "dispatch-v6",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+        token_factory=lambda: "cap-v6-1234567890abcdef",
+    )
+
+    with pytest.raises(ValueError, match="decision_pending"):
+        bridge.request_round(_canary_round("round-v5", "arcade", "plan-v5", "lead-arcade"))
+
+    result = bridge.request_round(_canary_round("round-v6", "arcade", "plan-v6", "lead-arcade"))
+    assert result["accepted"] is True
+    assert store.decision("decision-old-plan")[2] == "staged"
+
+
 def test_canary_admission_rejects_expired_or_unapproved_authority_and_preserves_single_stream(tmp_path: Path):
     for mode in ("expired", "unapproved"):
         store = PsychloBridgeStore(tmp_path / f"{mode}.sqlite3")

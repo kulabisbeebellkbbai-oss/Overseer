@@ -445,7 +445,11 @@ class PsychloBridge:
         _require_round(request)
         if callback_capability is not None and (not isinstance(callback_capability, str) or not re.fullmatch(r"capability:[A-Za-z0-9._:-]{1,220}", callback_capability)):
             raise ValueError("round callback capability is invalid")
-        if any(item["request"].get("projectId") == request["projectId"] for item in self.store.list_staged_decisions()) or self.store.external_gate_pending(str(request["projectId"])) or self.store.external_gate_blocked(str(request["projectId"])):
+        if any(
+            item["request"].get("projectId") == request["projectId"]
+            and item["request"].get("planId") == request["planId"]
+            for item in self.store.list_staged_decisions()
+        ) or self.store.external_gate_pending(str(request["projectId"])) or self.store.external_gate_blocked(str(request["projectId"])):
             raise ValueError("decision_pending")
         existing = self.store.get_round(str(request["roundId"]))
         if existing:

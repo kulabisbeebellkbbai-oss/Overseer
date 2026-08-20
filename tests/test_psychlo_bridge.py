@@ -2208,6 +2208,104 @@ def test_mark_dispatched_requires_confirmed_prompt_phase_and_started_predecessor
     assert store.get_round(request["roundId"])[4] == "dispatched"
 
 
+def test_confirmed_delivery_requires_submitted_predecessor(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store, "round-confirmed-edge")
+    binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+    with pytest.raises(ValueError, match="submitted predecessor"):
+        store.record_round_prompt_delivery_phase(
+            request["roundId"],
+            request,
+            "capability-round-confirmed-edge-1234567890abcdef",
+            binding,
+            "b" * 64,
+            "confirmed",
+            now=NOW,
+            expected_phase="composer-pending",
+        )
+    with pytest.raises(ValueError, match="submitted predecessor"):
+        store.record_round_prompt_delivery_phase(
+            request["roundId"] + "-missing",
+            request,
+            "capability-round-confirmed-edge-1234567890abcdef",
+            binding,
+            "b" * 64,
+            "confirmed",
+            now=NOW,
+            expected_phase="submitted",
+        )
+
+
+def test_existing_rollout_proof_advances_composer_pending_through_submitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store, "round-delayed-rollout-proof")
+    capability = "capability-round-delayed-rollout-proof-1234567890abcdef"
+    store.connection.execute(
+        "UPDATE rounds SET capability_hash=?, capability_token=? WHERE round_id=?",
+        (hashlib.sha256(capability.encode()).hexdigest(), capability, request["roundId"]),
+    )
+    binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+    prompt = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)._round_prompt(request, capability)
+    prompt_digest = hashlib.sha256(prompt.encode()).hexdigest()
+    store.record_round_prompt_delivery_phase(request["roundId"], request, capability, binding, prompt_digest, "composer-pending", now=NOW)
+    transitions = []
+    original = store.record_round_prompt_delivery_phase
+
+    def record(*args, **kwargs):
+        transitions.append((args[5], kwargs.get("expected_phase")))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "record_round_prompt_delivery_phase", record)
+    bridge = PsychloBridge(store=store, dispatcher=_RoundRecoveryDispatcher(existing=True), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    recovered = bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+
+    assert recovered["status"] == "recovered"
+    assert transitions == [("submitted", "composer-pending"), ("confirmed", "submitted")]
+
+
+def test_exception_rescan_delayed_rollout_proof_uses_submitted_then_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store, "round-exception-delayed-proof")
+    binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+
+    class CrashAfterSubmitted:
+        def __init__(self):
+            self.scan_count = 0
+
+        def scan_rollout(self, _lead, _prompt):
+            self.scan_count += 1
+            return {"found": self.scan_count == 3, **binding}
+
+        def __call__(self, _lead, _prompt, idempotency_key=None, phase_callback=None):
+            phase_callback("paste-intent")
+            phase_callback("submit-intent")
+            phase_callback("submitted")
+            raise RuntimeError("rollout append became visible after submit")
+
+    dispatcher = CrashAfterSubmitted()
+    transitions = []
+    original = store.record_round_prompt_delivery_phase
+
+    def record(*args, **kwargs):
+        transitions.append((args[5], kwargs.get("expected_phase")))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "record_round_prompt_delivery_phase", record)
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    recovered = bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+
+    assert recovered["status"] == "recovered"
+    assert transitions[-2:] == [("submitted", "submit-intent"), ("confirmed", "submitted")]
+
+
 @pytest.mark.parametrize(
     ("found", "extra"),
     [(True, False), (False, True)],
@@ -2427,6 +2525,28 @@ def test_recovery_redelivers_once_with_exact_round_idempotency_key(tmp_path: Pat
     assert dispatcher.calls[0][2] == request["idempotencyKey"]
     assert store.get_round(request["roundId"])[4] == "dispatched"
     assert store.round_recovery(request["roundId"])["evidence"]["source"] == "redelivery-rollout-scan"
+
+
+def test_recovery_fails_closed_for_composer_pending_without_current_input_proof(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store, "round-composer-pending")
+    capability = "capability-round-composer-pending-1234567890abcdef"
+    store.connection.execute(
+        "UPDATE rounds SET capability_hash=?, capability_token=? WHERE round_id=?",
+        (hashlib.sha256(capability.encode()).hexdigest(), capability, request["roundId"]),
+    )
+    binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+    prompt = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)._round_prompt(request, capability)
+    store.record_round_prompt_delivery_phase(request["roundId"], request, capability, binding, hashlib.sha256(prompt.encode()).hexdigest(), "composer-pending", now=NOW)
+
+    dispatcher = _RoundRecoveryDispatcher()
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    with pytest.raises(ValueError, match="redelivery already attempted"):
+        bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+
+    assert dispatcher.calls == []
+    assert store.round_prompt_delivery(request["roundId"])["phase"] == "composer-pending"
 
 
 def test_recovery_after_crash_rescans_and_never_redelivers_again(tmp_path: Path):

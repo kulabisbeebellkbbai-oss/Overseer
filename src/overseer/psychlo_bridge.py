@@ -608,8 +608,57 @@ class PsychloBridge:
                 if cancellation is None:
                     raise ValueError("round cancellation receipt is missing")
                 return {"accepted": True, "receipt": cancellation["receipt"]}
-            return {"accepted": True, "receipt": existing[1]}
+            return {"accepted": True, "receipt": self._receipt_with_completed_recovery_proof(request, existing[1])}
         return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-unknown:{request.get('roundId')}", "status": "unknown"}}
+
+    def _receipt_with_completed_recovery_proof(
+        self,
+        request: Mapping[str, Any],
+        receipt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return one exact, replay-stable proof for a completed rollout recovery."""
+        if receipt.get("deliveryProof") is not None:
+            return dict(receipt)
+        round_id = str(request.get("roundId", ""))
+        recovery = self.store.round_recovery(round_id)
+        delivery = self.store.round_prompt_delivery(round_id)
+        binding = self.store.round_binding(round_id)
+        if recovery is None or recovery.get("state") != "completed" or delivery is None or delivery.get("phase") != "confirmed" or binding is None:
+            return dict(receipt)
+        evidence = recovery.get("evidence")
+        observed_at = evidence.get("observedAt") if isinstance(evidence, Mapping) else None
+        if (
+            not isinstance(evidence, Mapping)
+            or evidence.get("deliveryProof") != "rollout-user-message"
+            or evidence.get("roundId") != round_id
+            or evidence.get("requestDigest") != recovery.get("requestDigest")
+            or evidence.get("rollout") != binding
+            or delivery.get("requestDigest") != recovery.get("requestDigest")
+            or delivery.get("binding") != binding
+            or not isinstance(observed_at, str)
+        ):
+            raise ValueError("completed round recovery proof is invalid")
+        try:
+            _time(observed_at)
+        except (TypeError, ValueError) as error:
+            raise ValueError("completed round recovery proof timestamp is invalid") from error
+        request_digest = str(recovery.get("requestDigest", ""))
+        if not SHA256_RE.fullmatch(request_digest):
+            raise ValueError("completed round recovery request digest is invalid")
+        provenance_id = f"overseer-round-recovery:{round_id}"
+        return {
+            **dict(receipt),
+            "provenanceId": provenance_id,
+            "deliveryProof": {
+                "schemaVersion": "psychlo.round-delivery-proof.v1",
+                "requestDigest": request_digest,
+                "evidenceDigest": canonical_digest(dict(evidence)),
+                "provenanceId": provenance_id,
+                "source": "overseer",
+                "status": "submitted",
+                "occurredAt": observed_at,
+            },
+        }
 
     def cancel_round_before_start(self, request: Mapping[str, Any], *, message_id: str | None = None) -> dict[str, Any]:
         if not isinstance(request, Mapping) or set(request) != {"cancellationId", "request", "requestDigest"}:
@@ -798,7 +847,7 @@ class PsychloBridge:
             if scan["found"]:
                 evidence = {"deliveryProof": "rollout-user-message", "source": "existing-rollout-scan", "promptDigest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "roundId": round_id, "requestDigest": self.store.round_recovery(round_id)["requestDigest"], "rollout": scan["binding"], "observedAt": now}
                 self._confirm_prompt_delivery(round_id, request, capability, recovery_binding, evidence["promptDigest"], now=now)
-                recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
+                recovered_receipt = self._receipt_with_recovery_evidence(receipt, evidence)
                 self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=now)
                 return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
             durable_delivery = self.store.round_prompt_delivery(round_id)
@@ -822,7 +871,7 @@ class PsychloBridge:
                 evidence = {**attempted, "deliveryProof": "rollout-user-message", "source": "pre-dispatch-rollout-scan", "rollout": pre_dispatch_scan["binding"], "observedAt": self.clock()}
                 if phase_capable:
                     self._confirm_prompt_delivery(round_id, request, capability, recovery_binding, attempted["promptDigest"], now=self.clock())
-                recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
+                recovered_receipt = self._receipt_with_recovery_evidence(receipt, evidence)
                 self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
                 return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
             def persist_phase(phase: str) -> None:
@@ -849,7 +898,7 @@ class PsychloBridge:
             evidence = {**attempted, "phase": "confirmed", "dispatchId": str(dispatch_id), "deliveryProof": "rollout-user-message", "source": "redelivery-rollout-scan", "observedAt": self.clock()}
             if phase_capable:
                 self._confirm_prompt_delivery(round_id, request, capability, recovery_binding, attempted["promptDigest"], now=self.clock())
-            recovered_receipt = {**receipt, "provenanceId": str(dispatch_id)}
+            recovered_receipt = self._receipt_with_recovery_evidence(receipt, evidence, provenance_id=str(dispatch_id))
             self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
             return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
         except Exception as error:
@@ -866,7 +915,7 @@ class PsychloBridge:
                 if post_scan["binding"] == (self.store.round_binding(round_id) or current.get("binding")) and post_scan["found"]:
                     evidence = {"redeliveryAttempted": True, "phase": "confirmed", "deliveryProof": "rollout-user-message", "source": "exception-rescan", "roundId": round_id, "requestDigest": current["requestDigest"], "rollout": post_scan["binding"], "observedAt": self.clock()}
                     self._confirm_prompt_delivery(round_id, request, capability, post_scan["binding"], hashlib.sha256(prompt.encode("utf-8")).hexdigest(), now=self.clock())
-                    recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
+                    recovered_receipt = self._receipt_with_recovery_evidence(receipt, evidence)
                     self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
                     return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
                 self.store.record_round_recovery_attempt(round_id, owner, claim_token, {"redeliveryAttempted": True, "phase": "unresolved", "deliveryProof": "unknown", "source": "recovery-exception", "roundId": round_id, "requestDigest": current["requestDigest"], "observedAt": self.clock()}, now=self.clock())
@@ -874,6 +923,34 @@ class PsychloBridge:
                 if delivery is not None:
                     self.store.record_round_prompt_delivery_phase(round_id, request, capability, delivery["binding"], delivery["promptDigest"], "unresolved", now=self.clock(), expected_phase=delivery["phase"])
             raise ValueError("rollout delivery proof is missing") from error
+
+    @staticmethod
+    def _receipt_with_recovery_evidence(
+        receipt: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        *,
+        provenance_id: str | None = None,
+    ) -> dict[str, Any]:
+        round_id = str(evidence.get("roundId", ""))
+        request_digest = str(evidence.get("requestDigest", ""))
+        observed_at = evidence.get("observedAt")
+        if not round_id or not SHA256_RE.fullmatch(request_digest) or not isinstance(observed_at, str):
+            raise ValueError("round recovery evidence is invalid")
+        _time(observed_at)
+        resolved_provenance = provenance_id or f"overseer-round-recovery:{round_id}"
+        return {
+            **dict(receipt),
+            "provenanceId": resolved_provenance,
+            "deliveryProof": {
+                "schemaVersion": "psychlo.round-delivery-proof.v1",
+                "requestDigest": request_digest,
+                "evidenceDigest": canonical_digest(dict(evidence)),
+                "provenanceId": resolved_provenance,
+                "source": "overseer",
+                "status": "submitted",
+                "occurredAt": observed_at,
+            },
+        }
 
     def _authorized_successor_conversation(self, request: Mapping[str, Any]) -> str | None:
         """Resolve a successor only from a completed, approved abandonment action."""

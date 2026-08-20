@@ -2493,6 +2493,18 @@ def _started_round(store: PsychloBridgeStore, round_id: str = "round-recovery") 
     return request
 
 
+def _started_bound_round(store: PsychloBridgeStore, round_id: str) -> dict:
+    request = {"roundId": round_id, "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": f"corr-{round_id}", "idempotencyKey": f"idempotency-{round_id}", "snapshotId": f"snapshot-{round_id}", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    capability = f"capability-{round_id}-1234567890abcdef"
+    receipt = {**request, "sourceId": request["projectLeadId"], "provenanceId": f"overseer-dispatch:{round_id}", "status": "accepted"}
+    binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+    store.record_round(request, receipt, capability)
+    probe = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", recover=False)
+    prompt_digest = hashlib.sha256(probe._round_prompt(request, capability).encode()).hexdigest()
+    assert store.start_round_dispatch(round_id, request, capability, NOW, binding=binding, prompt_digest=prompt_digest) is True
+    return request
+
+
 def test_recovers_started_round_from_existing_exact_rollout_without_redelivery(tmp_path: Path):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     request = _started_round(store)
@@ -2504,12 +2516,66 @@ def test_recovers_started_round_from_existing_exact_rollout_without_redelivery(t
     assert recovered["status"] == "recovered"
     assert dispatcher.calls == []
     assert store.get_round(request["roundId"])[4] == "dispatched"
-    assert recovered["receipt"] == {**request, "sourceId": request["projectLeadId"], "status": "accepted", "provenanceId": f"overseer-round-recovery:{request['roundId']}"}
     evidence = store.round_recovery(request["roundId"])
     assert evidence["state"] == "completed"
     assert evidence["evidence"]["deliveryProof"] == "rollout-user-message"
     assert evidence["evidence"]["source"] == "existing-rollout-scan"
     assert evidence["evidence"]["rollout"]["conversationId"] == "conversation-arcade"
+    assert recovered["receipt"] == {
+        **request,
+        "sourceId": request["projectLeadId"],
+        "status": "accepted",
+        "provenanceId": f"overseer-round-recovery:{request['roundId']}",
+        "deliveryProof": {
+            "schemaVersion": "psychlo.round-delivery-proof.v1",
+            "requestDigest": evidence["requestDigest"],
+            "evidenceDigest": canonical_digest(evidence["evidence"]),
+            "provenanceId": f"overseer-round-recovery:{request['roundId']}",
+            "source": "overseer",
+            "status": "submitted",
+            "occurredAt": NOW,
+        },
+    }
+
+
+def test_reconcile_adds_exact_proof_to_historical_completed_recovery(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_bound_round(store, "round-historical-recovery-proof")
+    bridge = PsychloBridge(store=store, dispatcher=_RoundRecoveryDispatcher(existing=True), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    recovered = bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+    historical_receipt = {key: value for key, value in recovered["receipt"].items() if key != "deliveryProof"}
+    stored_round = store.get_round(request["roundId"])
+    store.get_round = lambda _round_id: (stored_round[0], historical_receipt, *stored_round[2:])
+
+    reconciled = bridge.reconcile_round(request)
+
+    recovery = store.round_recovery(request["roundId"])
+    assert reconciled["receipt"]["deliveryProof"] == {
+        "schemaVersion": "psychlo.round-delivery-proof.v1",
+        "requestDigest": recovery["requestDigest"],
+        "evidenceDigest": canonical_digest(recovery["evidence"]),
+        "provenanceId": f"overseer-round-recovery:{request['roundId']}",
+        "source": "overseer",
+        "status": "submitted",
+        "occurredAt": NOW,
+    }
+
+
+def test_reconcile_rejects_corrupt_historical_recovery_proof(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_bound_round(store, "round-corrupt-recovery-proof")
+    bridge = PsychloBridge(store=store, dispatcher=_RoundRecoveryDispatcher(existing=True), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    recovered = bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+    historical_receipt = {key: value for key, value in recovered["receipt"].items() if key != "deliveryProof"}
+    stored_round = store.get_round(request["roundId"])
+    store.get_round = lambda _round_id: (stored_round[0], historical_receipt, *stored_round[2:])
+    recovery = store.round_recovery(request["roundId"])
+    store.round_recovery = lambda _round_id: {**recovery, "evidence": {"deliveryProof": "rollout-user-message"}}
+
+    assert "deliveryProof" not in historical_receipt
+    assert store.round_recovery(request["roundId"])["evidence"] == {"deliveryProof": "rollout-user-message"}
+    with pytest.raises(ValueError, match="completed round recovery proof is invalid"):
+        bridge._receipt_with_completed_recovery_proof(request, historical_receipt)
 
 
 def test_recovery_redelivers_once_with_exact_round_idempotency_key(tmp_path: Path):

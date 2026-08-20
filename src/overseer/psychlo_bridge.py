@@ -702,6 +702,42 @@ class PsychloBridge:
         from .psychlo_legacy_binding import attest_legacy_round_binding
         return attest_legacy_round_binding(self, round_id, manifest_path)
 
+    def _confirm_prompt_delivery(
+        self,
+        round_id: str,
+        request: Mapping[str, Any],
+        capability: str,
+        binding: Mapping[str, Any],
+        prompt_digest: str,
+        *,
+        now: str,
+    ) -> None:
+        """Advance proof-bearing delivery through submitted before confirmed."""
+        delivery = self.store.round_prompt_delivery(round_id)
+        if delivery is None or delivery["phase"] == "confirmed":
+            return
+        if delivery["phase"] != "submitted":
+            self.store.record_round_prompt_delivery_phase(
+                round_id,
+                request,
+                capability,
+                binding,
+                prompt_digest,
+                "submitted",
+                now=now,
+                expected_phase=delivery["phase"],
+            )
+        self.store.record_round_prompt_delivery_phase(
+            round_id,
+            request,
+            capability,
+            binding,
+            prompt_digest,
+            "confirmed",
+            now=now,
+            expected_phase="submitted",
+        )
+
     def stage_legacy_abandonment(self, **kwargs: Any) -> dict[str, Any]:
         from .psychlo_legacy_abandonment import stage_legacy_abandonment
         return stage_legacy_abandonment(bridge=self, **kwargs)
@@ -761,15 +797,13 @@ class PsychloBridge:
                 raise ValueError("rollout identity changed")
             if scan["found"]:
                 evidence = {"deliveryProof": "rollout-user-message", "source": "existing-rollout-scan", "promptDigest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "roundId": round_id, "requestDigest": self.store.round_recovery(round_id)["requestDigest"], "rollout": scan["binding"], "observedAt": now}
-                delivery = self.store.round_prompt_delivery(round_id)
-                if delivery is not None:
-                    self.store.record_round_prompt_delivery_phase(round_id, request, capability, recovery_binding, evidence["promptDigest"], "confirmed", now=now, expected_phase=delivery["phase"])
+                self._confirm_prompt_delivery(round_id, request, capability, recovery_binding, evidence["promptDigest"], now=now)
                 recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
                 self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=now)
                 return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
             durable_delivery = self.store.round_prompt_delivery(round_id)
             prior_phase = durable_delivery.get("phase") if durable_delivery is not None else (prior_evidence.get("phase") if isinstance(prior_evidence, dict) else None)
-            if prior_phase in {"failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved"}:
+            if prior_phase in {"failure-fence", "paste-intent", "pasted", "composer-pending", "submitted", "confirmed", "unresolved"}:
                 raise ValueError("rollout delivery proof is missing; redelivery already attempted (prompt delivery phase is unresolved)")
             if isinstance(prior_evidence, dict) and prior_evidence.get("redeliveryAttempted") is True and prior_phase not in {"prepared"}:
                 evidence = {**prior_evidence, "source": "recovery-rescan-no-proof", "observedAt": now}
@@ -787,17 +821,15 @@ class PsychloBridge:
             if pre_dispatch_scan["found"]:
                 evidence = {**attempted, "deliveryProof": "rollout-user-message", "source": "pre-dispatch-rollout-scan", "rollout": pre_dispatch_scan["binding"], "observedAt": self.clock()}
                 if phase_capable:
-                    delivery = self.store.round_prompt_delivery(round_id)
-                    if delivery is not None:
-                        self.store.record_round_prompt_delivery_phase(round_id, request, capability, recovery_binding, attempted["promptDigest"], "confirmed", now=self.clock(), expected_phase=delivery["phase"])
+                    self._confirm_prompt_delivery(round_id, request, capability, recovery_binding, attempted["promptDigest"], now=self.clock())
                 recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
                 self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
                 return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
             def persist_phase(phase: str) -> None:
-                if phase not in {"prepared", "paste-intent", "submit-intent", "submitted"}:
+                if phase not in {"prepared", "paste-intent", "submit-intent", "composer-pending", "submitted"}:
                     raise ValueError("codex dispatch phase is invalid")
                 if phase_capable:
-                    predecessor = {"paste-intent": "prepared", "submit-intent": "paste-intent", "submitted": "submit-intent"}.get(phase)
+                    predecessor = {"paste-intent": "prepared", "submit-intent": "paste-intent", "composer-pending": "submit-intent", "submitted": "submit-intent"}.get(phase)
                     self.store.record_round_prompt_delivery_phase(round_id, request, capability, recovery_binding, attempted["promptDigest"], phase, now=self.clock(), expected_phase=predecessor)
                 self.store.mark_round_recovery_attempted(round_id, owner, claim_token, {**attempted, "phase": phase, "observedAt": self.clock()}, now=self.clock())
 
@@ -816,7 +848,7 @@ class PsychloBridge:
                 raise ValueError("rollout delivery proof is missing")
             evidence = {**attempted, "phase": "confirmed", "dispatchId": str(dispatch_id), "deliveryProof": "rollout-user-message", "source": "redelivery-rollout-scan", "observedAt": self.clock()}
             if phase_capable:
-                self.store.record_round_prompt_delivery_phase(round_id, request, capability, recovery_binding, attempted["promptDigest"], "confirmed", now=self.clock(), expected_phase="submitted")
+                self._confirm_prompt_delivery(round_id, request, capability, recovery_binding, attempted["promptDigest"], now=self.clock())
             recovered_receipt = {**receipt, "provenanceId": str(dispatch_id)}
             self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
             return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
@@ -833,9 +865,7 @@ class PsychloBridge:
                 post_scan = _require_rollout_scan(self._scan_rollout(scanner, request, prompt, stored_binding["conversationId"]))
                 if post_scan["binding"] == (self.store.round_binding(round_id) or current.get("binding")) and post_scan["found"]:
                     evidence = {"redeliveryAttempted": True, "phase": "confirmed", "deliveryProof": "rollout-user-message", "source": "exception-rescan", "roundId": round_id, "requestDigest": current["requestDigest"], "rollout": post_scan["binding"], "observedAt": self.clock()}
-                    delivery = self.store.round_prompt_delivery(round_id)
-                    if delivery is not None:
-                        self.store.record_round_prompt_delivery_phase(round_id, request, capability, post_scan["binding"], hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "confirmed", now=self.clock(), expected_phase=delivery["phase"])
+                    self._confirm_prompt_delivery(round_id, request, capability, post_scan["binding"], hashlib.sha256(prompt.encode("utf-8")).hexdigest(), now=self.clock())
                     recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
                     self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
                     return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
@@ -972,9 +1002,9 @@ class PsychloBridge:
         def persist_phase(phase: str) -> None:
             if ledger_binding is None:
                 return
-            if phase not in {"prepared", "paste-intent", "submit-intent", "submitted"}:
+            if phase not in {"prepared", "paste-intent", "submit-intent", "composer-pending", "submitted"}:
                 raise ValueError("codex dispatch phase is invalid")
-            predecessor = {"paste-intent": "prepared", "submit-intent": "paste-intent", "submitted": "submit-intent"}.get(phase)
+            predecessor = {"paste-intent": "prepared", "submit-intent": "paste-intent", "composer-pending": "submit-intent", "submitted": "submit-intent"}.get(phase)
             self.store.record_round_prompt_delivery_phase(str(request["roundId"]), request, capability, ledger_binding, prompt_digest, phase, now=self.clock(), expected_phase=predecessor)
 
         provider_reference = self._dispatch_round(request, prompt, phase_callback=persist_phase if ledger_binding is not None else None, conversation_id=conversation_id)

@@ -566,6 +566,7 @@ class CodexDriver:
         idempotency_key: str | None = None,
         prompt_marker: str | None = None,
         phase_callback: Callable[[str], None] | None = None,
+        retry_composer: bool = False,
     ) -> AgentDispatchResult:
         """Dispatch the exact legacy prompt without weakening the generic DTO."""
 
@@ -583,6 +584,7 @@ class CodexDriver:
             prompt_text=prompt,
             prompt_marker=prompt_marker,
             phase_callback=phase_callback,
+            retry_composer=retry_composer,
         )
 
     def prepare_legacy_dispatch(
@@ -899,6 +901,7 @@ class CodexDriver:
         prompt_text: str | None = None,
         prompt_marker: str | None = None,
         phase_callback: Callable[[str], None] | None = None,
+        retry_composer: bool = False,
     ) -> AgentDispatchResult:
         with self._thread_operation_lock(session):
             return self._dispatch_session_locked(
@@ -907,6 +910,7 @@ class CodexDriver:
                 prompt_text=prompt_text,
                 prompt_marker=prompt_marker,
                 phase_callback=phase_callback,
+                retry_composer=retry_composer,
             )
 
     def _dispatch_session_locked(
@@ -917,6 +921,7 @@ class CodexDriver:
         prompt_text: str | None = None,
         prompt_marker: str | None = None,
         phase_callback: Callable[[str], None] | None = None,
+        retry_composer: bool = False,
     ) -> AgentDispatchResult:
         dispatch_prompt = request.prompt if prompt_text is None else prompt_text
         # Structured app-server delivery is a round-only transport.  The
@@ -978,6 +983,17 @@ class CodexDriver:
         baseline_output = (
             baseline_result.stdout.casefold() if baseline_result.returncode == 0 else ""
         )
+        if retry_composer:
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="delivery_unconfirmed",
+                reason="codex composer state cannot be proven from capture-pane history",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                stdout=baseline_result.stdout,
+                stderr=baseline_result.stderr,
+            )
         if phase_callback is not None:
             try:
                 phase_callback("prepared")
@@ -1099,22 +1115,6 @@ class CodexDriver:
                 stdout=enter_result.stdout,
                 stderr=enter_result.stderr,
             )
-        if phase_callback is not None:
-            try:
-                phase_callback("submitted")
-            except Exception as error:
-                return self._prompt_failure(
-                    request,
-                    session,
-                    resume_details,
-                    status="failed",
-                    reason="codex dispatch phase persistence failed",
-                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
-                    prompt_exit_code=prompt_result.returncode,
-                    enter_exit_code=enter_result.returncode,
-                    stdout=enter_result.stdout,
-                    stderr=str(error),
-                )
         pane_result = self._run(pane_command)
         pane_output = pane_result.stdout.casefold() if pane_result.returncode == 0 else ""
         rejection_marker = next(
@@ -1159,6 +1159,35 @@ class CodexDriver:
                 stderr=pane_result.stderr,
             )
         if delivery_evidence is not None and not delivery_evidence.confirm(dispatch_prompt):
+            if dispatch_prompt in pane_result.stdout:
+                if phase_callback is not None:
+                    try:
+                        phase_callback("composer-pending")
+                    except Exception as error:
+                        return self._prompt_failure(
+                            request,
+                            session,
+                            resume_details,
+                            status="failed",
+                            reason="codex dispatch phase persistence failed",
+                            prompt_exit_code=prompt_result.returncode,
+                            enter_exit_code=enter_result.returncode,
+                            stdout=pane_result.stdout,
+                            stderr=str(error),
+                            category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                        )
+                return self._prompt_failure(
+                    request,
+                    session,
+                    resume_details,
+                    status="delivery_unconfirmed",
+                    reason="codex prompt remains in composer without durable rollout proof",
+                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                    prompt_exit_code=prompt_result.returncode,
+                    enter_exit_code=enter_result.returncode,
+                    stdout=pane_result.stdout,
+                    stderr=pane_result.stderr,
+                )
             return self._prompt_failure(
                 request,
                 session,
@@ -1171,6 +1200,22 @@ class CodexDriver:
                 stdout=pane_result.stdout,
                 stderr=pane_result.stderr,
             )
+        if phase_callback is not None:
+            try:
+                phase_callback("submitted")
+            except Exception as error:
+                return self._prompt_failure(
+                    request,
+                    session,
+                    resume_details,
+                    status="failed",
+                    reason="codex dispatch phase persistence failed",
+                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                    prompt_exit_code=prompt_result.returncode,
+                    enter_exit_code=enter_result.returncode,
+                    stdout=enter_result.stdout,
+                    stderr=str(error),
+                )
         reason = "prompt submitted to codex project; advisory result not yet confirmed"
         details = LegacyPromptDetails(
             status="prompt_dispatched",

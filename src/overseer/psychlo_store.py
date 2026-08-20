@@ -1196,9 +1196,11 @@ class PsychloBridgeStore:
         return result
 
     def record_round_prompt_delivery_phase(self, round_id: str, request: Mapping[str, Any], capability: str, binding: Mapping[str, Any], prompt_digest: str, phase: str, *, now: str, expected_phase: str | None = None) -> dict[str, Any]:
-        phases = ("prepared", "failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "abandonment-fence", "confirmed", "unresolved")
+        phases = ("prepared", "failure-fence", "paste-intent", "pasted", "submit-intent", "composer-pending", "submitted", "abandonment-fence", "confirmed", "unresolved")
         if phase not in phases or not isinstance(prompt_digest, str) or len(prompt_digest) != 64:
             raise ValueError("round prompt delivery phase is invalid")
+        if phase == "confirmed" and expected_phase != "submitted":
+            raise ValueError("confirmed delivery requires submitted predecessor")
         request_digest = self._round_request_digest(request)
         capability_hash = _token_hash(capability)
         encoded_binding = _dump_wire(binding)
@@ -1208,6 +1210,8 @@ class PsychloBridgeStore:
             if round_state is not None and round_state[0] == "legacy-abandoned":
                 raise ValueError("legacy-abandoned round prompt delivery is terminal")
             row = self.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            if phase == "confirmed" and row is None:
+                raise ValueError("confirmed delivery requires submitted predecessor")
             if row is None:
                 self.connection.execute("INSERT INTO round_prompt_deliveries(round_id,request_digest,capability_hash,binding_json,phase,prompt_digest,updated_at) VALUES (?,?,?,?,?,?,?)", (round_id, request_digest, capability_hash, encoded_binding, phase, prompt_digest, now))
             else:

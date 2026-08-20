@@ -477,6 +477,13 @@ class PsychloBridgeStore:
         rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') ORDER BY rowid").fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def _reject_cancelled_round_in_transaction(self, request: Mapping[str, Any]) -> None:
+        row = self.connection.execute("SELECT request_digest FROM round_cancellations WHERE round_id=?", (request["roundId"],)).fetchone()
+        if row is not None:
+            if row[0] != canonical_digest(request):
+                raise ValueError("round cancellation identity conflict")
+            raise ValueError("round was cancelled before start")
+
     def record_canary_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, authorization_id: str, expected_revision: int, now: str) -> None:
         """Atomically reserve one of the two authorized canary streams.
 
@@ -487,6 +494,7 @@ class PsychloBridgeStore:
         """
         self.connection.execute("BEGIN IMMEDIATE")
         try:
+            self._reject_cancelled_round_in_transaction(request)
             auth_row = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (authorization_id,)).fetchone()
             if auth_row is None or auth_row[1] != "delivered":
                 raise ValueError("concurrency canary authorization is unavailable")
@@ -571,6 +579,7 @@ class PsychloBridgeStore:
         """
         self.connection.execute("BEGIN IMMEDIATE")
         try:
+            self._reject_cancelled_round_in_transaction(request)
             change = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-ceiling-change' AND state IN ('delivered','settled') ORDER BY updated_at DESC, rowid DESC LIMIT 1").fetchone()
             if change is None:
                 raise ValueError("concurrency ceiling is unavailable")
@@ -700,6 +709,7 @@ class PsychloBridgeStore:
         """Atomically preserve the default global ceiling of one."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
+            self._reject_cancelled_round_in_transaction(request)
             if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') LIMIT 1").fetchone() is not None:
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
@@ -709,6 +719,7 @@ class PsychloBridgeStore:
             raise
 
     def record_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str) -> None:
+        self._reject_cancelled_round_in_transaction(request)
         self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
 
     def start_round_dispatch(self, round_id: str, request: Mapping[str, Any], capability: str, started_at: str, *, binding: Mapping[str, Any] | None = None, prompt_digest: str | None = None) -> bool:
@@ -790,7 +801,9 @@ class PsychloBridgeStore:
             ).fetchone()
             if existing is not None:
                 round_state = self.connection.execute("SELECT dispatch_state,started_at,codex_binding_json,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
-                if existing[:4] != (cancellation_id, round_id, request_digest, encoded_attestation) or round_state != ("cancelled-before-start", None, None, None):
+                stored_receipt = json.loads(existing[4])
+                expected_round_state = None if stored_receipt.get("before", {}).get("dispatchState") == "absent" else ("cancelled-before-start", None, None, None)
+                if existing[:4] != (cancellation_id, round_id, request_digest, encoded_attestation) or round_state != expected_round_state:
                     raise ValueError("round cancellation conflict")
                 self.connection.execute("COMMIT")
                 return {"accepted": True, "inserted": False, "receipt": json.loads(existing[4])}
@@ -801,6 +814,16 @@ class PsychloBridgeStore:
             recovery = self.connection.execute("SELECT 1 FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone()
             failure = self.connection.execute("SELECT 1 FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
             abandonment = self.connection.execute("SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed') LIMIT 1", (round_id,)).fetchone()
+            if row is None:
+                before = {"dispatchState": "absent", "startedAt": None, "codexBinding": None, "result": None, "recovery": False, "operationalFailure": False}
+                unsigned = {"schemaVersion": "psychlo.round-cancel-before-start.v1", "kind": "round-cancel-before-start", "status": "cancelled", "roundId": round_id, "projectId": str(request["projectId"]), "requestDigest": request_digest, "before": before, "cancelledAt": now}
+                receipt = {**unsigned, "digest": canonical_digest(unsigned)}
+                self.connection.execute(
+                    "INSERT INTO round_cancellations(cancellation_id,round_id,request_digest,attestation_json,receipt_json,inserted_at) VALUES (?,?,?,?,?,?)",
+                    (cancellation_id, round_id, request_digest, encoded_attestation, _dump_wire(receipt), now),
+                )
+                self.connection.execute("COMMIT")
+                return {"accepted": True, "inserted": True, "receipt": receipt}
             if row is None or json.loads(row[0]) != dict(request) or canonical_digest(json.loads(row[0])) != request_digest or row[1] != "pending" or row[2] is not None or row[3] is not None or row[4] is not None or recovery is not None or failure is not None or abandonment is not None:
                 raise ValueError("round is not provably pending before start")
             before = {"dispatchState": "pending", "startedAt": None, "codexBinding": None, "result": None, "recovery": False, "operationalFailure": False}

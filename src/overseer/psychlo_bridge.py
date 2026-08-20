@@ -445,6 +445,11 @@ class PsychloBridge:
         _require_round(request)
         if callback_capability is not None and (not isinstance(callback_capability, str) or not re.fullmatch(r"capability:[A-Za-z0-9._:-]{1,220}", callback_capability)):
             raise ValueError("round callback capability is invalid")
+        cancellation = self.store.round_cancellation(str(request["roundId"]))
+        if cancellation is not None:
+            if cancellation["requestDigest"] != canonical_digest(request):
+                raise ValueError("round cancellation identity conflict")
+            raise ValueError("round was cancelled before start")
         if any(
             item["request"].get("projectId") == request["projectId"]
             and item["request"].get("planId") == request["planId"]
@@ -613,7 +618,13 @@ class PsychloBridge:
                     raise ValueError("round cancellation receipt is missing")
                 return {"accepted": True, "receipt": cancellation["receipt"]}
             return {"accepted": True, "receipt": self._receipt_with_completed_recovery_proof(request, existing[1])}
-        return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-unknown:{request.get('roundId')}", "status": "unknown"}}
+        _require_round(request)
+        round_id = str(request["roundId"])
+        request_digest = canonical_digest(request)
+        cancellation = self.store.cancel_round_before_start(
+            f"round-cancel-before-start:{round_id}", request, request_digest, now=self.clock(),
+        )["receipt"]
+        return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-cancelled:{round_id}", "status": "cancelled", "cancellation": cancellation}}
 
     def _receipt_with_completed_recovery_proof(
         self,

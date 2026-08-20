@@ -2490,6 +2490,25 @@ def test_does_not_repeat_an_uncertain_durably_started_dispatch(tmp_path: Path):
     assert len(attempts) == 1
 
 
+def test_reconcile_tombstones_a_round_absent_before_bridge_start(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "must-not-dispatch", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    request = _canary_round("round-absent-before-start", "arcade", "plan-v6", "lead-arcade")
+
+    first = bridge.reconcile_round(request)
+    replay = bridge.reconcile_round(request)
+
+    assert first == replay
+    assert first["receipt"]["status"] == "cancelled"
+    assert first["receipt"]["cancellation"]["before"]["dispatchState"] == "absent"
+    assert store.get_round(request["roundId"]) is None
+    assert store.round_cancellation(request["roundId"])["requestDigest"] == canonical_digest(request)
+    with pytest.raises(ValueError, match="cancelled before start"):
+        bridge.request_round(request)
+    with pytest.raises(ValueError, match="conflict"):
+        bridge.reconcile_round({**request, "planVersion": "v7"})
+
+
 class _RoundRecoveryDispatcher:
     def __init__(self, *, existing: bool = False, crash_after_send: bool = False, binding: str = "a" * 64):
         self.existing = existing

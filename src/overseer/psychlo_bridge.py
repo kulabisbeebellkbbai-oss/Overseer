@@ -980,12 +980,7 @@ class PsychloBridge:
                 continue
             if successor.get("successorThreadId") != thread_id:
                 continue
-            # A matching thread is not enough: plan/version/conversation must
-            # be the exact frozen successor identity and the original action
-            # must still be backed by its approved Sisko plan.
-            if (payload.get("projectId") != request.get("projectId")
-                    or successor.get("successorPlanId") != request.get("planId")
-                    or successor.get("successorPlanVersion") != request.get("planVersion")):
+            if payload.get("projectId") != request.get("projectId"):
                 continue
             original_round = self.store.get_round(str(payload.get("roundId")))
             original_request = original_round[0] if original_round is not None else None
@@ -993,6 +988,26 @@ class PsychloBridge:
                     or original_request.get("projectId") != request.get("projectId")
                     or original_request.get("projectLeadId") != request.get("projectLeadId")):
                 raise ValueError("successor round lead identity does not match approved action")
+            exact_successor_plan = (
+                successor.get("successorPlanId") == request.get("planId")
+                and successor.get("successorPlanVersion") == request.get("planVersion")
+            )
+            if not exact_successor_plan:
+                # Once the first successor is admitted, later A-Team plan
+                # changes may continue on that same approved thread.  Bind the
+                # new plan to the strict current registration; never infer it
+                # from the thread or historical action alone.
+                current = self.store.project(str(request["projectId"]))
+                if current is None:
+                    continue
+                current_identity = self._project_registration_identity(current[0], current[1])
+                if any(current_identity.get(key) != request.get(field) for key, field in (
+                    ("projectId", "projectId"),
+                    ("projectLeadId", "projectLeadId"),
+                    ("planId", "planId"),
+                    ("planVersion", "planVersion"),
+                )):
+                    continue
             if self.approval_store is None:
                 raise ValueError("approved successor authority is unavailable")
             try:

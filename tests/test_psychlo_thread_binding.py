@@ -174,6 +174,56 @@ def test_completed_approved_successor_binds_exact_conversation_and_dispatch_call
     assert dispatcher.dispatch_calls == [("lead-arcade", "conversation-successor", "thread-successor")]
 
 
+def test_current_registered_plan_reuses_approved_successor_thread_after_plan_change(tmp_path: Path, monkeypatch):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    _completed_successor_intent(store)
+    store.record_project("arcade", {"current": "registration"}, {"current": "scheduling"})
+    dispatcher = _ThreadAwareDispatcher(static_conversation="conversation-old", available={"conversation-successor"})
+    primary = SimpleNamespace(load_admin_change_plan=lambda _plan_id: object())
+    monkeypatch.setattr("overseer.psychlo_legacy_abandonment._require_approved_sisko_plan", lambda *_args: None)
+    monkeypatch.setattr("overseer.psychlo_legacy_abandonment._expected_plan", lambda *_args: object())
+    monkeypatch.setattr("overseer.psychlo_legacy_abandonment._immutable_plan_digest", lambda *_args: "d" * 64)
+    monkeypatch.setattr("overseer.psychlo_legacy_abandonment._validate_wire", lambda *_args: {"signed": True})
+    bridge = PsychloBridge(
+        store=store, dispatcher=dispatcher, approval_store=primary,
+        sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    monkeypatch.setattr(bridge, "_project_registration_identity", lambda *_args: {
+        "projectId": "arcade", "planId": "plan-current", "planVersion": "v3",
+        "aTeamId": "team-arcade", "projectLeadId": "lead-arcade", "receiptId": "receipt-current",
+    })
+
+    request = {**_request(thread_id="thread-successor"), "planId": "plan-current", "planVersion": "v3"}
+    result = bridge.request_round(request)
+
+    assert result["accepted"] is True
+    assert dispatcher.binding_calls == [("lead-arcade", "conversation-successor", "thread-successor")]
+    assert dispatcher.dispatch_calls == [("lead-arcade", "conversation-successor", "thread-successor")]
+
+
+def test_successor_thread_does_not_authorize_a_plan_outside_current_registration(tmp_path: Path, monkeypatch):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    _completed_successor_intent(store)
+    store.record_project("arcade", {"current": "registration"}, {"current": "scheduling"})
+    dispatcher = _ThreadAwareDispatcher(available={"conversation-old", "conversation-successor"})
+    bridge = PsychloBridge(
+        store=store, dispatcher=dispatcher, approval_store=SimpleNamespace(load_admin_change_plan=lambda _plan_id: object()),
+        sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    monkeypatch.setattr(bridge, "_project_registration_identity", lambda *_args: {
+        "projectId": "arcade", "planId": "plan-current", "planVersion": "v3",
+        "aTeamId": "team-arcade", "projectLeadId": "lead-arcade", "receiptId": "receipt-current",
+    })
+    request = {**_request(thread_id="thread-successor"), "planId": "plan-unregistered", "planVersion": "v4"}
+
+    with pytest.raises(ValueError, match="not authorized"):
+        bridge.request_round(request)
+
+    assert dispatcher.dispatch_calls == []
+
+
 def test_successor_thread_with_mismatched_plan_is_rejected_before_dispatch(tmp_path: Path, monkeypatch):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     _completed_successor_intent(store)

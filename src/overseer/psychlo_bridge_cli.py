@@ -113,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         observation = _closed_json(Path(args.observation_file), None)
         receipts = _closed_json(Path(args.receipt_file), None)
         if not isinstance(receipts, list): raise ValueError("usage receipt input must be an array")
+        bridge.retry_unforwarded_results()
         ledger = UsageAttributionLedger(args.attribution_ledger, approved_authority_id=authority["authorityId"], approved_authority_binding_id=authority["authorityBindingId"], approved_authority_binding_digest=authority["authorityBindingDigest"], approved_account_id=authority["accountId"], approved_authority_public_key=base64.b64decode(authority["publicKey"], validate=True), receipt_identity_validator=managed_receipt_validator(bridge.store), lease_seconds=args.delivery_lease_seconds)
         ledger.record_provider_observation(observation)
         for receipt in receipts:

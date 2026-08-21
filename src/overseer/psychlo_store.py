@@ -482,6 +482,14 @@ class PsychloBridgeStore:
         row = self.connection.execute("SELECT request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded FROM rounds WHERE round_id=?", (round_id,)).fetchone()
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
+    def unforwarded_round_results(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(32, int(limit)))
+        rows = self.connection.execute(
+            "SELECT round_id,request_json,result_json FROM rounds WHERE result_json IS NOT NULL AND result_forwarded=0 ORDER BY COALESCE(completed_at,''),rowid LIMIT ?",
+            (bounded_limit,),
+        ).fetchall()
+        return [{"roundId": str(row[0]), "request": json.loads(row[1]), "result": json.loads(row[2])} for row in rows]
+
     def active_round(self) -> str | None:
         row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') LIMIT 1").fetchone()
         return None if row is None else str(row[0])

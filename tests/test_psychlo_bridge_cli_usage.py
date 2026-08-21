@@ -144,6 +144,7 @@ def test_cli_legacy_abandonment_delivery_conversation_is_optional_v2_extension()
 
 def test_cli_propagates_delivery_lease_to_usage_ledger(monkeypatch, tmp_path: Path, capsys):
     captured = {}
+    retried = []
 
     class Ledger:
         def __init__(self, _path, **kwargs):
@@ -174,7 +175,7 @@ def test_cli_propagates_delivery_lease_to_usage_ledger(monkeypatch, tmp_path: Pa
         "publicKey": base64.b64encode(b"k" * 32).decode(),
     }
     observation = {"observationId": "observation-test"}
-    monkeypatch.setattr(cli, "create_bridge_from_environment", lambda: SimpleNamespace(sender=lambda *_: {}, store=object()))
+    monkeypatch.setattr(cli, "create_bridge_from_environment", lambda: SimpleNamespace(sender=lambda *_: {}, store=object(), retry_unforwarded_results=lambda: retried.append(True) or {"processed": 0, "failed": 0}))
     monkeypatch.setattr(cli, "_closed_json", lambda path, keys: authority if keys is not None else ([] if Path(path).name == "receipts.json" else observation))
     monkeypatch.setattr(cli, "UsageAttributionLedger", Ledger)
     monkeypatch.setattr(cli, "UsageSnapshotProducer", Producer)
@@ -196,4 +197,5 @@ def test_cli_propagates_delivery_lease_to_usage_ledger(monkeypatch, tmp_path: Pa
     ])
     assert exit_code == 1
     assert captured["lease_seconds"] == 17
+    assert retried == [True]
     assert '"delivered": false' in capsys.readouterr().out

@@ -1080,11 +1080,25 @@ class PsychloBridge:
         _require_bound_result(request, result)
         if stored_result is not None and stored_result != dict(result): raise ValueError("round result conflict")
         if stored_result is None: self.store.record_result(str(request["roundId"]), result, self.clock())
-        if not forwarded:
-            response = dict(self.sender("round-result", str(request["roundId"]), result))
-            if response.get("accepted") is not True: raise ValueError("Psychlo rejected round result")
-            self.store.mark_forwarded(str(request["roundId"]))
+        if not forwarded: self._forward_stored_round_result(request, result)
         return {"accepted": True}
+
+    def _forward_stored_round_result(self, request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
+        _require_bound_result(request, result)
+        response = dict(self.sender("round-result", str(request["roundId"]), result))
+        if response.get("accepted") is not True: raise ValueError("Psychlo rejected round result")
+        self.store.mark_forwarded(str(request["roundId"]))
+
+    def retry_unforwarded_results(self, *, limit: int = 32) -> dict[str, int]:
+        """Retry exact persisted results; Psychlo's receiver makes replays idempotent."""
+        processed = failed = 0
+        for record in self.store.unforwarded_round_results(limit=limit):
+            try:
+                self._forward_stored_round_result(record["request"], record["result"])
+                processed += 1
+            except Exception:
+                failed += 1
+        return {"processed": processed, "failed": failed}
 
     def _dispatch_reserved(self, request: Mapping[str, Any], capability: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
         conversation_id = self._authorized_successor_conversation(request)

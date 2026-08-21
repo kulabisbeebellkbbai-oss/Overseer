@@ -2234,6 +2234,34 @@ def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
         bridge.request_round(request, callback_capability="capability:different-round-binding")
 
 
+def test_stored_unforwarded_result_is_retried_once_and_marked_forwarded(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    attempts = []
+    accepting = False
+
+    def sender(kind, message_id, payload):
+        attempts.append((kind, message_id, dict(payload)))
+        if not accepting:
+            raise RuntimeError("temporary receiver failure")
+        return {"accepted": True}
+
+    capability = "capability_retry_1234567890abcdef123456"
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "dispatch:retry", sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: capability)
+    request = {"roundId": "round-retry", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-retry", "idempotencyKey": "round-retry", "snapshotId": "snapshot-retry", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    bridge.request_round(request)
+    result = {**request, "sourceId": "member-hermione", "provenanceId": "result:round-retry", "status": "completed", "actualUsageCost": 4, "deliveredScope": "foundation", "remainingEstimate": 0, "blockers": [], "questions": [], "reachedExplicitGates": [], "occurredAt": NOW}
+
+    with pytest.raises(RuntimeError, match="temporary receiver failure"):
+        bridge.receive_round_result(capability, result)
+    assert store.get_round(request["roundId"])[5:] == (result, False)
+
+    accepting = True
+    assert bridge.retry_unforwarded_results() == {"processed": 1, "failed": 0}
+    assert store.get_round(request["roundId"])[5:] == (result, True)
+    assert bridge.retry_unforwarded_results() == {"processed": 0, "failed": 0}
+    assert attempts == [("round-result", "round-retry", result), ("round-result", "round-retry", result)]
+
+
 def test_pending_round_start_is_an_atomic_single_dispatch_claim(tmp_path: Path):
     request = {"roundId": "round-cas-start", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-cas-start", "idempotencyKey": "round-cas-start", "snapshotId": "snapshot-cas-start", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
     capability = "capability_cas_start_1234567890abcdef"

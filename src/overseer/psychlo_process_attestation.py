@@ -840,8 +840,11 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("registry and round binding conversation identity differ")
         if Path(process_binding["workspace"]).name.casefold() != str(request.get("projectId", "")).casefold():
             raise ProcessAttestationError("canonical workspace is not bound to the round project")
-        expected_start = f"{CANONICAL_CODEX_MEMORY_SESSION} resume {process_binding['conversationId']} --cd {shlex.quote(process_binding['workspace'])}"
-        tmux = capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_command=expected_start)
+        expected_starts = (
+            f"{CANONICAL_CODEX_MEMORY_SESSION} resume {process_binding['conversationId']} --cd {shlex.quote(process_binding['workspace'])}",
+            f"{CANONICAL_CODEX_MEMORY_SESSION} --cd {shlex.quote(process_binding['workspace'])}",
+        )
+        tmux = capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_commands=expected_starts)
         pane_pid = int(tmux["paneProcess"]["pid"])
         if tmux.get("paneParentPid") != int(tmux["serverProcess"]["pid"]):
             raise ProcessAttestationError("tmux pane is not directly owned by its server")
@@ -860,7 +863,7 @@ class AuthoritativeProcessEvidenceCollector:
         # the CAS insert, so this is not a caller-authored snapshot.
         if _collect_bound_rollout_evidence(scanner, binding_loader, lead_id, prompt, binding) != scan:
             raise ProcessAttestationError("rollout evidence changed during collection")
-        if capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_command=expected_start) != tmux:
+        if capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_commands=expected_starts) != tmux:
             raise ProcessAttestationError("tmux identity changed during collection")
         observed_window_end = _observation_clock(self.bridge)
         if _parse_utc_timestamp(observed_window_start, "observation start") > _parse_utc_timestamp(observed_window_end, "observation end"):
@@ -1654,9 +1657,19 @@ def capture_socket_identity(socket_path: str | Path) -> dict[str, Any]:
     return {"dev": before.st_dev, "ino": before.st_ino, "mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid}
 
 
-def capture_tmux_identity(socket_path: str, target: str, *, expected_command: str | None = None, expected_start_command: str | None = None) -> dict[str, Any]:
+def capture_tmux_identity(
+    socket_path: str,
+    target: str,
+    *,
+    expected_command: str | None = None,
+    expected_start_command: str | None = None,
+    expected_start_commands: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Capture headless-safe tmux evidence through explicit socket/list-panes."""
-    if not Path(socket_path).is_absolute() or (not target.strip() and expected_start_command is None):
+    if expected_start_command is not None and expected_start_commands is not None:
+        raise ProcessAttestationError("only one tmux start-command selector is allowed")
+    accepted_start_commands = expected_start_commands or ((expected_start_command,) if expected_start_command is not None else ())
+    if not Path(socket_path).is_absolute() or (not target.strip() and not accepted_start_commands):
         raise ProcessAttestationError("tmux socket and target are required")
     socket_identity = capture_socket_identity(socket_path)
     executable = Path(_TMUX)
@@ -1684,12 +1697,12 @@ def capture_tmux_identity(socket_path: str, target: str, *, expected_command: st
         raw_matches = [row for row in rows if row[0] == target or row[2] == target]
     else:
         raw_matches = rows
-    if expected_start_command is not None:
-        expected_tokens = _command_tokens(expected_start_command)
-        raw_matches = [row for row in raw_matches if len(row) == 6 and _command_tokens(row[5]) == expected_tokens]
+    if accepted_start_commands:
+        accepted_tokens = {_command_tokens(command) for command in accepted_start_commands}
+        raw_matches = [row for row in raw_matches if len(row) == 6 and _command_tokens(row[5]) in accepted_tokens]
     if expected_command is not None:
         raw_matches = [row for row in raw_matches if len(row) >= 5 and row[4] == expected_command]
-    if len(raw_matches) != 1 or ((expected_command is not None or expected_start_command is not None) and len(raw_matches[0]) != 6):
+    if len(raw_matches) != 1 or ((expected_command is not None or accepted_start_commands) and len(raw_matches[0]) != 6):
         raise ProcessAttestationError("tmux target identity is not unique")
     if len(raw_matches[0]) == 4:
         session_id, window_id, pane_id, pane_pid = raw_matches[0]
@@ -1700,9 +1713,9 @@ def capture_tmux_identity(socket_path: str, target: str, *, expected_command: st
         pane_start_command = raw_matches[0][5] if len(raw_matches[0]) == 6 else ""
     if expected_command is not None and pane_command != expected_command:
         raise ProcessAttestationError("tmux pane command is not bound to the registry command")
-    if expected_start_command is not None and _command_tokens(pane_start_command) != _command_tokens(expected_start_command):
-        raise ProcessAttestationError("tmux pane start command is not the exact Codex resume chain")
-    if (expected_command is not None or expected_start_command is not None) and not pane_start_command:
+    if accepted_start_commands and _command_tokens(pane_start_command) not in {_command_tokens(command) for command in accepted_start_commands}:
+        raise ProcessAttestationError("tmux pane start command is not an exact Codex launch chain")
+    if (expected_command is not None or accepted_start_commands) and not pane_start_command:
         raise ProcessAttestationError("tmux pane start command is unavailable")
     server_rows = [line.split("|") for line in sessions_stdout.splitlines() if len(line.split("|")) == 2 and line.split("|")[0] == session_id]
     if len(server_rows) != 1 or not server_rows[0][1].isdigit():

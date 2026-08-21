@@ -166,12 +166,19 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
         else:
             raise LegacyAbandonmentError("round recovery conflicts with abandonment")
     delivery = bridge.store.round_prompt_delivery(round_id)
-    expected_delivery_phases = ({"submitted", "unresolved", "abandonment-fence"} if allow_fence else {"submitted", "unresolved"})
-    if delivery is None or delivery.get("phase") not in expected_delivery_phases:
-        raise LegacyAbandonmentError("submitted prompt delivery or terminal uncertain prompt delivery is required")
-    if recovery_authority is None and delivery.get("phase") != ("abandonment-fence" if allow_fence and delivery.get("phase") == "abandonment-fence" else "submitted"):
-        raise LegacyAbandonmentError("submitted prompt delivery is required")
-    if recovery_authority is not None and delivery.get("phase") not in ({"unresolved", "abandonment-fence"} if allow_fence else {"unresolved"}):
+    ambiguous_delivery_phases = {"submit-intent", "composer-pending", "submitted"}
+    effective_delivery_phase = delivery.get("phase") if delivery is not None else None
+    if effective_delivery_phase == "abandonment-fence" and allow_fence:
+        provisional_action_id = f"legacy-abandonment:{round_id}:{successor.get('successorPlanId', '')}"
+        fenced_intent = bridge.store.legacy_abandonment(provisional_action_id)
+        frozen_delivery = fenced_intent.get("payload", {}).get("delivery", {}) if isinstance(fenced_intent, Mapping) else {}
+        effective_delivery_phase = frozen_delivery.get("phase")
+    expected_delivery_phases = ambiguous_delivery_phases | {"unresolved"}
+    if delivery is None or effective_delivery_phase not in expected_delivery_phases:
+        raise LegacyAbandonmentError("ambiguous prompt delivery or terminal uncertain prompt delivery is required")
+    if recovery_authority is None and effective_delivery_phase not in ambiguous_delivery_phases:
+        raise LegacyAbandonmentError("ambiguous prompt delivery is required")
+    if recovery_authority is not None and effective_delivery_phase != "unresolved":
         raise LegacyAbandonmentError("uncertain recovery requires unresolved prompt delivery")
     if delivery.get("requestDigest") != request_digest or delivery.get("capabilityHash") != capability_hash:
         raise LegacyAbandonmentError("prompt delivery binding is not exact")
@@ -179,7 +186,7 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
     if binding is None or binding != delivery.get("binding"):
         raise LegacyAbandonmentError("round execution binding is not exact")
     prompt_digest = _digest(delivery.get("promptDigest"), "prompt digest")
-    delivery_digest = _delivery_digest(delivery, "unresolved" if recovery_authority is not None else "submitted")
+    delivery_digest = _delivery_digest(delivery, str(effective_delivery_phase))
     _digest(delivery_digest, "delivery digest")
     bridge_evidence = manifest.get("bridge")
     expected_binding_digest = hashlib.sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest()
@@ -188,7 +195,7 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
     observation_recovery_exact = (
         recovery_authority is None
         and bridge_evidence.get("recoveryPresent") is False
-        and bridge_evidence.get("deliveryPhase") == "submitted"
+        and bridge_evidence.get("deliveryPhase") == effective_delivery_phase
     ) or (
         recovery_authority is not None
         and bridge_evidence.get("recoveryPresent") is True
@@ -237,7 +244,7 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
         "projectId": _id(request.get("projectId"), "project id"), "requestDigest": request_digest,
         "capabilityHash": capability_hash, "observationId": _id(observation.get("observationId"), "observation id"),
         "observationDigest": observation_digest, "observationPlanDigest": observation_plan_digest,
-        "delivery": {"phase": "unresolved" if recovery_authority is not None else "submitted", "promptDigest": prompt_digest, "deliveryDigest": delivery_digest, "bindingDigest": expected_binding_digest},
+        "delivery": {"phase": effective_delivery_phase, "promptDigest": prompt_digest, "deliveryDigest": delivery_digest, "bindingDigest": expected_binding_digest},
         "originalPlan": {"planId": original_plan_id, "planVersion": original_plan_version, "conversationId": original_conversation_id, "threadId": original_thread_id},
         "successorPlan": dict(successor), "observationPlanId": observation_plan_id, "reason": REASON,
     }

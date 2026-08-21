@@ -421,6 +421,16 @@ def test_observation_window_is_collection_window_and_recorded_at_is_store_envelo
     assert "recordedAt" not in checked
 
 
+@pytest.mark.parametrize("delivery_phase", ["submit-intent", "composer-pending", "submitted"])
+def test_negative_observation_accepts_exact_ambiguous_delivery_phases(delivery_phase):
+    import overseer.psychlo_process_attestation as module
+
+    value = _manifest()
+    value["bridge"]["deliveryPhase"] = delivery_phase
+
+    assert module._manifest(value, "round")["bridge"]["deliveryPhase"] == delivery_phase
+
+
 def test_runtime_hardlink_database_is_rejected(tmp_path):
     from overseer.psychlo_process_attestation import _validate_runtime_path
 

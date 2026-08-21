@@ -791,8 +791,8 @@ class AuthoritativeProcessEvidenceCollector:
         binding = self.bridge.store.round_binding(round_id)
         recovery = self.bridge.store.round_recovery(round_id)
         recovery_mode = recovery is not None
-        expected_phase = "unresolved" if recovery_mode else "submitted"
-        if delivery is None or delivery.get("phase") != expected_phase or binding is None:
+        expected_phases = {"unresolved"} if recovery_mode else {"submit-intent", "composer-pending", "submitted"}
+        if delivery is None or delivery.get("phase") not in expected_phases or binding is None:
             raise ProcessAttestationError("round delivery is not an observable abandonment state with an immutable binding")
         if recovery_mode:
             evidence = recovery.get("evidence") if isinstance(recovery, Mapping) else None
@@ -1160,7 +1160,7 @@ def _manifest(value: Mapping[str, Any], round_id: str) -> dict[str, Any]:
         and bridge.get("failurePresent") is False
         and bridge.get("cancelPresent") is False
         and (
-            (schema == SCHEMA and bridge.get("deliveryPhase") == "submitted" and bridge.get("recoveryPresent") is False)
+            (schema == SCHEMA and bridge.get("deliveryPhase") in {"submit-intent", "composer-pending", "submitted"} and bridge.get("recoveryPresent") is False)
             or (schema == RECOVERY_SCHEMA and bridge.get("deliveryPhase") == "unresolved" and bridge.get("recoveryPresent") is True and bridge.get("recoveryState") == "uncertain" and isinstance(bridge.get("recoveryDigest"), str) and _HEX64.fullmatch(bridge["recoveryDigest"]))
         )
     )

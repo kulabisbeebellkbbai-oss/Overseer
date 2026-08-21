@@ -1145,11 +1145,17 @@ class PsychloBridgeStore:
                 elif recovery["state"] == "abandonment-fenced" and isinstance(recovery.get("evidence"), dict):
                     fence = recovery["evidence"]
                     recovery_exact = fence.get("actionId") == action_id and fence.get("actionDigest") == action_digest and fence.get("priorRecoveryDigest") == recovery_authority.get("recoveryDigest") and fence.get("priorEvidenceDigest") == recovery_authority.get("evidenceDigest")
-            expected_phases = {"unresolved", "abandonment-fence"} if recovery_authority is not None else {"submitted", "abandonment-fence"}
+            payload_phase = payload.get("delivery", {}).get("phase")
+            if recovery_authority is not None:
+                expected_phases = {"unresolved", "abandonment-fence"}
+            elif payload_phase in {"submit-intent", "composer-pending", "submitted"}:
+                expected_phases = {payload_phase, "abandonment-fence"}
+            else:
+                raise ValueError("legacy abandonment delivery phase is invalid")
             if round_row is None or round_row[0] != "started" or round_row[1] is not None or delivery is None or delivery[0] not in expected_phases or competing or not recovery_exact:
                 raise ValueError("legacy abandonment round changed before claim")
             self.connection.execute("UPDATE legacy_abandonment_intents SET state='peer-pending',attempts=attempts+1,last_error=NULL,updated_at=? WHERE action_id=? AND action_digest=? AND state IN ('claimed','peer-pending')", (now, action_id, action_digest))
-            self.connection.execute("UPDATE round_prompt_deliveries SET phase='abandonment-fence',updated_at=? WHERE round_id=? AND phase IN ('submitted','unresolved')", (now, row[0]))
+            self.connection.execute("UPDATE round_prompt_deliveries SET phase='abandonment-fence',updated_at=? WHERE round_id=? AND phase=?", (now, row[0], payload_phase))
             if isinstance(recovery_authority, dict) and recovery is not None and recovery["state"] == "uncertain":
                 fence = {"schemaVersion": "overseer.round-recovery-abandonment-fence.v1", "actionId": action_id, "actionDigest": action_digest, "priorRecoveryDigest": recovery_authority["recoveryDigest"], "priorEvidenceDigest": recovery_authority["evidenceDigest"], "priorEvidence": recovery["evidence"], "priorUpdatedAt": recovery["updatedAt"]}
                 self.connection.execute("UPDATE round_recoveries SET state='abandonment-fenced',evidence_json=?,updated_at=? WHERE round_id=? AND state='uncertain'", (_dump_wire(fence), now, row[0]))
@@ -1191,7 +1197,9 @@ class PsychloBridgeStore:
                 "UPDATE legacy_abandonment_intents SET state='claimed',last_error=NULL,updated_at=? WHERE action_id=? AND action_digest=? AND state='peer-pending'",
                 (now, action_id, action_digest),
             )
-            restored_phase = "unresolved" if recovery_authority is not None else "submitted"
+            restored_phase = "unresolved" if recovery_authority is not None else payload.get("delivery", {}).get("phase")
+            if restored_phase not in {"submit-intent", "composer-pending", "submitted", "unresolved"}:
+                raise ValueError("legacy abandonment delivery phase is invalid")
             self.connection.execute("UPDATE round_prompt_deliveries SET phase=?,updated_at=? WHERE round_id=? AND phase='abandonment-fence'", (restored_phase, now, row[0]))
             if recovery_authority is not None:
                 self.connection.execute("UPDATE round_recoveries SET state='uncertain',evidence_json=?,updated_at=? WHERE round_id=? AND state='abandonment-fenced'", (_dump_wire(fence["priorEvidence"]), fence["priorUpdatedAt"], row[0]))

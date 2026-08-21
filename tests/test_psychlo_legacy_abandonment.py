@@ -33,7 +33,7 @@ def _payload_action(payload):
     return payload.get("action", payload)
 
 
-def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thread_id="old-conversation", uncertain_recovery=False):
+def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thread_id="old-conversation", uncertain_recovery=False, delivery_phase="submitted"):
     bridge_store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     request = {
         "roundId": "round-arcade", "projectId": "arcade", "projectLeadId": "hermione",
@@ -49,7 +49,7 @@ def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thre
     binding = {"conversationId": "old-conversation", "sessionId": "old-session"}
     bridge_store.record_round(request, receipt, capability)
     bridge_store.start_round_dispatch("round-arcade", request, capability, NOW, binding=binding, prompt_digest="4" * 64)
-    bridge_store.record_round_prompt_delivery_phase("round-arcade", request, capability, binding, "4" * 64, "submitted", now=NOW, expected_phase="prepared")
+    bridge_store.record_round_prompt_delivery_phase("round-arcade", request, capability, binding, "4" * 64, delivery_phase, now=NOW, expected_phase="prepared")
     recovery_digest = None
     if uncertain_recovery:
         recovery_evidence = {
@@ -79,10 +79,10 @@ def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thre
     capability_hash = bridge_store.connection.execute("SELECT capability_hash FROM rounds WHERE round_id='round-arcade'").fetchone()[0]
     binding_digest = __import__("hashlib").sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest()
     delivery = bridge_store.round_prompt_delivery("round-arcade")
-    delivery_digest = __import__("overseer.psychlo_legacy_abandonment", fromlist=["_delivery_digest"])._delivery_digest(delivery)
+    delivery_digest = __import__("overseer.psychlo_legacy_abandonment", fromlist=["_delivery_digest"])._delivery_digest(delivery, delivery_phase)
     manifest = _process_manifest("round-arcade", "observation-plan")
     manifest["requestDigest"] = request_digest
-    manifest["bridge"] = {"dispatchState": "started", "resultPresent": False, "deliveryPhase": "submitted", "recoveryPresent": False, "failurePresent": False, "cancelPresent": False, "requestDigest": request_digest, "capabilityHash": capability_hash, "bindingDigest": binding_digest, "promptDigest": "4" * 64}
+    manifest["bridge"] = {"dispatchState": "started", "resultPresent": False, "deliveryPhase": delivery_phase, "recoveryPresent": False, "failurePresent": False, "cancelPresent": False, "requestDigest": request_digest, "capabilityHash": capability_hash, "bindingDigest": binding_digest, "promptDigest": "4" * 64}
     if uncertain_recovery:
         manifest["schemaVersion"] = "psychlo.legacy-process-observation.v2"
         manifest["bridge"].update({"deliveryPhase": "unresolved", "recoveryPresent": True, "recoveryState": "uncertain", "recoveryDigest": recovery_digest})
@@ -129,6 +129,36 @@ def test_uncertain_recovery_can_be_superseded_by_exact_approved_abandonment(tmp_
     assert result["status"] == "legacy-abandoned-uncertain"
     assert bridge.store.round_recovery("round-arcade")["state"] == "abandonment-fenced"
     assert bridge.store.get_round("round-arcade")[4] == "legacy-abandoned"
+
+
+@pytest.mark.parametrize("delivery_phase", ["submit-intent", "composer-pending"])
+def test_preconfirmation_delivery_can_be_abandoned_with_exact_negative_observation(tmp_path, delivery_phase):
+    bridge, primary = _runtime(tmp_path, delivery_phase=delivery_phase)
+
+    staged = _stage(bridge)
+    action = bridge.store.legacy_abandonment(staged["actionId"])["payload"]
+    plan = primary.load_admin_change_plan("abandon-plan")
+    assert action["delivery"]["phase"] == delivery_phase
+    assert plan.adapter_metadata["legacy_abandonment"]["submittedPhase"] == delivery_phase
+    primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", NOW))
+
+    result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+
+    assert result["status"] == "legacy-abandoned-uncertain"
+    assert bridge.store.get_round("round-arcade")[4] == "legacy-abandoned"
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "abandonment-fence"
+
+
+def test_preconfirmation_fence_release_restores_exact_delivery_phase(tmp_path):
+    bridge, primary = _runtime(tmp_path, delivery_phase="submit-intent")
+    staged = _stage(bridge)
+    plan = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(plan)
+    bridge.store.claim_legacy_abandonment(staged["actionId"], staged["actionDigest"], now=NOW)
+
+    bridge.store.release_unsent_legacy_abandonment_reservation(staged["actionId"], staged["actionDigest"], now=NOW)
+
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "submit-intent"
 
 
 def test_uncertain_recovery_abandonment_rejects_recovery_evidence_drift(tmp_path):
@@ -215,13 +245,13 @@ def test_v2_historical_misbinding_requires_the_immutable_delivery_binding(tmp_pa
         )
 
 
-def test_v2_historical_misbinding_is_only_stageable_for_submitted_delivery(tmp_path):
+def test_v2_historical_misbinding_rejects_non_ambiguous_delivery(tmp_path):
     bridge, _primary = _runtime(tmp_path, request_thread_id="requested-thread")
     bridge.store.connection.execute(
         "UPDATE round_prompt_deliveries SET phase='prepared' WHERE round_id=?",
         ("round-arcade",),
     )
-    with pytest.raises(LegacyAbandonmentError, match="submitted prompt delivery"):
+    with pytest.raises(LegacyAbandonmentError, match="ambiguous prompt delivery"):
         _stage_v2(bridge)
     assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2") is None
 

@@ -551,7 +551,7 @@ def plan_psychlo_legacy_abandonment(
             raise ValueError(f"legacy abandonment {name} is invalid")
     if requested_thread_id is not None and requested_thread_id == delivery_conversation_id:
         raise ValueError("historical misbinding thread and delivery conversation must be distinct")
-    if delivery_phase not in {"submitted", "unresolved"}:
+    if delivery_phase not in {"submit-intent", "composer-pending", "submitted", "unresolved"}:
         raise ValueError("legacy abandonment delivery phase is invalid")
     if (recovery_digest is None) != (recovery_evidence_digest is None) or (delivery_phase == "unresolved") != (recovery_digest is not None):
         raise ValueError("uncertain recovery authority must be complete")

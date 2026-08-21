@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -317,6 +318,18 @@ def _project_path_for_store(store_path: str) -> Path:
     if store_parent.name == "state":
         return store_parent.parent
     return Path.cwd()
+
+
+def _require_decision_peer_message_binding(message: dict[str, Any]) -> None:
+    payload = message.get("payload")
+    if not isinstance(payload, dict) or not isinstance(payload.get("decisionId"), str):
+        raise ValueError("decision peer message identity is invalid")
+    decision_id = payload["decisionId"]
+    if not decision_id:
+        raise ValueError("decision peer message identity is invalid")
+    expected = decision_id if re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", decision_id) else f"decision:{hashlib.sha256(decision_id.encode()).hexdigest()}"
+    if message.get("messageId") != expected:
+        raise ValueError("decision peer message identity is invalid")
 
 
 def make_api_handler(
@@ -1399,6 +1412,8 @@ def make_api_handler(
                 headers = self._singleton_headers()
                 if not isinstance(request_bridge.peer_secret, bytes): raise ValueError("peer_secret_unavailable")
                 message = verify_peer_request(request_bridge.peer_secret, request_bridge.store, kind, body, headers, expected_authority=psychlo_peer_authority)
+                if kind in {"decision-stage", "decision-reconcile"}:
+                    _require_decision_peer_message_binding(message)
                 if kind == "project-register":
                     result = request_bridge.register_project(message["payload"])
                 elif kind == "round-request":

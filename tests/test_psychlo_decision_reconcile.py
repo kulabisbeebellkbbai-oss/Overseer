@@ -259,3 +259,45 @@ def test_http_reconciliation_is_authenticated_and_response_bound(tmp_path: Path)
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_http_decision_stage_requires_the_canonical_safe_transport_identity(tmp_path: Path) -> None:
+    secret = PEER_SECRET
+    bridge, _ = _bridge(tmp_path)
+    decision_id = "roadex:round:arcade:usage-attribution-f8b71029532e11a147aaa752:worktree:arcade@2578756:task7-source-reviewed-207-tests"
+    request = {**_request(), "decisionId": decision_id, "idempotencyKey": "decision:arcade:task-7:unsafe-provenance"}
+    expected_message_id = f"decision:{hashlib.sha256(decision_id.encode()).hexdigest()}"
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    handler = make_api_handler(
+        str(tmp_path / "primary.sqlite3"),
+        psychlo_bridge=bridge,
+        psychlo_peer_authority=f"127.0.0.1:{port}",
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def post(message_id: str, nonce: str) -> tuple[int, dict[str, object]]:
+            timestamp = datetime.now(UTC).isoformat()
+            body = json.dumps({"kind": "decision-stage", "messageId": message_id, "occurredAt": timestamp, "payload": request}, separators=(",", ":")).encode()
+            headers = sign_peer_message(secret, "psychlo-to-overseer", "decision-stage", message_id, timestamp, nonce, body, authority=f"127.0.0.1:{server.server_port}")
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            connection.request("POST", "/psychlo/decisions", body=body, headers=headers)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+
+        wrong_status, wrong_body = post(f"decision:{'0' * 64}", "request-wrong-id-123456")
+        assert wrong_status == 400, wrong_body
+        assert bridge.store.decision_record(decision_id) is None
+
+        status, body = post(expected_message_id, "request-exact-id-123456")
+        assert status == 202, body
+        assert body["receipt"]["decisionId"] == decision_id
+        assert bridge.store.decision_record(decision_id)["request"] == request
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

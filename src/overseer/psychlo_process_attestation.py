@@ -656,21 +656,24 @@ def _capture_launcher_chain(pane_pid: int, process_binding: Mapping[str, str]) -
         raise ProcessAttestationError("memory-session trampoline does not bind the reviewed Documents wrapper")
     raw_cmdline = _read_proc_bytes(Path(f"/proc/{pane_pid}/cmdline"))
     argv = raw_cmdline.split(b"\0")[:-1]
-    expected_tail = [CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.as_posix().encode(), b"resume",
-                     process_binding["conversationId"].encode(), b"--cd",
-                     process_binding["workspace"].encode()]
-    if len(argv) != len(expected_tail) + 1 or argv[0] not in {b"bash", b"/usr/bin/bash"} or argv[1:] != expected_tail:
+    resume_tail = (CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.as_posix().encode(), b"resume",
+                   process_binding["conversationId"].encode(), b"--cd",
+                   process_binding["workspace"].encode())
+    initial_tail = (CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.as_posix().encode(), b"--cd",
+                    process_binding["workspace"].encode())
+    if len(argv) < 2 or argv[0] not in {b"bash", b"/usr/bin/bash"} or tuple(argv[1:]) not in {resume_tail, initial_tail}:
         raise ProcessAttestationError("tmux pane does not execute the exact reviewed memory-session wrapper")
+    launch_mode = "resume" if tuple(argv[1:]) == resume_tail else "initial"
     raw_environment = _read_proc_bytes(Path(f"/proc/{pane_pid}/environ"))
     overrides = [entry.split(b"=", 1)[1].decode(errors="strict") for entry in raw_environment.split(b"\0") if entry.startswith(b"MEMORY_VAULT_PROJECT=")]
     if overrides and overrides != [str(expected_root)]:
         raise ProcessAttestationError("memory-session environment override is unsafe")
     return {"launcher": launcher_identity, "memorySession": link_identity,
             "trampoline": trampoline_identity, "wrapper": wrapper_identity,
-            "paneArgvDigest": sha256(raw_cmdline).hexdigest()}
+            "paneArgvDigest": sha256(raw_cmdline).hexdigest(), "launchMode": launch_mode}
 
 
-def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -> None:
+def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -> dict[str, Any]:
     """Bind the pane shell and complete launcher chain, including file identity."""
     try:
         pane_executable = Path(os.readlink(Path(f"/proc/{pane_pid}/exe")))
@@ -682,7 +685,7 @@ def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -
     pane_identity = capture_process_identity(pane_pid)
     if pane_identity["exeDigest"] != pane_digest or pane_meta.st_nlink != 1:
         raise ProcessAttestationError("tmux pane shell identity changed")
-    _capture_launcher_chain(pane_pid, process_binding)
+    return _capture_launcher_chain(pane_pid, process_binding)
 
 
 @dataclass(frozen=True)
@@ -847,8 +850,11 @@ class AuthoritativeProcessEvidenceCollector:
         pane_pid = int(tmux["paneProcess"]["pid"])
         if tmux.get("paneParentPid") != int(tmux["serverProcess"]["pid"]):
             raise ProcessAttestationError("tmux pane is not directly owned by its server")
-        _validate_pane_launcher(pane_pid, process_binding)
-        child = capture_direct_codex_child(pane_pid, expected_conversation_id=process_binding["conversationId"], expected_workspace=process_binding["workspace"])
+        launcher_chain = _validate_pane_launcher(pane_pid, process_binding)
+        child = capture_direct_codex_child(
+            pane_pid, expected_conversation_id=process_binding["conversationId"],
+            expected_workspace=process_binding["workspace"], expected_launch_mode=launcher_chain["launchMode"],
+        )
         self._hold_identities(tmux, child)
         if child.get("parentPid") != pane_pid:
             raise ProcessAttestationError("Codex child is not bound to the pane process")
@@ -1572,7 +1578,7 @@ def _proc_parent_pid(pid: int) -> int:
         raise ProcessAttestationError("process parent identity is invalid") from error
 
 
-def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | None = None, expected_conversation_id: str | None = None, expected_exe_digest: str | None = None, expected_exe_path: str | None = None, expected_exe_dev: int | None = None, expected_exe_ino: int | None = None, expected_workspace: str | None = None) -> dict[str, Any]:
+def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | None = None, expected_conversation_id: str | None = None, expected_exe_digest: str | None = None, expected_exe_path: str | None = None, expected_exe_dev: int | None = None, expected_exe_ino: int | None = None, expected_workspace: str | None = None, expected_launch_mode: str = "resume") -> dict[str, Any]:
     """Require exactly one direct child and persist only redacted identity."""
     parent_before = capture_process_identity(parent_pid)
     workspace_identity = _cwd_identity(parent_pid, expected_workspace) if expected_workspace is not None else None
@@ -1588,7 +1594,11 @@ def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | N
     if expected_conversation_id is not None:
         raw = _read_proc_bytes(Path(f"/proc/{children[0]}/cmdline"))
         argv = raw.split(b"\0")[:-1]
-        expected = [b"codex", b"resume", expected_conversation_id.encode("utf-8")]
+        if expected_launch_mode not in {"initial", "resume"}:
+            raise ProcessAttestationError("direct Codex child launch mode is invalid")
+        expected = [b"codex"]
+        if expected_launch_mode == "resume":
+            expected.extend((b"resume", expected_conversation_id.encode("utf-8")))
         if expected_workspace is not None:
             expected.extend((b"--cd", expected_workspace.encode("utf-8")))
         if argv != expected:

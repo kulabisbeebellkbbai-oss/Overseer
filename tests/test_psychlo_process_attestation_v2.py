@@ -557,6 +557,21 @@ def test_live_two_hop_trampoline_chain_is_hashed_and_bound_to_pane_argv(tmp_path
     assert chain["memorySession"]["target"] == str(trampoline)
     assert chain["trampoline"]["digest"] == hashlib.sha256(trampoline.read_bytes()).hexdigest()
     assert chain["wrapper"]["path"] == str(wrapper)
+    assert chain["launchMode"] == "resume"
+
+
+def test_live_two_hop_trampoline_accepts_exact_initial_launch(tmp_path, monkeypatch):
+    module, docs, wrapper, trampoline, memory_session, _launcher, binding = _two_hop_chain_fixture(tmp_path)
+    monkeypatch.setattr(module, "CANONICAL_CODEX_MEMORY_SESSION", str(memory_session))
+    monkeypatch.setattr(module, "CANONICAL_CODEX_MEMORY_SESSION_TRAMPOLINE", trampoline)
+    monkeypatch.setattr(module, "CANONICAL_CODEX_MEMORY_SESSION_SCRIPT", wrapper)
+    monkeypatch.setattr(module, "_read_proc_bytes", lambda path: (
+        b"bash\0" + str(wrapper).encode() + b"\0--cd\0" + str(docs).encode() + b"\0"
+        if str(path).endswith("/cmdline") else b"MEMORY_VAULT_PROJECT=" + str(docs).encode() + b"\0"
+    ))
+
+    chain = module._capture_launcher_chain(77, binding)
+    assert chain["launchMode"] == "initial"
 
 
 def test_live_trampoline_rejects_replace_target_and_environment_override(tmp_path, monkeypatch):

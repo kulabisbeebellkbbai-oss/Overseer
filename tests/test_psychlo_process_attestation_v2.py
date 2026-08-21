@@ -873,8 +873,39 @@ def test_tmux_scan_accepts_unique_initial_or_resume_start_chain(monkeypatch, tmp
     monkeypatch.setattr(module, "_proc_parent_pid", lambda _pid: 11)
 
     result = module.capture_tmux_identity(
-        str(socket_path), "", expected_start_commands=(resume, shlex.quote(resume), initial, shlex.quote(initial)),
+        str(socket_path), "",
+        expected_start_commands=(resume, shlex.quote(resume), initial, shlex.quote(initial)),
+        preferred_start_commands=(resume, shlex.quote(resume)),
     )
+    assert (result["sessionId"], result["paneId"]) == ("$2", "%2")
+
+
+def test_tmux_scan_prefers_exact_resume_over_unrelated_initial_chain(monkeypatch, tmp_path):
+    import overseer.psychlo_process_attestation as module
+    socket_path = tmp_path / "tmux.sock"
+    initial = "/home/god/.local/bin/codex-memory-session --cd '/home/god/Documents/Codex Workspace/Arcade'"
+    resume = "/home/god/.local/bin/codex-memory-session resume conversation-arcade --cd '/home/god/Documents/Codex Workspace/Arcade'"
+    rows = (
+        '$1|@1|%1|101|bash|/home/god/.local/bin/codex-memory-session --cd "/home/god/Documents/Codex Workspace/Arcade"\n'
+        '$2|@2|%2|102|bash|/home/god/.local/bin/codex-memory-session resume conversation-arcade --cd "/home/god/Documents/Codex Workspace/Arcade"\n'
+    )
+
+    class Result:
+        returncode = 0
+        def __init__(self, stdout): self.stdout = stdout
+
+    monkeypatch.setattr(module, "capture_socket_identity", lambda _path: {"dev": 1, "ino": 2, "mode": 0o770, "uid": os.getuid()})
+    monkeypatch.setattr(module.subprocess, "run", lambda command, **_kwargs: Result("$1|11\n$2|12\n") if "list-sessions" in command else Result(rows))
+    identity = {"pid": 12, "startTicks": 1, "exeDigest": "a" * 64, "argvDigest": "b" * 64, "cgroupDigest": "c" * 64, "pidfdSupported": True}
+    monkeypatch.setattr(module, "capture_process_identity", lambda pid: {**identity, "pid": pid})
+    monkeypatch.setattr(module, "_proc_parent_pid", lambda _pid: 11)
+
+    result = module.capture_tmux_identity(
+        str(socket_path), "",
+        expected_start_commands=(resume, shlex.quote(resume), initial, shlex.quote(initial)),
+        preferred_start_commands=(resume, shlex.quote(resume)),
+    )
+
     assert (result["sessionId"], result["paneId"]) == ("$2", "%2")
 
 

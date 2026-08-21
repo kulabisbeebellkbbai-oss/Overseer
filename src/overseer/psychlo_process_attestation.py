@@ -846,7 +846,12 @@ class AuthoritativeProcessEvidenceCollector:
         resume_start = f"{CANONICAL_CODEX_MEMORY_SESSION} resume {process_binding['conversationId']} --cd {shlex.quote(process_binding['workspace'])}"
         initial_start = f"{CANONICAL_CODEX_MEMORY_SESSION} --cd {shlex.quote(process_binding['workspace'])}"
         expected_starts = (resume_start, shlex.quote(resume_start), initial_start, shlex.quote(initial_start))
-        tmux = capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_commands=expected_starts)
+        tmux = capture_tmux_identity(
+            self.tmux_socket,
+            self.tmux_target,
+            expected_start_commands=expected_starts,
+            preferred_start_commands=(resume_start, shlex.quote(resume_start)),
+        )
         pane_pid = int(tmux["paneProcess"]["pid"])
         if tmux.get("paneParentPid") != int(tmux["serverProcess"]["pid"]):
             raise ProcessAttestationError("tmux pane is not directly owned by its server")
@@ -868,7 +873,12 @@ class AuthoritativeProcessEvidenceCollector:
         # the CAS insert, so this is not a caller-authored snapshot.
         if _collect_bound_rollout_evidence(scanner, binding_loader, lead_id, prompt, binding) != scan:
             raise ProcessAttestationError("rollout evidence changed during collection")
-        if capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_commands=expected_starts) != tmux:
+        if capture_tmux_identity(
+            self.tmux_socket,
+            self.tmux_target,
+            expected_start_commands=expected_starts,
+            preferred_start_commands=(resume_start, shlex.quote(resume_start)),
+        ) != tmux:
             raise ProcessAttestationError("tmux identity changed during collection")
         observed_window_end = _observation_clock(self.bridge)
         if _parse_utc_timestamp(observed_window_start, "observation start") > _parse_utc_timestamp(observed_window_end, "observation end"):
@@ -1673,11 +1683,14 @@ def capture_tmux_identity(
     expected_command: str | None = None,
     expected_start_command: str | None = None,
     expected_start_commands: tuple[str, ...] | None = None,
+    preferred_start_commands: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Capture headless-safe tmux evidence through explicit socket/list-panes."""
     if expected_start_command is not None and expected_start_commands is not None:
         raise ProcessAttestationError("only one tmux start-command selector is allowed")
     accepted_start_commands = expected_start_commands or ((expected_start_command,) if expected_start_command is not None else ())
+    if preferred_start_commands is not None and not accepted_start_commands:
+        raise ProcessAttestationError("preferred tmux start commands require accepted commands")
     if not Path(socket_path).is_absolute() or (not target.strip() and not accepted_start_commands):
         raise ProcessAttestationError("tmux socket and target are required")
     socket_identity = capture_socket_identity(socket_path)
@@ -1709,6 +1722,13 @@ def capture_tmux_identity(
     if accepted_start_commands:
         accepted_tokens = {_command_tokens(command) for command in accepted_start_commands}
         raw_matches = [row for row in raw_matches if len(row) == 6 and _command_tokens(row[5]) in accepted_tokens]
+        if preferred_start_commands:
+            preferred_tokens = {_command_tokens(command) for command in preferred_start_commands}
+            if not preferred_tokens.issubset(accepted_tokens):
+                raise ProcessAttestationError("preferred tmux start commands must be accepted")
+            preferred_matches = [row for row in raw_matches if _command_tokens(row[5]) in preferred_tokens]
+            if preferred_matches:
+                raw_matches = preferred_matches
     if expected_command is not None:
         raw_matches = [row for row in raw_matches if len(row) >= 5 and row[4] == expected_command]
     if len(raw_matches) != 1 or ((expected_command is not None or accepted_start_commands) and len(raw_matches[0]) != 6):

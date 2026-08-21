@@ -868,7 +868,7 @@ class PsychloBridge:
                 return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
             durable_delivery = self.store.round_prompt_delivery(round_id)
             prior_phase = durable_delivery.get("phase") if durable_delivery is not None else (prior_evidence.get("phase") if isinstance(prior_evidence, dict) else None)
-            if prior_phase in {"failure-fence", "paste-intent", "pasted", "composer-pending", "submitted", "confirmed", "unresolved"}:
+            if prior_phase in {"failure-fence", "paste-intent", "pasted", "submit-intent", "composer-pending", "submitted", "confirmed", "unresolved"}:
                 raise ValueError("rollout delivery proof is missing; redelivery already attempted (prompt delivery phase is unresolved)")
             if isinstance(prior_evidence, dict) and prior_evidence.get("redeliveryAttempted") is True and prior_phase not in {"prepared"}:
                 evidence = {**prior_evidence, "source": "recovery-rescan-no-proof", "observedAt": now}

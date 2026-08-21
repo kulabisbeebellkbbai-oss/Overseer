@@ -2659,6 +2659,34 @@ def test_recovery_fails_closed_for_composer_pending_without_current_input_proof(
     assert store.round_prompt_delivery(request["roundId"])["phase"] == "composer-pending"
 
 
+def test_recovery_fails_closed_for_submit_intent_without_regressing_delivery_phase(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_bound_round(store, "round-submit-intent")
+    capability = f"capability-{request['roundId']}-1234567890abcdef"
+    delivery = store.round_prompt_delivery(request["roundId"])
+    assert delivery is not None
+    for phase, predecessor in (("paste-intent", "prepared"), ("submit-intent", "paste-intent")):
+        store.record_round_prompt_delivery_phase(
+            request["roundId"],
+            request,
+            capability,
+            delivery["binding"],
+            delivery["promptDigest"],
+            phase,
+            now=NOW,
+            expected_phase=predecessor,
+        )
+
+    dispatcher = _RoundRecoveryDispatcher()
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    with pytest.raises(ValueError, match="redelivery already attempted"):
+        bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+
+    assert dispatcher.calls == []
+    assert store.round_prompt_delivery(request["roundId"])["phase"] == "submit-intent"
+
+
 def test_recovery_after_crash_rescans_and_never_redelivers_again(tmp_path: Path):
     store_path = tmp_path / "bridge.sqlite3"
     store = PsychloBridgeStore(store_path)

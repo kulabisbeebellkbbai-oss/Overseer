@@ -1033,6 +1033,47 @@ def test_composer_visible_without_rollout_proof_never_persists_submitted(
     assert phases == ["prepared", "paste-intent", "submit-intent", "composer-pending"]
 
 
+def test_composer_visible_when_rollout_scan_fails_persists_composer_pending(
+    codex_csv: Path,
+) -> None:
+    prompt = "Continue exactly one bounded round after a rollout scan failure."
+    phases: list[str] = []
+
+    class ComposerVisibleRunner(RecordingRunner):
+        def __call__(self, command, input=None, text=True, capture_output=True):
+            result = super().__call__(command, input=input, text=text, capture_output=capture_output)
+            if command[1] == "capture-pane" and self.capture_count == 2:
+                return subprocess.CompletedProcess(command, 0, f"Codex ready\n{prompt}", "")
+            return result
+
+    class FailingEvidence:
+        def confirm(self, _prompt: str) -> bool:
+            raise OSError("rollout scan failed")
+
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=ComposerVisibleRunner(),
+        delivery_evidence_factory=lambda _session: FailingEvidence(),
+        sleep=lambda _delay: None,
+    )
+
+    result = adapter.dispatch_legacy(
+        adapter.discover()[0],
+        prompt,
+        idempotency_key="round:composer-scan-failed",
+        prompt_marker="round:composer-scan-failed",
+        phase_callback=phases.append,
+    )
+
+    assert result.state is AgentOperationState.FAILED
+    assert result.error_message == "codex prompt remains in composer without durable rollout proof"
+    assert phases == ["prepared", "paste-intent", "submit-intent", "composer-pending"]
+
+
 def test_composer_pending_retry_fails_closed_without_current_composer_proof(
     codex_csv: Path,
 ) -> None:

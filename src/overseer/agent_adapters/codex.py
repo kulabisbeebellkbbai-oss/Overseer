@@ -1158,7 +1158,15 @@ class CodexDriver:
                 stdout=pane_result.stdout,
                 stderr=pane_result.stderr,
             )
-        if delivery_evidence is not None and not delivery_evidence.confirm(dispatch_prompt):
+        delivery_confirmed = True
+        delivery_error = ""
+        if delivery_evidence is not None:
+            try:
+                delivery_confirmed = delivery_evidence.confirm(dispatch_prompt)
+            except Exception as error:
+                delivery_confirmed = False
+                delivery_error = str(error)
+        if delivery_evidence is not None and not delivery_confirmed:
             if dispatch_prompt in pane_result.stdout:
                 if phase_callback is not None:
                     try:
@@ -1186,7 +1194,7 @@ class CodexDriver:
                     prompt_exit_code=prompt_result.returncode,
                     enter_exit_code=enter_result.returncode,
                     stdout=pane_result.stdout,
-                    stderr=pane_result.stderr,
+                    stderr=delivery_error or pane_result.stderr,
                 )
             return self._prompt_failure(
                 request,
@@ -1198,7 +1206,7 @@ class CodexDriver:
                 prompt_exit_code=prompt_result.returncode,
                 enter_exit_code=enter_result.returncode,
                 stdout=pane_result.stdout,
-                stderr=pane_result.stderr,
+                stderr=delivery_error or pane_result.stderr,
             )
         if phase_callback is not None:
             try:

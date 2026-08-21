@@ -49,8 +49,8 @@ from .psychlo_contracts import (
     parse_telemetry_checkpoint,
 )
 from .psychlo_contracts import SHA256_RE
-from .audit import ApprovalRequest, ApprovalStatus
-from .core import ApprovalLevel
+from .audit import ApprovalRequest, ApprovalStatus, AuditEventType
+from .core import ApprovalLevel, ClaimStatus
 from .admin import AdminChangePlan
 from .store import SQLiteStore
 from .psychlo_legacy_binding import _private_group_is_safe
@@ -348,6 +348,7 @@ class PsychloBridge:
             self._recover_decision_intents()
             self.recover_protocol_records()
             self._recover_policy_exception_records()
+            self.retry_unforwarded_results()
 
     def request_scoped(self) -> "PsychloBridge":
         """Create a bridge whose SQLite handles belong to the request worker.
@@ -1078,13 +1079,20 @@ class PsychloBridge:
         if record is None: raise ValueError("unknown round capability")
         request, _, _, _, _, stored_result, forwarded = record
         _require_bound_result(request, result)
+        fulfillments = self._fulfilled_result_claims(request, result)
         if stored_result is not None and stored_result != dict(result): raise ValueError("round result conflict")
-        if stored_result is None: self.store.record_result(str(request["roundId"]), result, self.clock())
+        if fulfillments:
+            self.store.bind_result_claim_fulfillments(str(request["roundId"]), request, result, fulfillments, completed_at=self.clock())
+        elif stored_result is None:
+            self.store.record_result(str(request["roundId"]), result, self.clock())
         if not forwarded: self._forward_stored_round_result(request, result)
         return {"accepted": True}
 
     def _forward_stored_round_result(self, request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
         _require_bound_result(request, result)
+        fulfillments = self._fulfilled_result_claims(request, result)
+        if fulfillments:
+            self.store.bind_result_claim_fulfillments(str(request["roundId"]), request, result, fulfillments, completed_at=self.clock())
         response = dict(self.sender("round-result", str(request["roundId"]), result))
         if response.get("accepted") is not True: raise ValueError("Psychlo rejected round result")
         self.store.mark_forwarded(str(request["roundId"]))
@@ -1099,6 +1107,36 @@ class PsychloBridge:
             except Exception:
                 failed += 1
         return {"processed": processed, "failed": failed}
+
+    def _fulfilled_result_claims(self, request: Mapping[str, Any], result: Mapping[str, Any]) -> list[dict[str, str]]:
+        claim_ids = sorted(match.group(1) for gate in result.get("reachedExplicitGates", []) if (match := re.fullmatch(r"overseer-temporary-loopback-claim:([A-Za-z0-9][A-Za-z0-9._:-]{0,159}):approved-used-released", gate)) is not None)
+        if not claim_ids:
+            return []
+        persisted = self.store.result_claim_fulfillments(str(request["roundId"]))
+        if persisted:
+            request_digest = canonical_digest(request)
+            result_digest = _round_result_digest(result)
+            if [record["claimId"] for record in persisted] != claim_ids or any(record["requestDigest"] != request_digest or record["resultDigest"] != result_digest for record in persisted):
+                raise ValueError("resource claim fulfillment conflicts with immutable history")
+            return persisted
+        fulfillments: list[dict[str, str]] = []
+        for claim_id in claim_ids:
+            if self.approval_store is None:
+                raise ValueError("fulfilled resource claim requires authoritative Overseer evidence")
+            try:
+                claim = self.approval_store.load_claim(claim_id)
+                approval = self.approval_store.load_approval(str(claim.approval_id))
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("fulfilled resource claim requires authoritative Overseer evidence") from None
+            thread_id = request.get("threadId")
+            if claim.status != ClaimStatus.RELEASED or not isinstance(thread_id, str) or claim.owner_thread != thread_id or approval.id != claim.approval_id or approval.subject_id != claim_id or approval.requester_thread != thread_id or approval.status != ApprovalStatus.APPROVED or not approval.decided_by:
+                raise ValueError("fulfilled resource claim does not bind to the round authority")
+            releases = [event for event in self.approval_store.list_audit_events(subject_prefix=claim_id, event_type=AuditEventType.RELEASED) if event.subject_id == claim_id]
+            if len(releases) != 1 or not releases[0].evidence_ids:
+                raise ValueError("fulfilled resource claim lacks exact release evidence")
+            release = releases[0]
+            fulfillments.append({"claimId": claim_id, "approvalId": approval.id, "releaseEventId": release.id, "releaseEvidenceDigest": canonical_digest({"releaseEventId": release.id, "evidenceIds": list(release.evidence_ids)})})
+        return fulfillments
 
     def _dispatch_reserved(self, request: Mapping[str, Any], capability: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
         conversation_id = self._authorized_successor_conversation(request)
@@ -3175,10 +3213,46 @@ def _require_operational_failure_acceptance(response: Mapping[str, Any], project
 
 
 def _require_bound_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
+    required_result_fields = {"sourceId", "provenanceId", "status", "actualUsageCost", "deliveredScope", "remainingEstimate", "occurredAt"}
+    optional_result_fields = {"blockers", "questions", "reachedExplicitGates"}
+    if set(result) - (set(request) | required_result_fields | optional_result_fields) or not required_result_fields.issubset(result):
+        raise ValueError("round result schema is invalid")
     for key, value in request.items():
         if result.get(key) != value: raise ValueError("round result does not bind to request")
     if result.get("sourceId") != request["projectLeadId"] or result.get("status") not in {"completed", "blocked"}: raise ValueError("round result is invalid")
     _required_string(result, "provenanceId")
+    _required_string(result, "deliveredScope")
+    for name in ("actualUsageCost", "remainingEstimate"):
+        value = result.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+            raise ValueError("round result schema is invalid")
+    arrays: dict[str, tuple[int, int]] = {"blockers": (8, 500), "questions": (1, 500), "reachedExplicitGates": (8, 120)}
+    parsed_arrays: dict[str, list[str]] = {}
+    for name, (maximum_items, maximum_length) in arrays.items():
+        value = result.get(name, [])
+        if not isinstance(value, list) or len(value) > maximum_items or any(not isinstance(item, str) or not item.strip() or len(item.strip()) > maximum_length for item in value):
+            raise ValueError("round result schema is invalid")
+        if name == "reachedExplicitGates" and any(item != item.strip() for item in value):
+            raise ValueError("round result schema is invalid")
+        parsed_arrays[name] = value
+    status = str(result["status"])
+    blockers, questions, gates = parsed_arrays["blockers"], parsed_arrays["questions"], parsed_arrays["reachedExplicitGates"]
+    if len(set(gates)) != len(gates):
+        raise ValueError("round result schema is invalid")
+    unresolved = status == "blocked" or any(re.fullmatch(r"overseer-temporary-loopback-claim:[A-Za-z0-9][A-Za-z0-9._:-]{0,159}:approved-used-released", gate) is None for gate in gates)
+    if status == "blocked" and not blockers:
+        raise ValueError("round result schema is invalid")
+    if unresolved and len(questions) != 1:
+        raise ValueError("round result schema is invalid")
+    if status == "completed" and not unresolved and questions:
+        raise ValueError("round result schema is invalid")
+    occurred_at = _required_string(result, "occurredAt")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", occurred_at) is None:
+        raise ValueError("round result schema is invalid")
+    try:
+        _time(occurred_at)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("round result schema is invalid") from None
 
 
 def _round_result_digest(result: Mapping[str, Any]) -> str:

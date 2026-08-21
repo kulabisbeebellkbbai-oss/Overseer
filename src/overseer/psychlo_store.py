@@ -85,6 +85,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, capability_token TEXT NOT NULL, dispatch_state TEXT NOT NULL, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS round_recoveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, evidence_json TEXT, binding_json TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_prompt_deliveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL UNIQUE, capability_hash TEXT NOT NULL UNIQUE, binding_json TEXT NOT NULL, phase TEXT NOT NULL, prompt_digest TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS round_result_claim_fulfillments(claim_id TEXT PRIMARY KEY, round_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, result_digest TEXT NOT NULL, approval_id TEXT NOT NULL, release_event_id TEXT NOT NULL UNIQUE, release_evidence_digest TEXT NOT NULL, recorded_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operational_failure_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_binding_attestations(round_id TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_cancellations(cancellation_id TEXT PRIMARY KEY, round_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, receipt_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
@@ -489,6 +490,42 @@ class PsychloBridgeStore:
             (bounded_limit,),
         ).fetchall()
         return [{"roundId": str(row[0]), "request": json.loads(row[1]), "result": json.loads(row[2])} for row in rows]
+
+    def result_claim_fulfillments(self, round_id: str) -> list[dict[str, str]]:
+        rows = self.connection.execute(
+            "SELECT claim_id,round_id,request_digest,result_digest,approval_id,release_event_id,release_evidence_digest,recorded_at FROM round_result_claim_fulfillments WHERE round_id=? ORDER BY claim_id",
+            (round_id,),
+        ).fetchall()
+        fields = ("claimId", "roundId", "requestDigest", "resultDigest", "approvalId", "releaseEventId", "releaseEvidenceDigest", "recordedAt")
+        return [dict(zip(fields, (str(value) for value in row), strict=True)) for row in rows]
+
+    def bind_result_claim_fulfillments(self, round_id: str, request: Mapping[str, Any], result: Mapping[str, Any], fulfillments: list[Mapping[str, str]], *, completed_at: str) -> None:
+        request_digest = canonical_digest(request)
+        result_digest = _round_result_digest(result)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            abandonment = self.connection.execute("SELECT state FROM legacy_abandonment_intents WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or (row[1] is not None and json.loads(row[1]) != dict(result)):
+                raise ValueError("round result conflict")
+            if row[1] is None and (row[0] not in {"started", "dispatched"} or (delivery is not None and delivery[0] == "abandonment-fence") or (abandonment is not None and abandonment[0] in {"peer-pending", "completed"})):
+                raise ValueError("round result is fenced or no longer expected")
+            for fulfillment in fulfillments:
+                expected = (fulfillment["claimId"], round_id, request_digest, result_digest, fulfillment["approvalId"], fulfillment["releaseEventId"], fulfillment["releaseEvidenceDigest"])
+                existing = self.connection.execute("SELECT claim_id,round_id,request_digest,result_digest,approval_id,release_event_id,release_evidence_digest FROM round_result_claim_fulfillments WHERE claim_id=? OR round_id=? OR release_event_id=? LIMIT 1", (fulfillment["claimId"], round_id, fulfillment["releaseEventId"])).fetchone()
+                if existing is not None and tuple(str(value) for value in existing) != expected:
+                    raise ValueError("resource claim fulfillment conflicts with immutable history")
+                if existing is None:
+                    self.connection.execute("INSERT INTO round_result_claim_fulfillments VALUES (?,?,?,?,?,?,?,?)", (*expected, completed_at))
+            if row[1] is None:
+                updated = self.connection.execute("UPDATE rounds SET result_json=?,completed_at=COALESCE(completed_at,?) WHERE round_id=? AND dispatch_state IN ('started','dispatched') AND result_json IS NULL AND NOT EXISTS (SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed')) AND NOT EXISTS (SELECT 1 FROM round_prompt_deliveries WHERE round_id=? AND phase='abandonment-fence')", (_dump_wire(result), completed_at, round_id, round_id, round_id))
+                if updated.rowcount != 1:
+                    raise ValueError("round result state changed before persistence")
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def active_round(self) -> str | None:
         row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') LIMIT 1").fetchone()

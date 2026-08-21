@@ -32,8 +32,8 @@ from overseer.psychlo_bridge import (
 from overseer.psychlo_contracts import canonical_digest, ContractError, parse_policy_exception_outcome, policy_exception_outcome_digest, policy_exception_request_digest
 from overseer.psychlo_store import _round_result_digest
 from overseer.psychlo_contracts import parse_policy_exception_request
-from overseer.audit import ApprovalRequest, ApprovalStatus
-from overseer.core import ApprovalLevel, OwnerDomain
+from overseer.audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
+from overseer.core import ApprovalLevel, Claim, ClaimStatus, ClaimType, OwnerDomain, RiskLevel
 from overseer.admin import plan_user_service_restart
 from overseer.store import SQLiteStore
 
@@ -2251,6 +2251,14 @@ def test_stored_unforwarded_result_is_retried_once_and_marked_forwarded(tmp_path
     bridge.request_round(request)
     result = {**request, "sourceId": "member-hermione", "provenanceId": "result:round-retry", "status": "completed", "actualUsageCost": 4, "deliveredScope": "foundation", "remainingEstimate": 0, "blockers": [], "questions": [], "reachedExplicitGates": [], "occurredAt": NOW}
 
+    with pytest.raises(ValueError, match="schema"):
+        bridge.receive_round_result(capability, {**result, "occurredAt": "2026-08-10 02:00:00+00:00"})
+    assert store.get_round(request["roundId"])[5] is None
+    fulfilled_gate = "overseer-temporary-loopback-claim:claim.arcade.duplicate:approved-used-released"
+    with pytest.raises(ValueError, match="schema"):
+        bridge.receive_round_result(capability, {**result, "reachedExplicitGates": [fulfilled_gate, fulfilled_gate]})
+    assert store.get_round(request["roundId"])[5] is None
+
     with pytest.raises(RuntimeError, match="temporary receiver failure"):
         bridge.receive_round_result(capability, result)
     assert store.get_round(request["roundId"])[5:] == (result, False)
@@ -2260,6 +2268,66 @@ def test_stored_unforwarded_result_is_retried_once_and_marked_forwarded(tmp_path
     assert store.get_round(request["roundId"])[5:] == (result, True)
     assert bridge.retry_unforwarded_results() == {"processed": 0, "failed": 0}
     assert attempts == [("round-result", "round-retry", result), ("round-result", "round-retry", result)]
+
+
+def test_fulfilled_resource_claim_requires_exact_approved_release_evidence(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    capability = "capability_fulfilled_1234567890abcdef1234"
+    thread_id = "thread-fulfilled-claim"
+    request = {"roundId": "round-fulfilled", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "threadId": thread_id, "correlationId": "corr-fulfilled", "idempotencyKey": "round-fulfilled", "snapshotId": "snapshot-fulfilled", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: capability)
+    receipt = {**request, "sourceId": request["projectLeadId"], "provenanceId": "receipt:round-fulfilled", "status": "accepted"}
+    store.record_round(request, receipt, capability)
+    store.mark_dispatch_started(request["roundId"], NOW)
+    store.mark_dispatched(request["roundId"], receipt)
+    claim_id = "claim.arcade.task7.loopback.example"
+    result = {**request, "sourceId": "member-hermione", "provenanceId": "result:round-fulfilled", "status": "completed", "actualUsageCost": 4, "deliveredScope": "approved claim used and released", "remainingEstimate": 0, "blockers": [], "questions": [], "reachedExplicitGates": [f"overseer-temporary-loopback-claim:{claim_id}:approved-used-released"], "occurredAt": NOW}
+
+    with pytest.raises(ValueError, match="authoritative Overseer evidence"):
+        bridge.receive_round_result(capability, result)
+    assert store.get_round(request["roundId"])[5] is None
+
+    primary = SQLiteStore(tmp_path / "primary.sqlite3")
+    approval_id = f"approval.{claim_id}"
+    primary.save_claim(Claim(claim_id, "resource.loopback.ephemeral.arcade", ClaimType.LEASE, thread_id, OwnerDomain.DAX, "bounded smoke", "bind then close", RiskLevel.LOW, ClaimStatus.RELEASED, approval_id=approval_id))
+    primary.save_approval(ApprovalRequest(approval_id, claim_id, ApprovalLevel.ROLE, thread_id, OwnerDomain.DAX, "approved bounded smoke", ApprovalStatus.APPROVED, (), "human-user", NOW))
+    primary.save_audit_event(AuditEvent(f"audit.{claim_id}.released", AuditEventType.RELEASED, OwnerDomain.DAX, claim_id, "claim used and released", RiskLevel.LOW, ("evidence.loopback.closed",), NOW))
+    accepting = False
+    def sender(*_args):
+        if not accepting:
+            raise RuntimeError("lost receiver response")
+        return {"accepted": True}
+    authorized = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, approval_store=primary, recover=False)
+
+    with pytest.raises(RuntimeError, match="lost receiver response"):
+        authorized.receive_round_result(capability, result)
+    assert store.get_round(request["roundId"])[5:] == (result, False)
+    assert store.result_claim_fulfillments(request["roundId"])[0]["claimId"] == claim_id
+    accepting = True
+    restarted_without_primary = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, recover=False)
+    assert restarted_without_primary.retry_unforwarded_results() == {"processed": 1, "failed": 0}
+    assert store.get_round(request["roundId"])[5:] == (result, True)
+
+    second_request = {**request, "roundId": "round-fulfilled-replay", "idempotencyKey": "round-fulfilled-replay", "snapshotId": "snapshot-fulfilled-replay"}
+    second_receipt = {**second_request, "sourceId": second_request["projectLeadId"], "provenanceId": "receipt:round-fulfilled-replay", "status": "accepted"}
+    second_capability = "capability_fulfilled_replay_1234567890abcdef"
+    store.record_round(second_request, second_receipt, second_capability)
+    store.mark_dispatch_started(second_request["roundId"], NOW)
+    store.mark_dispatched(second_request["roundId"], second_receipt)
+    second_result = {**result, **second_request, "provenanceId": "result:round-fulfilled-replay"}
+    with pytest.raises(ValueError, match="immutable history"):
+        authorized.receive_round_result(second_capability, second_result)
+    assert store.get_round(second_request["roundId"])[5] is None
+
+    fenced_request = {**request, "roundId": "round-fulfilled-fenced", "idempotencyKey": "round-fulfilled-fenced", "snapshotId": "snapshot-fulfilled-fenced"}
+    fenced_receipt = {**fenced_request, "sourceId": fenced_request["projectLeadId"], "provenanceId": "receipt:round-fulfilled-fenced", "status": "accepted"}
+    store.record_round(fenced_request, fenced_receipt, "capability_fulfilled_fenced_1234567890abcdef")
+    store.mark_dispatch_started(fenced_request["roundId"], NOW)
+    store.connection.execute("INSERT INTO legacy_abandonment_intents VALUES (?,?,?,?, 'peer-pending',0,NULL,NULL,?)", ("action-fenced", fenced_request["roundId"], "a" * 64, "{}", NOW))
+    fenced_result = {**result, **fenced_request, "provenanceId": "result:round-fulfilled-fenced"}
+    with pytest.raises(ValueError, match="fenced"):
+        store.bind_result_claim_fulfillments(fenced_request["roundId"], fenced_request, fenced_result, [{"claimId": "claim.arcade.fenced", "approvalId": "approval.claim.arcade.fenced", "releaseEventId": "audit.claim.arcade.fenced.released", "releaseEvidenceDigest": "b" * 64}], completed_at=NOW)
+    assert store.get_round(fenced_request["roundId"])[5] is None
 
 
 def test_pending_round_start_is_an_atomic_single_dispatch_claim(tmp_path: Path):

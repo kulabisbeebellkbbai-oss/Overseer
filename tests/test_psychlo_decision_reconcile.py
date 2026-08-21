@@ -12,7 +12,10 @@ import threading
 import pytest
 
 from overseer.api import _decide_roadex_human, make_api_handler
+from overseer.cli import request_claim_status
+from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.psychlo_bridge import PsychloBridge, PsychloBridgeStore, sign_peer_message, verify_peer_response
+from overseer.store import SQLiteStore
 
 
 NOW = "2026-08-20T18:00:00+00:00"
@@ -70,6 +73,44 @@ def test_api_supplies_a_canonical_reason_for_an_approved_psychlo_decision(tmp_pa
     assert result["action_status"] == "approved"
     assert forwarded == [("decision-outcome", request["decisionId"], {**request, "sourceId": "overseer", "provenanceId": f"roadex-outcome:{request['decisionId']}:approved", "status": "approved"})]
     assert bridge.store.decision_record(request["decisionId"])["reason"] == "Approved by human-user in Overseer."
+
+
+def test_api_approves_and_activates_the_exact_structurally_bound_claim_before_delivering_outcome(tmp_path: Path) -> None:
+    primary_path = tmp_path / "primary.sqlite3"
+    resource_id = "resource.loopback.ephemeral.arcade.task7"
+    claim_id = "claim.arcade.task7.loopback.bound"
+    store = SQLiteStore(primary_path)
+    store.save_resource(Resource(id=resource_id, name="Arcade loopback", type=ResourceType.VIRTUAL_ASSET, owner_domain=OwnerDomain.DAX, risk_level=RiskLevel.LOW))
+    store.close()
+    requested = request_claim_status(primary_path, claim_id, resource_id, "lease", "thread-arcade", "dax", "one smoke test", "bind loopback", "low")
+    bridge, forwarded = _bridge(tmp_path)
+    request = {**_request(), "resourceClaimId": claim_id}
+    bridge.stage_decision(request)
+
+    result = _decide_roadex_human(
+        str(primary_path),
+        {"plan_id": request["decisionId"], "decision": "approve", "decided_by": "human-user", "reason": "Approved exact claim."},
+        None,
+        bridge,
+    )
+
+    store = SQLiteStore(primary_path)
+    try:
+        assert store.load_approval(requested["approval_id"]).status.value == "approved"
+        assert store.load_claim(claim_id).status.value == "active"
+    finally:
+        store.close()
+    assert result["action_status"] == "approved"
+    assert forwarded[0][2]["resourceClaimId"] == claim_id
+
+    replay = _decide_roadex_human(
+        str(primary_path),
+        {"plan_id": request["decisionId"], "decision": "approve", "decided_by": "human-user", "reason": "Approved exact claim."},
+        None,
+        bridge,
+    )
+    assert replay["mutation_performed"] is False
+    assert len(forwarded) == 1
 
 
 def test_reconcile_decision_returns_exact_pending_identity(tmp_path: Path) -> None:

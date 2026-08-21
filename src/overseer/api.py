@@ -27,6 +27,8 @@ from .roadex_approval_fixture import (
 )
 
 from .codex_usage import CodexUsageTracker
+from .audit import ApprovalStatus
+from .core import ClaimStatus
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, sign_peer_response, verify_peer_request, MAX_BODY_BYTES
 from .store import SQLiteStore
 from .cli import (
@@ -1602,8 +1604,40 @@ def _decide_roadex_human(store_path: str, payload: dict[str, Any], adapter_facto
         reason = str(payload["reason"])
         if decision == "approve" and not reason.strip():
             reason = f"Approved by {decided_by} in Overseer."
+        if decision == "approve":
+            record = psychlo_bridge.store.decision_record(plan_id)
+            if record is None:
+                raise ValueError("an exact staged Psychlo decision is required")
+            _activate_bound_decision_claim(store_path, record["request"], decided_by)
         return psychlo_bridge.decide(plan_id, decision, decided_by, reason)
     return dict(decide_roadex_human_plan_api(store_path, payload, adapter_factory))
+
+
+def _activate_bound_decision_claim(store_path: str, request: dict[str, Any], decided_by: str) -> None:
+    claim_id = request.get("resourceClaimId")
+    if claim_id is None:
+        return
+    if not isinstance(claim_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", claim_id):
+        raise ValueError("decision resource claim binding is invalid")
+    approval_id = f"approval.{claim_id}"
+    store = SQLiteStore(store_path)
+    try:
+        claim = store.load_claim(claim_id)
+        approval = store.load_approval(approval_id)
+        if approval.subject_id != claim_id:
+            raise ValueError("decision resource claim approval does not bind to the claim")
+        approval_status = approval.status
+        claim_status = claim.status
+    finally:
+        store.close()
+    if approval_status == ApprovalStatus.PENDING:
+        approve_claim_status(store_path, approval_id, decided_by)
+    elif approval_status != ApprovalStatus.APPROVED:
+        raise ValueError("decision resource claim approval is not active")
+    if claim_status == ClaimStatus.REQUESTED:
+        activate_claim_status(store_path, claim_id, approval_id)
+    elif claim_status != ClaimStatus.ACTIVE:
+        raise ValueError("decision resource claim is not activatable")
 
 
 def run_api_server(

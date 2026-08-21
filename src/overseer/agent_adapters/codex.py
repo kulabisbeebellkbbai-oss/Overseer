@@ -1042,6 +1042,7 @@ class CodexDriver:
             [
                 str(self.tmux_path),
                 "paste-buffer",
+                "-p",
                 "-b",
                 "overseer-dispatch",
                 "-t",

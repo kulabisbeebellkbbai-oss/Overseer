@@ -480,7 +480,7 @@ def test_dispatch_preserves_request_bindings_and_exact_tmux_sequence(
         ),
         ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
         ("/tmp/tmux", "load-buffer", "-b", "overseer-dispatch", "-"),
-        ("/tmp/tmux", "paste-buffer", "-b", "overseer-dispatch", "-t", "example"),
+        ("/tmp/tmux", "paste-buffer", "-p", "-b", "overseer-dispatch", "-t", "example"),
         ("/tmp/tmux", "send-keys", "-t", "example", "Enter"),
         ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
     ]

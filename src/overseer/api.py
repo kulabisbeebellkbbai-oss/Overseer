@@ -1597,7 +1597,12 @@ def _decide_roadex_human(store_path: str, payload: dict[str, Any], adapter_facto
     if psychlo_bridge is not None and psychlo_bridge.store.decision(plan_id) is not None:
         if set(payload) != {"plan_id", "decision", "decided_by", "reason"}:
             raise ValueError("exact Roadex human decision fields are required")
-        return psychlo_bridge.decide(plan_id, str(payload["decision"]), str(payload["decided_by"]), str(payload["reason"]))
+        decision = str(payload["decision"])
+        decided_by = str(payload["decided_by"])
+        reason = str(payload["reason"])
+        if decision == "approve" and not reason.strip():
+            reason = f"Approved by {decided_by} in Overseer."
+        return psychlo_bridge.decide(plan_id, decision, decided_by, reason)
     return dict(decide_roadex_human_plan_api(store_path, payload, adapter_factory))
 
 

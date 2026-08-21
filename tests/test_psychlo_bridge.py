@@ -1385,6 +1385,46 @@ def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoi
     assert request.full_url == f"{endpoint}/internal/overseer/usage-snapshot"
 
 
+def test_peer_sender_derives_a_safe_transport_identity_for_an_exact_unsafe_decision_outcome(monkeypatch):
+    decision_id = "roadex:round:arcade:usage-attribution-f8b71029532e11a147aaa752:worktree:arcade@2578756:task7-source-reviewed-207-tests"
+    transport_id = f"decision:{hashlib.sha256(decision_id.encode()).hexdigest()}"
+    payload = {"decisionId": decision_id, "status": "approved"}
+    response_body = b'{"accepted":true}'
+    response_nonce = "response-decision-123456"
+    request_nonce = "request-decision-123456"
+    response_headers = {
+        "content-type": "application/json",
+        "x-psychlo-peer-response-kind": "decision-outcome",
+        "x-psychlo-peer-response-timestamp": NOW,
+        "x-psychlo-peer-response-nonce": response_nonce,
+        "x-psychlo-peer-response-signature": _bound_response_signature(
+            "decision-outcome", transport_id, request_nonce, payload, NOW, response_nonce, response_body,
+        ),
+    }
+    requests = []
+
+    class Headers:
+        def get_content_type(self): return "application/json"
+        def items(self): return response_headers.items()
+
+    class Response:
+        status = 202
+        headers = Headers()
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self, _limit): return response_body
+
+    sender = PsychloPeerSender("http://127.0.0.1:43127", SECRET, clock=lambda: NOW)
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda _size: request_nonce)
+    monkeypatch.setattr(sender.opener, "open", lambda request, **_kwargs: requests.append(request) or Response())
+
+    assert sender("decision-outcome", decision_id, payload)["accepted"] is True
+    body = json.loads(requests[0].data)
+    assert body["messageId"] == transport_id
+    assert body["payload"]["decisionId"] == decision_id
+    assert requests[0].get_header("X-psychlo-peer-message-id") == transport_id
+
+
 def test_peer_sender_rejects_missing_response_proof(monkeypatch):
     class Headers:
         def get_content_type(self):

@@ -2583,10 +2583,11 @@ class PsychloPeerSender:
         self.opener = build_opener(ProxyHandler({}), _RejectRedirects())
 
     def __call__(self, kind: str, message_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_message_id = _peer_transport_message_id(kind, message_id, payload)
         timestamp = self.clock()
         nonce = secrets.token_urlsafe(24)
-        body = json.dumps({"kind": kind, "messageId": message_id, "occurredAt": timestamp, "payload": dict(payload)}, separators=(",", ":")).encode()
-        headers = sign_peer_message(self.secret, "overseer-to-psychlo", kind, message_id, timestamp, nonce, body, authority=self.authority)
+        body = json.dumps({"kind": kind, "messageId": transport_message_id, "occurredAt": timestamp, "payload": dict(payload)}, separators=(",", ":")).encode()
+        headers = sign_peer_message(self.secret, "overseer-to-psychlo", kind, transport_message_id, timestamp, nonce, body, authority=self.authority)
         request = Request(f"{self.endpoint}/internal/overseer/{kind}", data=body, headers=headers, method="POST")
         with self.opener.open(request, timeout=self.timeout) as response:
             if response.status not in {200, 201, 202, 409} or response.headers.get_content_type() != "application/json":
@@ -2607,7 +2608,7 @@ class PsychloPeerSender:
             kind,
             data,
             response_headers,
-            request_message_id=message_id,
+            request_message_id=transport_message_id,
             request_nonce=nonce,
             request_digest=hashlib.sha256(body).hexdigest(),
             now=self.clock(),
@@ -2627,6 +2628,14 @@ class PsychloPeerSender:
             self._response_nonces.pop()
         self._response_nonces.add(nonce)
         return True
+
+
+def _peer_transport_message_id(kind: str, message_id: str, payload: Mapping[str, Any]) -> str:
+    if kind != "decision-outcome":
+        return message_id
+    if not isinstance(message_id, str) or not message_id or payload.get("decisionId") != message_id:
+        raise ValueError("decision peer message identity is invalid")
+    return message_id if re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", message_id) else f"decision:{hashlib.sha256(message_id.encode()).hexdigest()}"
 
 
 class _RejectRedirects(HTTPRedirectHandler):

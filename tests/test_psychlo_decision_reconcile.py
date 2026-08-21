@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from overseer.api import make_api_handler
+from overseer.api import _decide_roadex_human, make_api_handler
 from overseer.psychlo_bridge import PsychloBridge, PsychloBridgeStore, sign_peer_message, verify_peer_response
 
 
@@ -53,6 +53,23 @@ def _bridge(tmp_path: Path) -> tuple[PsychloBridge, list[tuple[str, str, dict[st
         clock=lambda: NOW,
     )
     return bridge, forwarded
+
+
+def test_api_supplies_a_canonical_reason_for_an_approved_psychlo_decision(tmp_path: Path) -> None:
+    bridge, forwarded = _bridge(tmp_path)
+    request = _request()
+    bridge.stage_decision(request)
+
+    result = _decide_roadex_human(
+        str(tmp_path / "primary.sqlite3"),
+        {"plan_id": request["decisionId"], "decision": "approve", "decided_by": "human-user", "reason": ""},
+        None,
+        bridge,
+    )
+
+    assert result["action_status"] == "approved"
+    assert forwarded == [("decision-outcome", request["decisionId"], {**request, "sourceId": "overseer", "provenanceId": f"roadex-outcome:{request['decisionId']}:approved", "status": "approved"})]
+    assert bridge.store.decision_record(request["decisionId"])["reason"] == "Approved by human-user in Overseer."
 
 
 def test_reconcile_decision_returns_exact_pending_identity(tmp_path: Path) -> None:

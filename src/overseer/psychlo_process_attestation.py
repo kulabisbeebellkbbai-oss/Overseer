@@ -37,6 +37,7 @@ from .psychlo_legacy_binding import _private_group_is_safe
 
 
 SCHEMA = "psychlo.legacy-process-observation.v1"
+RECOVERY_SCHEMA = "psychlo.legacy-process-observation.v2"
 _FORBIDDEN_KEYS = {"prompt", "rawprompt", "callback", "panecapture", "capture", "argv", "commandline"}
 _TMUX = "/usr/bin/tmux"
 _GIT = "/usr/bin/git"
@@ -785,8 +786,18 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("round capability is missing")
         delivery = self.bridge.store.round_prompt_delivery(round_id)
         binding = self.bridge.store.round_binding(round_id)
-        if delivery is None or delivery.get("phase") != "submitted" or binding is None:
-            raise ProcessAttestationError("round delivery must be exactly submitted with an immutable binding")
+        recovery = self.bridge.store.round_recovery(round_id)
+        recovery_mode = recovery is not None
+        expected_phase = "unresolved" if recovery_mode else "submitted"
+        if delivery is None or delivery.get("phase") != expected_phase or binding is None:
+            raise ProcessAttestationError("round delivery is not an observable abandonment state with an immutable binding")
+        if recovery_mode:
+            evidence = recovery.get("evidence") if isinstance(recovery, Mapping) else None
+            if (recovery.get("state") != "uncertain" or recovery.get("ownerId") is not None
+                    or recovery.get("claimToken") is not None or recovery.get("leaseExpiresAt") is not None
+                    or not isinstance(evidence, Mapping) or evidence.get("redeliveryAttempted") is not True
+                    or evidence.get("phase") != "unresolved" or evidence.get("deliveryProof") not in {"unknown", "missing"}):
+                raise ProcessAttestationError("round recovery is not an exact terminal uncertain recovery")
         request_digest = sha256(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
         binding_digest = sha256(json.dumps(binding, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
         if delivery.get("requestDigest") != request_digest or delivery.get("capabilityHash") != capability_hash or delivery.get("binding") != binding or delivery.get("promptDigest") is None:
@@ -799,7 +810,9 @@ class AuthoritativeProcessEvidenceCollector:
             "requestDigest": request_digest, "capabilityHash": capability_hash,
             "bindingDigest": binding_digest, "promptDigest": delivery["promptDigest"],
         }
-        if any(bridge_state[key] for key in ("recoveryPresent", "failurePresent", "cancelPresent")):
+        if recovery_mode:
+            bridge_state.update({"recoveryState": "uncertain", "recoveryDigest": canonical_digest(recovery)})
+        if bridge_state["failurePresent"] or bridge_state["cancelPresent"]:
             raise ProcessAttestationError("round has a conflicting recovery, failure, or cancellation record")
         lead_id = request.get("projectLeadId")
         if not isinstance(lead_id, str) or not lead_id.strip():
@@ -854,7 +867,7 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("observation window is not chronological")
         started_at = (self.bridge.store.round_timing(round_id) or {}).get("startedAt")
         return {
-            "schemaVersion": SCHEMA, "observationId": f"observation-{round_id}", "roundId": round_id,
+            "schemaVersion": RECOVERY_SCHEMA if recovery_mode else SCHEMA, "observationId": f"observation-{round_id}", "roundId": round_id,
             "requestDigest": request_digest,
             "startedAt": started_at,
             "historical": True, "authoritative": False, "executable": False,
@@ -1110,7 +1123,8 @@ def _validate_redacted(value: Any, *, path: str = "manifest") -> None:
 def _manifest(value: Mapping[str, Any], round_id: str) -> dict[str, Any]:
     if set(value) != {"schemaVersion", "observationId", "roundId", "requestDigest", "startedAt", "historical", "authoritative", "executable", "observedWindowStart", "observedWindowEnd", "registry", "tmux", "process", "rollout", "bridge", "approval", "source"}:
         raise ProcessAttestationError("manifest fields are not exact")
-    if value.get("schemaVersion") != SCHEMA or value.get("roundId") != round_id:
+    schema = value.get("schemaVersion")
+    if schema not in {SCHEMA, RECOVERY_SCHEMA} or value.get("roundId") != round_id:
         raise ProcessAttestationError("manifest identity is invalid")
     _validate_redacted(value)
     if not isinstance(value.get("observationId"), str) or not value["observationId"].strip() or value.get("historical") is not True or value.get("authoritative") is not False or value.get("executable") is not False:
@@ -1127,9 +1141,22 @@ def _manifest(value: Mapping[str, Any], round_id: str) -> dict[str, Any]:
     if not isinstance(approval, Mapping) or set(approval) != {"planId", "planDigest"} or not isinstance(approval["planId"], str) or not approval["planId"].strip() or not isinstance(approval["planDigest"], str) or (approval["planDigest"] and not _HEX64.fullmatch(approval["planDigest"])):
         raise ProcessAttestationError("manifest approval identity is invalid")
     bridge = value.get("bridge")
-    if not isinstance(bridge, Mapping) or set(bridge) != {"dispatchState", "resultPresent", "deliveryPhase", "recoveryPresent", "failurePresent", "cancelPresent", "requestDigest", "capabilityHash", "bindingDigest", "promptDigest"}:
+    bridge_keys = {"dispatchState", "resultPresent", "deliveryPhase", "recoveryPresent", "failurePresent", "cancelPresent", "requestDigest", "capabilityHash", "bindingDigest", "promptDigest"}
+    if schema == RECOVERY_SCHEMA:
+        bridge_keys |= {"recoveryState", "recoveryDigest"}
+    if not isinstance(bridge, Mapping) or set(bridge) != bridge_keys:
         raise ProcessAttestationError("bridge state evidence is invalid")
-    if bridge.get("dispatchState") != "started" or bridge.get("resultPresent") is not False or bridge.get("deliveryPhase") != "submitted" or any(bridge.get(key) is not False for key in ("recoveryPresent", "failurePresent", "cancelPresent")):
+    exact_bridge_state = (
+        bridge.get("dispatchState") == "started"
+        and bridge.get("resultPresent") is False
+        and bridge.get("failurePresent") is False
+        and bridge.get("cancelPresent") is False
+        and (
+            (schema == SCHEMA and bridge.get("deliveryPhase") == "submitted" and bridge.get("recoveryPresent") is False)
+            or (schema == RECOVERY_SCHEMA and bridge.get("deliveryPhase") == "unresolved" and bridge.get("recoveryPresent") is True and bridge.get("recoveryState") == "uncertain" and isinstance(bridge.get("recoveryDigest"), str) and _HEX64.fullmatch(bridge["recoveryDigest"]))
+        )
+    )
+    if not exact_bridge_state:
         raise ProcessAttestationError("bridge is not the exact submitted result-less state")
     if any(not isinstance(bridge.get(key), str) or not _HEX64.fullmatch(bridge[key]) for key in ("requestDigest", "capabilityHash", "bindingDigest", "promptDigest")):
         raise ProcessAttestationError("bridge digest evidence is invalid")
@@ -1697,12 +1724,23 @@ def _validate_bridge_round(bridge: PsychloBridgeStore, round_id: str, manifest: 
     """Read-fence the exact bridge state; this function performs no writes."""
     row = bridge.connection.execute("SELECT request_json,capability_hash,dispatch_state,result_json,codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
     delivery = bridge.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
-    forbidden = any(bridge.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (round_id,)).fetchone() is not None for table in ("round_recoveries", "operational_failure_intents", "round_cancellations"))
     bridge_state = manifest.get("bridge") if isinstance(manifest, Mapping) else None
+    recovery = bridge.round_recovery(round_id)
+    recovery_mode = isinstance(bridge_state, Mapping) and bridge_state.get("recoveryPresent") is True
+    forbidden = any(bridge.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (round_id,)).fetchone() is not None for table in ("operational_failure_intents", "round_cancellations"))
     request_digest = None
     if row is not None:
         request_digest = bridge._round_request_digest(json.loads(row[0]))
-    if row is None or row[2] != "started" or row[3] is not None or not isinstance(row[4], str) or forbidden or delivery is None or delivery[0] != request_digest or delivery[1] != row[1] or delivery[2] != row[4] or delivery[3] != "submitted" or not isinstance(bridge_state, Mapping) or bridge_state.get("requestDigest") != request_digest or bridge_state.get("capabilityHash") != row[1] or bridge_state.get("bindingDigest") != sha256(row[4].encode()).hexdigest() or delivery[4] != bridge_state.get("promptDigest"):
+    exact_recovery = (
+        recovery_mode
+        and isinstance(recovery, Mapping)
+        and recovery.get("state") == "uncertain"
+        and canonical_digest(recovery) == bridge_state.get("recoveryDigest")
+        and delivery is not None
+        and delivery[3] == "unresolved"
+    )
+    exact_no_recovery = not recovery_mode and recovery is None and delivery is not None and delivery[3] == "submitted"
+    if row is None or row[2] != "started" or row[3] is not None or not isinstance(row[4], str) or forbidden or delivery is None or not (exact_recovery or exact_no_recovery) or delivery[0] != request_digest or delivery[1] != row[1] or delivery[2] != row[4] or not isinstance(bridge_state, Mapping) or bridge_state.get("requestDigest") != request_digest or bridge_state.get("capabilityHash") != row[1] or bridge_state.get("bindingDigest") != sha256(row[4].encode()).hexdigest() or delivery[4] != bridge_state.get("promptDigest"):
         raise ProcessAttestationError("bridge state changed before primary publication")
 
 

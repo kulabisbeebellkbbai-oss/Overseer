@@ -519,6 +519,9 @@ def plan_psychlo_legacy_abandonment(
     binding_digest: str | None = None,
     prompt_digest: str | None = None,
     project_id: str | None = None,
+    delivery_phase: str = "submitted",
+    recovery_digest: str | None = None,
+    recovery_evidence_digest: str | None = None,
 ) -> AdminChangePlan:
     """Create high-risk Sisko/HUMAN authority for one typed legacy abandonment.
 
@@ -548,12 +551,19 @@ def plan_psychlo_legacy_abandonment(
             raise ValueError(f"legacy abandonment {name} is invalid")
     if requested_thread_id is not None and requested_thread_id == delivery_conversation_id:
         raise ValueError("historical misbinding thread and delivery conversation must be distinct")
+    if delivery_phase not in {"submitted", "unresolved"}:
+        raise ValueError("legacy abandonment delivery phase is invalid")
+    if (recovery_digest is None) != (recovery_evidence_digest is None) or (delivery_phase == "unresolved") != (recovery_digest is not None):
+        raise ValueError("uncertain recovery authority must be complete")
+    for name, value in (("recoveryDigest", recovery_digest), ("recoveryEvidenceDigest", recovery_evidence_digest)):
+        if value is not None and not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError(f"legacy abandonment {name} is invalid")
     metadata = {
         "legacy_abandonment": {
             "roundId": round_id, "observationId": observation_id,
             "observationDigest": observation_digest, "observationPlanDigest": observation_plan_digest,
             "requestDigest": request_digest, "capabilityHash": capability_hash,
-            "deliveryDigest": delivery_digest, "submittedPhase": "submitted",
+            "deliveryDigest": delivery_digest, "submittedPhase": delivery_phase,
             "originalPlanId": original_plan_id, "originalPlanVersion": original_plan_version,
             "originalConversationId": original_conversation_id, "originalThreadId": original_thread_id,
             "successorPlanId": successor_plan_id, "successorPlanVersion": successor_plan_version,
@@ -561,6 +571,12 @@ def plan_psychlo_legacy_abandonment(
             "reason": "ambiguous-submitted-delivery",
         }
     }
+    if recovery_digest is not None:
+        metadata["legacy_abandonment"]["uncertainRecovery"] = {
+            "state": "uncertain",
+            "recoveryDigest": recovery_digest,
+            "evidenceDigest": recovery_evidence_digest,
+        }
     if requested_thread_id is not None:
         metadata["legacy_abandonment"].update({
             "projectId": project_id,

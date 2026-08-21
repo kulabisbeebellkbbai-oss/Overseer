@@ -33,7 +33,7 @@ def _payload_action(payload):
     return payload.get("action", payload)
 
 
-def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thread_id="old-conversation"):
+def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thread_id="old-conversation", uncertain_recovery=False):
     bridge_store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     request = {
         "roundId": "round-arcade", "projectId": "arcade", "projectLeadId": "hermione",
@@ -50,6 +50,30 @@ def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thre
     bridge_store.record_round(request, receipt, capability)
     bridge_store.start_round_dispatch("round-arcade", request, capability, NOW, binding=binding, prompt_digest="4" * 64)
     bridge_store.record_round_prompt_delivery_phase("round-arcade", request, capability, binding, "4" * 64, "submitted", now=NOW, expected_phase="prepared")
+    recovery_digest = None
+    if uncertain_recovery:
+        recovery_evidence = {
+            "redeliveryAttempted": True,
+            "phase": "unresolved",
+            "deliveryProof": "unknown",
+            "source": "recovery-exception",
+            "roundId": "round-arcade",
+            "requestDigest": bridge_store._round_request_digest(request),
+            "observedAt": NOW,
+        }
+        bridge_store.connection.execute(
+            "INSERT INTO round_recoveries(round_id,request_digest,capability_hash,idempotency_key,state,attempts,evidence_json,updated_at) VALUES (?,?,?,?, 'uncertain',1,?,?)",
+            (
+                "round-arcade",
+                recovery_evidence["requestDigest"],
+                bridge_store.get_round("round-arcade")[2],
+                request["idempotencyKey"],
+                json.dumps(recovery_evidence, separators=(",", ":")),
+                NOW,
+            ),
+        )
+        bridge_store.connection.execute("UPDATE round_prompt_deliveries SET phase='unresolved' WHERE round_id=?", ("round-arcade",))
+        recovery_digest = canonical_digest(bridge_store.round_recovery("round-arcade"))
     primary = SQLiteStore(tmp_path / "primary.sqlite3")
     request_digest = bridge_store._round_request_digest(request)
     capability_hash = bridge_store.connection.execute("SELECT capability_hash FROM rounds WHERE round_id='round-arcade'").fetchone()[0]
@@ -59,6 +83,9 @@ def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thre
     manifest = _process_manifest("round-arcade", "observation-plan")
     manifest["requestDigest"] = request_digest
     manifest["bridge"] = {"dispatchState": "started", "resultPresent": False, "deliveryPhase": "submitted", "recoveryPresent": False, "failurePresent": False, "cancelPresent": False, "requestDigest": request_digest, "capabilityHash": capability_hash, "bindingDigest": binding_digest, "promptDigest": "4" * 64}
+    if uncertain_recovery:
+        manifest["schemaVersion"] = "psychlo.legacy-process-observation.v2"
+        manifest["bridge"].update({"deliveryPhase": "unresolved", "recoveryPresent": True, "recoveryState": "uncertain", "recoveryDigest": recovery_digest})
     observation_digest = manifest_digest(manifest)
     source = manifest["source"]
     observation_plan = plan_psychlo_legacy_process_observation("observation-plan", "round-arcade", observation_digest, source["commit"], source["treeDigest"], source["moduleDigest"])
@@ -82,6 +109,67 @@ def _stage(bridge):
 
 def _stage_v2(bridge):
     return stage_legacy_abandonment(bridge=bridge, plan_id="abandon-plan", observation_plan_id="observation-plan", round_id="round-arcade", successor_plan_id="arcade-plan-2", successor_plan_version="2.0", successor_conversation_id="new-conversation", successor_thread_id="new-thread", delivery_conversation_id="old-conversation")
+
+
+def _runtime_with_uncertain_recovery(tmp_path):
+    return _runtime(tmp_path, uncertain_recovery=True)
+
+
+def test_uncertain_recovery_can_be_superseded_by_exact_approved_abandonment(tmp_path):
+    bridge, primary = _runtime_with_uncertain_recovery(tmp_path)
+
+    staged = _stage(bridge)
+    action = bridge.store.legacy_abandonment(staged["actionId"])["payload"]
+    assert action["recovery"]["state"] == "uncertain"
+    assert action["delivery"]["phase"] == "unresolved"
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+
+    result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+
+    assert result["status"] == "legacy-abandoned-uncertain"
+    assert bridge.store.round_recovery("round-arcade")["state"] == "abandonment-fenced"
+    assert bridge.store.get_round("round-arcade")[4] == "legacy-abandoned"
+
+
+def test_uncertain_recovery_abandonment_rejects_recovery_evidence_drift(tmp_path):
+    bridge, primary = _runtime_with_uncertain_recovery(tmp_path)
+    _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    bridge.store.connection.execute(
+        "UPDATE round_recoveries SET evidence_json=? WHERE round_id=?",
+        (json.dumps({"redeliveryAttempted": True, "phase": "unresolved", "deliveryProof": "missing"}), "round-arcade"),
+    )
+
+    with pytest.raises(LegacyAbandonmentError, match="recovery.*changed|bridge evidence is stale"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+
+    assert bridge._test_sent == []
+
+
+def test_uncertain_recovery_abandonment_replays_exact_fence_after_peer_timeout(tmp_path):
+    calls = []
+
+    def sender(_kind, _key, payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            raise RuntimeError("peer response lost")
+        action = _payload_action(payload)
+        return {"accepted": True, "actionId": action["actionId"], "actionDigest": action["actionDigest"], "roundId": action["roundId"], "requestDigest": action["requestDigest"], "status": "already-abandoned", "status_code": 202}
+
+    bridge, primary = _runtime(tmp_path, sender=sender, uncertain_recovery=True)
+    staged = _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+
+    with pytest.raises(RuntimeError, match="response lost"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge.store.round_recovery("round-arcade")["state"] == "abandonment-fenced"
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "abandonment-fence"
+
+    result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+
+    assert result["status"] == "legacy-abandoned-uncertain"
+    assert calls[1] == calls[0]
+    assert bridge.store.legacy_abandonment(staged["actionId"])["state"] == "completed"
 
 
 def test_v2_historical_misbinding_freezes_both_thread_identities_and_replays_exact_envelope(tmp_path):
@@ -429,6 +517,26 @@ def test_primary_claim_failure_releases_unsent_bridge_reservation(tmp_path, monk
     assert intent["state"] == "claimed"
     assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "submitted"
     primary.save_admin_change_plan(cancel_admin_change_plan(approved, "sisko", "claim failed", NOW))
+
+
+def test_primary_claim_failure_restores_exact_uncertain_recovery_fence(tmp_path, monkeypatch):
+    bridge, primary = _runtime(tmp_path, uncertain_recovery=True)
+    before = bridge.store.round_recovery("round-arcade")
+    _stage(bridge)
+    approved = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(approved)
+    monkeypatch.setattr(
+        primary,
+        "claim_psychlo_legacy_abandonment_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("authority changed")),
+    )
+
+    with pytest.raises(LegacyAbandonmentError, match="execution claim failed"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+
+    assert bridge._test_sent == []
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "unresolved"
+    assert bridge.store.round_recovery("round-arcade") == before
 
 
 def test_crash_after_bridge_reservation_can_be_canceled_and_releases_on_replay(tmp_path, monkeypatch):

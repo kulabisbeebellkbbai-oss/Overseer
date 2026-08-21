@@ -12,6 +12,7 @@ import hashlib
 import math
 from pathlib import Path
 import os
+import re
 import secrets
 import sqlite3
 import stat
@@ -34,6 +35,19 @@ def _dump(value: Mapping[str, Any]) -> str:
 def _dump_wire(value: Mapping[str, Any]) -> str:
     """Retain authenticated contract insertion order for cross-language digests."""
     return json.dumps(dict(value), ensure_ascii=False, separators=(",", ":"))
+
+
+def _legacy_recovery_authority(payload: Any) -> dict[str, str] | None:
+    if not isinstance(payload, dict):
+        raise ValueError("legacy abandonment payload is invalid")
+    recovery = payload.get("recovery")
+    if recovery is None:
+        return None
+    if (not isinstance(recovery, dict) or set(recovery) != {"state", "recoveryDigest", "evidenceDigest"}
+            or recovery.get("state") != "uncertain"
+            or any(not isinstance(recovery.get(key), str) or not re.fullmatch(r"[a-f0-9]{64}", recovery[key]) for key in ("recoveryDigest", "evidenceDigest"))):
+        raise ValueError("legacy abandonment recovery authority is invalid")
+    return recovery
 
 
 def _requested_values_equal(left: Any, right: Any) -> bool:
@@ -1115,16 +1129,30 @@ class PsychloBridgeStore:
     def claim_legacy_abandonment(self, action_id: str, action_digest: str, *, now: str) -> dict[str, Any]:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            row = self.connection.execute("SELECT round_id,action_digest,state FROM legacy_abandonment_intents WHERE action_id=?", (action_id,)).fetchone()
+            row = self.connection.execute("SELECT round_id,action_digest,state,payload_json FROM legacy_abandonment_intents WHERE action_id=?", (action_id,)).fetchone()
             if row is None or row[1] != action_digest or row[2] not in {"claimed", "peer-pending"}:
                 raise ValueError("legacy abandonment action is not executable")
             round_row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (row[0],)).fetchone()
             delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (row[0],)).fetchone()
-            competing = any(self.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (row[0],)).fetchone() is not None for table in ("round_recoveries", "operational_failure_intents", "round_cancellations"))
-            if round_row is None or round_row[0] != "started" or round_row[1] is not None or delivery is None or delivery[0] not in {"submitted", "abandonment-fence"} or competing:
+            payload = json.loads(row[3])
+            recovery_authority = _legacy_recovery_authority(payload)
+            recovery = self.round_recovery(row[0])
+            competing = any(self.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (row[0],)).fetchone() is not None for table in ("operational_failure_intents", "round_cancellations"))
+            recovery_exact = recovery is None and recovery_authority is None
+            if isinstance(recovery_authority, dict) and isinstance(recovery, dict):
+                if recovery["state"] == "uncertain":
+                    recovery_exact = canonical_digest(recovery) == recovery_authority.get("recoveryDigest") and canonical_digest(recovery.get("evidence")) == recovery_authority.get("evidenceDigest")
+                elif recovery["state"] == "abandonment-fenced" and isinstance(recovery.get("evidence"), dict):
+                    fence = recovery["evidence"]
+                    recovery_exact = fence.get("actionId") == action_id and fence.get("actionDigest") == action_digest and fence.get("priorRecoveryDigest") == recovery_authority.get("recoveryDigest") and fence.get("priorEvidenceDigest") == recovery_authority.get("evidenceDigest")
+            expected_phases = {"unresolved", "abandonment-fence"} if recovery_authority is not None else {"submitted", "abandonment-fence"}
+            if round_row is None or round_row[0] != "started" or round_row[1] is not None or delivery is None or delivery[0] not in expected_phases or competing or not recovery_exact:
                 raise ValueError("legacy abandonment round changed before claim")
             self.connection.execute("UPDATE legacy_abandonment_intents SET state='peer-pending',attempts=attempts+1,last_error=NULL,updated_at=? WHERE action_id=? AND action_digest=? AND state IN ('claimed','peer-pending')", (now, action_id, action_digest))
-            self.connection.execute("UPDATE round_prompt_deliveries SET phase='abandonment-fence',updated_at=? WHERE round_id=? AND phase='submitted'", (now, row[0]))
+            self.connection.execute("UPDATE round_prompt_deliveries SET phase='abandonment-fence',updated_at=? WHERE round_id=? AND phase IN ('submitted','unresolved')", (now, row[0]))
+            if isinstance(recovery_authority, dict) and recovery is not None and recovery["state"] == "uncertain":
+                fence = {"schemaVersion": "overseer.round-recovery-abandonment-fence.v1", "actionId": action_id, "actionDigest": action_digest, "priorRecoveryDigest": recovery_authority["recoveryDigest"], "priorEvidenceDigest": recovery_authority["evidenceDigest"], "priorEvidence": recovery["evidence"], "priorUpdatedAt": recovery["updatedAt"]}
+                self.connection.execute("UPDATE round_recoveries SET state='abandonment-fenced',evidence_json=?,updated_at=? WHERE round_id=? AND state='uncertain'", (_dump_wire(fence), now, row[0]))
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
@@ -1139,7 +1167,7 @@ class PsychloBridgeStore:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             row = self.connection.execute(
-                "SELECT round_id,action_digest,state,receipt_json FROM legacy_abandonment_intents WHERE action_id=?",
+                "SELECT round_id,action_digest,state,receipt_json,payload_json FROM legacy_abandonment_intents WHERE action_id=?",
                 (action_id,),
             ).fetchone()
             if row is None or row[1] != action_digest or row[2] != "peer-pending" or row[3] is not None:
@@ -1152,14 +1180,21 @@ class PsychloBridgeStore:
             ).fetchone()
             if delivery is None or delivery[0] != "abandonment-fence" or round_row is None or round_row[0] != "started" or round_row[1] is not None:
                 raise ValueError("legacy abandonment reservation changed before release")
+            payload = json.loads(row[4])
+            recovery_authority = _legacy_recovery_authority(payload)
+            recovery = self.round_recovery(row[0])
+            if recovery_authority is not None:
+                fence = recovery.get("evidence") if isinstance(recovery, dict) else None
+                if not isinstance(fence, dict) or recovery.get("state") != "abandonment-fenced" or fence.get("actionId") != action_id or fence.get("actionDigest") != action_digest or fence.get("priorRecoveryDigest") != recovery_authority.get("recoveryDigest"):
+                    raise ValueError("legacy abandonment recovery fence changed before release")
             self.connection.execute(
                 "UPDATE legacy_abandonment_intents SET state='claimed',last_error=NULL,updated_at=? WHERE action_id=? AND action_digest=? AND state='peer-pending'",
                 (now, action_id, action_digest),
             )
-            self.connection.execute(
-                "UPDATE round_prompt_deliveries SET phase='submitted',updated_at=? WHERE round_id=? AND phase='abandonment-fence'",
-                (now, row[0]),
-            )
+            restored_phase = "unresolved" if recovery_authority is not None else "submitted"
+            self.connection.execute("UPDATE round_prompt_deliveries SET phase=?,updated_at=? WHERE round_id=? AND phase='abandonment-fence'", (restored_phase, now, row[0]))
+            if recovery_authority is not None:
+                self.connection.execute("UPDATE round_recoveries SET state='uncertain',evidence_json=?,updated_at=? WHERE round_id=? AND state='abandonment-fenced'", (_dump_wire(fence["priorEvidence"]), fence["priorUpdatedAt"], row[0]))
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
@@ -1184,12 +1219,19 @@ class PsychloBridgeStore:
             if intent[3] != "peer-pending":
                 raise ValueError("legacy abandonment action is not peer-pending")
             round_id = intent[0]
+            payload = json.loads(intent[2])
+            recovery_authority = _legacy_recovery_authority(payload)
             row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
             delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
-            forbidden = any(self.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (round_id,)).fetchone() is not None for table in ("round_recoveries", "operational_failure_intents", "round_cancellations"))
-            if row is None or row[0] != "started" or row[1] is not None or delivery is None or delivery[0] != "abandonment-fence" or forbidden:
+            recovery = self.round_recovery(round_id)
+            recovery_exact = recovery is None and recovery_authority is None
+            if isinstance(recovery_authority, dict) and isinstance(recovery, dict) and recovery.get("state") == "abandonment-fenced" and isinstance(recovery.get("evidence"), dict):
+                fence = recovery["evidence"]
+                recovery_exact = fence.get("actionId") == action_id and fence.get("actionDigest") == action_digest and fence.get("priorRecoveryDigest") == recovery_authority.get("recoveryDigest") and fence.get("priorEvidenceDigest") == recovery_authority.get("evidenceDigest")
+            forbidden = any(self.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (round_id,)).fetchone() is not None for table in ("operational_failure_intents", "round_cancellations"))
+            if row is None or row[0] != "started" or row[1] is not None or delivery is None or delivery[0] != "abandonment-fence" or forbidden or not recovery_exact:
                 raise ValueError("legacy abandonment round changed before completion")
-            updated = self.connection.execute("UPDATE rounds SET dispatch_state='legacy-abandoned' WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL AND NOT EXISTS (SELECT 1 FROM round_recoveries WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM operational_failure_intents WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM round_cancellations WHERE round_id=?)", (round_id, round_id, round_id, round_id))
+            updated = self.connection.execute("UPDATE rounds SET dispatch_state='legacy-abandoned' WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL AND NOT EXISTS (SELECT 1 FROM operational_failure_intents WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM round_cancellations WHERE round_id=?)", (round_id, round_id, round_id))
             if updated.rowcount != 1:
                 raise ValueError("legacy abandonment round changed before completion")
             self.connection.execute("UPDATE legacy_abandonment_intents SET state='completed',receipt_json=?,updated_at=? WHERE action_id=? AND action_digest=? AND state='peer-pending'", (encoded_receipt, now, action_id, action_digest))

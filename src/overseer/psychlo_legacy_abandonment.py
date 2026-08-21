@@ -19,7 +19,7 @@ from typing import Any, Mapping
 from .admin import AdminChangeKind, AdminChangePlan, plan_psychlo_legacy_abandonment
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
 from .psychlo_contracts import canonical_digest
-from .psychlo_process_attestation import SCHEMA as PROCESS_OBSERVATION_SCHEMA, _validate_process_observation_row, admin_plan_digest
+from .psychlo_process_attestation import SCHEMA as PROCESS_OBSERVATION_SCHEMA, RECOVERY_SCHEMA as PROCESS_RECOVERY_OBSERVATION_SCHEMA, _validate_process_observation_row, admin_plan_digest
 
 
 SCHEMA = "psychlo.legacy-round-abandon.v1"
@@ -83,12 +83,12 @@ def _require_approved_sisko_plan(plan: AdminChangePlan, kind: AdminChangeKind, t
         raise LegacyAbandonmentError("approved Sisko plan timestamp is not UTC")
 
 
-def _delivery_digest(delivery: Mapping[str, Any]) -> str:
+def _delivery_digest(delivery: Mapping[str, Any], phase: str = "submitted") -> str:
     selected = {
         "requestDigest": delivery.get("requestDigest"),
         "capabilityHash": delivery.get("capabilityHash"),
         "binding": delivery.get("binding"),
-        "submittedPhase": "submitted",
+        "submittedPhase": phase,
         "promptDigest": delivery.get("promptDigest"),
     }
     return canonical_digest(selected)
@@ -120,7 +120,7 @@ def _strict_source_observation(primary: Any, round_id: str, observation_plan_id:
     except Exception as error:
         raise LegacyAbandonmentError("recorded historical observation is invalid") from error
     if (
-        manifest.get("schemaVersion") != PROCESS_OBSERVATION_SCHEMA
+        manifest.get("schemaVersion") not in {PROCESS_OBSERVATION_SCHEMA, PROCESS_RECOVERY_OBSERVATION_SCHEMA}
         or manifest.get("historical") is not True
         or manifest.get("authoritative") is not False
         or manifest.get("executable") is not False
@@ -148,22 +148,57 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
     request_digest = bridge.store._round_request_digest(request)
     _digest(request_digest, "request digest")
     _digest(capability_hash, "capability hash")
+    recovery = bridge.store.round_recovery(round_id)
+    recovery_authority = None
+    if recovery is not None:
+        evidence = recovery.get("evidence") if isinstance(recovery, Mapping) else None
+        if recovery.get("state") == "uncertain":
+            if (recovery.get("ownerId") is not None or recovery.get("claimToken") is not None
+                    or recovery.get("leaseExpiresAt") is not None or not isinstance(evidence, Mapping)
+                    or evidence.get("redeliveryAttempted") is not True or evidence.get("phase") != "unresolved"
+                    or evidence.get("deliveryProof") not in {"unknown", "missing"}):
+                raise LegacyAbandonmentError("round recovery is not an exact terminal uncertain recovery")
+            recovery_authority = {"state": "uncertain", "recoveryDigest": canonical_digest(recovery), "evidenceDigest": canonical_digest(evidence)}
+        elif allow_fence and recovery.get("state") == "abandonment-fenced" and isinstance(evidence, Mapping):
+            if not all(isinstance(evidence.get(key), str) and _DIGEST_RE.fullmatch(evidence[key]) for key in ("priorRecoveryDigest", "priorEvidenceDigest")):
+                raise LegacyAbandonmentError("abandonment-fenced recovery authority is invalid")
+            recovery_authority = {"state": "uncertain", "recoveryDigest": evidence["priorRecoveryDigest"], "evidenceDigest": evidence["priorEvidenceDigest"]}
+        else:
+            raise LegacyAbandonmentError("round recovery conflicts with abandonment")
     delivery = bridge.store.round_prompt_delivery(round_id)
-    if delivery is None or delivery.get("phase") not in ({"submitted", "abandonment-fence"} if allow_fence else {"submitted"}):
+    expected_delivery_phases = ({"submitted", "unresolved", "abandonment-fence"} if allow_fence else {"submitted", "unresolved"})
+    if delivery is None or delivery.get("phase") not in expected_delivery_phases:
+        raise LegacyAbandonmentError("submitted prompt delivery or terminal uncertain prompt delivery is required")
+    if recovery_authority is None and delivery.get("phase") != ("abandonment-fence" if allow_fence and delivery.get("phase") == "abandonment-fence" else "submitted"):
         raise LegacyAbandonmentError("submitted prompt delivery is required")
+    if recovery_authority is not None and delivery.get("phase") not in ({"unresolved", "abandonment-fence"} if allow_fence else {"unresolved"}):
+        raise LegacyAbandonmentError("uncertain recovery requires unresolved prompt delivery")
     if delivery.get("requestDigest") != request_digest or delivery.get("capabilityHash") != capability_hash:
         raise LegacyAbandonmentError("prompt delivery binding is not exact")
     binding = bridge.store.round_binding(round_id)
     if binding is None or binding != delivery.get("binding"):
         raise LegacyAbandonmentError("round execution binding is not exact")
     prompt_digest = _digest(delivery.get("promptDigest"), "prompt digest")
-    delivery_digest = _delivery_digest(delivery)
+    delivery_digest = _delivery_digest(delivery, "unresolved" if recovery_authority is not None else "submitted")
     _digest(delivery_digest, "delivery digest")
     bridge_evidence = manifest.get("bridge")
     expected_binding_digest = hashlib.sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest()
-    if not isinstance(bridge_evidence, Mapping) or bridge_evidence.get("dispatchState") != "started" or bridge_evidence.get("resultPresent") is not False or bridge_evidence.get("deliveryPhase") != "submitted" or bridge_evidence.get("recoveryPresent") is not False or bridge_evidence.get("failurePresent") is not False or bridge_evidence.get("cancelPresent") is not False or bridge_evidence.get("requestDigest") != request_digest or bridge_evidence.get("capabilityHash") != capability_hash or bridge_evidence.get("bindingDigest") != expected_binding_digest or bridge_evidence.get("promptDigest") != prompt_digest:
+    if not isinstance(bridge_evidence, Mapping):
         raise LegacyAbandonmentError("historical bridge evidence is stale")
-    forbidden_tables = ("round_recoveries", "operational_failure_intents", "round_cancellations")
+    observation_recovery_exact = (
+        recovery_authority is None
+        and bridge_evidence.get("recoveryPresent") is False
+        and bridge_evidence.get("deliveryPhase") == "submitted"
+    ) or (
+        recovery_authority is not None
+        and bridge_evidence.get("recoveryPresent") is True
+        and bridge_evidence.get("recoveryState") == "uncertain"
+        and bridge_evidence.get("recoveryDigest") == recovery_authority["recoveryDigest"]
+        and bridge_evidence.get("deliveryPhase") == "unresolved"
+    )
+    if bridge_evidence.get("dispatchState") != "started" or bridge_evidence.get("resultPresent") is not False or not observation_recovery_exact or bridge_evidence.get("failurePresent") is not False or bridge_evidence.get("cancelPresent") is not False or bridge_evidence.get("requestDigest") != request_digest or bridge_evidence.get("capabilityHash") != capability_hash or bridge_evidence.get("bindingDigest") != expected_binding_digest or bridge_evidence.get("promptDigest") != prompt_digest:
+        raise LegacyAbandonmentError("historical bridge evidence is stale")
+    forbidden_tables = ("operational_failure_intents", "round_cancellations")
     if any(bridge.store.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (round_id,)).fetchone() is not None for table in forbidden_tables):
         raise LegacyAbandonmentError("round already has a recovery, failure, cancellation, or abandonment intent")
     existing_abandonment = bridge.store.legacy_abandonment(f"legacy-abandonment:{round_id}:{successor.get('successorPlanId', '')}")
@@ -202,10 +237,12 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
         "projectId": _id(request.get("projectId"), "project id"), "requestDigest": request_digest,
         "capabilityHash": capability_hash, "observationId": _id(observation.get("observationId"), "observation id"),
         "observationDigest": observation_digest, "observationPlanDigest": observation_plan_digest,
-        "delivery": {"phase": "submitted", "promptDigest": prompt_digest, "deliveryDigest": delivery_digest, "bindingDigest": expected_binding_digest},
+        "delivery": {"phase": "unresolved" if recovery_authority is not None else "submitted", "promptDigest": prompt_digest, "deliveryDigest": delivery_digest, "bindingDigest": expected_binding_digest},
         "originalPlan": {"planId": original_plan_id, "planVersion": original_plan_version, "conversationId": original_conversation_id, "threadId": original_thread_id},
         "successorPlan": dict(successor), "observationPlanId": observation_plan_id, "reason": REASON,
     }
+    if recovery_authority is not None:
+        action["recovery"] = recovery_authority
     if delivery_conversation_id is not None:
         action.update({
             "requestedThreadId": requested_thread_id,
@@ -232,15 +269,19 @@ def stage_legacy_abandonment(*, bridge: Any, plan_id: str, observation_plan_id: 
         delivery_conversation_id=delivery_conversation_id,
     )
     metadata = action
-    plan_kwargs = {}
+    plan_kwargs = {
+        "delivery_phase": action["delivery"]["phase"],
+        "recovery_digest": action.get("recovery", {}).get("recoveryDigest"),
+        "recovery_evidence_digest": action.get("recovery", {}).get("evidenceDigest"),
+    }
     if "requestedThreadId" in action or "deliveryConversationId" in action:
-        plan_kwargs = {
+        plan_kwargs.update({
             "requested_thread_id": action.get("requestedThreadId"),
             "delivery_conversation_id": action.get("deliveryConversationId"),
             "binding_digest": action["delivery"]["bindingDigest"],
             "prompt_digest": action["delivery"]["promptDigest"],
             "project_id": action["projectId"],
-        }
+        })
     plan = plan_psychlo_legacy_abandonment(
         plan_id, round_id, action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["originalPlan"]["conversationId"], action["originalPlan"]["threadId"], successor_plan_id, successor_plan_version, successor_conversation_id, successor_thread_id, **plan_kwargs,
     )
@@ -279,15 +320,19 @@ def _plan_exists(primary: Any, plan_id: str) -> bool:
 
 
 def _expected_plan(action: Mapping[str, Any], plan_id: str) -> AdminChangePlan:
-    plan_kwargs = {}
+    plan_kwargs = {
+        "delivery_phase": action["delivery"]["phase"],
+        "recovery_digest": action.get("recovery", {}).get("recoveryDigest"),
+        "recovery_evidence_digest": action.get("recovery", {}).get("evidenceDigest"),
+    }
     if "requestedThreadId" in action or "deliveryConversationId" in action:
-        plan_kwargs = {
+        plan_kwargs.update({
             "requested_thread_id": action.get("requestedThreadId"),
             "delivery_conversation_id": action.get("deliveryConversationId"),
             "binding_digest": action["delivery"]["bindingDigest"],
             "prompt_digest": action["delivery"]["promptDigest"],
             "project_id": action["projectId"],
-        }
+        })
     return plan_psychlo_legacy_abandonment(plan_id, action["roundId"], action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["originalPlan"]["conversationId"], action["originalPlan"]["threadId"], action["successorPlan"]["successorPlanId"], action["successorPlan"]["successorPlanVersion"], action["successorPlan"]["successorConversationId"], action["successorPlan"]["successorThreadId"], **plan_kwargs)
 
 

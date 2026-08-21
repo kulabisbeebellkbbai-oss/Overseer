@@ -4,6 +4,7 @@ import json
 import os
 import inspect
 import hashlib
+import shlex
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -834,7 +835,7 @@ def test_tmux_scan_accepts_unique_initial_or_resume_start_chain(monkeypatch, tmp
     socket_path = tmp_path / "tmux.sock"
     initial = "/home/god/.local/bin/codex-memory-session --cd '/home/god/Documents/Codex Workspace/Arcade'"
     resume = "/home/god/.local/bin/codex-memory-session resume conversation-arcade --cd '/home/god/Documents/Codex Workspace/Arcade'"
-    rows = '$2|@2|%2|102|bash|/home/god/.local/bin/codex-memory-session --cd "/home/god/Documents/Codex Workspace/Arcade"\n'
+    rows = '$2|@2|%2|102|bash|"/home/god/.local/bin/codex-memory-session --cd \'/home/god/Documents/Codex Workspace/Arcade\'"\n'
 
     class Result:
         returncode = 0
@@ -846,7 +847,9 @@ def test_tmux_scan_accepts_unique_initial_or_resume_start_chain(monkeypatch, tmp
     monkeypatch.setattr(module, "capture_process_identity", lambda pid: {**identity, "pid": pid})
     monkeypatch.setattr(module, "_proc_parent_pid", lambda _pid: 11)
 
-    result = module.capture_tmux_identity(str(socket_path), "", expected_start_commands=(resume, initial))
+    result = module.capture_tmux_identity(
+        str(socket_path), "", expected_start_commands=(resume, shlex.quote(resume), initial, shlex.quote(initial)),
+    )
     assert (result["sessionId"], result["paneId"]) == ("$2", "%2")
 
 

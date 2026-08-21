@@ -840,10 +840,9 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("registry and round binding conversation identity differ")
         if Path(process_binding["workspace"]).name.casefold() != str(request.get("projectId", "")).casefold():
             raise ProcessAttestationError("canonical workspace is not bound to the round project")
-        expected_starts = (
-            f"{CANONICAL_CODEX_MEMORY_SESSION} resume {process_binding['conversationId']} --cd {shlex.quote(process_binding['workspace'])}",
-            f"{CANONICAL_CODEX_MEMORY_SESSION} --cd {shlex.quote(process_binding['workspace'])}",
-        )
+        resume_start = f"{CANONICAL_CODEX_MEMORY_SESSION} resume {process_binding['conversationId']} --cd {shlex.quote(process_binding['workspace'])}"
+        initial_start = f"{CANONICAL_CODEX_MEMORY_SESSION} --cd {shlex.quote(process_binding['workspace'])}"
+        expected_starts = (resume_start, shlex.quote(resume_start), initial_start, shlex.quote(initial_start))
         tmux = capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_commands=expected_starts)
         pane_pid = int(tmux["paneProcess"]["pid"])
         if tmux.get("paneParentPid") != int(tmux["serverProcess"]["pid"]):

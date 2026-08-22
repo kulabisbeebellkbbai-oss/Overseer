@@ -173,9 +173,10 @@ def test_current_legacy_schema_recreates_claim_continuation_tables_on_reopen(tmp
         connection.execute("DROP TABLE claim_approval_continuations")
         connection.execute("DROP TABLE claim_activation_groups")
         connection.execute("DROP TABLE claim_approval_continuation_attempts")
+        connection.execute("DELETE FROM schema_migrations")
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version > ?",
-            (CURRENT_SCHEMA_VERSION - 1,),
+            "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
+            (4, "deployed v4 schema", "2026-08-21T00:00:00+00:00"),
         )
         connection.commit()
 
@@ -194,7 +195,11 @@ def test_current_legacy_schema_recreates_claim_continuation_tables_on_reopen(tmp
         assert store._connection.execute(
             "SELECT payload FROM resources WHERE id=?", ("resource.preserved",)
         ).fetchone()[0] == '{"preserved":true}'
-        assert store.list_schema_migrations()[0].version == CURRENT_SCHEMA_VERSION
+        integer_versions = [
+            row.version for row in store.list_schema_migrations()
+            if isinstance(row.version, int)
+        ]
+        assert integer_versions == [4, CURRENT_SCHEMA_VERSION]
 
 
 def test_dispatch_payload_excludes_raw_prompt_transcript(tmp_path: Path) -> None:

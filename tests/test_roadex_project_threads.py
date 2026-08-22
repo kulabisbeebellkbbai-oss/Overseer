@@ -20,6 +20,7 @@ from overseer.roadex_project_threads import (
     stable_json,
     QUESTION_RECEIPT_DOMAIN,
     QUESTION_RECEIPT_SCHEMA,
+    PSYCHLO_RELAY_RECEIPT_SCHEMA,
     RoadexQuestionSender,
     question_request_headers,
 )
@@ -78,7 +79,7 @@ def envelope(record_type: str, record: dict, record_id: str, *, nonce: str) -> t
 
 def accepted_receipt(body: bytes, headers: dict[str, str]) -> dict:
     request = json.loads(body)
-    return {"accepted": True, "recordType": request["recordType"], "recordId": request["recordId"], "recordDigest": request["recordDigest"]}
+    return {"schemaVersion": PSYCHLO_RELAY_RECEIPT_SCHEMA, "accepted": True, "recordType": request["recordType"], "recordId": request["recordId"], "recordDigest": request["recordDigest"], "state": "inserted"}
 
 
 def relay(tmp_path: Path, forwarder=None) -> RoadexProjectThreadRelay:
@@ -108,7 +109,7 @@ def test_persists_inbox_and_outbox_before_forward_and_recovers_after_restart(tmp
 
     def forward(record_type, record_id, record):
         calls.append((record_type, record_id, record["recordDigest"]))
-        return {"accepted": True, "receipt": {"recordType": record_type, "recordId": record_id, "recordDigest": record["recordDigest"]}}
+        return {"schemaVersion": PSYCHLO_RELAY_RECEIPT_SCHEMA, "accepted": True, "recordType": record_type, "recordId": record_id, "recordDigest": record["recordDigest"], "state": "inserted"}
 
     second = relay(tmp_path, forwarder=forward)
     assert second.forward_pending() == {"delivered": 1, "failed": 0}
@@ -233,6 +234,21 @@ def test_psychlo_question_egress_recovers_stale_claim_after_restart(tmp_path: Pa
     second.close()
 
 
+def test_psychlo_question_retry_pending_recovers_stale_claim_after_restart(tmp_path: Path):
+    path = tmp_path / "relay.sqlite"
+    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("crash")))
+    first.enqueue(message())
+    with pytest.raises(RuntimeError):
+        first.deliver("human-message-1")
+    with first.store._lock:
+        first.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='sending',claimed_at=? WHERE record_id=?", ("2026-08-22T10:00:00.000Z", "human-message-1"))
+    first.close()
+    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
+    assert second.retry_pending() == {"delivered": 1, "failed": 0}
+    assert second.store.connection.execute("SELECT state FROM roadex_project_thread_question_outbox WHERE record_id=?", ("human-message-1",)).fetchone()[0] == "delivered"
+    second.close()
+
+
 def test_psychlo_question_egress_concurrent_claim_is_single_owner(tmp_path: Path):
     path = tmp_path / "relay.sqlite"
     first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("held")))
@@ -241,6 +257,7 @@ def test_psychlo_question_egress_concurrent_claim_is_single_owner(tmp_path: Path
     with first.store._lock:
         first.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='sending',claimed_at=? WHERE record_id=?", ("2026-08-22T12:00:00.000Z", "human-message-1"))
     second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
+    assert second.retry_pending() == {"delivered": 0, "failed": 0}
     with pytest.raises(ValueError, match="claimed"):
         second.deliver("human-message-1")
     first.close(); second.close()

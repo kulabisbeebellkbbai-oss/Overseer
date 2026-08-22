@@ -7,7 +7,7 @@ all intentionally independent from ``psychlo_bridge``'s execution protocol.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -383,9 +383,9 @@ class RoadexProjectThreadRelay:
         for row in self.store.pending(limit):
             try:
                 result = self.forwarder(row["recordType"], row["recordId"], row["record"])
-                if not isinstance(result, Mapping) or result.get("accepted") is not True or not isinstance(result.get("receipt"), Mapping): raise ValueError("Psychlo rejected project-thread record")
-                receipt = dict(result["receipt"])
-                if receipt.get("recordType") != row["recordType"] or receipt.get("recordId") != row["recordId"] or receipt.get("recordDigest") != row["recordDigest"]: raise ValueError("Psychlo project-thread receipt binding is invalid")
+                if not isinstance(result, Mapping): raise ValueError("Psychlo rejected project-thread record")
+                receipt = dict(result)
+                if set(receipt) != {"schemaVersion", "accepted", "recordType", "recordId", "recordDigest", "state"} or receipt.get("schemaVersion") != PSYCHLO_RELAY_RECEIPT_SCHEMA or receipt.get("accepted") is not True or receipt.get("state") not in {"inserted", "replayed"} or receipt.get("recordType") != row["recordType"] or receipt.get("recordId") != row["recordId"] or receipt.get("recordDigest") != row["recordDigest"]: raise ValueError("Psychlo project-thread receipt binding is invalid")
                 self.store.mark_delivered(row["recordId"], receipt); delivered += 1
             except Exception as error:
                 self.store.mark_failed(row["recordId"], str(error)); failed += 1
@@ -407,6 +407,7 @@ QUESTION_REQUEST_DOMAIN = "overseer.roadex.project-human-thread.question.v1"
 QUESTION_RECEIPT_DOMAIN = "roadex.overseer.project-human-thread.question-receipt.v1"
 QUESTION_AUTHORITY = "127.0.0.1:8780"
 PSYCHLO_QUESTION_RECEIPT_SCHEMA = "overseer.psychlo.project-human-thread-question-receipt.v1"
+PSYCHLO_RELAY_RECEIPT_SCHEMA = "psychlo.overseer.project-human-thread-relay-receipt.v1"
 
 
 def question_request_headers(secret: bytes, body: bytes, timestamp: str, nonce: str) -> dict[str, str]:
@@ -460,7 +461,21 @@ class RoadexQuestionSender:
     def _rows(self, limit: int) -> list[dict[str, Any]]:
         with self.store._lock:
             self.store.connection.execute("""CREATE TABLE IF NOT EXISTS roadex_project_thread_question_outbox(record_id TEXT PRIMARY KEY,record_type TEXT NOT NULL,record_digest TEXT NOT NULL,body BLOB NOT NULL,request_nonce TEXT NOT NULL UNIQUE,request_timestamp TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,claimed_at TEXT)""")
-            rows = self.store.connection.execute("SELECT record_id,record_type,record_digest,body,request_nonce,request_timestamp,state,attempts FROM roadex_project_thread_question_outbox WHERE state='pending' ORDER BY rowid LIMIT ?", (max(1, min(128, int(limit))),)).fetchall()
+            try:
+                now = datetime.fromisoformat(self.clock().replace("Z", "+00:00"))
+                stale_before = (now - timedelta(seconds=self.claim_timeout_seconds)).isoformat()
+            except (AttributeError, TypeError, ValueError):
+                # An invalid clock cannot safely classify an in-flight claim;
+                # pending work remains retryable and sending work is left for
+                # the next valid tick.
+                stale_before = None
+            query = "SELECT record_id,record_type,record_digest,body,request_nonce,request_timestamp,state,attempts FROM roadex_project_thread_question_outbox WHERE state='pending'"
+            parameters: tuple[Any, ...] = ()
+            if stale_before is not None:
+                query += " OR (state='sending' AND claimed_at IS NOT NULL AND julianday(claimed_at) < julianday(?))"
+                parameters = (stale_before,)
+            query += " ORDER BY rowid LIMIT ?"
+            rows = self.store.connection.execute(query, (*parameters, max(1, min(128, int(limit))))).fetchall()
         return [{"recordId": row[0], "recordType": row[1], "recordDigest": row[2], "body": bytes(row[3]), "requestNonce": row[4], "requestTimestamp": row[5], "state": row[6], "attempts": row[7]} for row in rows]
 
     def _claim(self, record_id: str) -> dict[str, Any]:
@@ -540,4 +555,4 @@ def create_project_thread_question_sender(*, store: RoadexProjectThreadStore, se
     return RoadexQuestionSender(store=store, secret=secret, endpoint=endpoint, clock=clock)
 
 
-__all__ = ["ROADEx_THREAD_AUTHORITY", "ROADEx_THREAD_ENDPOINT_PATH", "REQUEST_SCHEMA", "RECEIPT_SCHEMA", "REQUEST_DOMAIN", "RECEIPT_DOMAIN", "QUESTION_ENDPOINT_PATH", "QUESTION_REQUEST_SCHEMA", "QUESTION_RECEIPT_SCHEMA", "QUESTION_REQUEST_DOMAIN", "QUESTION_RECEIPT_DOMAIN", "PSYCHLO_QUESTION_RECEIPT_SCHEMA", "RoadexProjectThreadRelay", "RoadexProjectThreadStore", "RoadexQuestionSender", "RelayResponse", "ProjectThreadContractError", "parse_project_human_thread_binding", "parse_project_human_thread_message", "parse_project_human_thread_response", "request_headers", "question_request_headers", "relay_sha256", "stable_json"]
+__all__ = ["ROADEx_THREAD_AUTHORITY", "ROADEx_THREAD_ENDPOINT_PATH", "REQUEST_SCHEMA", "RECEIPT_SCHEMA", "REQUEST_DOMAIN", "RECEIPT_DOMAIN", "QUESTION_ENDPOINT_PATH", "QUESTION_REQUEST_SCHEMA", "QUESTION_RECEIPT_SCHEMA", "QUESTION_REQUEST_DOMAIN", "QUESTION_RECEIPT_DOMAIN", "PSYCHLO_QUESTION_RECEIPT_SCHEMA", "PSYCHLO_RELAY_RECEIPT_SCHEMA", "RoadexProjectThreadRelay", "RoadexProjectThreadStore", "RoadexQuestionSender", "RelayResponse", "ProjectThreadContractError", "parse_project_human_thread_binding", "parse_project_human_thread_message", "parse_project_human_thread_response", "request_headers", "question_request_headers", "relay_sha256", "stable_json"]

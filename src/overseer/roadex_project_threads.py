@@ -20,10 +20,11 @@ import sqlite3
 import stat
 import threading
 from typing import Any, Callable, Mapping
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 MAX_BODY_BYTES = 256 * 1024
 ROADEx_THREAD_ENDPOINT_PATH = "/api/roadex/project-human-thread-relay"
-ROADEx_THREAD_AUTHORITY = "127.0.0.1:8773"
+ROADEx_THREAD_AUTHORITY = "127.0.0.1:8766"
 REQUEST_SCHEMA = "roadex.overseer.project-human-thread-relay.v1"
 RECEIPT_SCHEMA = "overseer.roadex.project-human-thread-relay-receipt.v1"
 REQUEST_DOMAIN = "roadex.overseer.project-human-thread-relay.request.v1"
@@ -172,6 +173,11 @@ def _hmac(secret: bytes, domain: str, *parts: str) -> str:
     return hmac.new(secret, "\n".join((domain, *parts)).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _require_secret(secret: bytes, label: str) -> None:
+    if not isinstance(secret, bytes) or not 32 <= len(secret) <= 256 or any(byte < 0x20 or byte > 0x7E for byte in secret):
+        raise ValueError(f"{label} is invalid")
+
+
 def request_headers(secret: bytes, body: bytes, timestamp: str, nonce: str) -> dict[str, str]:
     return {"content-type": "application/json", "content-length": str(len(body)), "x-roadex-relay-timestamp": timestamp, "x-roadex-relay-nonce": nonce, "x-roadex-relay-signature": _hmac(secret, REQUEST_DOMAIN, timestamp, nonce, relay_sha256(body))}
 
@@ -201,8 +207,15 @@ class RoadexProjectThreadStore:
         CREATE TABLE IF NOT EXISTS roadex_project_thread_relay_inbox(record_id TEXT PRIMARY KEY,record_type TEXT NOT NULL,record_digest TEXT NOT NULL UNIQUE,project_id TEXT NOT NULL,record_json TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS roadex_project_thread_relay_outbox(record_id TEXT PRIMARY KEY,record_type TEXT NOT NULL,record_digest TEXT NOT NULL UNIQUE,project_id TEXT NOT NULL,record_json TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,updated_at TEXT NOT NULL,receipt_json TEXT);
         CREATE TABLE IF NOT EXISTS roadex_project_thread_relay_receipts(record_id TEXT PRIMARY KEY,request_digest TEXT NOT NULL UNIQUE,request_nonce TEXT NOT NULL UNIQUE,receipt_nonce TEXT NOT NULL UNIQUE,body BLOB NOT NULL,occurred_at TEXT NOT NULL,signature TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS roadex_project_thread_question_outbox(record_id TEXT PRIMARY KEY,record_type TEXT NOT NULL,record_digest TEXT NOT NULL,body BLOB NOT NULL,request_nonce TEXT NOT NULL UNIQUE,request_timestamp TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,claimed_at TEXT);
+        CREATE TABLE IF NOT EXISTS roadex_project_thread_question_receipts(record_id TEXT PRIMARY KEY,request_nonce TEXT NOT NULL UNIQUE,receipt_nonce TEXT NOT NULL UNIQUE,body BLOB NOT NULL,receipt_digest TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS roadex_project_thread_question_nonces(nonce TEXT PRIMARY KEY,message_id TEXT NOT NULL,claimed_at TEXT NOT NULL);
         """)
         self._lock = threading.RLock()
+        try:
+            self.connection.execute("ALTER TABLE roadex_project_thread_question_outbox ADD COLUMN claimed_at TEXT")
+        except sqlite3.OperationalError:
+            pass
 
     def close(self) -> None: self.connection.close()
 
@@ -270,22 +283,41 @@ def _parse_record(record_type: str, record: Mapping[str, Any]) -> dict[str, Any]
 
 
 class RoadexProjectThreadRelay:
-    def __init__(self, *, store: RoadexProjectThreadStore, secret: bytes, clock: Callable[[], str] | None = None, forwarder: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]] | None = None):
-        if not isinstance(secret, bytes) or len(secret) < 32: raise ValueError("Roadex relay secret is invalid")
-        self.store, self.secret, self.clock, self.forwarder = store, secret, clock or (lambda: datetime.now(UTC).isoformat()), forwarder
+    def __init__(self, *, store: RoadexProjectThreadStore, secret: bytes, clock: Callable[[], str] | None = None, forwarder: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]] | None = None, question_sender: "RoadexQuestionSender | None" = None):
+        _require_secret(secret, "Roadex relay secret")
+        self.store, self.secret, self.clock, self.forwarder, self.question_sender = store, secret, clock or (lambda: datetime.now(UTC).isoformat()), forwarder, question_sender
         self._lock = threading.RLock()
 
     def request_scoped(self) -> "RoadexProjectThreadRelay":
         """Give a threaded HTTP worker its own SQLite handle."""
+        scoped_store = RoadexProjectThreadStore(self.store.filename)
+        scoped_sender = None
+        if self.question_sender is not None:
+            scoped_sender = RoadexQuestionSender(store=scoped_store, secret=self.question_sender.secret, endpoint=self.question_sender.endpoint, clock=self.question_sender.clock, send=self.question_sender._send)
         return RoadexProjectThreadRelay(
-            store=RoadexProjectThreadStore(self.store.filename),
+            store=scoped_store,
             secret=self.secret,
             clock=self.clock,
             forwarder=self.forwarder,
+            question_sender=scoped_sender,
         )
 
     def close(self) -> None:
         self.store.close()
+
+    def claim_question_nonce(self, nonce: str, message_id: str, claimed_at: str) -> bool:
+        with self.store._lock:
+            self.store.connection.execute("INSERT OR IGNORE INTO roadex_project_thread_question_nonces VALUES (?,?,?)", (nonce, message_id, claimed_at))
+            row = self.store.connection.execute("SELECT message_id FROM roadex_project_thread_question_nonces WHERE nonce=?", (nonce,)).fetchone()
+            return row is not None and row[0] == message_id
+
+    def receive_psychlo_question(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if self.question_sender is None:
+            raise ValueError("project_thread_question_sender_not_configured")
+        parsed = parse_project_human_thread_message(payload)
+        queued = self.question_sender.enqueue(parsed)
+        persistence_id = f"overseer-roadex-project-thread-question:{relay_sha256(parsed['messageId'])[:48]}"
+        return {"schemaVersion": PSYCHLO_QUESTION_RECEIPT_SCHEMA, "accepted": True, "messageId": parsed["messageId"], "messageDigest": parsed["messageDigest"], "persistenceId": persistence_id, "state": queued["state"]}
 
     def _verify(self, body: bytes, headers: Mapping[str, str]) -> tuple[str, str, str]:
         # Roadex's fetch transport supplies content-type and the three signed
@@ -301,7 +333,11 @@ class RoadexProjectThreadRelay:
         except (UnicodeDecodeError, json.JSONDecodeError) as error: raise ValueError("invalid_message") from error
         if not isinstance(envelope, dict) or set(envelope) != {"schemaVersion", "recordType", "recordId", "recordDigest", "record"} or envelope["schemaVersion"] != REQUEST_SCHEMA: raise ValueError("invalid_message")
         record_type, record_id, record_digest, record = envelope["recordType"], envelope["recordId"], envelope["recordDigest"], envelope["record"]
-        if record_type not in {"binding", "message", "response"} or not isinstance(record, dict): raise ValueError("invalid_project_thread_record")
+        # Roadex sends lifecycle bindings and human responses into this
+        # receiver.  Questions/messages originate in Psychlo and use the
+        # separate question egress below; accepting them here would collapse
+        # the two directions and re-open the approval-route confusion.
+        if record_type not in {"binding", "response"} or not isinstance(record, dict): raise ValueError("unsupported_project_thread_record")
         _id(record_id, "recordId")
         try: parsed = _parse_record(record_type, record)
         except ProjectThreadContractError as error: raise ValueError(str(error)) from error
@@ -356,7 +392,152 @@ class RoadexProjectThreadRelay:
         return {"delivered": delivered, "failed": failed}
 
     def tick(self, *, limit: int = 32) -> dict[str, int]:
-        return self.forward_pending(limit=limit)
+        result = self.forward_pending(limit=limit)
+        if self.question_sender is not None:
+            question_result = self.question_sender.retry_pending(limit=limit)
+            result["questionDelivered"] = question_result["delivered"]
+            result["questionFailed"] = question_result["failed"]
+        return result
 
 
-__all__ = ["ROADEx_THREAD_AUTHORITY", "ROADEx_THREAD_ENDPOINT_PATH", "REQUEST_SCHEMA", "RECEIPT_SCHEMA", "REQUEST_DOMAIN", "RECEIPT_DOMAIN", "RoadexProjectThreadRelay", "RoadexProjectThreadStore", "RelayResponse", "ProjectThreadContractError", "parse_project_human_thread_binding", "parse_project_human_thread_message", "parse_project_human_thread_response", "request_headers", "relay_sha256", "stable_json"]
+QUESTION_ENDPOINT_PATH = "/api/roadex/project-human-thread-question"
+QUESTION_REQUEST_SCHEMA = "overseer.project-human-thread-question.v1"
+QUESTION_RECEIPT_SCHEMA = "roadex.overseer.project-human-thread.question-receipt.v1"
+QUESTION_REQUEST_DOMAIN = "overseer.roadex.project-human-thread.question.v1"
+QUESTION_RECEIPT_DOMAIN = "roadex.overseer.project-human-thread.question-receipt.v1"
+QUESTION_AUTHORITY = "127.0.0.1:8780"
+PSYCHLO_QUESTION_RECEIPT_SCHEMA = "overseer.psychlo.project-human-thread-question-receipt.v1"
+
+
+def question_request_headers(secret: bytes, body: bytes, timestamp: str, nonce: str) -> dict[str, str]:
+    return {"content-type": "application/json", "content-length": str(len(body)), "x-overseer-question-timestamp": timestamp, "x-overseer-question-nonce": nonce, "x-overseer-question-signature": _hmac(secret, QUESTION_REQUEST_DOMAIN, timestamp, nonce, relay_sha256(body))}
+
+
+def _question_receipt_signature(secret: bytes, timestamp: str, request_nonce: str, body: bytes) -> str:
+    return _hmac(secret, QUESTION_RECEIPT_DOMAIN, timestamp, request_nonce, relay_sha256(body))
+
+
+class RoadexQuestionSender:
+    """Durable Psychlo-question egress to Roadex on a separate endpoint."""
+
+    def __init__(self, *, store: RoadexProjectThreadStore, secret: bytes, endpoint: str = "http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock: Callable[[], str] | None = None, send: Callable[[bytes, Mapping[str, str]], Mapping[str, Any]] | None = None, claim_timeout_seconds: int = 60):
+        _require_secret(secret, "Roadex question secret")
+        if endpoint != "http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH: raise ValueError("Roadex question endpoint is invalid")
+        self.store, self.secret, self.endpoint = store, secret, endpoint
+        self.clock, self._send, self.claim_timeout_seconds = clock or (lambda: datetime.now(UTC).isoformat()), send or self._http_send, max(1, int(claim_timeout_seconds))
+        self._lock = threading.RLock()
+
+    def request_scoped(self) -> "RoadexQuestionSender":
+        return RoadexQuestionSender(store=RoadexProjectThreadStore(self.store.filename), secret=self.secret, endpoint=self.endpoint, clock=self.clock, send=self._send, claim_timeout_seconds=self.claim_timeout_seconds)
+
+    def close(self) -> None: self.store.close()
+
+    def _http_send(self, body: bytes, headers: Mapping[str, str]) -> Mapping[str, Any]:
+        request = Request(self.endpoint, data=body, headers=dict(headers), method="POST")
+        class _RejectRedirects(HTTPRedirectHandler):
+            def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+                raise ValueError("Roadex question redirects are forbidden")
+        with build_opener(ProxyHandler({}), _RejectRedirects()).open(request, timeout=10.0) as response:
+            return {"status": response.status, "body": response.read(MAX_BODY_BYTES + 1), "headers": dict(response.headers.items())}
+
+    def enqueue(self, record: Mapping[str, Any], delivery_id: str | None = None) -> dict[str, Any]:
+        parsed = parse_project_human_thread_message(record)
+        record_id = delivery_id or parsed["messageId"]
+        _id(record_id, "question recordId")
+        digest = parsed["messageDigest"]
+        body = stable_json({"schemaVersion": QUESTION_REQUEST_SCHEMA, "message": parsed}).encode()
+        timestamp = self.clock(); nonce = f"question-{secrets.token_urlsafe(18)}"
+        _timestamp(timestamp, "question timestamp")
+        with self.store._lock:
+            existing = self.store.connection.execute("SELECT record_type,record_digest,body,request_nonce,request_timestamp,state,attempts FROM roadex_project_thread_question_outbox WHERE record_id=?", (record_id,)).fetchone()
+            if existing is not None:
+                if tuple(existing[:3]) != ("message", digest, body): raise ValueError("project-thread question conflict")
+                return {"recordId": record_id, "recordDigest": digest, "state": existing[5], "attempts": existing[6], "requestNonce": existing[3], "requestTimestamp": existing[4]}
+            self.store.connection.execute("""CREATE TABLE IF NOT EXISTS roadex_project_thread_question_outbox(record_id TEXT PRIMARY KEY,record_type TEXT NOT NULL,record_digest TEXT NOT NULL,body BLOB NOT NULL,request_nonce TEXT NOT NULL UNIQUE,request_timestamp TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,claimed_at TEXT)""")
+            self.store.connection.execute("INSERT INTO roadex_project_thread_question_outbox(record_id,record_type,record_digest,body,request_nonce,request_timestamp,state,attempts,claimed_at) VALUES (?,?,?,?,?,?,'pending',0,NULL)", (record_id, "message", digest, body, nonce, timestamp))
+        return {"recordId": record_id, "recordDigest": digest, "state": "pending", "attempts": 0, "requestNonce": nonce, "requestTimestamp": timestamp}
+
+    def _rows(self, limit: int) -> list[dict[str, Any]]:
+        with self.store._lock:
+            self.store.connection.execute("""CREATE TABLE IF NOT EXISTS roadex_project_thread_question_outbox(record_id TEXT PRIMARY KEY,record_type TEXT NOT NULL,record_digest TEXT NOT NULL,body BLOB NOT NULL,request_nonce TEXT NOT NULL UNIQUE,request_timestamp TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,claimed_at TEXT)""")
+            rows = self.store.connection.execute("SELECT record_id,record_type,record_digest,body,request_nonce,request_timestamp,state,attempts FROM roadex_project_thread_question_outbox WHERE state='pending' ORDER BY rowid LIMIT ?", (max(1, min(128, int(limit))),)).fetchall()
+        return [{"recordId": row[0], "recordType": row[1], "recordDigest": row[2], "body": bytes(row[3]), "requestNonce": row[4], "requestTimestamp": row[5], "state": row[6], "attempts": row[7]} for row in rows]
+
+    def _claim(self, record_id: str) -> dict[str, Any]:
+        with self.store._lock:
+            self.store.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.store.connection.execute("""CREATE TABLE IF NOT EXISTS roadex_project_thread_question_outbox(record_id TEXT PRIMARY KEY,record_type TEXT NOT NULL,record_digest TEXT NOT NULL,body BLOB NOT NULL,request_nonce TEXT NOT NULL UNIQUE,request_timestamp TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,claimed_at TEXT)""")
+                row = self.store.connection.execute("SELECT record_id,record_type,record_digest,body,request_nonce,request_timestamp,state,attempts FROM roadex_project_thread_question_outbox WHERE record_id=?", (record_id,)).fetchone()
+                if row is None: raise ValueError("project-thread question is missing")
+                if row[6] == "delivered":
+                    self.store.connection.execute("COMMIT")
+                    return {"recordId": row[0], "recordType": row[1], "recordDigest": row[2], "body": bytes(row[3]), "requestNonce": row[4], "requestTimestamp": row[5], "state": row[6], "attempts": row[7]}
+                current_state = row[6]
+                if current_state == "sending":
+                    claimed = self.store.connection.execute("SELECT claimed_at FROM roadex_project_thread_question_outbox WHERE record_id=?", (record_id,)).fetchone()[0]
+                    try:
+                        stale = (datetime.fromisoformat(self.clock().replace("Z", "+00:00")) - datetime.fromisoformat(str(claimed).replace("Z", "+00:00"))).total_seconds() > self.claim_timeout_seconds
+                    except (TypeError, ValueError):
+                        stale = False
+                    if not stale: raise ValueError("project-thread question is already claimed")
+                    self.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='pending',claimed_at=NULL WHERE record_id=?", (record_id,))
+                    current_state = "pending"
+                if current_state != "pending": raise ValueError("project-thread question is already claimed")
+                claimed_at = self.clock()
+                self.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='sending',attempts=attempts+1,claimed_at=? WHERE record_id=? AND state='pending'", (claimed_at, record_id))
+                self.store.connection.execute("COMMIT")
+                return {"recordId": row[0], "recordType": row[1], "recordDigest": row[2], "body": bytes(row[3]), "requestNonce": row[4], "requestTimestamp": row[5], "state": "sending", "attempts": row[7] + 1}
+            except Exception:
+                self.store.connection.execute("ROLLBACK")
+                raise
+
+    def _reset(self, record_id: str, error: str) -> None:
+        with self.store._lock:
+            self.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='pending' WHERE record_id=? AND state='sending'", (record_id,))
+
+    def deliver(self, record_id: str) -> dict[str, Any]:
+        row = self._claim(record_id)
+        if row["state"] == "delivered": return row
+        try:
+            headers = question_request_headers(self.secret, row["body"], row["requestTimestamp"], row["requestNonce"])
+            if self._send is None:
+                raise ValueError("Roadex question HTTP sender is not configured")
+            response = self._send(row["body"], headers)
+            status = int(response.get("status", 0)); response_body = response.get("body", b"")
+            response_body = response_body.encode() if isinstance(response_body, str) else bytes(response_body)
+            response_headers = {str(k).lower(): str(v) for k, v in dict(response.get("headers", {})).items()}
+            if status != 202 or stable_json(json.loads(response_body.decode())) != response_body.decode(): raise ValueError("project-thread question receipt is invalid")
+            receipt = json.loads(response_body.decode())
+            expected = {"schemaVersion": QUESTION_RECEIPT_SCHEMA, "accepted": True, "messageId": row["recordId"], "messageDigest": row["recordDigest"], "requestNonce": row["requestNonce"], "receiptNonce": receipt.get("receiptNonce"), "occurredAt": receipt.get("occurredAt")}
+            if receipt != expected or not isinstance(receipt.get("receiptNonce"), str) or not _NONCE.fullmatch(receipt["receiptNonce"]): raise ValueError("project-thread question receipt binding is invalid")
+            _timestamp(receipt["occurredAt"], "question receipt timestamp")
+            if response_headers.get("x-roadex-question-timestamp") != receipt["occurredAt"] or not hmac.compare_digest(response_headers.get("x-roadex-question-signature", ""), _question_receipt_signature(self.secret, receipt["occurredAt"], row["requestNonce"], response_body)): raise ValueError("project-thread question receipt signature is invalid")
+            with self.store._lock:
+                self.store.connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self.store.connection.execute("INSERT INTO roadex_project_thread_question_receipts VALUES (?,?,?,?,?)", (row["recordId"], row["requestNonce"], receipt["receiptNonce"], response_body, relay_sha256(response_body)))
+                    self.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='delivered',claimed_at=NULL WHERE record_id=? AND state='sending'", (record_id,))
+                    self.store.connection.execute("COMMIT")
+                except Exception:
+                    self.store.connection.execute("ROLLBACK")
+                    raise
+            return {**row, "state": "delivered", "receipt": receipt}
+        except Exception:
+            self._reset(record_id, "delivery failed")
+            raise
+
+    def retry_pending(self, *, limit: int = 32) -> dict[str, int]:
+        delivered = failed = 0
+        for row in self._rows(limit):
+            try: self.deliver(row["recordId"]); delivered += 1
+            except Exception: failed += 1
+        return {"delivered": delivered, "failed": failed}
+
+
+def create_project_thread_question_sender(*, store: RoadexProjectThreadStore, secret: bytes, endpoint: str, clock: Callable[[], str] | None = None) -> RoadexQuestionSender:
+    """Build the outgoing sender with a fixed, loopback-only endpoint."""
+    return RoadexQuestionSender(store=store, secret=secret, endpoint=endpoint, clock=clock)
+
+
+__all__ = ["ROADEx_THREAD_AUTHORITY", "ROADEx_THREAD_ENDPOINT_PATH", "REQUEST_SCHEMA", "RECEIPT_SCHEMA", "REQUEST_DOMAIN", "RECEIPT_DOMAIN", "QUESTION_ENDPOINT_PATH", "QUESTION_REQUEST_SCHEMA", "QUESTION_RECEIPT_SCHEMA", "QUESTION_REQUEST_DOMAIN", "QUESTION_RECEIPT_DOMAIN", "PSYCHLO_QUESTION_RECEIPT_SCHEMA", "RoadexProjectThreadRelay", "RoadexProjectThreadStore", "RoadexQuestionSender", "RelayResponse", "ProjectThreadContractError", "parse_project_human_thread_binding", "parse_project_human_thread_message", "parse_project_human_thread_response", "request_headers", "question_request_headers", "relay_sha256", "stable_json"]

@@ -18,6 +18,10 @@ from overseer.roadex_project_threads import (
     relay_sha256,
     request_headers,
     stable_json,
+    QUESTION_RECEIPT_DOMAIN,
+    QUESTION_RECEIPT_SCHEMA,
+    RoadexQuestionSender,
+    question_request_headers,
 )
 
 
@@ -59,7 +63,7 @@ def message(*, message_id: str = "human-message-1", content: str = "Do you want 
         "choices": [],
         "contentDigest": relay_sha256(content),
         "correlationId": "correlation-1",
-        "idempotencyKey": f"key-{message_id}",
+        "idempotencyKey": f"key-{message_id[:150]}",
         "occurredAt": NOW,
     }
     value["messageDigest"] = relay_sha256(stable_json(value))
@@ -86,11 +90,10 @@ def test_binding_lifecycle_uses_independent_event_id_and_message_requires_curren
     body, headers = envelope("binding", binding(), "binding-event-create-1", nonce="request-nonce-0001")
     assert service.receive(body, headers).status == 202
     message_body, message_headers = envelope("message", message(), "message-event-1", nonce="request-nonce-0002")
-    assert service.receive(message_body, message_headers).status == 202
+    with pytest.raises(ValueError, match="unsupported"):
+        service.receive(message_body, message_headers)
     retired_body, retired_headers = envelope("binding", binding(status="retired"), "binding-event-retire-1", nonce="request-nonce-0003")
     assert service.receive(retired_body, retired_headers).status == 202
-    with pytest.raises(ValueError, match="not current"):
-        service.receive(*envelope("message", message(message_id="message-event-2"), "message-event-2", nonce="request-nonce-0004"))
     service.store.close()
 
 
@@ -141,12 +144,13 @@ def test_rejects_approval_shaped_records_but_allows_ordinary_text(tmp_path: Path
     bad = message(content="approved deploy decision")
     bad["approved"] = True
     bad["messageDigest"] = relay_sha256(stable_json(bad))
-    with pytest.raises(ValueError, match="fields|approval"):
+    with pytest.raises(ValueError, match="unsupported|fields|approval"):
         service.receive(*envelope("message", bad, "message-approval-shaped", nonce="request-nonce-0030"))
     body, headers = envelope("binding", binding(), "binding-valid-text", nonce="request-nonce-0031")
     assert service.receive(body, headers).status == 202
     body, headers = envelope("message", message(content="Do you want to deploy and test the app?"), "message-valid-text", nonce="request-nonce-0032")
-    assert service.receive(body, headers).status == 202
+    with pytest.raises(ValueError, match="unsupported"):
+        service.receive(body, headers)
     service.store.close()
 
 
@@ -179,3 +183,73 @@ def test_concurrent_duplicate_delivery_has_one_receipt_and_one_outbox(tmp_path: 
         assert connection.execute("SELECT count(*) FROM roadex_project_thread_relay_inbox").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM roadex_project_thread_relay_outbox").fetchone()[0] == 1
     service.store.close()
+
+
+def question_receipt(body: bytes, headers: dict[str, str], *, record_id: str | None = None, record_digest: str | None = None) -> dict:
+    request = json.loads(body)
+    occurred_at = "2026-08-22T12:00:01.000Z"
+    receipt = {"schemaVersion": QUESTION_RECEIPT_SCHEMA, "accepted": True, "messageId": record_id or request["message"]["messageId"], "messageDigest": record_digest or request["message"]["messageDigest"], "requestNonce": headers["x-overseer-question-nonce"], "receiptNonce": "question-receipt-0001", "occurredAt": occurred_at}
+    encoded = stable_json(receipt).encode()
+    import hmac
+    signature = hmac.new(SECRET, "\n".join((QUESTION_RECEIPT_DOMAIN, occurred_at, headers["x-overseer-question-nonce"], relay_sha256(encoded))).encode(), hashlib.sha256).hexdigest()
+    return {"status": 202, "body": encoded, "headers": {"x-roadex-question-timestamp": occurred_at, "x-roadex-question-signature": signature}}
+
+
+def test_psychlo_question_egress_persists_before_send_and_replays_after_restart(tmp_path: Path):
+    path = tmp_path / "relay.sqlite"
+    calls: list[tuple[bytes, dict[str, str]]] = []
+    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: NOW, send=lambda body, headers: calls.append((body, dict(headers))) or (_ for _ in ()).throw(RuntimeError("lost response")))
+    first.enqueue(message())
+    with pytest.raises(RuntimeError, match="lost response"):
+        first.deliver("human-message-1")
+    first.close()
+    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", send=lambda body, headers: calls.append((body, dict(headers))) or question_receipt(body, headers))
+    assert second.retry_pending() == {"delivered": 1, "failed": 0}
+    assert calls[0] == calls[1]
+    second.close()
+
+
+def test_psychlo_question_egress_rejects_substituted_receipt_and_concurrent_claim(tmp_path: Path):
+    release = False
+    def send(body, headers):
+        return question_receipt(body, headers, record_id="other-message")
+    sender = RoadexQuestionSender(store=RoadexProjectThreadStore(tmp_path / "relay.sqlite"), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: NOW, send=send)
+    sender.enqueue(message())
+    with pytest.raises(ValueError, match="binding"):
+        sender.deliver("human-message-1")
+    sender.close()
+
+
+def test_psychlo_question_egress_recovers_stale_claim_after_restart(tmp_path: Path):
+    path = tmp_path / "relay.sqlite"
+    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("crash")))
+    first.enqueue(message())
+    with pytest.raises(RuntimeError): first.deliver("human-message-1")
+    with first.store._lock:
+        first.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='sending',claimed_at=? WHERE record_id=?", ("2026-08-22T10:00:00.000Z", "human-message-1"))
+    first.close()
+    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
+    assert second.deliver("human-message-1")["state"] == "delivered"
+    second.close()
+
+
+def test_psychlo_question_egress_concurrent_claim_is_single_owner(tmp_path: Path):
+    path = tmp_path / "relay.sqlite"
+    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("held")))
+    first.enqueue(message())
+    with pytest.raises(RuntimeError): first.deliver("human-message-1")
+    with first.store._lock:
+        first.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='sending',claimed_at=? WHERE record_id=?", ("2026-08-22T12:00:00.000Z", "human-message-1"))
+    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
+    with pytest.raises(ValueError, match="claimed"):
+        second.deliver("human-message-1")
+    first.close(); second.close()
+
+
+def test_psychlo_question_ack_uses_bounded_persistence_identity(tmp_path: Path):
+    sender = RoadexQuestionSender(store=RoadexProjectThreadStore(tmp_path / "relay.sqlite"), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: NOW, send=lambda *_: {"status": 202, "body": b"{}", "headers": {}})
+    relay = RoadexProjectThreadRelay(store=sender.store, secret=SECRET, clock=lambda: NOW, question_sender=sender)
+    result = relay.receive_psychlo_question(message(message_id="a" * 160))
+    assert len(result["persistenceId"]) <= 160
+    assert result["schemaVersion"] == "overseer.psychlo.project-human-thread-question-receipt.v1"
+    relay.close()

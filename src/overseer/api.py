@@ -351,6 +351,7 @@ def make_api_handler(
     human_approval_identity: str | None = None,
     psychlo_bridge: PsychloBridge | None = None,
     psychlo_peer_authority: str = "127.0.0.1:8766",
+    roadex_relay_authority: str = "127.0.0.1:8766",
 ):
     if psychlo_bridge is not None:
         def load_bridge_approval(approval_id: str):
@@ -743,6 +744,12 @@ def make_api_handler(
             route = urlsplit(self.path)
             raw_path = route.path
             path = _strip_protected_gateway_prefix(route.path)
+            # This is a raw, custom-HMAC endpoint.  It intentionally runs
+            # before the generic bearer/human authorization dispatcher and
+            # has no approval token or approval-store side effects.
+            if raw_path == "/api/roadex/project-human-thread-relay":
+                self._handle_roadex_project_human_thread_relay()
+                return
             peer_kinds = {
                 "/psychlo/projects": "project-register",
                 "/psychlo/rounds": "round-request",
@@ -766,6 +773,7 @@ def make_api_handler(
                 "/psychlo/concurrency/canary-results": "concurrency-canary-result",
                 "/psychlo/policy-exceptions": "policy-exception-request",
                 "/psychlo/policy-exception-requests": "policy-exception-request",
+                "/psychlo/project-human-thread/questions": "project-human-thread-question",
             }
             if raw_path in peer_kinds:
                 self._handle_psychlo_peer(peer_kinds[raw_path])
@@ -1440,7 +1448,18 @@ def make_api_handler(
                 body = self._read_bounded_body()
                 headers = self._singleton_headers()
                 if not isinstance(request_bridge.peer_secret, bytes): raise ValueError("peer_secret_unavailable")
-                message = verify_peer_request(request_bridge.peer_secret, request_bridge.store, kind, body, headers, expected_authority=psychlo_peer_authority)
+                if kind == "project-human-thread-question":
+                    relay = request_bridge.project_thread_relay
+                    if relay is None:
+                        raise ValueError("project_thread_relay_not_configured")
+                    class _QuestionNonceStore:
+                        def claim_nonce(self, nonce: str, message_id: str, claimed_at: str) -> bool:
+                            return relay.claim_question_nonce(nonce, message_id, claimed_at)
+                    message = verify_peer_request(request_bridge.peer_secret, _QuestionNonceStore(), kind, body, headers, expected_authority=psychlo_peer_authority)
+                    if message["messageId"] != message["payload"].get("messageId"):
+                        raise ValueError("project human thread question identity is invalid")
+                else:
+                    message = verify_peer_request(request_bridge.peer_secret, request_bridge.store, kind, body, headers, expected_authority=psychlo_peer_authority)
                 if kind in {"decision-stage", "decision-reconcile"}:
                     _require_decision_peer_message_binding(message)
                 if kind == "project-register":
@@ -1480,6 +1499,8 @@ def make_api_handler(
                     result = request_bridge.receive_policy_exception_request(message["payload"], message_id=message["messageId"])
                 elif kind == "decision-outcome":
                     result = request_bridge.receive_external_decision_outcome(message["payload"])
+                elif kind == "project-human-thread-question":
+                    result = request_bridge.receive_project_human_thread_question(message["payload"])
                 else:
                     raise ValueError("unsupported Psychlo peer kind")
                 self._write_json(
@@ -1503,6 +1524,28 @@ def make_api_handler(
                         peer_request_digest=hashlib.sha256(failure_body).hexdigest(),
                     )
                 else:
+                    self._write_json({"accepted": False, "error": code}, status)
+
+        def _handle_roadex_project_human_thread_relay(self) -> None:
+            forbidden = ("authorization", "cookie", "origin", "transfer-encoding", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")
+            with self._psychlo_request() as request_bridge:
+                if request_bridge is None or request_bridge.project_thread_relay is None or any(self.headers.get_all(name) for name in forbidden):
+                    self._write_json({"accepted": False, "error": "project_thread_relay_not_configured"}, HTTPStatus.NOT_FOUND)
+                    return
+                try:
+                    body = self._read_bounded_body()
+                    expected_host = roadex_relay_authority
+                    hosts = self.headers.get_all("host") or []
+                    names = ("content-type", "content-length", "x-roadex-relay-timestamp", "x-roadex-relay-nonce", "x-roadex-relay-signature")
+                    values = {name: self.headers.get_all(name) or [] for name in names}
+                    if hosts != [expected_host] or any(len(items) != 1 for items in values.values()):
+                        raise ValueError("invalid_roadex_relay_headers")
+                    headers = {name: values[name][0] for name in names}
+                    response = request_bridge.receive_project_human_thread(body, headers)
+                    self._write_raw_relay_response(response.status, response.body, response.headers)
+                except ValueError as error:
+                    code = str(error)
+                    status = HTTPStatus.CONFLICT if code in {"replay_receipt_missing", "nonce_reuse", "project thread record conflict"} else HTTPStatus.BAD_REQUEST
                     self._write_json({"accepted": False, "error": code}, status)
 
         def _handle_psychlo_round_result(self, capability: str) -> None:
@@ -1588,6 +1631,20 @@ def make_api_handler(
             self.send_header("content-length", str(len(body)))
             for name, value in response_headers.items():
                 self.send_header(name, value)
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                return
+
+        def _write_raw_relay_response(self, status: int, body: bytes, headers: dict[str, str]) -> None:
+            """Write the persisted relay receipt byte-for-byte."""
+            self.send_response(int(status))
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            for name, value in headers.items():
+                if name.lower() != "content-type":
+                    self.send_header(name, value)
             self.end_headers()
             try:
                 self.wfile.write(body)

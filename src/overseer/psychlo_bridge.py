@@ -252,7 +252,7 @@ class _LegacyPsychloBridgeStore:
 # isolated projection store.  The new store retains all legacy round/decision
 # methods, so existing callers do not cross the external-execution boundary.
 from .psychlo_store import PsychloBridgeStore
-from .roadex_project_threads import RoadexProjectThreadRelay
+from .roadex_project_threads import RoadexProjectThreadRelay, RoadexProjectThreadStore, RoadexQuestionSender, QUESTION_ENDPOINT_PATH
 
 
 def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind: str, body: bytes, headers: Mapping[str, str], *, now: str | None = None, expected_authority: str) -> dict[str, Any]:
@@ -456,6 +456,11 @@ class PsychloBridge:
         if self.project_thread_relay is None:
             raise ValueError("project_thread_relay_not_configured")
         return self.project_thread_relay.receive(body, headers)
+
+    def receive_project_human_thread_question(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if self.project_thread_relay is None:
+            raise ValueError("project_thread_relay_not_configured")
+        return self.project_thread_relay.receive_psychlo_question(payload)
 
     def _coordination_retry_due(self, record: Mapping[str, Any]) -> bool:
         attempts = int(record.get("attempts", 0) or 0)
@@ -2965,6 +2970,45 @@ def _open_store_by_identity(path: Path, expected: tuple[int, int], label: str) -
     return descriptor
 
 
+def _create_project_thread_relay_from_environment(environment: Mapping[str, str], *, sender: PsychloPeerSender, psychlo_secret: bytes) -> RoadexProjectThreadRelay | None:
+    secret_file = environment.get("OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_SECRET_FILE")
+    database = environment.get("OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE")
+    if secret_file is None and database is None:
+        return None
+    if not secret_file or not database:
+        raise ValueError("Roadex project human thread secret and database are required together")
+    relay_path = Path(database).expanduser().resolve()
+    for other_name in ("OVERSEER_PSYCHLO_BRIDGE_DATABASE", "OVERSEER_STORE_DATABASE", "OVERSEER_STORE_PATH"):
+        other = environment.get(other_name)
+        if other and relay_path == Path(other).expanduser().resolve():
+            raise ValueError("Roadex project human thread database must be distinct from authority stores")
+    try:
+        roadex_secret = _read_private_file(Path(secret_file), maximum_bytes=256)
+    except (OSError, ValueError):
+        raise ValueError("Roadex project human thread secret is unavailable") from None
+    if len(roadex_secret) < 32 or any(byte < 0x20 or byte > 0x7E for byte in roadex_secret):
+        raise ValueError("Roadex project human thread secret is unavailable")
+    if hmac.compare_digest(roadex_secret, psychlo_secret):
+        raise ValueError("Roadex project human thread secret must be distinct from the Psychlo peer secret")
+    store = RoadexProjectThreadStore(database)
+    endpoint = environment.get("OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT", "http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH)
+    question_sender = RoadexQuestionSender(store=store, secret=roadex_secret, endpoint=endpoint)
+
+    def forward(record_type: str, record_id: str, record: Mapping[str, Any]) -> Mapping[str, Any]:
+        peer_kind = {"binding": "project-human-thread-binding", "response": "project-human-thread-response"}.get(record_type)
+        if peer_kind is None:
+            raise ValueError("unsupported project human thread forward kind")
+        response = sender(peer_kind, record_id, record)
+        if not isinstance(response, Mapping) or response.get("accepted") is not True:
+            raise ValueError("Psychlo rejected project human thread record")
+        receipt = response.get("receipt", response)
+        if not isinstance(receipt, Mapping) or receipt.get("recordType") != record_type or receipt.get("recordId") != record_id or receipt.get("recordDigest") != record.get({"binding": "recordDigest", "response": "responseDigest"}[record_type]):
+            raise ValueError("Psychlo project human thread receipt binding is invalid")
+        return {"accepted": True, "receipt": dict(receipt)}
+
+    return RoadexProjectThreadRelay(store=store, secret=roadex_secret, forwarder=forward, question_sender=question_sender)
+
+
 def create_bridge_from_environment(environment: Mapping[str, str] | None = None, *, recover: bool = True, require_distinct_authority_store: bool = False) -> PsychloBridge:
     selected = environment or os.environ
     bridge_path_value = selected.get("OVERSEER_PSYCHLO_BRIDGE_DATABASE")
@@ -2979,6 +3023,7 @@ def create_bridge_from_environment(environment: Mapping[str, str] | None = None,
     sender = PsychloPeerSender(selected.get("OVERSEER_PSYCHLO_ENDPOINT", "http://127.0.0.1:8798"), secret)
     if bridge_path_value is None:
         raise ValueError("OVERSEER_PSYCHLO_BRIDGE_DATABASE is required")
+    project_thread_relay = _create_project_thread_relay_from_environment(selected, sender=sender, psychlo_secret=secret)
     primary_store_path = primary_store_value or bridge_path_value
     descriptors: tuple[int, ...] = ()
     store: PsychloBridgeStore | None = None
@@ -3009,11 +3054,12 @@ def create_bridge_from_environment(environment: Mapping[str, str] | None = None,
             supervisor_result_collector=AuthoritativeAgentResultCollector(primary_store_path, "supervisor_result"),
             require_external_binding=True,
             recover=recover,
+            project_thread_relay=project_thread_relay,
         )
         bridge._verified_store_fds = descriptors
         return bridge
     except Exception:
-        for resource in (store, primary):
+        for resource in (store, primary, project_thread_relay):
             if resource is not None:
                 try:
                     resource.close()

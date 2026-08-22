@@ -252,6 +252,7 @@ class _LegacyPsychloBridgeStore:
 # isolated projection store.  The new store retains all legacy round/decision
 # methods, so existing callers do not cross the external-execution boundary.
 from .psychlo_store import PsychloBridgeStore
+from .roadex_project_threads import RoadexProjectThreadRelay
 
 
 def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind: str, body: bytes, headers: Mapping[str, str], *, now: str | None = None, expected_authority: str) -> dict[str, Any]:
@@ -323,7 +324,7 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
 
 
 class PsychloBridge:
-    def __init__(self, *, store: PsychloBridgeStore, dispatcher: Callable[..., str], sender: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]], callback_origin: str, clock: Callable[[], str] | None = None, token_factory: Callable[[], str] | None = None, require_external_binding: bool = False, approval_loader: Callable[[str], Any] | None = None, approval_store: SQLiteStore | None = None, approval_owner_domain: str = "sisko", supervisor_dispatcher: Callable[..., str] | None = None, project_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, supervisor_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, coordination_owner_id: str | None = None, coordination_lease_seconds: int = 30, coordination_tick_lock: threading.Lock | None = None, recover: bool = True):
+    def __init__(self, *, store: PsychloBridgeStore, dispatcher: Callable[..., str], sender: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]], callback_origin: str, clock: Callable[[], str] | None = None, token_factory: Callable[[], str] | None = None, require_external_binding: bool = False, approval_loader: Callable[[str], Any] | None = None, approval_store: SQLiteStore | None = None, approval_owner_domain: str = "sisko", supervisor_dispatcher: Callable[..., str] | None = None, project_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, supervisor_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, coordination_owner_id: str | None = None, coordination_lease_seconds: int = 30, coordination_tick_lock: threading.Lock | None = None, project_thread_relay: RoadexProjectThreadRelay | None = None, recover: bool = True):
         self.store, self.dispatcher, self.sender = store, dispatcher, sender
         self.peer_secret = getattr(sender, "secret", None)
         self.callback_origin = callback_origin.rstrip("/")
@@ -341,6 +342,9 @@ class PsychloBridge:
         self.supervisor_dispatcher = supervisor_dispatcher
         self.project_result_collector = project_result_collector
         self.supervisor_result_collector = supervisor_result_collector
+        # This is an optional, separately constructed relay.  It never shares
+        # the approval peer secret, route, or SQLite projections above.
+        self.project_thread_relay = project_thread_relay
         self.coordination_owner_id = coordination_owner_id or f"{os.getpid()}:{secrets.token_hex(12)}"
         self.coordination_lease_seconds = max(5, min(300, int(coordination_lease_seconds)))
         self._coordination_tick_lock = coordination_tick_lock or threading.Lock()
@@ -381,6 +385,7 @@ class PsychloBridge:
                 coordination_owner_id=self.coordination_owner_id,
                 coordination_lease_seconds=self.coordination_lease_seconds,
                 coordination_tick_lock=self._coordination_tick_lock,
+                project_thread_relay=(self.project_thread_relay.request_scoped() if self.project_thread_relay is not None else None),
                 recover=False,
             )
         except Exception:
@@ -401,6 +406,11 @@ class PsychloBridge:
                 continue
             try:
                 resource.close()
+            except Exception as error:
+                errors.append(error)
+        if self.project_thread_relay is not None and self.project_thread_relay.store is not self.store and self.project_thread_relay.store is not self.approval_store:
+            try:
+                self.project_thread_relay.close()
             except Exception as error:
                 errors.append(error)
         for descriptor in getattr(self, "_verified_store_fds", ()):
@@ -428,9 +438,24 @@ class PsychloBridge:
                 except Exception as error:
                     self.store.transition_protocol("coordination-work-request", str(record["id"]), "forward-pending", "poll-failed")
                     failed += 1
-            return {"busy": False, "processed": processed, "failed": failed}
+            result: dict[str, int | bool] = {"busy": False, "processed": processed, "failed": failed}
+            if self.project_thread_relay is not None:
+                relay_result = self.project_thread_relay.tick(limit=limit)
+                result["projectThreadForwarded"] = relay_result["delivered"]
+                result["projectThreadFailed"] = relay_result["failed"]
+            return result
         finally:
             self._coordination_tick_lock.release()
+
+    def receive_project_human_thread(self, body: bytes, headers: Mapping[str, str]):
+        """Receive the isolated Roadex relay protocol, if configured.
+
+        This method intentionally exposes no approval/decision operation and
+        never projects the record into the Psychlo approval store.
+        """
+        if self.project_thread_relay is None:
+            raise ValueError("project_thread_relay_not_configured")
+        return self.project_thread_relay.receive(body, headers)
 
     def _coordination_retry_due(self, record: Mapping[str, Any]) -> bool:
         attempts = int(record.get("attempts", 0) or 0)

@@ -9,7 +9,7 @@ import threading
 from datetime import UTC, datetime
 
 from overseer.api import make_api_handler
-from overseer.psychlo_bridge import PsychloBridge, PsychloBridgeStore, PsychloPeerSender, create_bridge_from_environment, sign_peer_message
+from overseer.psychlo_bridge import PsychloBridge, PsychloBridgeStore, PsychloPeerSender, _require_project_thread_peer_receipt, create_bridge_from_environment, sign_peer_message
 from overseer.roadex_project_threads import (
     QUESTION_ENDPOINT_PATH,
     RoadexProjectThreadRelay,
@@ -127,3 +127,20 @@ def test_factory_constructs_distinct_relay_secret_and_database(tmp_path: Path):
         assert bridge.project_thread_relay.store.filename == tmp_path / "roadex-thread.sqlite"
     finally:
         bridge.close()
+
+
+def test_psychlo_project_thread_receipt_is_closed_and_exact():
+    receipt = {
+        "schemaVersion": "psychlo.overseer.project-human-thread-relay-receipt.v1",
+        "accepted": True,
+        "recordType": "binding",
+        "recordId": "binding-api-event-1",
+        "recordDigest": "a" * 64,
+        "state": "inserted",
+    }
+    assert _require_project_thread_peer_receipt(receipt, "binding", "binding-api-event-1", "a" * 64) == receipt
+    for key, value in (("extra", "secret"), ("recordId", "other"), ("state", "pending")):
+        changed = {**receipt, key: value}
+        import pytest
+        with pytest.raises(ValueError, match="receipt binding"):
+            _require_project_thread_peer_receipt(changed, "binding", "binding-api-event-1", "a" * 64)

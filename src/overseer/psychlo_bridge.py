@@ -443,6 +443,8 @@ class PsychloBridge:
                 relay_result = self.project_thread_relay.tick(limit=limit)
                 result["projectThreadForwarded"] = relay_result["delivered"]
                 result["projectThreadFailed"] = relay_result["failed"]
+                result["questionDelivered"] = relay_result.get("questionDelivered", 0)
+                result["questionFailed"] = relay_result.get("questionFailed", 0)
             return result
         finally:
             self._coordination_tick_lock.release()
@@ -3001,10 +3003,12 @@ def _create_project_thread_relay_from_environment(environment: Mapping[str, str]
         response = sender(peer_kind, record_id, record)
         if not isinstance(response, Mapping) or response.get("accepted") is not True:
             raise ValueError("Psychlo rejected project human thread record")
-        receipt = response.get("receipt", response)
-        if not isinstance(receipt, Mapping) or receipt.get("recordType") != record_type or receipt.get("recordId") != record_id or receipt.get("recordDigest") != record.get({"binding": "recordDigest", "response": "responseDigest"}[record_type]):
+        receipt = {key: response.get(key) for key in ("schemaVersion", "accepted", "recordType", "recordId", "recordDigest", "state")}
+        if set(response).intersection({"receipt"}):
             raise ValueError("Psychlo project human thread receipt binding is invalid")
-        return {"accepted": True, "receipt": dict(receipt)}
+        if any(value is None for value in receipt.values()) or receipt.get("schemaVersion") != "psychlo.overseer.project-human-thread-relay-receipt.v1" or receipt.get("accepted") is not True or receipt.get("state") not in {"inserted", "replayed"} or receipt.get("recordType") != record_type or receipt.get("recordId") != record_id or receipt.get("recordDigest") != record.get({"binding": "recordDigest", "response": "responseDigest"}[record_type]):
+            raise ValueError("Psychlo project human thread receipt binding is invalid")
+        return dict(receipt)
 
     return RoadexProjectThreadRelay(store=store, secret=roadex_secret, forwarder=forward, question_sender=question_sender)
 

@@ -52,7 +52,7 @@ def test_project_thread_relay_is_optional_and_ticks_separately_from_approval_pro
     }
     binding["recordDigest"] = relay_sha256(stable_json(binding))
     body = stable_json({"schemaVersion": "roadex.overseer.project-human-thread-relay.v1", "recordType": "binding", "recordId": "binding-event-1", "recordDigest": binding["recordDigest"], "record": binding}).encode()
-    relay = RoadexProjectThreadRelay(store=project_store, secret=secret, clock=lambda: "2026-08-22T12:00:00.000Z", forwarder=lambda kind, record_id, record: {"accepted": True, "receipt": {"recordType": kind, "recordId": record_id, "recordDigest": record["recordDigest"]}})
+    relay = RoadexProjectThreadRelay(store=project_store, secret=secret, clock=lambda: "2026-08-22T12:00:00.000Z", forwarder=lambda kind, record_id, record: {"schemaVersion": "psychlo.overseer.project-human-thread-relay-receipt.v1", "accepted": True, "recordType": kind, "recordId": record_id, "recordDigest": record["recordDigest"], "state": "inserted"})
     relay.receive(body, request_headers(secret, body, "2026-08-22T12:00:00.000Z", "request-nonce-0001"))
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "psychlo.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, project_thread_relay=relay)
     result = bridge.tick()

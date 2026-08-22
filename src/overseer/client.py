@@ -705,11 +705,39 @@ class OverseerApiClient:
     def approve_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/approve", payload)
 
-    def register_claim_group(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/claims/groups/register", payload)
+    def register_claim_group(
+        self,
+        payload: dict[str, Any],
+        *,
+        project_id: str | None = None,
+        plan_id: str | None = None,
+        plan_version: str | None = None,
+    ) -> dict[str, Any]:
+        request = dict(payload)
+        if project_id is not None:
+            request["project_id"] = project_id
+        if plan_id is not None:
+            request["plan_id"] = plan_id
+        if plan_version is not None:
+            request["plan_version"] = plan_version
+        return self._post("/claims/groups/register", request)
 
-    def create_claim_group(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/claims/groups/create", payload)
+    def create_claim_group(
+        self,
+        payload: dict[str, Any],
+        *,
+        project_id: str | None = None,
+        plan_id: str | None = None,
+        plan_version: str | None = None,
+    ) -> dict[str, Any]:
+        request = dict(payload)
+        if project_id is not None:
+            request["project_id"] = project_id
+        if plan_id is not None:
+            request["plan_id"] = plan_id
+        if plan_version is not None:
+            request["plan_version"] = plan_version
+        return self._post("/claims/groups/create", request)
 
     def claim_group_status(self, group_id: str) -> dict[str, Any]:
         return self._get(f"/claims/groups/status?group_id={quote(group_id, safe='')}")

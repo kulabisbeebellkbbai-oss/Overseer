@@ -86,6 +86,13 @@ class OverseerCoordinator:
             raise ValueError("approval decisions require a store")
         with self.store.agent_transaction():
             current = self.store.load_approval(approval_id)
+            # ROLE approvals are decided by the owning crew role.  Check the
+            # binding before considering an idempotent retry or constructing
+            # any audit/continuation records so another crew cannot obtain a
+            # durable decision under its own identity.  HUMAN/SISKO approvals
+            # retain their separate human/operator actor contract.
+            if current.approval_level == ApprovalLevel.ROLE and decided_by != current.owner_domain.value:
+                raise ValueError("approval decision actor is not the authorized owner role")
             if current.status == ApprovalStatus.APPROVED:
                 if current.decided_by != decided_by or current.decided_at != decided_at:
                     raise ValueError("approved decision is immutable and exact retry metadata differs")

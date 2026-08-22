@@ -1740,7 +1740,8 @@ def _request_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _claim_group_register_args(payload: dict[str, Any]) -> dict[str, Any]:
     allowed = {
-        "group_id", "lifecycle_id", "owner_thread", "owner_role",
+        "group_id", "lifecycle_id", "project_id", "plan_id", "plan_version",
+        "owner_thread", "owner_role",
         "claim_ids", "approval_ids", "resource_ids",
     }
     unknown = set(payload) - allowed
@@ -1749,6 +1750,9 @@ def _claim_group_register_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "group_id": _required_string(payload, "group_id"),
         "lifecycle_id": _required_string(payload, "lifecycle_id"),
+        "project_id": _required_string(payload, "project_id"),
+        "plan_id": _required_string(payload, "plan_id"),
+        "plan_version": _required_string(payload, "plan_version"),
         "owner_thread": _required_string(payload, "owner_thread"),
         "owner_role": _required_string(payload, "owner_role"),
         "claim_ids": _required_string_array(payload, "claim_ids"),

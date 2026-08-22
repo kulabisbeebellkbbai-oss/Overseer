@@ -32,8 +32,8 @@ class ClaimApprovalContinuation:
     resource_id: str
     owner_thread: str
     owner_role: OwnerDomain
-    activation_group_id: str | None
-    lifecycle_id: str | None
+    activation_group_id: str
+    lifecycle_id: str
     state: ContinuationState = ContinuationState.PENDING
     attempt_id: str | None = None
 
@@ -61,6 +61,8 @@ def continuation_for_claim(claim: Claim, approval_id: str) -> ClaimApprovalConti
     """Build the deterministic outbox identity for one exact ROLE approval."""
     if not claim.owner_thread.strip():
         raise ValueError("claim approval continuation requires an exact owner thread")
+    if not claim.activation_group_id or not claim.lifecycle_id:
+        raise ValueError("claim approval continuation requires explicit lifecycle and activation group bindings")
     return ClaimApprovalContinuation(
         id=f"continuation.{approval_id}",
         claim_id=claim.id,
@@ -78,11 +80,11 @@ def continuation_prompt(continuation: ClaimApprovalContinuation) -> str:
         f"ROLE approval {continuation.approval_id} for claim {continuation.claim_id} "
         f"on resource {continuation.resource_id} is approved. Activation remains "
         f"a separate explicit step for lifecycle {continuation.lifecycle_id} "
-        f"and activation group {continuation.activation_group_id or '[not bound]'}."
+        f"and activation group {continuation.activation_group_id}."
     )
 
 
-def dispatch_claim_approval_continuation_status(
+def dispatch_claim_approval_continuations_status(
     store_path: str,
     continuation_id: str,
     *,
@@ -142,7 +144,10 @@ def dispatch_claim_approval_continuation_status(
 
     selected_adapter = adapter or CodexProjectThreadAdapter()
     try:
-        result = selected_adapter.dispatch_prompt(
+        dispatch = getattr(selected_adapter, "dispatch_prompt_exact", None)
+        if dispatch is None:
+            dispatch = selected_adapter.dispatch_prompt
+        result = dispatch(
             continuation.owner_thread,
             continuation_prompt(continuation),
         )
@@ -173,6 +178,11 @@ def dispatch_claim_approval_continuation_status(
         final=delivered,
     )
     return continuation_status(delivered, dispatched_by=dispatched_by)
+
+
+def dispatch_claim_approval_continuation_status(*args: Any, **kwargs: Any) -> dict[str, object]:
+    """Compatibility wrapper for the original singular API name."""
+    return dispatch_claim_approval_continuations_status(*args, **kwargs)
 
 
 def _validate_binding(continuation: ClaimApprovalContinuation, claim: Claim, approval: Any) -> None:
@@ -207,7 +217,7 @@ def _validate_delivery_result(result: Any, owner_thread: str) -> None:
         conversation_id = getattr(resume_result, "conversation_id", None)
     if conversation_id is not None and conversation_id != owner_thread:
         raise ValueError("dispatch returned a different conversation identity")
-    if status not in {"prompt_dispatched", "delivered", "acknowledged"}:
+    if status not in {"prompt_dispatched", "delivered"}:
         raise ValueError("dispatch delivery is not confirmed")
 
 
@@ -303,4 +313,5 @@ __all__ = [
     "continuation_prompt",
     "continuation_status",
     "dispatch_claim_approval_continuation_status",
+    "dispatch_claim_approval_continuations_status",
 ]

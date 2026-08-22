@@ -688,8 +688,19 @@ class OverseerApiClient:
             payload["now"] = now
         return self._post("/claims/cleanup-requests/execute", payload)
 
-    def request_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/claims/request", payload)
+    def request_claim(
+        self,
+        payload: dict[str, Any],
+        *,
+        activation_group_id: str | None = None,
+        lifecycle_id: str | None = None,
+    ) -> dict[str, Any]:
+        request = dict(payload)
+        if activation_group_id is not None:
+            request["activation_group_id"] = activation_group_id
+        if lifecycle_id is not None:
+            request["lifecycle_id"] = lifecycle_id
+        return self._post("/claims/request", request)
 
     def approve_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/approve", payload)

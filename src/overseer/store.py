@@ -44,7 +44,12 @@ from .agent_contracts import (
     ProviderHealthObservation,
 )
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
-from .claim_continuation import ClaimApprovalContinuation, ClaimApprovalContinuationAttempt
+from .claim_continuation import (
+    ClaimActivationGroup,
+    ClaimActivationGroupState,
+    ClaimApprovalContinuation,
+    ClaimApprovalContinuationAttempt,
+)
 from .core import ApprovalLevel, Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
 from .crew import CrewMessage
 from .health import HealthEvidence, HealthTarget
@@ -593,6 +598,11 @@ class SQLiteStore:
                 id TEXT PRIMARY KEY,
                 claim_id TEXT NOT NULL,
                 approval_id TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS claim_activation_groups (
+                id TEXT PRIMARY KEY,
+                lifecycle_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS claim_approval_continuation_attempts (
@@ -2239,6 +2249,41 @@ class SQLiteStore:
             ),
         )
         self._commit_agent_mutation()
+
+    def save_claim_activation_group(self, group: ClaimActivationGroup) -> None:
+        existing_row = self._connection.execute(
+            "SELECT payload FROM claim_activation_groups WHERE id = ?",
+            (group.id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _load_dataclass(ClaimActivationGroup, str(existing_row["payload"]))
+            immutable_fields = (
+                "id",
+                "lifecycle_id",
+                "owner_thread",
+                "owner_role",
+                "claim_ids",
+                "approval_ids",
+                "resource_ids",
+            )
+            if any(getattr(existing, field) != getattr(group, field) for field in immutable_fields):
+                raise ValueError("claim activation group identity is immutable")
+            if existing.state == ClaimActivationGroupState.RELEASED and group.state != existing.state:
+                raise ValueError("released claim activation group cannot be reopened")
+        self._connection.execute(
+            "INSERT OR REPLACE INTO claim_activation_groups (id, lifecycle_id, payload) VALUES (?, ?, ?)",
+            (group.id, group.lifecycle_id, _dump(group)),
+        )
+        self._commit_agent_mutation()
+
+    def load_claim_activation_group(self, group_id: str) -> ClaimActivationGroup:
+        return _load_dataclass(ClaimActivationGroup, self._get_payload("claim_activation_groups", group_id))
+
+    def list_claim_activation_groups(self) -> tuple[ClaimActivationGroup, ...]:
+        return tuple(
+            _load_dataclass(ClaimActivationGroup, payload)
+            for payload in self._list_payloads("claim_activation_groups")
+        )
 
     def load_claim_approval_continuation(self, continuation_id: str) -> ClaimApprovalContinuation:
         return _load_dataclass(

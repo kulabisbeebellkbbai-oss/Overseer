@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType, approval_from_decision, audit_event_from_decision
 from .claim_continuation import continuation_for_claim
-from .core import ApprovalLevel, Claim, ClaimStatus, OwnerDomain, Resource, RiskLevel
+from .core import ApprovalLevel, Claim, ClaimStatus, OwnerDomain, Resource, RiskLevel, required_approval
 from .crew import CrewMessage, build_crew_message
 from .registry import ClaimRecord, ResourceRegistry
 from .store import SQLiteStore
@@ -37,6 +37,12 @@ class OverseerCoordinator:
         return stored
 
     def request_claim(self, claim: Claim) -> CoordinationResult:
+        resource = self.registry.get_resource(claim.resource_id)
+        if required_approval(resource, claim) == ApprovalLevel.ROLE:
+            if not claim.activation_group_id or not claim.lifecycle_id:
+                raise ValueError(
+                    "ROLE-gated claim requires explicit lifecycle_id and activation_group_id"
+                )
         record = self.registry.request_claim(claim)
         approval = approval_from_decision(
             f"approval.{claim.id}",

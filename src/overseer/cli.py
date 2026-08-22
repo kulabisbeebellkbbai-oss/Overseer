@@ -69,6 +69,10 @@ from .codex_dispatch_system_activation import (
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .claim_continuation import (
+    activate_claim_group_status,
+    claim_group_status,
+    register_claim_activation_group_status,
+    release_claim_group_status,
     dispatch_claim_approval_continuations_status,
 )
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
@@ -11444,6 +11448,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     activate_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     activate_parser.add_argument("--claim-id", required=True)
     activate_parser.add_argument("--approval-id")
+    for group_command in ("register-claim-group", "create-claim-group"):
+        group_parser = subparsers.add_parser(group_command, help="register an exact claim activation group")
+        group_parser.add_argument("--store", required=True)
+        group_parser.add_argument("--group-id", required=True)
+        group_parser.add_argument("--lifecycle-id", required=True)
+        group_parser.add_argument("--owner-thread", required=True)
+        group_parser.add_argument("--owner-role", required=True, choices=[item.value for item in OwnerDomain])
+        group_parser.add_argument("--claim-id", action="append", required=True)
+        group_parser.add_argument("--approval-id", action="append", required=True)
+        group_parser.add_argument("--resource-id", action="append", required=True)
+    group_status_parser = subparsers.add_parser("claim-group-status", help="read one claim activation group")
+    group_status_parser.add_argument("--store", required=True)
+    group_status_parser.add_argument("--group-id", required=True)
+    activate_group_parser = subparsers.add_parser("activate-claim-group", help="atomically activate a claim group")
+    activate_group_parser.add_argument("--store", required=True)
+    activate_group_parser.add_argument("--group-id", required=True)
+    release_group_parser = subparsers.add_parser("release-claim-group", help="atomically release a claim group")
+    release_group_parser.add_argument("--store", required=True)
+    release_group_parser.add_argument("--group-id", required=True)
+    release_group_parser.add_argument("--evidence-id", action="append", required=True)
     approve_parser = subparsers.add_parser("approve-claim", help="approve a stored approval request")
     approve_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     approve_parser.add_argument("--approval-id", required=True)
@@ -13074,6 +13098,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command in {"register-claim-group", "create-claim-group"}:
+        print(json.dumps(register_claim_activation_group_status(
+            args.store,
+            args.group_id,
+            args.lifecycle_id,
+            args.owner_thread,
+            args.owner_role,
+            args.claim_id,
+            args.approval_id,
+            args.resource_id,
+        ), sort_keys=True))
+        return 0
+
+    if args.command == "claim-group-status":
+        print(json.dumps(claim_group_status(args.store, args.group_id), sort_keys=True))
+        return 0
+
+    if args.command == "activate-claim-group":
+        print(json.dumps(activate_claim_group_status(args.store, args.group_id), sort_keys=True))
+        return 0
+
+    if args.command == "release-claim-group":
+        print(json.dumps(release_claim_group_status(args.store, args.group_id, args.evidence_id), sort_keys=True))
         return 0
 
     if args.command == "activate-claim":

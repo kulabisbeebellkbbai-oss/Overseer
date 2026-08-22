@@ -3750,6 +3750,8 @@ class OverseerApiTests(unittest.TestCase):
                         "intent": "use proxy",
                         "requested_action": "bind proxy",
                         "risk_level": RiskLevel.LOW.value,
+                        "activation_group_id": "group.claim.api.proxy",
+                        "lifecycle_id": "lifecycle.claim.api.proxy",
                     },
                 )
                 approved = server.post(
@@ -5212,6 +5214,8 @@ class OverseerApiClientTests(unittest.TestCase):
                         "intent": "use proxy",
                         "requested_action": "bind proxy",
                         "risk_level": RiskLevel.LOW.value,
+                        "activation_group_id": "group.claim.client.proxy",
+                        "lifecycle_id": "lifecycle.claim.client.proxy",
                     }
                 )
                 approved = client.approve_claim(
@@ -5267,6 +5271,8 @@ class OverseerApiClientTests(unittest.TestCase):
                         "intent": "use gateway",
                         "requested_action": "bind gateway",
                         "risk_level": RiskLevel.LOW.value,
+                        "activation_group_id": "group.claim.gateway.review",
+                        "lifecycle_id": "lifecycle.claim.gateway.review",
                         "expires_at": "2026-07-18T20:00:00+00:00",
                     }
                 )
@@ -10820,6 +10826,10 @@ class CliDemoTests(unittest.TestCase):
                         "bind 127.0.0.1:8796 for BSBBS protected gateway rollout",
                         "--risk-level",
                         RiskLevel.MEDIUM.value,
+                        "--activation-group-id",
+                        "group.claim.bsbbs.port.8796",
+                        "--lifecycle-id",
+                        "lifecycle.claim.bsbbs.port.8796",
                         "--port",
                         "8796",
                     ]
@@ -11761,6 +11771,8 @@ class RuntimeTests(unittest.TestCase):
                 "use proxy",
                 "bind proxy",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.first",
+                lifecycle_id="lifecycle.claim.cli.first",
             )
             approval = approve_claim_status(store_path, first["approval_id"], "sisko")
             activated = activate_claim_status(store_path, first["claim"], approval["approval_id"])
@@ -11774,6 +11786,8 @@ class RuntimeTests(unittest.TestCase):
                 "use proxy too",
                 "bind proxy",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.second",
+                lifecycle_id="lifecycle.claim.cli.second",
             )
 
             self.assertEqual(first["claim_status"], ClaimStatus.REQUESTED.value)
@@ -11807,6 +11821,8 @@ class RuntimeTests(unittest.TestCase):
                 "run one bounded loopback test",
                 "bind an OS-assigned loopback listener",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.role-handoff",
+                lifecycle_id="lifecycle.claim.cli.role-handoff",
                 release_condition="release immediately after the test",
             )
 
@@ -11873,6 +11889,8 @@ class RuntimeTests(unittest.TestCase):
                 "reject a modified approval handoff",
                 "review the original claim",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.tampered-handoff",
+                lifecycle_id="lifecycle.claim.cli.tampered-handoff",
             )
             store = SQLiteStore(store_path)
             handoff = store.load_crew_message(requested["approval_handoff_id"])
@@ -11919,6 +11937,8 @@ class RuntimeTests(unittest.TestCase):
                 "reject ambiguous approval handoffs",
                 "review the original claim",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.duplicate-handoff",
+                lifecycle_id="lifecycle.claim.cli.duplicate-handoff",
             )
             store = SQLiteStore(store_path)
             handoff = store.load_crew_message(requested["approval_handoff_id"])
@@ -11962,6 +11982,8 @@ class RuntimeTests(unittest.TestCase):
                 "approve exactly once under concurrent dispatch",
                 "review the original claim",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.concurrent-handoff",
+                lifecycle_id="lifecycle.claim.cli.concurrent-handoff",
             )
             barrier = threading.Barrier(2)
             results = []
@@ -12021,6 +12043,8 @@ class RuntimeTests(unittest.TestCase):
                 "recover a missing approval handoff",
                 "review the original claim",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.recovered-handoff",
+                lifecycle_id="lifecycle.claim.cli.recovered-handoff",
             )
             unrelated = request_claim_status(
                 store_path,
@@ -12032,6 +12056,8 @@ class RuntimeTests(unittest.TestCase):
                 "leave an unrelated approval outside the exact dispatch scope",
                 "review a different claim",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.unrelated-handoff",
+                lifecycle_id="lifecycle.claim.cli.unrelated-handoff",
             )
             store = SQLiteStore(store_path)
             store._connection.execute(
@@ -12478,6 +12504,8 @@ class RuntimeTests(unittest.TestCase):
                 "use proxy",
                 "bind proxy",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.approval",
+                lifecycle_id="lifecycle.claim.cli.approval",
             )
 
             with self.assertRaises(ValueError):
@@ -12507,6 +12535,8 @@ class RuntimeTests(unittest.TestCase):
                 "use proxy",
                 "bind proxy",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.state",
+                lifecycle_id="lifecycle.claim.cli.state",
             )
             approve_claim_status(store_path, requested["approval_id"], "sisko")
 
@@ -12708,6 +12738,8 @@ class RuntimeTests(unittest.TestCase):
                 "use gateway",
                 "bind gateway",
                 RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.gateway",
+                lifecycle_id="lifecycle.claim.cli.gateway",
             )
             approval = approve_claim_status(store_path, requested["approval_id"], "sisko")
             activate_claim_status(store_path, requested["claim"], approval["approval_id"])
@@ -12787,6 +12819,8 @@ class OverseerCoordinatorTests(unittest.TestCase):
                 intent="prove the handoff bundle is atomic",
                 requested_action="review one bounded lease",
                 risk_level=RiskLevel.LOW,
+                activation_group_id="group.claim.coordinator.atomic-handoff",
+                lifecycle_id="lifecycle.claim.coordinator.atomic-handoff",
             )
 
             with patch.object(store, "save_crew_message", side_effect=RuntimeError("handoff write failed")):
@@ -12823,6 +12857,8 @@ class OverseerCoordinatorTests(unittest.TestCase):
                     intent="use proxy",
                     requested_action="bind proxy",
                     risk_level=RiskLevel.LOW,
+                    activation_group_id="group.claim.coordinator.proxy",
+                    lifecycle_id="lifecycle.claim.coordinator.proxy",
                 )
             )
 

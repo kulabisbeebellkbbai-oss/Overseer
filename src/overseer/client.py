@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -704,6 +704,21 @@ class OverseerApiClient:
 
     def approve_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/approve", payload)
+
+    def register_claim_group(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/claims/groups/register", payload)
+
+    def create_claim_group(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/claims/groups/create", payload)
+
+    def claim_group_status(self, group_id: str) -> dict[str, Any]:
+        return self._get(f"/claims/groups/status?group_id={quote(group_id, safe='')}")
+
+    def activate_claim_group(self, group_id: str) -> dict[str, Any]:
+        return self._post("/claims/groups/activate", {"group_id": group_id})
+
+    def release_claim_group(self, group_id: str, evidence_ids: tuple[str, ...] = ()) -> dict[str, Any]:
+        return self._post("/claims/groups/release", {"group_id": group_id, "evidence_ids": list(evidence_ids)})
 
     def dispatch_claim_approval_continuation(
         self,

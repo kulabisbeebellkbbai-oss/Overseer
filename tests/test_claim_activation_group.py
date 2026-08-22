@@ -1,0 +1,154 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from overseer.claim_continuation import (
+    ClaimActivationGroup,
+    ClaimActivationGroupState,
+    activate_claim_group_status,
+    claim_group_status,
+    register_claim_activation_group_status,
+    release_claim_group_status,
+)
+from overseer.audit import AuditEventType
+from overseer.cli import approve_claim_status, request_claim_status
+from overseer.core import Claim, ClaimStatus, OwnerDomain, Resource, ResourceType, RiskLevel
+from overseer.store import SQLiteStore
+from overseer.serialization import to_jsonable
+
+
+def _store_with_resource(path: Path) -> None:
+    store = SQLiteStore(path)
+    store.save_resource(Resource(id="proxy.continuation", name="proxy", type=ResourceType.VIRTUAL_ASSET, owner_domain=OwnerDomain.DAX, risk_level=RiskLevel.LOW))
+    store.close()
+
+
+def _store_with_group(path: Path, *, second_resource: str = "proxy.continuation.two") -> dict[str, object]:
+    store = SQLiteStore(path)
+    for resource_id in ("proxy.continuation", second_resource):
+        store.save_resource(Resource(id=resource_id, name=resource_id, type=ResourceType.VIRTUAL_ASSET, owner_domain=OwnerDomain.DAX, risk_level=RiskLevel.LOW))
+    group = ClaimActivationGroup(
+        id="group.arcade.task9", lifecycle_id="arcade-lifecycle-v10", owner_thread="thread.exact-owner", owner_role=OwnerDomain.DAX,
+        claim_ids=("claim.continuation.one", "claim.continuation.two"), approval_ids=("approval.claim.continuation.one", "approval.claim.continuation.two"), resource_ids=("proxy.continuation", second_resource),
+    )
+    store.save_claim_activation_group(group)
+    store.close()
+    first = request_claim_status(path, "claim.continuation.one", "proxy.continuation", "lease", "thread.exact-owner", OwnerDomain.DAX.value, "run paired listener", "reserve first listener", RiskLevel.LOW.value, activation_group_id=group.id, lifecycle_id=group.lifecycle_id)
+    second = request_claim_status(path, "claim.continuation.two", second_resource, "lease", "thread.exact-owner", OwnerDomain.DAX.value, "run paired listener", "reserve second listener", RiskLevel.LOW.value, activation_group_id=group.id, lifecycle_id=group.lifecycle_id)
+    for requested in (first, second):
+        approve_claim_status(path, str(requested["approval_id"]), OwnerDomain.DAX.value)
+    return {"group": group.id, "first": first, "second": second}
+
+
+def test_group_registration_is_public_and_exactly_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    args = dict(
+        group_id="group.registered",
+        lifecycle_id="arcade-lifecycle-v10",
+        owner_thread="thread.exact-owner",
+        owner_role=OwnerDomain.DAX.value,
+        claim_ids=("claim.one", "claim.two"),
+        approval_ids=("approval.claim.one", "approval.claim.two"),
+        resource_ids=("proxy.one", "proxy.two"),
+    )
+    first = register_claim_activation_group_status(path, **args)
+    second = register_claim_activation_group_status(path, **args)
+    assert first["group_status"] == ClaimActivationGroupState.REQUESTED.value
+    assert second["idempotent"] is True
+    with pytest.raises(ValueError, match="conflicts"):
+        register_claim_activation_group_status(path, **{**args, "owner_thread": "thread.other"})
+
+
+def test_role_request_rejects_unbound_claim_before_persistence(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    _store_with_resource(path)
+    with pytest.raises(ValueError, match="explicit lifecycle_id"):
+        request_claim_status(
+            path, "claim.unbound", "proxy.continuation", "lease", "thread.exact-owner",
+            OwnerDomain.DAX.value, "bounded test", "reserve", RiskLevel.LOW.value,
+        )
+    store = SQLiteStore(path)
+    assert store.list_claims() == ()
+    assert store.list_approvals() == ()
+    store.close()
+
+
+def test_group_activation_requires_explicit_persisted_bindings_and_is_atomic(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    records = _store_with_group(path)
+    result = activate_claim_group_status(path, str(records["group"]))
+    assert result["group_status"] == ClaimActivationGroupState.ACTIVE.value
+    store = SQLiteStore(path)
+    assert all(claim.status == ClaimStatus.ACTIVE for claim in store.list_claims())
+    assert all(resource.current_claim_id for resource in store.list_resources())
+    group = store.load_claim_activation_group(str(records["group"]))
+    assert group.state == ClaimActivationGroupState.ACTIVE
+    activated = [event for event in store.list_audit_events(subject_prefix=str(records["group"])) if event.event_type == AuditEventType.EXECUTED]
+    assert len(activated) == 1
+    store.close()
+
+
+@pytest.mark.parametrize("tamper", ["owner", "lifecycle", "approval"])
+def test_group_activation_rejects_binding_tamper_without_partial_writes(tmp_path: Path, tamper: str) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    records = _store_with_group(path)
+    store = SQLiteStore(path)
+    group = store.load_claim_activation_group(str(records["group"]))
+    if tamper == "owner":
+        group = ClaimActivationGroup(**{**group.__dict__, "owner_thread": "thread.other"})
+    elif tamper == "lifecycle":
+        claim = store.load_claim("claim.continuation.two")
+        store.save_claim(Claim(**{**claim.__dict__, "lifecycle_id": "lifecycle.other"}))
+    else:
+        group = ClaimActivationGroup(**{**group.__dict__, "approval_ids": ("approval.other", group.approval_ids[1])})
+    if tamper != "lifecycle":
+        payload = json.dumps(to_jsonable(group), sort_keys=True, separators=(",", ":"))
+        store._connection.execute("UPDATE claim_activation_groups SET payload = ? WHERE id = ?", (payload, group.id))
+        store._connection.commit()
+    store.close()
+    with pytest.raises(ValueError):
+        activate_claim_group_status(path, str(records["group"]))
+    store = SQLiteStore(path)
+    assert all(claim.status == ClaimStatus.REQUESTED for claim in store.list_claims())
+    assert all(resource.current_claim_id is None for resource in store.list_resources())
+    store.close()
+
+
+def test_group_activation_rejects_internal_and_external_conflicts_without_partial_writes(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    records = _store_with_group(path, second_resource="proxy.continuation")
+    with pytest.raises(ValueError, match="resource"):
+        activate_claim_group_status(path, str(records["group"]))
+    store = SQLiteStore(path)
+    assert all(claim.status == ClaimStatus.REQUESTED for claim in store.list_claims())
+    store.close()
+
+
+def test_group_activation_retry_is_idempotent_only_for_complete_group(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    records = _store_with_group(path)
+    first = activate_claim_group_status(path, str(records["group"]))
+    second = activate_claim_group_status(path, str(records["group"]))
+    assert second["idempotent"] is True
+    assert first["audit_event"] == second["audit_event"]
+    store = SQLiteStore(path)
+    activated = [event for event in store.list_audit_events(subject_prefix=str(records["group"])) if event.event_type == AuditEventType.EXECUTED]
+    assert len(activated) == 1
+    store.close()
+
+
+def test_group_release_requires_evidence_and_releases_both_claims_atomically(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    records = _store_with_group(path)
+    activate_claim_group_status(path, str(records["group"]))
+    with pytest.raises(ValueError, match="evidence"):
+        release_claim_group_status(path, str(records["group"]), ())
+    result = release_claim_group_status(path, str(records["group"]), ("result.receipt", "cleanup.listeners"))
+    assert result["group_status"] == ClaimActivationGroupState.RELEASED.value
+    assert result["release_evidence_complete"] is True
+    store = SQLiteStore(path)
+    assert all(claim.status == ClaimStatus.RELEASED for claim in store.list_claims())
+    assert all(resource.current_claim_id is None for resource in store.list_resources())
+    assert claim_group_status(path, str(records["group"]))["state"] == ClaimActivationGroupState.RELEASED.value
+    store.close()

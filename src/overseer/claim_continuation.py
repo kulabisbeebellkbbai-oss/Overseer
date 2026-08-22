@@ -10,12 +10,16 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+import json
+from pathlib import Path
+import sqlite3
 from typing import Any, Protocol
 
 from .audit import ApprovalStatus, AuditEvent, AuditEventType
 from .core import (
     ApprovalLevel,
     Claim,
+    EXCLUSIVE_CLAIM_TYPES,
     ClaimStatus,
     ConflictOutcome,
     OwnerDomain,
@@ -24,6 +28,9 @@ from .core import (
     ResourceState,
     decide_claim,
 )
+
+
+TRUSTED_PSYCHLO_STORE = Path("/home/god/Documents/Codex Workspace/Psychlo/data/psychlo.sqlite3")
 
 
 class ClaimActivationGroupState(StrEnum):
@@ -38,6 +45,9 @@ class ClaimActivationGroup:
 
     id: str
     lifecycle_id: str
+    project_id: str
+    plan_id: str
+    plan_version: str
     owner_thread: str
     owner_role: OwnerDomain
     claim_ids: tuple[str, ...]
@@ -47,8 +57,8 @@ class ClaimActivationGroup:
     evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.id.strip() or not self.lifecycle_id.strip() or not self.owner_thread.strip():
-            raise ValueError("claim activation group requires identity, lifecycle, and owner thread")
+        if not all(value.strip() for value in (self.id, self.lifecycle_id, self.project_id, self.plan_id, self.plan_version, self.owner_thread)):
+            raise ValueError("claim activation group requires identity, lifecycle, project, plan, version, and owner thread")
         if not self.claim_ids or len(self.claim_ids) != len(self.approval_ids) or len(self.claim_ids) != len(self.resource_ids):
             raise ValueError("claim activation group claim, approval, and resource memberships must align")
         if len(set(self.claim_ids)) != len(self.claim_ids):
@@ -96,6 +106,68 @@ class ClaimApprovalContinuationAttempt:
 
 class PromptAdapter(Protocol):
     def dispatch_prompt(self, owner_thread: str, prompt: str) -> Any: ...
+
+
+def _validate_psychlo_round(
+    db_path: str | Path,
+    *,
+    lifecycle_id: str,
+    project_id: str,
+    plan_id: str,
+    plan_version: str,
+    owner_thread: str,
+) -> None:
+    """Validate a claim lifecycle against the authoritative Psychlo DB.
+
+    This is intentionally a read-only lookup.  A claim group cannot be
+    persisted for an opaque, terminal, or cross-plan round.  Tests may pass a
+    temporary database through the private in-process seam; production callers
+    use ``TRUSTED_PSYCHLO_STORE`` through the CLI/API wrappers.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        raise ValueError("trusted Psychlo lifecycle database is unavailable")
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        raise ValueError("trusted Psychlo lifecycle database is unavailable") from error
+    try:
+        row = connection.execute(
+            """
+            SELECT r.id, r.project_id, r.state, r.request_json,
+                   p.plan_id, p.plan_version
+              FROM rounds AS r
+              JOIN projects AS p ON p.id = r.project_id
+             WHERE r.id = ?
+            """,
+            (lifecycle_id,),
+        ).fetchone()
+    except sqlite3.Error as error:
+        raise ValueError("trusted Psychlo lifecycle database is invalid") from error
+    finally:
+        connection.close()
+    if row is None:
+        raise ValueError("claim activation lifecycle does not reference an exact Psychlo round")
+    round_id, stored_project_id, state, request_json, stored_plan_id, stored_plan_version = row
+    if state != "active":
+        raise ValueError("claim activation lifecycle round is not active")
+    if (stored_project_id, stored_plan_id, stored_plan_version) != (project_id, plan_id, plan_version):
+        raise ValueError("claim activation lifecycle does not match the trusted project plan")
+    try:
+        request = json.loads(request_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("claim activation lifecycle round request is invalid") from error
+    if not isinstance(request, dict):
+        raise ValueError("claim activation lifecycle round request is invalid")
+    expected = {
+        "roundId": lifecycle_id,
+        "projectId": project_id,
+        "planId": plan_id,
+        "planVersion": plan_version,
+        "threadId": owner_thread,
+    }
+    if any(request.get(key) != value for key, value in expected.items()):
+        raise ValueError("claim activation lifecycle round request binding is invalid")
 
 
 def continuation_for_claim(claim: Claim, approval_id: str) -> ClaimApprovalContinuation:
@@ -328,11 +400,16 @@ def register_claim_activation_group_status(
     store_path: str,
     group_id: str,
     lifecycle_id: str,
+    project_id: str,
+    plan_id: str,
+    plan_version: str,
     owner_thread: str,
     owner_role: str,
     claim_ids: tuple[str, ...] | list[str],
     approval_ids: tuple[str, ...] | list[str],
     resource_ids: tuple[str, ...] | list[str],
+    *,
+    _psychlo_store_path: str | Path | None = None,
 ) -> dict[str, object]:
     """Register an exact group before its claims are requested.
 
@@ -344,11 +421,42 @@ def register_claim_activation_group_status(
     group = ClaimActivationGroup(
         id=str(group_id),
         lifecycle_id=str(lifecycle_id),
+        project_id=str(project_id),
+        plan_id=str(plan_id),
+        plan_version=str(plan_version),
         owner_thread=str(owner_thread),
         owner_role=OwnerDomain(owner_role),
         claim_ids=tuple(str(item) for item in claim_ids),
         approval_ids=tuple(str(item) for item in approval_ids),
         resource_ids=tuple(str(item) for item in resource_ids),
+    )
+    # A lifecycle identifier is only meaningful when it is an exact active
+    # Psychlo round.  The private override is an in-process test seam; the
+    # public CLI/API parsers do not expose it and always use the trusted path.
+    # Check an existing identity first so a conflicting retry reports the
+    # immutable-record conflict rather than leaking a misleading round error.
+    probe = SQLiteStore(store_path)
+    try:
+        try:
+            existing = probe.load_claim_activation_group(group.id)
+        except KeyError:
+            existing = None
+        if existing is not None:
+            immutable_fields = (
+                "id", "lifecycle_id", "project_id", "plan_id", "plan_version",
+                "owner_thread", "owner_role", "claim_ids", "approval_ids", "resource_ids",
+            )
+            if any(getattr(existing, field) != getattr(group, field) for field in immutable_fields):
+                raise ValueError("claim activation group registration conflicts with existing identity")
+    finally:
+        probe.close()
+    _validate_psychlo_round(
+        _psychlo_store_path or TRUSTED_PSYCHLO_STORE,
+        lifecycle_id=group.lifecycle_id,
+        project_id=group.project_id,
+        plan_id=group.plan_id,
+        plan_version=group.plan_version,
+        owner_thread=group.owner_thread,
     )
     store = SQLiteStore(store_path)
     try:
@@ -360,7 +468,8 @@ def register_claim_activation_group_status(
                 existing = group
             else:
                 immutable_fields = (
-                    "id", "lifecycle_id", "owner_thread", "owner_role",
+                    "id", "lifecycle_id", "project_id", "plan_id", "plan_version",
+                    "owner_thread", "owner_role",
                     "claim_ids", "approval_ids", "resource_ids",
                 )
                 if any(getattr(existing, field) != getattr(group, field) for field in immutable_fields):
@@ -371,6 +480,9 @@ def register_claim_activation_group_status(
                 "group_status": existing.state.value,
                 "state": existing.state.value,
                 "lifecycle_id": existing.lifecycle_id,
+                "project_id": existing.project_id,
+                "plan_id": existing.plan_id,
+                "plan_version": existing.plan_version,
                 "owner_thread": existing.owner_thread,
                 "owner_role": existing.owner_role.value,
                 "claim_ids": list(existing.claim_ids),
@@ -433,6 +545,12 @@ def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
                 diagnostics.append(f"missing resource {resource_id}")
             else:
                 resources.append(resource)
+                if resource.owner_domain != group.owner_role or (claim is not None and resource.owner_domain != claim.owner_role):
+                    diagnostics.append(f"resource {resource_id} owner binding mismatch")
+                    exact_bindings = False
+            if claim is not None and claim.claim_type not in EXCLUSIVE_CLAIM_TYPES:
+                diagnostics.append(f"claim {claim_id} is not an allowed exclusive claim type")
+                exact_bindings = False
             continuation = continuations.get(claim_id)
             if continuation is None:
                 diagnostics.append(f"missing continuation for {claim_id}")
@@ -571,7 +689,9 @@ def release_claim_group_status(
             ):
                 raise ValueError("claim activation group must be wholly active before release")
             for claim, resource in zip(claims, resources):
-                if claim.is_exclusive() and resource.current_claim_id != claim.id:
+                # Every group member is exclusive; do not let a tampered
+                # claim_type bypass the exact resource ownership check.
+                if resource.current_claim_id != claim.id:
                     raise ValueError(
                         f"resource {resource.id} current claim does not match paired claim {claim.id}"
                     )
@@ -594,7 +714,8 @@ def release_claim_group_status(
                 normalized_evidence,
             )
             store.save_audit_event(event)
-            status = _claim_group_status(released_group, released_claims, resources, audit_event=event.id)
+            released_resources = tuple(replace(resource, current_claim_id=None) for resource in resources)
+            status = _claim_group_status(released_group, released_claims, released_resources, audit_event=event.id)
             status["release_evidence_complete"] = True
             return status
     finally:
@@ -632,6 +753,13 @@ def _validate_group_bindings(
             raise ValueError("claim activation group owner binding is invalid")
         if claim.resource_id != resource_id:
             raise ValueError("claim activation group resource binding is invalid")
+        if claim.claim_type not in EXCLUSIVE_CLAIM_TYPES:
+            raise ValueError("claim activation group requires an allowed exclusive claim type")
+        resource = next((item for item in resources if item.id == resource_id), None)
+        if resource is None:
+            raise ValueError("claim activation group resource binding is invalid")
+        if resource.owner_domain != group.owner_role or resource.owner_domain != claim.owner_role:
+            raise ValueError("claim activation group resource owner binding is invalid")
         if approval.id != approval_id or approval.subject_id != claim.id:
             raise ValueError("claim activation group approval binding is invalid")
         if approval.approval_level != ApprovalLevel.ROLE or not approval.can_execute():
@@ -691,6 +819,9 @@ def _claim_group_status(
         "group_status": group.state.value,
         "state": group.state.value,
         "lifecycle_id": group.lifecycle_id,
+        "project_id": group.project_id,
+        "plan_id": group.plan_id,
+        "plan_version": group.plan_version,
         "owner_thread": group.owner_thread,
         "owner_role": group.owner_role.value,
         "claim_ids": list(group.claim_ids),
@@ -712,6 +843,9 @@ def _registered_group_status(group: ClaimActivationGroup, missing_reason: str) -
         "group_status": group.state.value,
         "state": group.state.value,
         "lifecycle_id": group.lifecycle_id,
+        "project_id": group.project_id,
+        "plan_id": group.plan_id,
+        "plan_version": group.plan_version,
         "owner_thread": group.owner_thread,
         "owner_role": group.owner_role.value,
         "claim_ids": list(group.claim_ids),

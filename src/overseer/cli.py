@@ -11453,6 +11453,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         group_parser.add_argument("--store", required=True)
         group_parser.add_argument("--group-id", required=True)
         group_parser.add_argument("--lifecycle-id", required=True)
+        group_parser.add_argument("--project-id", required=True)
+        group_parser.add_argument("--plan-id", required=True)
+        group_parser.add_argument("--plan-version", required=True)
         group_parser.add_argument("--owner-thread", required=True)
         group_parser.add_argument("--owner-role", required=True, choices=[item.value for item in OwnerDomain])
         group_parser.add_argument("--claim-id", action="append", required=True)
@@ -13105,6 +13108,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.store,
             args.group_id,
             args.lifecycle_id,
+            args.project_id,
+            args.plan_id,
+            args.plan_version,
             args.owner_thread,
             args.owner_role,
             args.claim_id,

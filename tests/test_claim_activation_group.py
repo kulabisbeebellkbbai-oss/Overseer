@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from overseer.claim_continuation import (
 )
 from overseer.audit import AuditEventType
 from overseer.cli import approve_claim_status, request_claim_status
-from overseer.core import Claim, ClaimStatus, OwnerDomain, Resource, ResourceType, RiskLevel
+from overseer.core import Claim, ClaimStatus, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.store import SQLiteStore
 from overseer.serialization import to_jsonable
 from overseer.api import _claim_group_register_args, _claim_group_release_args
@@ -25,12 +26,24 @@ def _store_with_resource(path: Path) -> None:
     store.close()
 
 
+def _psychlo_round(path: Path, *, lifecycle_id: str = "arcade-lifecycle-v10", project_id: str = "arcade", plan_id: str = "arcade-plan", plan_version: str = "v10", owner_thread: str = "thread.exact-owner") -> Path:
+    psychlo = path.with_name("psychlo.sqlite3")
+    connection = sqlite3.connect(psychlo)
+    connection.executescript("CREATE TABLE projects (id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, plan_version TEXT NOT NULL); CREATE TABLE rounds (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, state TEXT NOT NULL, request_json TEXT NOT NULL);")
+    request = {"roundId": lifecycle_id, "projectId": project_id, "planId": plan_id, "planVersion": plan_version, "threadId": owner_thread}
+    connection.execute("INSERT INTO projects VALUES (?, ?, ?)", (project_id, plan_id, plan_version))
+    connection.execute("INSERT INTO rounds VALUES (?, ?, 'active', ?)", (lifecycle_id, project_id, json.dumps(request)))
+    connection.commit()
+    connection.close()
+    return psychlo
+
+
 def _store_with_group(path: Path, *, second_resource: str = "proxy.continuation.two") -> dict[str, object]:
     store = SQLiteStore(path)
     for resource_id in ("proxy.continuation", second_resource):
         store.save_resource(Resource(id=resource_id, name=resource_id, type=ResourceType.VIRTUAL_ASSET, owner_domain=OwnerDomain.DAX, risk_level=RiskLevel.LOW))
     group = ClaimActivationGroup(
-        id="group.arcade.task9", lifecycle_id="arcade-lifecycle-v10", owner_thread="thread.exact-owner", owner_role=OwnerDomain.DAX,
+        id="group.arcade.task9", lifecycle_id="arcade-lifecycle-v10", project_id="arcade", plan_id="arcade-plan", plan_version="v10", owner_thread="thread.exact-owner", owner_role=OwnerDomain.DAX,
         claim_ids=("claim.continuation.one", "claim.continuation.two"), approval_ids=("approval.claim.continuation.one", "approval.claim.continuation.two"), resource_ids=("proxy.continuation", second_resource),
     )
     store.save_claim_activation_group(group)
@@ -47,18 +60,22 @@ def test_group_registration_is_public_and_exactly_idempotent(tmp_path: Path) -> 
     args = dict(
         group_id="group.registered",
         lifecycle_id="arcade-lifecycle-v10",
+        project_id="arcade",
+        plan_id="arcade-plan",
+        plan_version="v10",
         owner_thread="thread.exact-owner",
         owner_role=OwnerDomain.DAX.value,
         claim_ids=("claim.one", "claim.two"),
         approval_ids=("approval.claim.one", "approval.claim.two"),
         resource_ids=("proxy.one", "proxy.two"),
     )
-    first = register_claim_activation_group_status(path, **args)
-    second = register_claim_activation_group_status(path, **args)
+    psychlo = _psychlo_round(path)
+    first = register_claim_activation_group_status(path, **args, _psychlo_store_path=psychlo)
+    second = register_claim_activation_group_status(path, **args, _psychlo_store_path=psychlo)
     assert first["group_status"] == ClaimActivationGroupState.REQUESTED.value
     assert second["idempotent"] is True
     with pytest.raises(ValueError, match="conflicts"):
-        register_claim_activation_group_status(path, **{**args, "owner_thread": "thread.other"})
+        register_claim_activation_group_status(path, **{**args, "owner_thread": "thread.other"}, _psychlo_store_path=psychlo)
 
 
 def test_role_request_rejects_unbound_claim_before_persistence(tmp_path: Path) -> None:
@@ -155,6 +172,64 @@ def test_group_release_requires_evidence_and_releases_both_claims_atomically(tmp
     store.close()
 
 
+def test_group_release_returns_post_release_resources_with_null_claim_ids(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    records = _store_with_group(path)
+    activate_claim_group_status(path, str(records["group"]))
+
+    result = release_claim_group_status(path, str(records["group"]), ("cleanup.receipt",))
+
+    assert all(resource["current_claim_id"] is None for resource in result["resources"])
+
+
+def test_group_validation_rejects_resource_owner_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    records = _store_with_group(path)
+    activate_claim_group_status(path, str(records["group"]))
+    store = SQLiteStore(path)
+    resource = store.load_resource("proxy.continuation")
+    store.save_resource(Resource(**{**resource.__dict__, "owner_domain": OwnerDomain.ODO}))
+    store.close()
+
+    with pytest.raises(ValueError, match="resource owner"):
+        release_claim_group_status(path, str(records["group"]), ("cleanup.receipt",))
+
+
+def test_group_release_rejects_tampered_nonexclusive_claim_type(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    records = _store_with_group(path)
+    activate_claim_group_status(path, str(records["group"]))
+    store = SQLiteStore(path)
+    claim = store.load_claim("claim.continuation.one")
+    store.save_claim(Claim(**{**claim.__dict__, "claim_type": ClaimType.OBSERVATION}))
+    store.close()
+
+    with pytest.raises(ValueError, match="exclusive claim type"):
+        release_claim_group_status(path, str(records["group"]), ("cleanup.receipt",))
+
+
+@pytest.mark.parametrize("state", ["blocked", "completed"])
+def test_group_registration_rejects_terminal_or_blocked_psychlo_round(tmp_path: Path, state: str) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    psychlo = _psychlo_round(path)
+    connection = sqlite3.connect(psychlo)
+    connection.execute("UPDATE rounds SET state = ?", (state,))
+    connection.commit()
+    connection.close()
+    args = dict(
+        group_id="group.invalid-round", lifecycle_id="arcade-lifecycle-v10", project_id="arcade",
+        plan_id="arcade-plan", plan_version="v10", owner_thread="thread.exact-owner",
+        owner_role=OwnerDomain.DAX.value, claim_ids=("claim.one", "claim.two"),
+        approval_ids=("approval.one", "approval.two"), resource_ids=("proxy.one", "proxy.two"),
+    )
+
+    with pytest.raises(ValueError, match="not active"):
+        register_claim_activation_group_status(path, **args, _psychlo_store_path=psychlo)
+    store = SQLiteStore(path)
+    assert store.list_claim_activation_groups() == ()
+    store.close()
+
+
 def test_group_release_rejects_tampered_resource_ownership_without_partial_writes(tmp_path: Path) -> None:
     path = tmp_path / "overseer.sqlite3"
     records = _store_with_group(path)
@@ -182,6 +257,9 @@ def test_group_status_reports_pending_approval_without_activation_validation_err
     group = ClaimActivationGroup(
         id="group.pending",
         lifecycle_id="lifecycle.pending",
+        project_id="arcade",
+        plan_id="arcade-plan",
+        plan_version="v10",
         owner_thread="thread.pending",
         owner_role=OwnerDomain.DAX,
         claim_ids=("claim.pending.one", "claim.pending.two"),
@@ -209,6 +287,9 @@ def test_group_api_payload_validation_rejects_string_iterables_and_unknown_field
     payload = {
         "group_id": "group.api",
         "lifecycle_id": "lifecycle.api",
+        "project_id": "arcade",
+        "plan_id": "arcade-plan",
+        "plan_version": "v10",
         "owner_thread": "thread.api",
         "owner_role": "dax",
         "claim_ids": "claim.one",

@@ -69,6 +69,21 @@ def test_role_approval_atomically_persists_one_continuation_without_activation(t
     assert resource.current_claim_id is None
 
 
+def test_role_approval_rejects_wrong_owner_before_any_write(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    _store_with_resource(path)
+    requested = _request(path)
+
+    with pytest.raises(ValueError, match="authorized owner role"):
+        approve_claim_status(path, str(requested["approval_id"]), OwnerDomain.ODO.value)
+
+    store = SQLiteStore(path)
+    assert store.load_approval(str(requested["approval_id"])).status == ApprovalStatus.PENDING
+    assert store.list_claim_approval_continuations() == ()
+    assert not any(event.id.endswith(".approved") for event in store.list_audit_events())
+    store.close()
+
+
 def test_approval_retry_does_not_duplicate_continuation(tmp_path: Path) -> None:
     path = tmp_path / "overseer.sqlite3"
     _store_with_resource(path)

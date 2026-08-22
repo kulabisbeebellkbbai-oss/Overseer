@@ -714,7 +714,7 @@ def make_api_handler(
                 self._handle(lambda: claim_cleanup_plan_status(store_path, _query_first(query, "now")))
                 return
             if path == "/claims/groups/status":
-                self._handle(lambda: claim_group_status(store_path, _query_first(query, "group_id") or ""))
+                self._handle(lambda: claim_group_status(store_path, _claim_group_status_query(query)))
                 return
             if path == "/backup-provisioning/plans":
                 self._handle(lambda: list_backup_provisioning_plans(store_path))
@@ -986,10 +986,10 @@ def make_api_handler(
                 self._handle_json(lambda payload: register_claim_activation_group_status(store_path, **_claim_group_register_args(payload)))
                 return
             if path == "/claims/groups/activate":
-                self._handle_json(lambda payload: activate_claim_group_status(store_path, str(payload["group_id"])))
+                self._handle_json(lambda payload: activate_claim_group_status(store_path, _claim_group_id_args(payload)["group_id"]))
                 return
             if path == "/claims/groups/release":
-                self._handle_json(lambda payload: release_claim_group_status(store_path, str(payload["group_id"]), tuple(str(item) for item in payload.get("evidence_ids", ()))))
+                self._handle_json(lambda payload: release_claim_group_status(store_path, **_claim_group_release_args(payload)))
                 return
             if path == "/claims/activate":
                 self._handle_json(lambda payload: activate_claim_status(store_path, **_activate_claim_args(payload)))
@@ -1747,14 +1747,60 @@ def _claim_group_register_args(payload: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"unknown claim group fields: {sorted(unknown)}")
     return {
-        "group_id": str(payload["group_id"]),
-        "lifecycle_id": str(payload["lifecycle_id"]),
-        "owner_thread": str(payload["owner_thread"]),
-        "owner_role": str(payload["owner_role"]),
-        "claim_ids": tuple(str(item) for item in payload["claim_ids"]),
-        "approval_ids": tuple(str(item) for item in payload["approval_ids"]),
-        "resource_ids": tuple(str(item) for item in payload["resource_ids"]),
+        "group_id": _required_string(payload, "group_id"),
+        "lifecycle_id": _required_string(payload, "lifecycle_id"),
+        "owner_thread": _required_string(payload, "owner_thread"),
+        "owner_role": _required_string(payload, "owner_role"),
+        "claim_ids": _required_string_array(payload, "claim_ids"),
+        "approval_ids": _required_string_array(payload, "approval_ids"),
+        "resource_ids": _required_string_array(payload, "resource_ids"),
     }
+
+
+def _required_string_array(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = payload.get(key)
+    if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes)) or not value:
+        raise ValueError(f"{key} must be a non-empty array of strings")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"{key} must be a non-empty array of strings")
+    return tuple(item.strip() for item in value)
+
+
+def _required_string(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    return value.strip()
+
+
+def _claim_group_id_args(payload: dict[str, Any]) -> dict[str, str]:
+    unknown = set(payload) - {"group_id"}
+    if unknown:
+        raise ValueError(f"unknown claim group fields: {sorted(unknown)}")
+    group_id = payload.get("group_id")
+    if not isinstance(group_id, str) or not group_id.strip():
+        raise ValueError("group_id must be a non-empty string")
+    return {"group_id": group_id.strip()}
+
+
+def _claim_group_release_args(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(payload) - {"group_id", "evidence_ids"}
+    if unknown:
+        raise ValueError(f"unknown claim group fields: {sorted(unknown)}")
+    return {
+        "group_id": _claim_group_id_args({"group_id": payload.get("group_id")})["group_id"],
+        "evidence_ids": _required_string_array(payload, "evidence_ids"),
+    }
+
+
+def _claim_group_status_query(query: dict[str, list[str]]) -> str:
+    unknown = set(query) - {"group_id"}
+    if unknown:
+        raise ValueError(f"unknown claim group query fields: {sorted(unknown)}")
+    group_id = _query_first(query, "group_id")
+    if not group_id or not group_id.strip():
+        raise ValueError("group_id must be a non-empty string")
+    return group_id.strip()
 
 
 def _resource_args(payload: dict[str, Any]) -> dict[str, Any]:

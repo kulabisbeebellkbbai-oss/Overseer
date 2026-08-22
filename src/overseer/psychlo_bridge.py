@@ -2972,6 +2972,13 @@ def _open_store_by_identity(path: Path, expected: tuple[int, int], label: str) -
     return descriptor
 
 
+def _require_project_thread_peer_receipt(response: Mapping[str, Any], record_type: str, record_id: str, record_digest: str) -> dict[str, Any]:
+    keys = {"schemaVersion", "accepted", "recordType", "recordId", "recordDigest", "state"}
+    if set(response) != keys or response.get("schemaVersion") != "psychlo.overseer.project-human-thread-relay-receipt.v1" or response.get("accepted") is not True or response.get("state") not in {"inserted", "replayed"} or response.get("recordType") != record_type or response.get("recordId") != record_id or response.get("recordDigest") != record_digest:
+        raise ValueError("Psychlo project human thread receipt binding is invalid")
+    return dict(response)
+
+
 def _create_project_thread_relay_from_environment(environment: Mapping[str, str], *, sender: PsychloPeerSender, psychlo_secret: bytes) -> RoadexProjectThreadRelay | None:
     secret_file = environment.get("OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_SECRET_FILE")
     database = environment.get("OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE")
@@ -3001,14 +3008,9 @@ def _create_project_thread_relay_from_environment(environment: Mapping[str, str]
         if peer_kind is None:
             raise ValueError("unsupported project human thread forward kind")
         response = sender(peer_kind, record_id, record)
-        if not isinstance(response, Mapping) or response.get("accepted") is not True:
+        if not isinstance(response, Mapping):
             raise ValueError("Psychlo rejected project human thread record")
-        receipt = {key: response.get(key) for key in ("schemaVersion", "accepted", "recordType", "recordId", "recordDigest", "state")}
-        if set(response).intersection({"receipt"}):
-            raise ValueError("Psychlo project human thread receipt binding is invalid")
-        if any(value is None for value in receipt.values()) or receipt.get("schemaVersion") != "psychlo.overseer.project-human-thread-relay-receipt.v1" or receipt.get("accepted") is not True or receipt.get("state") not in {"inserted", "replayed"} or receipt.get("recordType") != record_type or receipt.get("recordId") != record_id or receipt.get("recordDigest") != record.get({"binding": "recordDigest", "response": "responseDigest"}[record_type]):
-            raise ValueError("Psychlo project human thread receipt binding is invalid")
-        return dict(receipt)
+        return _require_project_thread_peer_receipt(response, record_type, record_id, str(record[{"binding": "recordDigest", "response": "responseDigest"}[record_type]]))
 
     return RoadexProjectThreadRelay(store=store, secret=roadex_secret, forwarder=forward, question_sender=question_sender)
 

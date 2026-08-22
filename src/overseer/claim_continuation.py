@@ -146,7 +146,7 @@ def dispatch_claim_approval_continuations_status(
     try:
         dispatch = getattr(selected_adapter, "dispatch_prompt_exact", None)
         if dispatch is None:
-            dispatch = selected_adapter.dispatch_prompt
+            raise ValueError("continuation adapter must implement dispatch_prompt_exact")
         result = dispatch(
             continuation.owner_thread,
             continuation_prompt(continuation),
@@ -215,6 +215,8 @@ def _validate_delivery_result(result: Any, owner_thread: str) -> None:
     conversation_id = getattr(result, "conversation_id", None)
     if resume_result is not None:
         conversation_id = getattr(resume_result, "conversation_id", None)
+    if conversation_id is None:
+        raise ValueError("dispatch delivery proof is missing the exact conversation identity")
     if conversation_id is not None and conversation_id != owner_thread:
         raise ValueError("dispatch returned a different conversation identity")
     if status not in {"prompt_dispatched", "delivered"}:

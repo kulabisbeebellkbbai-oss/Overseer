@@ -115,6 +115,9 @@ class _Adapter:
             raise self.error
         return self.result
 
+    def dispatch_prompt_exact(self, owner_thread: str, prompt: str):
+        return self.dispatch_prompt(owner_thread, prompt)
+
 
 def test_dispatch_requires_exact_continuation_id_and_owner_thread(tmp_path: Path) -> None:
     path = tmp_path / "overseer.sqlite3"
@@ -122,7 +125,7 @@ def test_dispatch_requires_exact_continuation_id_and_owner_thread(tmp_path: Path
     requested = _request(path)
     approve_claim_status(path, str(requested["approval_id"]), OwnerDomain.DAX.value)
     adapter = _Adapter(
-        type("Result", (), {"status": "prompt_dispatched", "owner_thread": "thread.exact-owner", "reason": "delivered"})()
+        type("Result", (), {"status": "prompt_dispatched", "owner_thread": "thread.exact-owner", "conversation_id": "thread.exact-owner", "reason": "delivered"})()
     )
 
     result = dispatch_claim_approval_continuation_status(
@@ -190,4 +193,3 @@ def test_tampered_continuation_is_rejected_before_send(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="owner thread"):
         dispatch_claim_approval_continuation_status(path, continuation_id, adapter=adapter)
     assert adapter.calls == []
-

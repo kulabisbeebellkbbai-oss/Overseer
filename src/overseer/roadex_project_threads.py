@@ -31,6 +31,7 @@ RECEIPT_DOMAIN = "overseer.roadex.project-human-thread-relay.receipt.v1"
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _NONCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
+_TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$")
 _FORBIDDEN = {"approval", "approvalId", "decision", "decisionId", "plan", "planId", "execute", "execution", "cancel", "cancelId", "deploy", "deployment", "authorization", "authorizationId"}
 
 _BINDING_SCHEMA = "roadex.project-human-thread-binding.v1"
@@ -65,7 +66,7 @@ def _id(value: Any, name: str) -> None:
 
 
 def _timestamp(value: Any, name: str) -> None:
-    if not isinstance(value, str) or value != value.strip() or not value:
+    if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
         raise ProjectThreadContractError(f"{name} is invalid")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))

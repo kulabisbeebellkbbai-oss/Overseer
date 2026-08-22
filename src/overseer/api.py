@@ -31,7 +31,7 @@ from .audit import ApprovalStatus
 from .core import ClaimStatus
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, sign_peer_response, verify_peer_request, MAX_BODY_BYTES
 from .store import SQLiteStore
-from .claim_continuation import dispatch_claim_approval_continuation_status
+from .claim_continuation import dispatch_claim_approval_continuations_status
 from .cli import (
     DEFAULT_AGENT_REGISTRY,
     activate_claim_status,
@@ -967,7 +967,7 @@ def make_api_handler(
                 return
             if path == "/claims/approval-continuations/dispatch":
                 self._handle_json(
-                    lambda payload: dispatch_claim_approval_continuation_status(
+                    lambda payload: dispatch_claim_approval_continuations_status(
                         store_path,
                         **_dispatch_claim_approval_continuation_args(payload),
                     )
@@ -1715,6 +1715,8 @@ def _request_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
         "starts_at": str(payload["starts_at"]) if payload.get("starts_at") else None,
         "expires_at": str(payload["expires_at"]) if payload.get("expires_at") else None,
         "release_condition": str(payload["release_condition"]) if payload.get("release_condition") else None,
+        "activation_group_id": str(payload["activation_group_id"]) if payload.get("activation_group_id") else None,
+        "lifecycle_id": str(payload["lifecycle_id"]) if payload.get("lifecycle_id") else None,
     }
 
 

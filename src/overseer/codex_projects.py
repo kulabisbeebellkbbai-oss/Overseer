@@ -117,6 +117,34 @@ class CodexProjectThreadAdapter:
         details = self.driver.legacy_prompt_details(result)
         return _legacy_prompt_result(owner_thread, session, details)
 
+    def dispatch_prompt_exact(
+        self,
+        owner_thread: str,
+        prompt: str,
+    ) -> CodexProjectPromptDispatchResult:
+        """Dispatch only when ``owner_thread`` is the full conversation ID.
+
+        This deliberately performs the exact registry check before invoking
+        the driver, so aliases, project names, launchers, commands, and ID
+        prefixes cannot cause any resume or tmux side effect.
+        """
+        session = self._resolve_exact_conversation(owner_thread)
+        if session is None:
+            resume_result = CodexProjectResumeResult(
+                owner_thread=owner_thread,
+                status="not_found",
+                reason="owner_thread must be the exact discovered conversation_id",
+            )
+            return CodexProjectPromptDispatchResult(
+                owner_thread=owner_thread,
+                status=resume_result.status,
+                reason=resume_result.reason,
+                resume_result=resume_result,
+            )
+        result = self.driver.dispatch_legacy(session, prompt)
+        details = self.driver.legacy_prompt_details(result)
+        return _legacy_prompt_result(owner_thread, session, details)
+
     def _resolve_legacy_session(self, owner_thread: str) -> AgentSession | None:
         wanted = owner_thread.strip()
         if not wanted:
@@ -132,6 +160,15 @@ class CodexProjectThreadAdapter:
             if wanted == thread.project:
                 return session
             if thread.conversation_id.startswith(wanted):
+                return session
+        return None
+
+    def _resolve_exact_conversation(self, owner_thread: str) -> AgentSession | None:
+        wanted = owner_thread.strip()
+        if not wanted:
+            return None
+        for session in self.driver.discover():
+            if session.external_session_id == wanted:
                 return session
         return None
 

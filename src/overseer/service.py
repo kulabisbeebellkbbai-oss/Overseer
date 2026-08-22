@@ -78,37 +78,43 @@ class OverseerCoordinator:
     ) -> ApprovalDecisionResult:
         if self.store is None:
             raise ValueError("approval decisions require a store")
-        current = self.store.load_approval(approval_id)
-        approved = replace(
-            current,
-            status=ApprovalStatus.APPROVED,
-            decided_by=decided_by,
-            decided_at=decided_at,
-        )
-        risk_level = RiskLevel.LOW
-        try:
-            risk_level = self.store.load_claim(approved.subject_id).risk_level
-        except KeyError:
-            pass
-        approval_level = ApprovalLevel(approved.approval_level)
-        event = AuditEvent(
-            id=f"audit.{approval_id}.approved",
-            event_type=AuditEventType.APPROVED,
-            owner_domain=approved.owner_domain,
-            subject_id=approved.subject_id,
-            summary=f"{approval_level.value} approval granted",
-            risk_level=risk_level,
-            evidence_ids=(approval_id,),
-        )
         with self.store.agent_transaction():
+            current = self.store.load_approval(approval_id)
+            if current.status == ApprovalStatus.APPROVED:
+                if current.decided_by != decided_by or current.decided_at != decided_at:
+                    raise ValueError("approved decision is immutable and exact retry metadata differs")
+                approved = current
+            elif current.status != ApprovalStatus.PENDING:
+                raise ValueError("approval decision is no longer pending")
+            else:
+                approved = replace(
+                    current,
+                    status=ApprovalStatus.APPROVED,
+                    decided_by=decided_by,
+                    decided_at=decided_at,
+                )
+            risk_level = RiskLevel.LOW
+            claim = None
+            try:
+                claim = self.store.load_claim(approved.subject_id)
+                risk_level = claim.risk_level
+            except KeyError:
+                if approved.approval_level == ApprovalLevel.ROLE:
+                    raise ValueError("ROLE approval requires its exact claim record") from None
+            approval_level = ApprovalLevel(approved.approval_level)
+            event = AuditEvent(
+                id=f"audit.{approval_id}.approved",
+                event_type=AuditEventType.APPROVED,
+                owner_domain=approved.owner_domain,
+                subject_id=approved.subject_id,
+                summary=f"{approval_level.value} approval granted",
+                risk_level=risk_level,
+                evidence_ids=(approval_id,),
+            )
             self.store.save_approval(approved)
             self.store.save_audit_event(event)
             if approved.approval_level == ApprovalLevel.ROLE and approved.status == ApprovalStatus.APPROVED:
-                try:
-                    claim = self.store.load_claim(approved.subject_id)
-                except KeyError as error:
-                    raise ValueError("ROLE approval requires its exact claim record") from error
-                if claim.status != ClaimStatus.REQUESTED:
+                if claim is None or claim.status != ClaimStatus.REQUESTED:
                     raise ValueError("ROLE approval requires the still-requested claim")
                 continuation = continuation_for_claim(claim, approved.id)
                 self.store.save_claim_approval_continuation(continuation)

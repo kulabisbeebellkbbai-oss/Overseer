@@ -69,8 +69,7 @@ from .codex_dispatch_system_activation import (
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .claim_continuation import (
-    continuation_status,
-    dispatch_claim_approval_continuation_status,
+    dispatch_claim_approval_continuations_status,
 )
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
 from .agent_adapters.codex import CodexDriver, legacy_codex_session_resource
@@ -10188,6 +10187,8 @@ def request_claim_status(
     starts_at: str | None = None,
     expires_at: str | None = None,
     release_condition: str | None = None,
+    activation_group_id: str | None = None,
+    lifecycle_id: str | None = None,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -10206,6 +10207,8 @@ def request_claim_status(
                 expires_at=expires_at,
                 release_condition=release_condition,
                 port_reservations=frozenset(ports),
+                activation_group_id=activation_group_id,
+                lifecycle_id=lifecycle_id,
             )
         )
         return {
@@ -11408,6 +11411,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     claim_parser.add_argument("--starts-at")
     claim_parser.add_argument("--expires-at")
     claim_parser.add_argument("--release-condition")
+    claim_parser.add_argument("--activation-group-id")
+    claim_parser.add_argument("--lifecycle-id")
     claim_review_parser = subparsers.add_parser("claim-review", help="review active, queued, expired, and release-blocked claims")
     claim_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_review_parser.add_argument("--now", help="override review timestamp for deterministic checks")
@@ -12923,7 +12928,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "dispatch-claim-approval-continuation":
         print(
             json.dumps(
-                dispatch_claim_approval_continuation_status(
+                dispatch_claim_approval_continuations_status(
                     args.store,
                     args.continuation_id,
                     dispatched_by=args.dispatched_by,
@@ -13063,6 +13068,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.starts_at,
                     args.expires_at,
                     args.release_condition,
+                    args.activation_group_id,
+                    args.lifecycle_id,
                 ),
                 sort_keys=True,
             )

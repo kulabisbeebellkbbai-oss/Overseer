@@ -110,6 +110,7 @@ from .codex_projects import (
     codex_project_thread_resources,
     legacy_codex_session_resource,
 )
+from .claim_continuation import ClaimActivationGroup, ClaimActivationGroupState
 from .agent_adapters.codex import CodexDriver, codex_adapter_factory
 from .core import (
     ApprovalLevel,

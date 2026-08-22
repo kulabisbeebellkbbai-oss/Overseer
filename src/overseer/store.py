@@ -66,7 +66,7 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION = 3
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
@@ -511,7 +511,9 @@ class SQLiteStore:
             for row in self._connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
                 "AND name IN ('schema_migrations', 'agent_schema_migrations', "
-                "'roadex_approval_fixtures', 'psychlo_legacy_abandonment_execution_claims')"
+                "'roadex_approval_fixtures', 'psychlo_legacy_abandonment_execution_claims', "
+                "'claim_approval_continuations', 'claim_activation_groups', "
+                "'claim_approval_continuation_attempts')"
             ).fetchall()
         }
         if tables != {
@@ -519,6 +521,9 @@ class SQLiteStore:
             "agent_schema_migrations",
             "roadex_approval_fixtures",
             "psychlo_legacy_abandonment_execution_claims",
+            "claim_approval_continuations",
+            "claim_activation_groups",
+            "claim_approval_continuation_attempts",
         }:
             return False
         schema_current = self._connection.execute(
@@ -783,7 +788,7 @@ class SQLiteStore:
                 if current_version is None or int(current_version) < CURRENT_SCHEMA_VERSION:
                     self._record_schema_migration(
                         CURRENT_SCHEMA_VERSION,
-                        "persist exact-owner claim approval continuations",
+                        "persist claim activation and exact-owner approval continuation records",
                     )
             self._migrate_roadex_approval_fixture_schema()
             self._connection.execute(

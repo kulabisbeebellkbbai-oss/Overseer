@@ -157,6 +157,46 @@ def test_schema_migration_is_repeatable(tmp_path: Path) -> None:
     assert count == 1
 
 
+def test_current_legacy_schema_recreates_claim_continuation_tables_on_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-current.sqlite3"
+    with OverseerStore(path) as store:
+        store._connection.execute(
+            "INSERT INTO resources(id, payload) VALUES (?, ?)",
+            ("resource.preserved", '{"preserved":true}'),
+        )
+        store._connection.commit()
+
+    # Simulate the deployed legacy shape: the schema history is already at
+    # the previous current version, but the claim continuation DDL was never
+    # installed before the process returned early from initialization.
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE claim_approval_continuations")
+        connection.execute("DROP TABLE claim_activation_groups")
+        connection.execute("DROP TABLE claim_approval_continuation_attempts")
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version > ?",
+            (CURRENT_SCHEMA_VERSION - 1,),
+        )
+        connection.commit()
+
+    with OverseerStore(path) as store:
+        tables = {
+            row[0]
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {
+            "claim_approval_continuations",
+            "claim_activation_groups",
+            "claim_approval_continuation_attempts",
+        } <= tables
+        assert store._connection.execute(
+            "SELECT payload FROM resources WHERE id=?", ("resource.preserved",)
+        ).fetchone()[0] == '{"preserved":true}'
+        assert store.list_schema_migrations()[0].version == CURRENT_SCHEMA_VERSION
+
+
 def test_dispatch_payload_excludes_raw_prompt_transcript(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
 

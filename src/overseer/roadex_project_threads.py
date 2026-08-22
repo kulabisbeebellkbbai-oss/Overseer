@@ -400,7 +400,7 @@ class RoadexProjectThreadRelay:
         return result
 
 
-QUESTION_ENDPOINT_PATH = "/api/roadex/project-human-thread-question"
+QUESTION_ENDPOINT_PATH = "/api/internal/overseer/project-human-thread/questions"
 QUESTION_REQUEST_SCHEMA = "overseer.project-human-thread-question.v1"
 QUESTION_RECEIPT_SCHEMA = "roadex.overseer.project-human-thread.question-receipt.v1"
 QUESTION_REQUEST_DOMAIN = "overseer.roadex.project-human-thread.question.v1"

@@ -20,6 +20,7 @@ from overseer.roadex_project_threads import (
     stable_json,
     QUESTION_RECEIPT_DOMAIN,
     QUESTION_RECEIPT_SCHEMA,
+    QUESTION_ENDPOINT_PATH,
     PSYCHLO_RELAY_RECEIPT_SCHEMA,
     RoadexQuestionSender,
     question_request_headers,
@@ -29,6 +30,10 @@ from overseer.roadex_project_threads import (
 SECRET = b"roadex-overseer-project-thread-relay-secret-32"
 NOW = "2026-08-22T12:00:00.000Z"
 CONVERSATION = "019fc36f-0570-7623-912f-6da8181eda2d"
+
+
+def test_question_endpoint_matches_the_live_roadex_internal_route():
+    assert QUESTION_ENDPOINT_PATH == "/api/internal/overseer/project-human-thread/questions"
 
 
 def binding(*, status: str = "active", generation: int = 1, record_id: str | None = None) -> dict:
@@ -199,12 +204,12 @@ def question_receipt(body: bytes, headers: dict[str, str], *, record_id: str | N
 def test_psychlo_question_egress_persists_before_send_and_replays_after_restart(tmp_path: Path):
     path = tmp_path / "relay.sqlite"
     calls: list[tuple[bytes, dict[str, str]]] = []
-    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: NOW, send=lambda body, headers: calls.append((body, dict(headers))) or (_ for _ in ()).throw(RuntimeError("lost response")))
+    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: NOW, send=lambda body, headers: calls.append((body, dict(headers))) or (_ for _ in ()).throw(RuntimeError("lost response")))
     first.enqueue(message())
     with pytest.raises(RuntimeError, match="lost response"):
         first.deliver("human-message-1")
     first.close()
-    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", send=lambda body, headers: calls.append((body, dict(headers))) or question_receipt(body, headers))
+    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, send=lambda body, headers: calls.append((body, dict(headers))) or question_receipt(body, headers))
     assert second.retry_pending() == {"delivered": 1, "failed": 0}
     assert calls[0] == calls[1]
     second.close()
@@ -214,7 +219,7 @@ def test_psychlo_question_egress_rejects_substituted_receipt_and_concurrent_clai
     release = False
     def send(body, headers):
         return question_receipt(body, headers, record_id="other-message")
-    sender = RoadexQuestionSender(store=RoadexProjectThreadStore(tmp_path / "relay.sqlite"), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: NOW, send=send)
+    sender = RoadexQuestionSender(store=RoadexProjectThreadStore(tmp_path / "relay.sqlite"), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: NOW, send=send)
     sender.enqueue(message())
     with pytest.raises(ValueError, match="binding"):
         sender.deliver("human-message-1")
@@ -223,27 +228,27 @@ def test_psychlo_question_egress_rejects_substituted_receipt_and_concurrent_clai
 
 def test_psychlo_question_egress_recovers_stale_claim_after_restart(tmp_path: Path):
     path = tmp_path / "relay.sqlite"
-    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("crash")))
+    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("crash")))
     first.enqueue(message())
     with pytest.raises(RuntimeError): first.deliver("human-message-1")
     with first.store._lock:
         first.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='sending',claimed_at=? WHERE record_id=?", ("2026-08-22T10:00:00.000Z", "human-message-1"))
     first.close()
-    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
+    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
     assert second.deliver("human-message-1")["state"] == "delivered"
     second.close()
 
 
 def test_psychlo_question_retry_pending_recovers_stale_claim_after_restart(tmp_path: Path):
     path = tmp_path / "relay.sqlite"
-    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("crash")))
+    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("crash")))
     first.enqueue(message())
     with pytest.raises(RuntimeError):
         first.deliver("human-message-1")
     with first.store._lock:
         first.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='sending',claimed_at=? WHERE record_id=?", ("2026-08-22T10:00:00.000Z", "human-message-1"))
     first.close()
-    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
+    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
     assert second.retry_pending() == {"delivered": 1, "failed": 0}
     assert second.store.connection.execute("SELECT state FROM roadex_project_thread_question_outbox WHERE record_id=?", ("human-message-1",)).fetchone()[0] == "delivered"
     second.close()
@@ -251,12 +256,12 @@ def test_psychlo_question_retry_pending_recovers_stale_claim_after_restart(tmp_p
 
 def test_psychlo_question_egress_concurrent_claim_is_single_owner(tmp_path: Path):
     path = tmp_path / "relay.sqlite"
-    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("held")))
+    first = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda *_: (_ for _ in ()).throw(RuntimeError("held")))
     first.enqueue(message())
     with pytest.raises(RuntimeError): first.deliver("human-message-1")
     with first.store._lock:
         first.store.connection.execute("UPDATE roadex_project_thread_question_outbox SET state='sending',claimed_at=? WHERE record_id=?", ("2026-08-22T12:00:00.000Z", "human-message-1"))
-    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
+    second = RoadexQuestionSender(store=RoadexProjectThreadStore(path), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: "2026-08-22T12:00:00.000Z", send=lambda body, headers: question_receipt(body, headers))
     assert second.retry_pending() == {"delivered": 0, "failed": 0}
     with pytest.raises(ValueError, match="claimed"):
         second.deliver("human-message-1")
@@ -264,7 +269,7 @@ def test_psychlo_question_egress_concurrent_claim_is_single_owner(tmp_path: Path
 
 
 def test_psychlo_question_ack_uses_bounded_persistence_identity(tmp_path: Path):
-    sender = RoadexQuestionSender(store=RoadexProjectThreadStore(tmp_path / "relay.sqlite"), secret=SECRET, endpoint="http://127.0.0.1:8780/api/roadex/project-human-thread-question", clock=lambda: NOW, send=lambda *_: {"status": 202, "body": b"{}", "headers": {}})
+    sender = RoadexQuestionSender(store=RoadexProjectThreadStore(tmp_path / "relay.sqlite"), secret=SECRET, endpoint="http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH, clock=lambda: NOW, send=lambda *_: {"status": 202, "body": b"{}", "headers": {}})
     relay = RoadexProjectThreadRelay(store=sender.store, secret=SECRET, clock=lambda: NOW, question_sender=sender)
     result = relay.receive_psychlo_question(message(message_id="a" * 160))
     assert len(result["persistenceId"]) <= 160

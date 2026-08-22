@@ -44,6 +44,7 @@ from .agent_contracts import (
     ProviderHealthObservation,
 )
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
+from .claim_continuation import ClaimApprovalContinuation, ClaimApprovalContinuationAttempt
 from .core import ApprovalLevel, Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
 from .crew import CrewMessage
 from .health import HealthEvidence, HealthTarget
@@ -60,7 +61,7 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION = 3
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
@@ -588,6 +589,18 @@ class SQLiteStore:
                 subject_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS claim_approval_continuations (
+                id TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL,
+                approval_id TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS claim_approval_continuation_attempts (
+                id TEXT PRIMARY KEY,
+                continuation_id TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS audit_events (
                 id TEXT PRIMARY KEY,
                 subject_id TEXT NOT NULL,
@@ -753,6 +766,15 @@ class SQLiteStore:
                     CURRENT_SCHEMA_VERSION,
                     "bootstrap JSON payload store",
                 )
+            else:
+                current_version = self._connection.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()[0]
+                if current_version is None or int(current_version) < CURRENT_SCHEMA_VERSION:
+                    self._record_schema_migration(
+                        CURRENT_SCHEMA_VERSION,
+                        "persist exact-owner claim approval continuations",
+                    )
             self._migrate_roadex_approval_fixture_schema()
             self._connection.execute(
                 """
@@ -2180,6 +2202,96 @@ class SQLiteStore:
 
     def list_approvals(self) -> tuple[ApprovalRequest, ...]:
         return tuple(_load_dataclass(ApprovalRequest, payload) for payload in self._list_payloads("approvals"))
+
+    def save_claim_approval_continuation(self, continuation: ClaimApprovalContinuation) -> None:
+        existing_row = self._connection.execute(
+            "SELECT payload FROM claim_approval_continuations WHERE id = ?",
+            (continuation.id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _load_dataclass(
+                ClaimApprovalContinuation,
+                str(existing_row["payload"]),
+            )
+            immutable_fields = (
+                "id",
+                "claim_id",
+                "approval_id",
+                "resource_id",
+                "owner_thread",
+                "owner_role",
+                "activation_group_id",
+                "lifecycle_id",
+            )
+            if any(getattr(existing, field) != getattr(continuation, field) for field in immutable_fields):
+                raise ValueError("claim approval continuation identity is immutable")
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO claim_approval_continuations
+                (id, claim_id, approval_id, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                continuation.id,
+                continuation.claim_id,
+                continuation.approval_id,
+                _dump(continuation),
+            ),
+        )
+        self._commit_agent_mutation()
+
+    def load_claim_approval_continuation(self, continuation_id: str) -> ClaimApprovalContinuation:
+        return _load_dataclass(
+            ClaimApprovalContinuation,
+            self._get_payload("claim_approval_continuations", continuation_id),
+        )
+
+    def list_claim_approval_continuations(self) -> tuple[ClaimApprovalContinuation, ...]:
+        return tuple(
+            _load_dataclass(ClaimApprovalContinuation, payload)
+            for payload in self._list_payloads("claim_approval_continuations")
+        )
+
+    def save_claim_approval_continuation_attempt(
+        self,
+        attempt: ClaimApprovalContinuationAttempt,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO claim_approval_continuation_attempts
+                (id, continuation_id, attempted_at, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (attempt.id, attempt.continuation_id, attempt.attempted_at, _dump(attempt)),
+        )
+        self._commit_agent_mutation()
+
+    def load_claim_approval_continuation_attempt(
+        self,
+        attempt_id: str,
+    ) -> ClaimApprovalContinuationAttempt:
+        return _load_dataclass(
+            ClaimApprovalContinuationAttempt,
+            self._get_payload("claim_approval_continuation_attempts", attempt_id),
+        )
+
+    def list_claim_approval_continuation_attempts(
+        self,
+        continuation_id: str | None = None,
+    ) -> tuple[ClaimApprovalContinuationAttempt, ...]:
+        if continuation_id is None:
+            payloads = self._list_payloads("claim_approval_continuation_attempts")
+        else:
+            rows = self._connection.execute(
+                "SELECT payload FROM claim_approval_continuation_attempts "
+                "WHERE continuation_id = ? ORDER BY id",
+                (continuation_id,),
+            ).fetchall()
+            payloads = tuple(str(row["payload"]) for row in rows)
+        return tuple(
+            _load_dataclass(ClaimApprovalContinuationAttempt, payload)
+            for payload in payloads
+        )
 
     def save_runtime_heartbeat(self, heartbeat: RuntimeHeartbeat) -> None:
         self._upsert("runtime_heartbeats", heartbeat.id, _dump(heartbeat))

@@ -143,6 +143,8 @@ class Claim:
     dependency_ids: frozenset[str] = field(default_factory=frozenset)
     exclusive_groups: frozenset[str] = field(default_factory=frozenset)
     state_mutation: str = "none"
+    activation_group_id: str | None = None
+    lifecycle_id: str | None = None
 
     def is_exclusive(self) -> bool:
         return self.claim_type in EXCLUSIVE_CLAIM_TYPES

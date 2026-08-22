@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
 
-from .audit import AuditEvent, AuditEventType
+from .audit import ApprovalStatus, AuditEvent, AuditEventType
 from .core import (
     ApprovalLevel,
     Claim,
@@ -388,13 +388,92 @@ def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
 
     store = SQLiteStore(store_path)
     try:
-        try:
-            group, claims, approvals, resources = _load_group_bundle(store, group_id)
-        except ValueError as error:
-            group = store.load_claim_activation_group(group_id)
-            return _registered_group_status(group, str(error))
-        _validate_group_bindings(store, group, claims, approvals, resources, allow_released=True)
-        return _claim_group_status(group, claims, resources)
+        group = store.load_claim_activation_group(group_id)
+        claim_by_id = {claim.id: claim for claim in store.list_claims()}
+        approval_by_id = {approval.id: approval for approval in store.list_approvals()}
+        resource_by_id = {resource.id: resource for resource in store.list_resources()}
+        continuations = {item.claim_id: item for item in store.list_claim_approval_continuations()}
+        diagnostics: list[str] = []
+        claims: list[Claim] = []
+        approvals: list[Any] = []
+        resources: list[Resource] = []
+        exact_bindings = True
+        for claim_id, approval_id, resource_id in zip(group.claim_ids, group.approval_ids, group.resource_ids):
+            claim = claim_by_id.get(claim_id)
+            approval = approval_by_id.get(approval_id)
+            resource = resource_by_id.get(resource_id)
+            if claim is None:
+                diagnostics.append(f"missing claim {claim_id}")
+                exact_bindings = False
+            else:
+                claims.append(claim)
+                if claim.activation_group_id != group.id or claim.lifecycle_id != group.lifecycle_id:
+                    diagnostics.append(f"claim {claim_id} lifecycle/group binding mismatch")
+                    exact_bindings = False
+                if claim.owner_thread != group.owner_thread or claim.owner_role != group.owner_role:
+                    diagnostics.append(f"claim {claim_id} owner binding mismatch")
+                    exact_bindings = False
+                if claim.resource_id != resource_id:
+                    diagnostics.append(f"claim {claim_id} resource binding mismatch")
+                    exact_bindings = False
+            if approval is None:
+                diagnostics.append(f"missing approval {approval_id}")
+                exact_bindings = False
+            else:
+                approvals.append(approval)
+                if claim is not None and approval.subject_id != claim.id:
+                    diagnostics.append(f"approval {approval_id} subject mismatch")
+                    exact_bindings = False
+                if approval.status != ApprovalStatus.APPROVED:
+                    diagnostics.append(f"approval {approval_id} is {approval.status.value}")
+            if resource is None:
+                diagnostics.append(f"missing resource {resource_id}")
+            else:
+                resources.append(resource)
+            continuation = continuations.get(claim_id)
+            if continuation is None:
+                diagnostics.append(f"missing continuation for {claim_id}")
+                exact_bindings = False
+            elif continuation.approval_id != approval_id or continuation.activation_group_id != group.id or continuation.lifecycle_id != group.lifecycle_id:
+                diagnostics.append(f"continuation binding mismatch for {claim_id}")
+                exact_bindings = False
+        resource_by_group = {resource.id: resource for resource in resources}
+        all_approved = len(approvals) == len(group.approval_ids) and all(
+            approval.status == ApprovalStatus.APPROVED and approval.approval_level == ApprovalLevel.ROLE
+            for approval in approvals
+        )
+        all_requested = len(claims) == len(group.claim_ids) and all(claim.status == ClaimStatus.REQUESTED for claim in claims)
+        all_active = len(claims) == len(group.claim_ids) and all(
+            claim.status == ClaimStatus.ACTIVE
+            and (
+                not claim.is_exclusive()
+                or (
+                    resource_by_group.get(claim.resource_id) is not None
+                    and resource_by_group[claim.resource_id].current_claim_id == claim.id
+                )
+            )
+            for claim in claims
+        )
+        all_released = len(claims) == len(group.claim_ids) and all(
+            claim.status == ClaimStatus.RELEASED for claim in claims
+        ) and len(resources) == len(group.resource_ids) and all(resource.current_claim_id is None for resource in resources)
+        if group.state == ClaimActivationGroupState.ACTIVE and not (exact_bindings and all_approved and all_active):
+            diagnostics.append("stored active group is not fully active and structurally bound")
+            effective_state = "invalid"
+        elif group.state == ClaimActivationGroupState.RELEASED and not (exact_bindings and all_released):
+            diagnostics.append("stored released group is not fully released")
+            effective_state = "invalid"
+        else:
+            effective_state = group.state.value
+        return {
+            **_claim_group_status(group, tuple(claims), tuple(resources)),
+            "group_status": effective_state,
+            "state": effective_state,
+            "ready_for_activation": bool(group.state == ClaimActivationGroupState.REQUESTED and exact_bindings and all_approved and all_requested and not diagnostics),
+            "diagnostics": diagnostics,
+            "approvals": [{"id": approval.id, "status": approval.status.value, "subject_id": approval.subject_id} for approval in approvals],
+            "continuations": [{"claim_id": item.claim_id, "approval_id": item.approval_id, "state": item.state.value} for item in continuations.values() if item.claim_id in group.claim_ids],
+        }
     finally:
         store.close()
 
@@ -481,6 +560,11 @@ def release_claim_group_status(
                 claim.status != ClaimStatus.ACTIVE for claim in claims
             ):
                 raise ValueError("claim activation group must be wholly active before release")
+            for claim, resource in zip(claims, resources):
+                if claim.is_exclusive() and resource.current_claim_id != claim.id:
+                    raise ValueError(
+                        f"resource {resource.id} current claim does not match paired claim {claim.id}"
+                    )
             released_claims = tuple(replace(claim, status=ClaimStatus.RELEASED) for claim in claims)
             released_group = replace(
                 group,

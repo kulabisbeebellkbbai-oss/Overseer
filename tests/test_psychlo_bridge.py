@@ -29,6 +29,7 @@ from overseer.psychlo_bridge import (
     verify_peer_request,
     _read_secret,
 )
+from overseer.roadex_project_threads import RoadexProjectThreadRelay, RoadexProjectThreadStore, request_headers, relay_sha256, stable_json
 from overseer.psychlo_contracts import canonical_digest, ContractError, parse_policy_exception_outcome, policy_exception_outcome_digest, policy_exception_request_digest
 from overseer.psychlo_store import _round_result_digest
 from overseer.psychlo_contracts import parse_policy_exception_request
@@ -40,6 +41,24 @@ from overseer.store import SQLiteStore
 
 SECRET = b"0123456789abcdef0123456789abcdef"
 NOW = "2026-08-10T02:00:00+00:00"
+
+
+def test_project_thread_relay_is_optional_and_ticks_separately_from_approval_protocol(tmp_path: Path):
+    project_store = RoadexProjectThreadStore(tmp_path / "project-thread.sqlite3")
+    secret = b"roadex-overseer-project-thread-relay-secret-32"
+    binding = {
+        "schemaVersion": "roadex.project-human-thread-binding.v1", "bindingId": "project-human-thread:arcade:1", "projectId": "arcade",
+        "root": {"canonicalPath": "/srv/arcade", "dev": "1", "ino": "2"}, "purpose": "human-interaction", "conversationId": "019fc36f-0570-7623-912f-6da8181eda2d", "generation": 1, "status": "active", "predecessorGeneration": None, "creationMode": "created", "provenanceDigest": "a" * 64, "createdAt": "2026-08-22T12:00:00.000Z", "updatedAt": "2026-08-22T12:00:00.000Z", "retiredAt": None,
+    }
+    binding["recordDigest"] = relay_sha256(stable_json(binding))
+    body = stable_json({"schemaVersion": "roadex.overseer.project-human-thread-relay.v1", "recordType": "binding", "recordId": "binding-event-1", "recordDigest": binding["recordDigest"], "record": binding}).encode()
+    relay = RoadexProjectThreadRelay(store=project_store, secret=secret, clock=lambda: "2026-08-22T12:00:00.000Z", forwarder=lambda kind, record_id, record: {"accepted": True, "receipt": {"recordType": kind, "recordId": record_id, "recordDigest": record["recordDigest"]}})
+    relay.receive(body, request_headers(secret, body, "2026-08-22T12:00:00.000Z", "request-nonce-0001"))
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "psychlo.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, project_thread_relay=relay)
+    result = bridge.tick()
+    assert result["projectThreadForwarded"] == 1
+    assert result["projectThreadFailed"] == 0
+    bridge.close()
 
 
 def _bound_response_signature(kind: str, message_id: str, request_nonce: str, payload: dict, response_timestamp: str, response_nonce: str, response_body: bytes) -> str:

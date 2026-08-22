@@ -1784,6 +1784,8 @@ def _crew_message_args(payload: dict[str, Any]) -> dict[str, Any]:
         "requested_by": str(payload.get("requested_by", "operator")),
         "created_at": str(payload["created_at"]) if payload.get("created_at") else None,
         "related_resource_id": str(payload["related_resource_id"]) if payload.get("related_resource_id") else None,
+        "related_claim_id": str(payload["related_claim_id"]) if payload.get("related_claim_id") else None,
+        "related_approval_id": str(payload["related_approval_id"]) if payload.get("related_approval_id") else None,
         "related_plan_id": str(payload["related_plan_id"]) if payload.get("related_plan_id") else None,
         "related_limit_id": str(payload["related_limit_id"]) if payload.get("related_limit_id") else None,
         "acceptance_criteria": tuple(str(item) for item in payload.get("acceptance_criteria", [])),

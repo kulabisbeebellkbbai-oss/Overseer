@@ -417,6 +417,8 @@ class OverseerApiClient:
         related_resource_id: str | None = None,
         related_plan_id: str | None = None,
         related_limit_id: str | None = None,
+        related_claim_id: str | None = None,
+        related_approval_id: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "owner_domain": owner_domain,
@@ -429,6 +431,10 @@ class OverseerApiClient:
             payload["message_id"] = message_id
         if related_resource_id:
             payload["related_resource_id"] = related_resource_id
+        if related_claim_id:
+            payload["related_claim_id"] = related_claim_id
+        if related_approval_id:
+            payload["related_approval_id"] = related_approval_id
         if related_plan_id:
             payload["related_plan_id"] = related_plan_id
         if related_limit_id:

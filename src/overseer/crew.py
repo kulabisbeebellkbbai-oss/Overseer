@@ -48,6 +48,8 @@ class CrewMessage:
     superseded_by_message_id: str | None = None
     acceptance_criteria: tuple[str, ...] = ()
     request_evidence_ids: tuple[str, ...] = ()
+    related_claim_id: str | None = None
+    related_approval_id: str | None = None
 
 
 def build_crew_message(
@@ -64,6 +66,8 @@ def build_crew_message(
     supersedes_message_id: str | None = None,
     acceptance_criteria: tuple[str, ...] = (),
     request_evidence_ids: tuple[str, ...] = (),
+    related_claim_id: str | None = None,
+    related_approval_id: str | None = None,
 ) -> CrewMessage:
     if not subject.strip():
         raise ValueError("subject is required")
@@ -81,6 +85,8 @@ def build_crew_message(
         created_at=now,
         updated_at=now,
         related_resource_id=related_resource_id,
+        related_claim_id=related_claim_id,
+        related_approval_id=related_approval_id,
         related_plan_id=related_plan_id,
         related_limit_id=related_limit_id,
         supersedes_message_id=supersedes_message_id,
@@ -101,6 +107,8 @@ def crew_message_status(message: CrewMessage) -> dict[str, object]:
         "created_at": message.created_at,
         "updated_at": message.updated_at,
         "related_resource_id": message.related_resource_id,
+        "related_claim_id": message.related_claim_id,
+        "related_approval_id": message.related_approval_id,
         "related_plan_id": message.related_plan_id,
         "related_limit_id": message.related_limit_id,
         "review_status": CrewReviewStatus(message.review_status).value,

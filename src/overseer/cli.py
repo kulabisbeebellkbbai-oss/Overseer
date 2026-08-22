@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -12,6 +13,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import threading
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -176,7 +178,7 @@ from .runtime_state import (
     FreshnessStatus,
     assess_freshness,
 )
-from .service import OverseerCoordinator, coordinator_from_store
+from .service import OverseerCoordinator, coordinator_from_store, role_approval_handoff
 from .source_review import HostSecuritySourceReview, SourceReviewDisposition
 from .store import CURRENT_SCHEMA_VERSION, SQLiteStore, SchemaMigration
 from .scheduler import ScheduledWorkStatus, schedule_usage_limited_work
@@ -201,6 +203,9 @@ from .virtual_ops import (
 )
 from .service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 from .serialization import to_jsonable
+
+
+_CREW_DISPATCH_LOCK = threading.Lock()
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
 DEFAULT_AGENT_REGISTRY = Path(__file__).parents[2] / "config" / "agent-providers.json"
@@ -956,6 +961,12 @@ def persisted_demo_status(store_path: str | Path) -> dict[str, object]:
             "decision": result.record.decision.outcome.value,
             "approval": result.record.decision.approval_level.value,
             "approval_id": result.approval.id if result.approval else None,
+            "approval_handoff_id": (
+                f"crew.{result.record.claim.owner_role.value}.approval.{result.record.claim.id}"
+                if result.approval is not None
+                and result.approval.approval_level == ApprovalLevel.ROLE
+                else None
+            ),
             "audit_event": result.audit_event.id,
         }
     finally:
@@ -7091,6 +7102,8 @@ def record_crew_message_status(
     supersedes_message_id: str | None = None,
     acceptance_criteria: Sequence[str] = (),
     request_evidence_ids: Sequence[str] = (),
+    related_claim_id: str | None = None,
+    related_approval_id: str | None = None,
 ) -> dict[str, object]:
     crew_message = build_crew_message(
         owner_domain=owner_domain,
@@ -7101,6 +7114,8 @@ def record_crew_message_status(
         message_id=message_id,
         created_at=created_at,
         related_resource_id=related_resource_id,
+        related_claim_id=related_claim_id,
+        related_approval_id=related_approval_id,
         related_plan_id=related_plan_id,
         related_limit_id=related_limit_id,
         supersedes_message_id=supersedes_message_id,
@@ -7469,15 +7484,50 @@ def dispatch_crew_messages_status(
     dispatched_by: str = "sisko",
     dispatched_at: str | None = None,
 ) -> dict[str, object]:
+    lock_path = Path(f"{store_path}.crew-dispatch.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _CREW_DISPATCH_LOCK, lock_path.open("a", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        try:
+            return _dispatch_crew_messages_status_unlocked(
+                store_path,
+                owner_domain=owner_domain,
+                message_id=message_id,
+                dispatched_by=dispatched_by,
+                dispatched_at=dispatched_at,
+            )
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def _dispatch_crew_messages_status_unlocked(
+    store_path: str | Path,
+    owner_domain: str | None = None,
+    message_id: str | None = None,
+    dispatched_by: str = "sisko",
+    dispatched_at: str | None = None,
+) -> dict[str, object]:
     if owner_domain is not None:
         OwnerDomain(owner_domain)
     now = dispatched_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    handoff_reconciliation = _reconcile_role_approval_handoffs(
+        store_path,
+        now,
+        owner_domain=owner_domain,
+        message_id=message_id,
+    )
     store = SQLiteStore(store_path)
     try:
+        blocked_approval_ids = {
+            str(item["approval_id"])
+            for item in handoff_reconciliation["items"]
+            if item.get("approval_id")
+        }
         messages = [
             message
             for message in store.list_crew_messages()
             if message.status == CrewMessageStatus.OPEN
+            and message.related_approval_id not in blocked_approval_ids
             and (owner_domain is None or message.owner_domain == OwnerDomain(owner_domain))
             and (message_id is None or message.id == message_id)
         ]
@@ -7535,6 +7585,7 @@ def dispatch_crew_messages_status(
         "approved": sum(1 for result in results if result["review_status"] == CrewReviewStatus.APPROVED.value),
         "correction_requested": sum(1 for result in results if result["review_status"] == CrewReviewStatus.CORRECTION_REQUESTED.value),
         "items": results,
+        "handoff_reconciliation": handoff_reconciliation,
         "review_reconciliation": reconciliation,
         "mutation_performed": bool(results),
         "host_mutation_performed": any(_crew_dispatch_result_mutated_host(result) for result in results),
@@ -7677,6 +7728,8 @@ def _dispatch_crew_message(
     dispatched_by: str,
     dispatched_at: str,
 ) -> dict[str, object]:
+    if message.related_claim_id or message.related_approval_id:
+        return _dispatch_linked_role_approval_message(store_path, message, dispatched_at)
     dispatcher = {
         OwnerDomain.SISKO: _dispatch_sisko_message,
         OwnerDomain.KIRA: _dispatch_kira_message,
@@ -7691,6 +7744,68 @@ def _dispatch_crew_message(
     if dispatcher is None:
         return _crew_dispatch_result(message, "skipped", "no dispatcher is registered for this owner domain", [])
     return dispatcher(store_path, message, dispatched_by, dispatched_at)
+
+
+def _dispatch_linked_role_approval_message(
+    store_path: str | Path,
+    message,
+    dispatched_at: str,
+) -> dict[str, object]:
+    """Approve only the exact pending ROLE approval named by a handoff."""
+    if not (message.related_claim_id and message.related_approval_id):
+        raise ValueError("role approval handoff must identify both the exact claim and approval")
+    store = SQLiteStore(store_path)
+    try:
+        claim = store.load_claim(message.related_claim_id)
+        approval = store.load_approval(message.related_approval_id)
+        expected_message_id = f"crew.{claim.owner_role.value}.approval.{claim.id}"
+        if message.id != expected_message_id:
+            raise ValueError("role approval handoff message id does not match the exact claim")
+        if message.owner_domain != claim.owner_role:
+            raise ValueError("role approval handoff owner does not match the exact claim")
+        if message.related_resource_id != claim.resource_id:
+            raise ValueError("role approval handoff resource does not match the exact claim")
+        if approval.id != f"approval.{claim.id}" or approval.subject_id != claim.id:
+            raise ValueError("role approval handoff approval does not match the exact claim")
+        if approval.approval_level != ApprovalLevel.ROLE:
+            raise ValueError("role approval handoff requires a ROLE approval")
+        if approval.owner_domain != claim.owner_role:
+            raise ValueError("role approval handoff approval owner does not match the exact claim")
+        if claim.status != ClaimStatus.REQUESTED:
+            raise ValueError("role approval handoff requires the original requested claim")
+        expected = role_approval_handoff(claim, approval)
+        if expected is None or not _canonical_role_handoff_matches(message, expected):
+            raise ValueError("role approval handoff does not match the canonical approval request")
+        listener_discovery = None
+        if message.owner_domain == OwnerDomain.DAX:
+            listener_discovery = discover_virtual_listeners_status(store_path)
+        if approval.status == ApprovalStatus.PENDING:
+            coordinator = coordinator_from_store(store)
+            approved = coordinator.approve_request(approval.id, claim.owner_role.value, dispatched_at)
+            approved_approval = approved.approval
+        elif approval.status == ApprovalStatus.APPROVED and approval.decided_by == claim.owner_role.value:
+            approved_approval = approval
+        else:
+            raise ValueError("role approval handoff requires the original pending approval or its exact approved result")
+        action = {
+            "claim_id": claim.id,
+            "approval_id": approved_approval.id,
+            "approval_status": approved_approval.status.value,
+            "activation_required": True,
+        }
+        if listener_discovery is not None:
+            action = {
+                "virtual_listener_discovery": listener_discovery,
+                **action,
+            }
+    finally:
+        store.close()
+    return _crew_dispatch_result(
+        message,
+        "dispatched",
+        f"{message.owner_domain.value} approved the exact original ROLE approval {message.related_approval_id}; activation remains separate",
+        [action],
+    )
 
 
 def _dispatch_sisko_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
@@ -8596,6 +8711,100 @@ def _dispatch_dax_message(store_path: str | Path, message, dispatched_by: str, d
         return _crew_dispatch_result(message, "dispatched", f"Dax staged checkout claim for {message.related_resource_id}", [claim])
     discovery = discover_virtual_listeners_status(store_path)
     return _crew_dispatch_result(message, "dispatched", "Dax refreshed virtual listener inventory for checkout review", [discovery])
+
+
+def _reconcile_role_approval_handoffs(
+    store_path: str | Path,
+    reconciled_at: str,
+    owner_domain: str | None = None,
+    message_id: str | None = None,
+) -> dict[str, object]:
+    """Restore one durable owner-role handoff within the requested dispatch scope."""
+    created = 0
+    existing_count = 0
+    blocked: list[dict[str, str]] = []
+    store = SQLiteStore(store_path)
+    try:
+        with store.agent_transaction():
+            messages = store.list_crew_messages()
+            for approval in sorted(store.list_approvals(), key=lambda item: item.id):
+                if approval.approval_level != ApprovalLevel.ROLE or approval.status != ApprovalStatus.PENDING:
+                    continue
+                if owner_domain is not None and approval.owner_domain != OwnerDomain(owner_domain):
+                    continue
+                expected_id = f"crew.{approval.owner_domain.value}.approval.{approval.subject_id}"
+                if message_id is not None and expected_id != message_id:
+                    continue
+                try:
+                    claim = store.load_claim(approval.subject_id)
+                except KeyError:
+                    blocked.append({"approval_id": approval.id, "reason": "approval subject claim is missing"})
+                    continue
+                if claim.owner_role != approval.owner_domain or claim.status != ClaimStatus.REQUESTED:
+                    blocked.append({"approval_id": approval.id, "reason": "approval subject is not the original requested owner-role claim"})
+                    continue
+                expected = role_approval_handoff(claim, approval)
+                if expected is None:
+                    blocked.append({"approval_id": approval.id, "reason": "approval cannot produce an owner-role handoff"})
+                    continue
+                matches = [item for item in messages if item.related_approval_id == approval.id]
+                if len(matches) > 1:
+                    blocked.append({"approval_id": approval.id, "reason": "multiple handoffs exist for one approval"})
+                    continue
+                if matches:
+                    existing = matches[0]
+                    if not _canonical_role_handoff_matches(existing, expected):
+                        blocked.append({"approval_id": approval.id, "reason": "existing handoff does not match the exact approval"})
+                    else:
+                        existing_count += 1
+                    continue
+                store.save_crew_message(expected)
+                store.save_audit_event(
+                    AuditEvent(
+                        id=f"audit.{expected.id}",
+                        event_type=AuditEventType.REQUESTED,
+                        owner_domain=expected.owner_domain,
+                        subject_id=expected.id,
+                        summary=f"{expected.subject} reconciled for {expected.owner_domain.value}",
+                        risk_level=expected.priority,
+                        occurred_at=reconciled_at,
+                    )
+                )
+                messages = (*messages, expected)
+                created += 1
+    finally:
+        store.close()
+    return {
+        "created": created,
+        "existing": existing_count,
+        "blocked": len(blocked),
+        "items": blocked,
+        "reconciled_at": reconciled_at,
+        "mutation_performed": bool(created),
+    }
+
+
+def _canonical_role_handoff_matches(existing, expected) -> bool:
+    """Compare durable request identity while ignoring lifecycle/decision fields."""
+    fields = (
+        "id",
+        "owner_domain",
+        "subject",
+        "message",
+        "priority",
+        "requested_by",
+        "related_resource_id",
+        "related_claim_id",
+        "related_approval_id",
+        "related_plan_id",
+        "related_limit_id",
+        "supersedes_message_id",
+        "acceptance_criteria",
+        "request_evidence_ids",
+        "status",
+        "review_status",
+    )
+    return all(getattr(existing, field) == getattr(expected, field) for field in fields)
 
 
 def _dispatch_julian_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
@@ -10002,6 +10211,12 @@ def request_claim_status(
             "decision": result.record.decision.outcome.value,
             "approval": result.record.decision.approval_level.value,
             "approval_id": result.approval.id if result.approval else None,
+            "approval_handoff_id": (
+                f"crew.{result.record.claim.owner_role.value}.approval.{result.record.claim.id}"
+                if result.approval is not None
+                and result.approval.approval_level == ApprovalLevel.ROLE
+                else None
+            ),
             "audit_event": result.audit_event.id,
             "blocking_claim_ids": list(result.record.decision.blocking_claim_ids),
             "reason": result.record.decision.reason,
@@ -11066,6 +11281,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_crew_message_parser.add_argument("--message-id")
     record_crew_message_parser.add_argument("--created-at")
     record_crew_message_parser.add_argument("--related-resource-id")
+    record_crew_message_parser.add_argument("--related-claim-id")
+    record_crew_message_parser.add_argument("--related-approval-id")
     record_crew_message_parser.add_argument("--related-plan-id")
     record_crew_message_parser.add_argument("--related-limit-id")
     record_crew_message_parser.add_argument("--acceptance-criterion", action="append", default=[])
@@ -12659,6 +12876,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.related_resource_id,
                     args.related_plan_id,
                     args.related_limit_id,
+                    related_claim_id=args.related_claim_id,
+                    related_approval_id=args.related_approval_id,
                     acceptance_criteria=args.acceptance_criterion,
                     request_evidence_ids=args.request_evidence_id,
                 ),

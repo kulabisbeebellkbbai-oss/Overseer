@@ -2154,7 +2154,7 @@ class SQLiteStore:
                 "INSERT OR REPLACE INTO decisions (claim_id, payload) VALUES (?, ?)",
                 (claim.id, _dump(decision)),
             )
-        self._commit()
+        self._commit_agent_mutation()
 
     def load_claim(self, claim_id: str) -> Claim:
         return _load_dataclass(Claim, self._get_payload("claims", claim_id))

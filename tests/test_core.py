@@ -11782,6 +11782,292 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(second["claim_status"], ClaimStatus.QUEUED.value)
             self.assertEqual(second["blocking_claim_ids"], ["claim.cli.first"])
 
+    def test_role_claim_creates_and_dispatches_exact_dax_approval_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.role-handoff",
+                    name="Role Handoff Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.role-handoff",
+                "proxy.role-handoff",
+                ClaimType.LEASE.value,
+                "thread-role-handoff",
+                OwnerDomain.DAX.value,
+                "run one bounded loopback test",
+                "bind an OS-assigned loopback listener",
+                RiskLevel.LOW.value,
+                release_condition="release immediately after the test",
+            )
+
+            self.assertEqual(
+                requested["approval_handoff_id"],
+                "crew.dax.approval.claim.cli.role-handoff",
+            )
+            store = SQLiteStore(store_path)
+            handoff = store.load_crew_message(requested["approval_handoff_id"])
+            self.assertEqual(handoff.related_claim_id, requested["claim"])
+            self.assertEqual(handoff.related_approval_id, requested["approval_id"])
+            self.assertEqual(handoff.related_resource_id, "proxy.role-handoff")
+            self.assertEqual(handoff.status, CrewMessageStatus.OPEN)
+            store.close()
+
+            with patch(
+                "overseer.cli.discover_virtual_listeners_status",
+                return_value={"listeners": 0, "host_mutation_performed": False},
+            ):
+                dispatched = dispatch_crew_messages_status(
+                    store_path,
+                    message_id=requested["approval_handoff_id"],
+                    dispatched_at="2026-08-21T20:00:00+00:00",
+                )
+
+            store = SQLiteStore(store_path)
+            approval = store.load_approval(requested["approval_id"])
+            claims = store.list_claims()
+            message = store.load_crew_message(requested["approval_handoff_id"])
+            resource = store.load_resource("proxy.role-handoff")
+            store.close()
+
+            self.assertEqual(dispatched["processed"], 1)
+            self.assertEqual(dispatched["approved"], 1)
+            self.assertEqual(approval.status, ApprovalStatus.APPROVED)
+            self.assertEqual(approval.decided_by, OwnerDomain.DAX.value)
+            self.assertEqual([claim.id for claim in claims], [requested["claim"]])
+            self.assertEqual(claims[0].status, ClaimStatus.REQUESTED)
+            self.assertIsNone(claims[0].approval_id)
+            self.assertIsNone(resource.current_claim_id)
+            self.assertEqual(message.review_status, CrewReviewStatus.APPROVED)
+
+    def test_tampered_role_approval_handoff_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.tampered-handoff",
+                    name="Tampered Handoff Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.tampered-handoff",
+                "proxy.tampered-handoff",
+                ClaimType.LEASE.value,
+                "thread-tampered-handoff",
+                OwnerDomain.DAX.value,
+                "reject a modified approval handoff",
+                "review the original claim",
+                RiskLevel.LOW.value,
+            )
+            store = SQLiteStore(store_path)
+            handoff = store.load_crew_message(requested["approval_handoff_id"])
+            store.save_crew_message(replace(handoff, message="Approve a different request"))
+            store.close()
+
+            dispatched = dispatch_crew_messages_status(
+                store_path,
+                message_id=requested["approval_handoff_id"],
+                dispatched_at="2026-08-21T20:02:00+00:00",
+            )
+
+            store = SQLiteStore(store_path)
+            approval = store.load_approval(requested["approval_id"])
+            message = store.load_crew_message(requested["approval_handoff_id"])
+            store.close()
+            self.assertEqual(dispatched["processed"], 0)
+            self.assertEqual(dispatched["handoff_reconciliation"]["blocked"], 1)
+            self.assertEqual(approval.status, ApprovalStatus.PENDING)
+            self.assertEqual(message.status, CrewMessageStatus.OPEN)
+            self.assertEqual(message.review_status, CrewReviewStatus.PENDING)
+
+    def test_duplicate_role_approval_handoffs_block_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.duplicate-handoff",
+                    name="Duplicate Handoff Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.duplicate-handoff",
+                "proxy.duplicate-handoff",
+                ClaimType.LEASE.value,
+                "thread-duplicate-handoff",
+                OwnerDomain.DAX.value,
+                "reject ambiguous approval handoffs",
+                "review the original claim",
+                RiskLevel.LOW.value,
+            )
+            store = SQLiteStore(store_path)
+            handoff = store.load_crew_message(requested["approval_handoff_id"])
+            store.save_crew_message(replace(handoff, id="crew.dax.approval.duplicate-forged"))
+            store.close()
+
+            dispatched = dispatch_crew_messages_status(
+                store_path,
+                message_id=requested["approval_handoff_id"],
+                dispatched_at="2026-08-21T20:03:00+00:00",
+            )
+
+            store = SQLiteStore(store_path)
+            approval = store.load_approval(requested["approval_id"])
+            store.close()
+            self.assertEqual(dispatched["processed"], 0)
+            self.assertEqual(dispatched["handoff_reconciliation"]["blocked"], 1)
+            self.assertEqual(approval.status, ApprovalStatus.PENDING)
+
+    def test_concurrent_role_handoff_dispatch_reports_one_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.concurrent-handoff",
+                    name="Concurrent Handoff Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.concurrent-handoff",
+                "proxy.concurrent-handoff",
+                ClaimType.LEASE.value,
+                "thread-concurrent-handoff",
+                OwnerDomain.DAX.value,
+                "approve exactly once under concurrent dispatch",
+                "review the original claim",
+                RiskLevel.LOW.value,
+            )
+            barrier = threading.Barrier(2)
+            results = []
+
+            def dispatch():
+                barrier.wait()
+                results.append(
+                    dispatch_crew_messages_status(
+                        store_path,
+                        message_id=requested["approval_handoff_id"],
+                        dispatched_at="2026-08-21T20:04:00+00:00",
+                    )
+                )
+
+            with patch(
+                "overseer.cli.discover_virtual_listeners_status",
+                return_value={"listeners": 0, "host_mutation_performed": False},
+            ):
+                threads = [threading.Thread(target=dispatch) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+            self.assertEqual(sorted(result["processed"] for result in results), [0, 1])
+            self.assertEqual(sum(result["approved"] for result in results), 1)
+            store = SQLiteStore(store_path)
+            approval_events = [
+                event
+                for event in store.list_audit_events()
+                if event.id == f"audit.{requested['approval_id']}.approved"
+            ]
+            store.close()
+            self.assertEqual(len(approval_events), 1)
+
+    def test_dispatch_reconciles_a_missing_role_claim_approval_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.recovered-handoff",
+                    name="Recovered Handoff Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.recovered-handoff",
+                "proxy.recovered-handoff",
+                ClaimType.LEASE.value,
+                "thread-recovered-handoff",
+                OwnerDomain.DAX.value,
+                "recover a missing approval handoff",
+                "review the original claim",
+                RiskLevel.LOW.value,
+            )
+            unrelated = request_claim_status(
+                store_path,
+                "claim.cli.unrelated-handoff",
+                "proxy.recovered-handoff",
+                ClaimType.LEASE.value,
+                "thread-unrelated-handoff",
+                OwnerDomain.DAX.value,
+                "leave an unrelated approval outside the exact dispatch scope",
+                "review a different claim",
+                RiskLevel.LOW.value,
+            )
+            store = SQLiteStore(store_path)
+            store._connection.execute(
+                "DELETE FROM crew_messages WHERE id IN (?, ?)",
+                (requested["approval_handoff_id"], unrelated["approval_handoff_id"]),
+            )
+            store._connection.commit()
+            store.close()
+
+            with patch(
+                "overseer.cli.discover_virtual_listeners_status",
+                return_value={"listeners": 0, "host_mutation_performed": False},
+            ):
+                dispatched = dispatch_crew_messages_status(
+                    store_path,
+                    message_id=requested["approval_handoff_id"],
+                    dispatched_at="2026-08-21T20:05:00+00:00",
+                )
+
+            store = SQLiteStore(store_path)
+            handoffs = [
+                message
+                for message in store.list_crew_messages()
+                if message.related_approval_id == requested["approval_id"]
+            ]
+            approval = store.load_approval(requested["approval_id"])
+            unrelated_approval = store.load_approval(unrelated["approval_id"])
+            with self.assertRaises(KeyError):
+                store.load_crew_message(unrelated["approval_handoff_id"])
+            store.close()
+
+            self.assertEqual(dispatched["handoff_reconciliation"]["created"], 1)
+            self.assertEqual(len(handoffs), 1)
+            self.assertEqual(approval.status, ApprovalStatus.APPROVED)
+            self.assertEqual(unrelated_approval.status, ApprovalStatus.PENDING)
+
     def test_claim_review_status_flags_expired_active_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -12477,6 +12763,41 @@ class OverseerCoordinatorTests(unittest.TestCase):
             self.assertEqual(store.load_decision(claim.id).approval_level, ApprovalLevel.SISKO)
             self.assertEqual(store.load_approval(f"approval.{claim.id}").approval_level, ApprovalLevel.SISKO)
             self.assertEqual(store.list_audit_events()[0].event_type, AuditEventType.ESCALATED)
+            store.close()
+
+    def test_role_claim_handoff_bundle_rolls_back_when_handoff_persistence_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            coordinator = OverseerCoordinator(store=store)
+            resource = coordinator.register_resource(
+                Resource(
+                    id="proxy.atomic-handoff",
+                    name="Atomic Handoff Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            claim = Claim(
+                id="claim.coordinator.atomic-handoff",
+                resource_id=resource.id,
+                claim_type=ClaimType.LEASE,
+                owner_thread="thread-atomic-handoff",
+                owner_role=OwnerDomain.DAX,
+                intent="prove the handoff bundle is atomic",
+                requested_action="review one bounded lease",
+                risk_level=RiskLevel.LOW,
+            )
+
+            with patch.object(store, "save_crew_message", side_effect=RuntimeError("handoff write failed")):
+                with self.assertRaisesRegex(RuntimeError, "handoff write failed"):
+                    coordinator.request_claim(claim)
+
+            with self.assertRaises(KeyError):
+                store.load_claim(claim.id)
+            with self.assertRaises(KeyError):
+                store.load_approval(f"approval.{claim.id}")
+            self.assertEqual(store.list_audit_events(), ())
             store.close()
 
     def test_activate_and_release_claim_updates_store(self):

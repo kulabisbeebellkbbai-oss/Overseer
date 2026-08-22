@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType, approval_from_decision, audit_event_from_decision
-from .core import ApprovalLevel, Claim, ClaimStatus, Resource, RiskLevel
+from .core import ApprovalLevel, Claim, ClaimStatus, OwnerDomain, Resource, RiskLevel
+from .crew import CrewMessage, build_crew_message
 from .registry import ClaimRecord, ResourceRegistry
 from .store import SQLiteStore
 
@@ -110,11 +111,46 @@ class OverseerCoordinator:
     ) -> None:
         if self.store is None:
             return
-        self.store.save_claim(record.claim, record.decision)
-        self.store.save_resource(self.registry.get_resource(record.claim.resource_id))
-        if approval is not None:
-            self.store.save_approval(approval)
-        self.store.save_audit_event(event)
+        with self.store.agent_transaction():
+            self.store.save_claim(record.claim, record.decision)
+            self.store.save_resource(self.registry.get_resource(record.claim.resource_id))
+            if approval is not None:
+                self.store.save_approval(approval)
+            self.store.save_audit_event(event)
+            handoff = role_approval_handoff(record.claim, approval)
+            if handoff is not None:
+                self.store.save_crew_message(handoff)
+                self.store.save_audit_event(
+                    AuditEvent(
+                        id=f"audit.{handoff.id}",
+                        event_type=AuditEventType.REQUESTED,
+                        owner_domain=handoff.owner_domain,
+                        subject_id=handoff.id,
+                        summary=f"{handoff.subject} routed to {handoff.owner_domain.value}",
+                        risk_level=handoff.priority,
+                        occurred_at=handoff.created_at,
+                    )
+                )
+
+
+def role_approval_handoff(claim: Claim, approval: ApprovalRequest | None) -> CrewMessage | None:
+    """Build the single deterministic owner-role message for a ROLE approval."""
+    if approval is None or approval.approval_level != ApprovalLevel.ROLE:
+        return None
+    return build_crew_message(
+        owner_domain=claim.owner_role.value,
+        subject=f"Approve claim {claim.id}",
+        message=(
+            f"Review and approve the exact pending ROLE approval {approval.id} for claim {claim.id} "
+            f"on resource {claim.resource_id}. Activation remains a separate step."
+        ),
+        priority=claim.risk_level.value,
+        requested_by=claim.owner_thread,
+        message_id=f"crew.{claim.owner_role.value}.approval.{claim.id}",
+        related_resource_id=claim.resource_id,
+        related_claim_id=claim.id,
+        related_approval_id=approval.id,
+    )
 
 
 def coordinator_from_store(store: SQLiteStore) -> OverseerCoordinator:

@@ -424,6 +424,9 @@ def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
                 if claim is not None and approval.subject_id != claim.id:
                     diagnostics.append(f"approval {approval_id} subject mismatch")
                     exact_bindings = False
+                if approval.owner_domain != group.owner_role:
+                    diagnostics.append(f"approval {approval_id} owner binding mismatch")
+                    exact_bindings = False
                 if approval.status != ApprovalStatus.APPROVED:
                     diagnostics.append(f"approval {approval_id} is {approval.status.value}")
             if resource is None:
@@ -434,7 +437,14 @@ def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
             if continuation is None:
                 diagnostics.append(f"missing continuation for {claim_id}")
                 exact_bindings = False
-            elif continuation.approval_id != approval_id or continuation.activation_group_id != group.id or continuation.lifecycle_id != group.lifecycle_id:
+            elif (
+                continuation.approval_id != approval_id
+                or continuation.resource_id != resource_id
+                or continuation.owner_thread != group.owner_thread
+                or continuation.owner_role != group.owner_role
+                or continuation.activation_group_id != group.id
+                or continuation.lifecycle_id != group.lifecycle_id
+            ):
                 diagnostics.append(f"continuation binding mismatch for {claim_id}")
                 exact_bindings = False
         resource_by_group = {resource.id: resource for resource in resources}

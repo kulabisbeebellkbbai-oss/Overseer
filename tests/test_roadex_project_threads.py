@@ -150,6 +150,23 @@ def test_rejects_approval_shaped_records_but_allows_ordinary_text(tmp_path: Path
     service.store.close()
 
 
+@pytest.mark.parametrize("invalid_timestamp", [
+    "2026-08-22 12:00:00+00:00",
+    "2026-08-22T12:00:00+0000",
+])
+def test_rejects_timestamp_forms_the_typescript_contract_rejects_before_persistence(
+    tmp_path: Path, invalid_timestamp: str,
+):
+    service = relay(tmp_path)
+    invalid = binding()
+    invalid["updatedAt"] = invalid_timestamp
+    invalid["recordDigest"] = relay_sha256(stable_json({k: v for k, v in invalid.items() if k != "recordDigest"}))
+    with pytest.raises(ValueError, match="updatedAt is invalid"):
+        service.receive(*envelope("binding", invalid, "binding-invalid-timestamp", nonce="request-nonce-0033"))
+    assert service.store.existing("binding-invalid-timestamp") is None
+    service.store.close()
+
+
 def test_concurrent_duplicate_delivery_has_one_receipt_and_one_outbox(tmp_path: Path):
     body, headers = envelope("binding", binding(), "binding-concurrent", nonce="request-nonce-0040")
     service = relay(tmp_path)

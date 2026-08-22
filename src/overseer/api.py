@@ -31,6 +31,7 @@ from .audit import ApprovalStatus
 from .core import ClaimStatus
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, sign_peer_response, verify_peer_request, MAX_BODY_BYTES
 from .store import SQLiteStore
+from .claim_continuation import dispatch_claim_approval_continuation_status
 from .cli import (
     DEFAULT_AGENT_REGISTRY,
     activate_claim_status,
@@ -963,6 +964,14 @@ def make_api_handler(
                 return
             if path == "/claims/approve":
                 self._handle_json(lambda payload: approve_claim_status(store_path, **_approve_claim_args(payload)))
+                return
+            if path == "/claims/approval-continuations/dispatch":
+                self._handle_json(
+                    lambda payload: dispatch_claim_approval_continuation_status(
+                        store_path,
+                        **_dispatch_claim_approval_continuation_args(payload),
+                    )
+                )
                 return
             if path == "/claims/activate":
                 self._handle_json(lambda payload: activate_claim_status(store_path, **_activate_claim_args(payload)))
@@ -2287,6 +2296,21 @@ def _approve_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
         "approval_id": str(payload["approval_id"]),
         "decided_by": str(payload["decided_by"]),
         "decided_at": str(payload["decided_at"]) if payload.get("decided_at") else None,
+    }
+
+
+def _dispatch_claim_approval_continuation_args(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"continuation_id", "dispatched_by", "dispatched_at"}
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(f"unknown continuation dispatch fields: {sorted(unknown)}")
+    continuation_id = str(payload.get("continuation_id", "")).strip()
+    if not continuation_id:
+        raise ValueError("continuation_id is required")
+    return {
+        "continuation_id": continuation_id,
+        "dispatched_by": str(payload.get("dispatched_by", "overseer")),
+        "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
     }
 
 

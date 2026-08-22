@@ -694,6 +694,20 @@ class OverseerApiClient:
     def approve_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/approve", payload)
 
+    def dispatch_claim_approval_continuation(
+        self,
+        continuation_id: str,
+        dispatched_by: str = "overseer",
+        dispatched_at: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "continuation_id": continuation_id,
+            "dispatched_by": dispatched_by,
+        }
+        if dispatched_at:
+            payload["dispatched_at"] = dispatched_at
+        return self._post("/claims/approval-continuations/dispatch", payload)
+
     def activate_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/activate", payload)
 

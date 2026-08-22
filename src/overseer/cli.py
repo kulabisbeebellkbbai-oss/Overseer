@@ -68,6 +68,10 @@ from .codex_dispatch_system_activation import (
     validate_codex_dispatch_activation_plan,
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
+from .claim_continuation import (
+    continuation_status,
+    dispatch_claim_approval_continuation_status,
+)
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
 from .agent_adapters.codex import CodexDriver, legacy_codex_session_resource
 from .agent_contracts import (
@@ -10267,6 +10271,12 @@ def approve_claim_status(
     try:
         coordinator = coordinator_from_store(store)
         result = coordinator.approve_request(approval_id, decided_by, decided_at)
+        continuation_id = None
+        if result.approval.approval_level == ApprovalLevel.ROLE:
+            for continuation in store.list_claim_approval_continuations():
+                if continuation.approval_id == result.approval.id:
+                    continuation_id = continuation.id
+                    break
         return {
             "store": str(store.path),
             "approval_id": result.approval.id,
@@ -10274,6 +10284,7 @@ def approve_claim_status(
             "approval_status": result.approval.status.value,
             "decided_by": result.approval.decided_by,
             "audit_event": result.audit_event.id,
+            "continuation_id": continuation_id,
         }
     finally:
         store.close()
@@ -11293,6 +11304,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     dispatch_crew_parser.add_argument("--message-id")
     dispatch_crew_parser.add_argument("--dispatched-by", default="sisko")
     dispatch_crew_parser.add_argument("--dispatched-at")
+    continuation_dispatch_parser = subparsers.add_parser(
+        "dispatch-claim-approval-continuation",
+        help="dispatch one exact-owner claim approval continuation",
+    )
+    continuation_dispatch_parser.add_argument("--store", required=True)
+    continuation_dispatch_parser.add_argument("--continuation-id", required=True)
+    continuation_dispatch_parser.add_argument("--dispatched-by", default="overseer")
+    continuation_dispatch_parser.add_argument("--dispatched-at")
     decide_crew_parser = subparsers.add_parser("decide-crew-message", help="record an approval, correction request, or rejection for an acknowledged crew message")
     decide_crew_parser.add_argument("--store", required=True)
     decide_crew_parser.add_argument("--message-id", required=True)
@@ -12895,6 +12914,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.message_id,
                     args.dispatched_by,
                     args.dispatched_at,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "dispatch-claim-approval-continuation":
+        print(
+            json.dumps(
+                dispatch_claim_approval_continuation_status(
+                    args.store,
+                    args.continuation_id,
+                    dispatched_by=args.dispatched_by,
+                    dispatched_at=args.dispatched_at,
                 ),
                 sort_keys=True,
             )

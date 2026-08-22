@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType, approval_from_decision, audit_event_from_decision
+from .claim_continuation import continuation_for_claim
 from .core import ApprovalLevel, Claim, ClaimStatus, OwnerDomain, Resource, RiskLevel
 from .crew import CrewMessage, build_crew_message
 from .registry import ClaimRecord, ResourceRegistry
@@ -99,8 +100,30 @@ class OverseerCoordinator:
             risk_level=risk_level,
             evidence_ids=(approval_id,),
         )
-        self.store.save_approval(approved)
-        self.store.save_audit_event(event)
+        with self.store.agent_transaction():
+            self.store.save_approval(approved)
+            self.store.save_audit_event(event)
+            if approved.approval_level == ApprovalLevel.ROLE and approved.status == ApprovalStatus.APPROVED:
+                try:
+                    claim = self.store.load_claim(approved.subject_id)
+                except KeyError as error:
+                    raise ValueError("ROLE approval requires its exact claim record") from error
+                if claim.status != ClaimStatus.REQUESTED:
+                    raise ValueError("ROLE approval requires the still-requested claim")
+                continuation = continuation_for_claim(claim, approved.id)
+                self.store.save_claim_approval_continuation(continuation)
+                self.store.save_audit_event(
+                    AuditEvent(
+                        id=f"audit.{continuation.id}.created",
+                        event_type=AuditEventType.REQUESTED,
+                        owner_domain=continuation.owner_role,
+                        subject_id=continuation.id,
+                        summary="exact-owner claim approval continuation persisted; activation remains separate",
+                        risk_level=claim.risk_level,
+                        evidence_ids=(approved.id, claim.id),
+                        occurred_at=approved.decided_at,
+                    )
+                )
         return ApprovalDecisionResult(approved, event)
 
     def _persist_result(

@@ -116,6 +116,7 @@ def _validate_psychlo_round(
     plan_id: str,
     plan_version: str,
     owner_thread: str,
+    _connection: sqlite3.Connection | None = None,
 ) -> None:
     """Validate a claim lifecycle against the authoritative Psychlo DB.
 
@@ -127,10 +128,13 @@ def _validate_psychlo_round(
     path = Path(db_path)
     if not path.is_file():
         raise ValueError("trusted Psychlo lifecycle database is unavailable")
-    try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error as error:
-        raise ValueError("trusted Psychlo lifecycle database is unavailable") from error
+    connection = _connection
+    owns_connection = connection is None
+    if connection is None:
+        try:
+            connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        except sqlite3.Error as error:
+            raise ValueError("trusted Psychlo lifecycle database is unavailable") from error
     try:
         row = connection.execute(
             """
@@ -145,7 +149,8 @@ def _validate_psychlo_round(
     except sqlite3.Error as error:
         raise ValueError("trusted Psychlo lifecycle database is invalid") from error
     finally:
-        connection.close()
+        if owns_connection and connection is not None:
+            connection.close()
     if row is None:
         raise ValueError("claim activation lifecycle does not reference an exact Psychlo round")
     round_id, stored_project_id, state, request_json, stored_plan_id, stored_plan_version = row
@@ -494,7 +499,12 @@ def register_claim_activation_group_status(
         store.close()
 
 
-def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
+def claim_group_status(
+    store_path: str,
+    group_id: str,
+    *,
+    _psychlo_store_path: str | Path | None = None,
+) -> dict[str, object]:
     """Return the authoritative, read-only status of one claim group."""
     from .store import SQLiteStore
 
@@ -506,6 +516,20 @@ def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
         resource_by_id = {resource.id: resource for resource in store.list_resources()}
         continuations = {item.claim_id: item for item in store.list_claim_approval_continuations()}
         diagnostics: list[str] = []
+        lifecycle_valid = True
+        if group.state != ClaimActivationGroupState.RELEASED:
+            try:
+                _validate_psychlo_round(
+                    _psychlo_store_path or TRUSTED_PSYCHLO_STORE,
+                    lifecycle_id=group.lifecycle_id,
+                    project_id=group.project_id,
+                    plan_id=group.plan_id,
+                    plan_version=group.plan_version,
+                    owner_thread=group.owner_thread,
+                )
+            except ValueError as error:
+                lifecycle_valid = False
+                diagnostics.append(f"lifecycle validation failed: {error}")
         claims: list[Claim] = []
         approvals: list[Any] = []
         resources: list[Resource] = []
@@ -585,8 +609,10 @@ def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
         all_released = len(claims) == len(group.claim_ids) and all(
             claim.status == ClaimStatus.RELEASED for claim in claims
         ) and len(resources) == len(group.resource_ids) and all(resource.current_claim_id is None for resource in resources)
-        if group.state == ClaimActivationGroupState.ACTIVE and not (exact_bindings and all_approved and all_active):
+        if group.state == ClaimActivationGroupState.ACTIVE and not (lifecycle_valid and exact_bindings and all_approved and all_active):
             diagnostics.append("stored active group is not fully active and structurally bound")
+            effective_state = "invalid"
+        elif group.state == ClaimActivationGroupState.REQUESTED and not lifecycle_valid:
             effective_state = "invalid"
         elif group.state == ClaimActivationGroupState.RELEASED and not (exact_bindings and all_released):
             diagnostics.append("stored released group is not fully released")
@@ -597,7 +623,7 @@ def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
             **_claim_group_status(group, tuple(claims), tuple(resources)),
             "group_status": effective_state,
             "state": effective_state,
-            "ready_for_activation": bool(group.state == ClaimActivationGroupState.REQUESTED and exact_bindings and all_approved and all_requested and not diagnostics),
+            "ready_for_activation": bool(group.state == ClaimActivationGroupState.REQUESTED and lifecycle_valid and exact_bindings and all_approved and all_requested and not diagnostics),
             "diagnostics": diagnostics,
             "approvals": [{"id": approval.id, "status": approval.status.value, "subject_id": approval.subject_id} for approval in approvals],
             "continuations": [{"claim_id": item.claim_id, "approval_id": item.approval_id, "state": item.state.value} for item in continuations.values() if item.claim_id in group.claim_ids],
@@ -609,14 +635,50 @@ def claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
 create_claim_activation_group_status = register_claim_activation_group_status
 
 
-def activate_claim_group_status(store_path: str, group_id: str) -> dict[str, object]:
+def activate_claim_group_status(
+    store_path: str,
+    group_id: str,
+    *,
+    _psychlo_store_path: str | Path | None = None,
+) -> dict[str, object]:
     """Atomically activate every claim in a structurally bound group."""
+    return _activate_claim_group_status(store_path, group_id, _psychlo_store_path=_psychlo_store_path)
+
+
+def _activate_claim_group_status(
+    store_path: str,
+    group_id: str,
+    *,
+    _psychlo_store_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Implementation seam; production callers use the fixed Psychlo path.
+
+    Lock order is deliberately Psychlo (writer lock) then Overseer (writer
+    transaction).  This keeps a lifecycle transition from committing between
+    validation and claim activation.  Release does not acquire this lock so
+    cleanup remains possible after a round terminates.
+    """
     from .store import SQLiteStore
 
+    authority_path = Path(_psychlo_store_path or TRUSTED_PSYCHLO_STORE)
+    try:
+        psychlo = sqlite3.connect(f"file:{authority_path}?mode=rw", uri=True, timeout=5.0)
+        psychlo.execute("BEGIN IMMEDIATE")
+    except sqlite3.Error as error:
+        raise ValueError("trusted Psychlo lifecycle database is unavailable") from error
     store = SQLiteStore(store_path)
     try:
         with store.agent_transaction():
             group, claims, approvals, resources = _load_group_bundle(store, group_id)
+            _validate_psychlo_round(
+                authority_path,
+                lifecycle_id=group.lifecycle_id,
+                project_id=group.project_id,
+                plan_id=group.plan_id,
+                plan_version=group.plan_version,
+                owner_thread=group.owner_thread,
+                _connection=psychlo,
+            )
             _validate_group_bindings(store, group, claims, approvals, resources)
             claim_states = {claim.status for claim in claims}
             resource_claims = {resource.id: resource.current_claim_id for resource in resources}
@@ -660,6 +722,8 @@ def activate_claim_group_status(store_path: str, group_id: str) -> dict[str, obj
             return _claim_group_status(activated_group, activated_claims, resources, audit_event=event.id)
     finally:
         store.close()
+        psychlo.rollback()
+        psychlo.close()
 
 
 def release_claim_group_status(

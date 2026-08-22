@@ -53,22 +53,20 @@ def test_role_approval_requires_explicit_lifecycle_and_group_bindings(tmp_path: 
         )
     )
     store.close()
-    requested = request_claim_status(
-        path,
-        "claim.unbound",
-        "proxy.unbound",
-        "lease",
-        "conversation-full-123",
-        OwnerDomain.DAX.value,
-        "bounded test",
-        "bind proxy",
-        RiskLevel.LOW.value,
-    )
-
     with pytest.raises(ValueError, match="explicit lifecycle"):
-        approve_claim_status(path, str(requested["approval_id"]), OwnerDomain.DAX.value)
+        request_claim_status(
+            path,
+            "claim.unbound",
+            "proxy.unbound",
+            "lease",
+            "conversation-full-123",
+            OwnerDomain.DAX.value,
+            "bounded test",
+            "bind proxy",
+            RiskLevel.LOW.value,
+        )
 
     store = SQLiteStore(path)
-    assert store.load_approval(str(requested["approval_id"])).status.value == "pending"
+    assert store.list_approvals() == ()
     assert store.list_claim_approval_continuations() == ()
     store.close()

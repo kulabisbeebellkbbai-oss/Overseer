@@ -82,7 +82,12 @@ def test_api_approves_and_activates_the_exact_structurally_bound_claim_before_de
     store = SQLiteStore(primary_path)
     store.save_resource(Resource(id=resource_id, name="Arcade loopback", type=ResourceType.VIRTUAL_ASSET, owner_domain=OwnerDomain.DAX, risk_level=RiskLevel.LOW))
     store.close()
-    requested = request_claim_status(primary_path, claim_id, resource_id, "lease", "thread-arcade", "dax", "one smoke test", "bind loopback", "low")
+    requested = request_claim_status(
+        primary_path, claim_id, resource_id, "lease", "thread-arcade", "dax",
+        "one smoke test", "bind loopback", "low",
+        activation_group_id="group.claim.arcade.task7.loopback.bound",
+        lifecycle_id="lifecycle.arcade.task7",
+    )
     bridge, forwarded = _bridge(tmp_path)
     request = {**_request(), "resourceClaimId": claim_id}
     bridge.stage_decision(request)

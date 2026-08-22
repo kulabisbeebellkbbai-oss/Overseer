@@ -31,7 +31,13 @@ from .audit import ApprovalStatus
 from .core import ClaimStatus
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, sign_peer_response, verify_peer_request, MAX_BODY_BYTES
 from .store import SQLiteStore
-from .claim_continuation import dispatch_claim_approval_continuations_status
+from .claim_continuation import (
+    activate_claim_group_status,
+    claim_group_status,
+    dispatch_claim_approval_continuations_status,
+    register_claim_activation_group_status,
+    release_claim_group_status,
+)
 from .cli import (
     DEFAULT_AGENT_REGISTRY,
     activate_claim_status,
@@ -707,6 +713,9 @@ def make_api_handler(
             if path == "/claims/cleanup-plan":
                 self._handle(lambda: claim_cleanup_plan_status(store_path, _query_first(query, "now")))
                 return
+            if path == "/claims/groups/status":
+                self._handle(lambda: claim_group_status(store_path, _query_first(query, "group_id") or ""))
+                return
             if path == "/backup-provisioning/plans":
                 self._handle(lambda: list_backup_provisioning_plans(store_path))
                 return
@@ -972,6 +981,15 @@ def make_api_handler(
                         **_dispatch_claim_approval_continuation_args(payload),
                     )
                 )
+                return
+            if path == "/claims/groups/register" or path == "/claims/groups/create":
+                self._handle_json(lambda payload: register_claim_activation_group_status(store_path, **_claim_group_register_args(payload)))
+                return
+            if path == "/claims/groups/activate":
+                self._handle_json(lambda payload: activate_claim_group_status(store_path, str(payload["group_id"])))
+                return
+            if path == "/claims/groups/release":
+                self._handle_json(lambda payload: release_claim_group_status(store_path, str(payload["group_id"]), tuple(str(item) for item in payload.get("evidence_ids", ()))))
                 return
             if path == "/claims/activate":
                 self._handle_json(lambda payload: activate_claim_status(store_path, **_activate_claim_args(payload)))
@@ -1717,6 +1735,25 @@ def _request_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
         "release_condition": str(payload["release_condition"]) if payload.get("release_condition") else None,
         "activation_group_id": str(payload["activation_group_id"]) if payload.get("activation_group_id") else None,
         "lifecycle_id": str(payload["lifecycle_id"]) if payload.get("lifecycle_id") else None,
+    }
+
+
+def _claim_group_register_args(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "group_id", "lifecycle_id", "owner_thread", "owner_role",
+        "claim_ids", "approval_ids", "resource_ids",
+    }
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(f"unknown claim group fields: {sorted(unknown)}")
+    return {
+        "group_id": str(payload["group_id"]),
+        "lifecycle_id": str(payload["lifecycle_id"]),
+        "owner_thread": str(payload["owner_thread"]),
+        "owner_role": str(payload["owner_role"]),
+        "claim_ids": tuple(str(item) for item in payload["claim_ids"]),
+        "approval_ids": tuple(str(item) for item in payload["approval_ids"]),
+        "resource_ids": tuple(str(item) for item in payload["resource_ids"]),
     }
 
 

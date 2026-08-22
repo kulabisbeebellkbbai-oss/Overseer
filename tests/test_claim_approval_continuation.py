@@ -38,6 +38,8 @@ def _request(path: Path) -> dict[str, object]:
         "run one bounded continuation",
         "send the approved continuation prompt",
         RiskLevel.LOW.value,
+        activation_group_id="group.continuation",
+        lifecycle_id="lifecycle.continuation",
     )
 
 
@@ -188,3 +190,4 @@ def test_tampered_continuation_is_rejected_before_send(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="owner thread"):
         dispatch_claim_approval_continuation_status(path, continuation_id, adapter=adapter)
     assert adapter.calls == []
+

@@ -90,6 +90,20 @@ class OverseerProjectGuardTests(unittest.TestCase):
         self.assertEqual(guard.stop_check(self.payload(transcript)), 0)
         self.assertFalse(self.findings.exists())
 
+    def test_latest_turn_deduplicates_parallel_rollout_message_projections(self) -> None:
+        path = self.root / "duplicates.jsonl"
+        user = "Fix the local Overseer service."
+        assistant = "The service is fixed."
+        entries = [
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"text": user}]}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": user}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"text": assistant}]}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": assistant}},
+        ]
+        path.write_text("".join(json.dumps(item) + "\n" for item in entries), encoding="utf-8")
+
+        self.assertEqual(guard.latest_turn(path), [("user", user), ("assistant", assistant)])
+
     def test_stop_denies_missing_authoritative_record(self) -> None:
         claim = {
             "record_type": "crew_message",

@@ -147,6 +147,7 @@ def entry_role_and_text(entry: dict[str, Any]) -> tuple[str | None, str]:
 
 def latest_turn(path: Path) -> list[tuple[str | None, str]]:
     entries: list[tuple[str | None, str]] = []
+    last_message_source: str | None = None
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if not line.strip():
@@ -156,7 +157,20 @@ def latest_turn(path: Path) -> list[tuple[str | None, str]]:
             except json.JSONDecodeError:
                 continue
             if isinstance(raw, dict):
-                entries.append(entry_role_and_text(raw))
+                entry = entry_role_and_text(raw)
+                source = str(raw.get("type") or "")
+                role, text = entry
+                if (
+                    role in {"user", "assistant"}
+                    and bool(text)
+                    and bool(entries)
+                    and entries[-1] == entry
+                    and {source, last_message_source} == {"response_item", "event_msg"}
+                ):
+                    last_message_source = source
+                    continue
+                entries.append(entry)
+                last_message_source = source if role in {"user", "assistant"} else None
     last_user = max((index for index, (role, _text) in enumerate(entries) if role == "user"), default=-1)
     return entries[last_user:] if last_user >= 0 else entries
 

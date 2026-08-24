@@ -45,6 +45,11 @@ class RepairPolicy(StrEnum):
     PREAPPROVED_LOW_RISK = "preapproved_low_risk"
 
 
+class TriageIncidentStatus(StrEnum):
+    OPEN = "open"
+    RESOLVED = "resolved"
+
+
 def _identifier(value: object, label: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-blank identifier")
@@ -67,7 +72,7 @@ def _non_negative(value: object, label: str) -> None:
         raise ValueError(f"{label} must be a non-negative integer")
 
 
-def _timestamp(value: object, label: str) -> None:
+def _parse_timestamp(value: object, label: str) -> datetime:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be an ISO-8601 UTC timestamp")
     try:
@@ -76,6 +81,11 @@ def _timestamp(value: object, label: str) -> None:
         raise ValueError(f"{label} must be an ISO-8601 UTC timestamp") from error
     if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(None):
         raise ValueError(f"{label} must be an ISO-8601 UTC timestamp")
+    return parsed.astimezone(UTC)
+
+
+def _timestamp(value: object, label: str) -> None:
+    _parse_timestamp(value, label)
 
 
 def _optional_timestamp(value: object, label: str) -> None:
@@ -171,6 +181,9 @@ class CollectionJobState:
         _optional_identifier(self.lease_owner, "lease owner")
         _optional_timestamp(self.lease_expires_at, "lease expiry")
         _non_negative(self.lease_generation, "lease generation")
+        lease_values = (self.active_lease_id, self.lease_owner, self.lease_expires_at)
+        if any(value is not None for value in lease_values) and not all(value is not None for value in lease_values):
+            raise ValueError("active lease id, owner, and expiry must be provided together")
         if self.circuit_state is CircuitState.OPEN and self.cooldown_until is None:
             raise ValueError("open circuit requires a cooldown deadline")
 
@@ -246,6 +259,7 @@ class TriageIncident:
     severity: RiskLevel
     owner_domain: OwnerDomain
     evidence_ids: tuple[str, ...] = ()
+    status: TriageIncidentStatus = TriageIncidentStatus.OPEN
     repair_state: str = "pending"
     resolution: str | None = None
     generation: int = 1
@@ -253,11 +267,14 @@ class TriageIncident:
     def __post_init__(self) -> None:
         for value, label in ((self.id, "incident id"), (self.job_id, "job id"), (self.resource_id, "resource id")):
             _identifier(value, label)
-        _timestamp(self.first_failure_at, "first failure")
-        _timestamp(self.latest_failure_at, "latest failure")
+        first_failure = _parse_timestamp(self.first_failure_at, "first failure")
+        latest_failure = _parse_timestamp(self.latest_failure_at, "latest failure")
+        if latest_failure < first_failure:
+            raise ValueError("latest failure cannot precede first failure")
         object.__setattr__(self, "severity", _enum(self.severity, RiskLevel, "incident severity"))
         object.__setattr__(self, "owner_domain", _enum(self.owner_domain, OwnerDomain, "owner domain"))
         object.__setattr__(self, "evidence_ids", _tuple_of_identifiers(self.evidence_ids, "evidence id"))
+        object.__setattr__(self, "status", _enum(self.status, TriageIncidentStatus, "incident status"))
         _identifier(self.repair_state, "repair state")
         _optional_identifier(self.resolution, "incident resolution")
         _positive(self.generation, "incident generation")
@@ -268,6 +285,8 @@ class RepairRunbook:
     """An exact repair binding with an explicit automatic-repair boundary."""
 
     id: str
+    job_id: str
+    resource_id: str
     failure_categories: tuple[str, ...]
     risk_level: RiskLevel
     idempotency_contract: str
@@ -277,6 +296,8 @@ class RepairRunbook:
 
     def __post_init__(self) -> None:
         _identifier(self.id, "runbook id")
+        _identifier(self.job_id, "runbook job id")
+        _identifier(self.resource_id, "runbook resource id")
         categories = _tuple_of_identifiers(self.failure_categories, "failure category")
         object.__setattr__(self, "failure_categories", categories)
         object.__setattr__(self, "risk_level", _enum(self.risk_level, RiskLevel, "runbook risk level"))

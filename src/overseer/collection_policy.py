@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
-from .collection_models import CircuitState, CollectionJob, CollectionJobState
+from .collection_models import CircuitState, CollectionJob, CollectionJobState, CollectionOutcome
 
 
 def _utc(value: str, label: str) -> datetime:
@@ -72,19 +73,14 @@ def circuit_after_failure(job: CollectionJob, consecutive_failures: int) -> Circ
 def circuit_after_success(state: CollectionJobState) -> CollectionJobState:
     """Close a circuit after a successful verification and clear its failures."""
 
-    return CollectionJobState(
-        job_id=state.job_id,
-        next_due_at=state.next_due_at,
-        last_started_at=state.last_started_at,
-        last_completed_at=state.last_completed_at,
-        last_outcome=state.last_outcome,
+    if state.circuit_state is not CircuitState.HALF_OPEN:
+        raise ValueError("circuit success requires a half-open state")
+    return replace(
+        state,
         consecutive_failures=0,
         circuit_state=CircuitState.CLOSED,
         cooldown_until=None,
-        active_lease_id=state.active_lease_id,
-        lease_owner=state.lease_owner,
-        lease_expires_at=state.lease_expires_at,
-        lease_generation=state.lease_generation,
+        last_outcome=CollectionOutcome.SUCCEEDED,
     )
 
 

@@ -124,6 +124,7 @@ from .collection_models import (
     RepairPolicy,
     RepairRunbook,
     TriageIncident,
+    TriageIncidentStatus,
 )
 from .collection_policy import (
     circuit_after_failure,
@@ -327,6 +328,7 @@ __all__ = [
     "TriageIncident",
     "RepairRunbook",
     "RepairAttempt",
+    "TriageIncidentStatus",
     "deterministic_jitter",
     "next_success_due",
     "next_failure_delay",

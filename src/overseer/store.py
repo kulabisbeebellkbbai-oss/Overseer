@@ -50,6 +50,19 @@ from .claim_continuation import (
     ClaimApprovalContinuation,
     ClaimApprovalContinuationAttempt,
 )
+from .collection_models import (
+    CircuitState,
+    CollectionJob,
+    CollectionJobState,
+    CollectionOutcome,
+    CollectionRequest,
+    CollectionRun,
+    RepairAttempt,
+    RepairRunbook,
+    TriageIncident,
+    TriageIncidentStatus,
+)
+from .collection_policy import circuit_after_failure, next_failure_due, next_success_due
 from .core import ApprovalLevel, Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
 from .crew import CrewMessage
 from .health import HealthEvidence, HealthTarget
@@ -67,7 +80,8 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
+MAX_COLLECTION_PAYLOAD_LENGTH = 65536
 _AUDIT_EVENT_INSERT_TRIGGER = "audit_events_validate_normalized_insert"
 _AUDIT_EVENT_UPDATE_TRIGGER = "audit_events_validate_normalized_update"
 _AUDIT_EVENT_PAYLOAD_PREDICATE = """
@@ -582,7 +596,9 @@ class SQLiteStore:
                 "'claim_approval_continuations', 'claim_activation_groups', "
                 "'claim_approval_continuation_attempts', "
                 "'audit_event_normalization_state', 'package_inspection_records', "
-                "'package_reconciliation_evidence')"
+                "'package_reconciliation_evidence', 'collection_jobs', "
+                "'collection_job_states', 'collection_requests', 'collection_runs', "
+                "'triage_incidents', 'repair_runbooks', 'repair_attempts')"
             ).fetchall()
         }
         if tables != {
@@ -596,7 +612,31 @@ class SQLiteStore:
             "audit_event_normalization_state",
             "package_inspection_records",
             "package_reconciliation_evidence",
+            "collection_jobs",
+            "collection_job_states",
+            "collection_requests",
+            "collection_runs",
+            "triage_incidents",
+            "repair_runbooks",
+            "repair_attempts",
         }:
+            return False
+        required_collection_indexes = {
+            "idx_collection_jobs_enabled_priority",
+            "idx_collection_job_state_due",
+            "idx_collection_runs_job_started",
+            "idx_collection_request_pending_job",
+            "idx_triage_open_generation",
+        }
+        collection_indexes = {
+            str(row[1])
+            for row in self._connection.execute(
+                "SELECT type, name FROM sqlite_master WHERE type='index' "
+                "AND name IN (?, ?, ?, ?, ?)",
+                tuple(sorted(required_collection_indexes)),
+            ).fetchall()
+        }
+        if collection_indexes != required_collection_indexes:
             return False
         schema_current = self._connection.execute(
             "SELECT MAX(version) AS version FROM schema_migrations"
@@ -791,6 +831,130 @@ class SQLiteStore:
         except Exception:
             self._connection.rollback()
             raise
+
+    def _migrate_collection_schema(self) -> None:
+        """Install the v12 normalized scheduler schema as one rollback unit."""
+
+        savepoint = "collection_schema_v12"
+        self._connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            schema_sql = f"""
+                CREATE TABLE IF NOT EXISTS collection_jobs (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    owner_domain TEXT NOT NULL,
+                    resource_id TEXT,
+                    target_id TEXT,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                    interval_seconds INTEGER NOT NULL,
+                    jitter_seconds INTEGER NOT NULL,
+                    timeout_seconds INTEGER NOT NULL,
+                    priority INTEGER NOT NULL,
+                    concurrency_key TEXT NOT NULL,
+                    retention_limit INTEGER NOT NULL,
+                    repair_policy TEXT NOT NULL,
+                    max_backoff_seconds INTEGER NOT NULL,
+                    failure_threshold INTEGER NOT NULL,
+                    payload TEXT NOT NULL CHECK(length(payload) <= {MAX_COLLECTION_PAYLOAD_LENGTH})
+                );
+                CREATE TABLE IF NOT EXISTS collection_job_states (
+                    job_id TEXT PRIMARY KEY,
+                    next_due_at TEXT NOT NULL,
+                    last_started_at TEXT,
+                    last_completed_at TEXT,
+                    last_outcome TEXT,
+                    consecutive_failures INTEGER NOT NULL,
+                    circuit_state TEXT NOT NULL,
+                    cooldown_until TEXT,
+                    active_lease_id TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    lease_generation INTEGER NOT NULL,
+                    payload TEXT NOT NULL CHECK(length(payload) <= {MAX_COLLECTION_PAYLOAD_LENGTH})
+                );
+                CREATE TABLE IF NOT EXISTS collection_requests (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    requester TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    earliest_execution_at TEXT,
+                    status TEXT NOT NULL,
+                    terminal_disposition TEXT,
+                    payload TEXT NOT NULL CHECK(length(payload) <= {MAX_COLLECTION_PAYLOAD_LENGTH})
+                );
+                CREATE TABLE IF NOT EXISTS collection_runs (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    evidence_ids TEXT NOT NULL,
+                    error_category TEXT NOT NULL,
+                    retry_disposition TEXT NOT NULL,
+                    request_id TEXT,
+                    payload TEXT NOT NULL CHECK(length(payload) <= {MAX_COLLECTION_PAYLOAD_LENGTH})
+                );
+                CREATE TABLE IF NOT EXISTS triage_incidents (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    first_failure_at TEXT NOT NULL,
+                    latest_failure_at TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    owner_domain TEXT NOT NULL,
+                    evidence_ids TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('open', 'resolved')),
+                    repair_state TEXT NOT NULL,
+                    resolution TEXT,
+                    generation INTEGER NOT NULL,
+                    payload TEXT NOT NULL CHECK(length(payload) <= {MAX_COLLECTION_PAYLOAD_LENGTH})
+                );
+                CREATE TABLE IF NOT EXISTS repair_runbooks (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    failure_categories TEXT NOT NULL,
+                    risk_level TEXT NOT NULL,
+                    idempotency_contract TEXT NOT NULL,
+                    cooldown_seconds INTEGER NOT NULL,
+                    approval_required INTEGER NOT NULL CHECK(approval_required IN (0, 1)),
+                    adapter_binding TEXT NOT NULL,
+                    payload TEXT NOT NULL CHECK(length(payload) <= {MAX_COLLECTION_PAYLOAD_LENGTH})
+                );
+                CREATE TABLE IF NOT EXISTS repair_attempts (
+                    id TEXT PRIMARY KEY,
+                    incident_id TEXT NOT NULL,
+                    runbook_id TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL,
+                    authorization_id TEXT,
+                    outcome TEXT NOT NULL,
+                    result_evidence_ids TEXT NOT NULL,
+                    verification_run_id TEXT,
+                    payload TEXT NOT NULL CHECK(length(payload) <= {MAX_COLLECTION_PAYLOAD_LENGTH})
+                );
+                CREATE INDEX IF NOT EXISTS idx_collection_jobs_enabled_priority
+                ON collection_jobs (enabled, priority);
+                CREATE INDEX IF NOT EXISTS idx_collection_job_state_due
+                ON collection_job_states (next_due_at, lease_expires_at);
+                CREATE INDEX IF NOT EXISTS idx_collection_runs_job_started
+                ON collection_runs (job_id, started_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_request_pending_job
+                ON collection_requests (job_id) WHERE status = 'pending';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_triage_open_generation
+                ON triage_incidents (job_id, generation) WHERE status = 'open';
+                """
+            for statement in schema_sql.split(";"):
+                if statement.strip():
+                    self._connection.execute(statement)
+        except Exception:
+            self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def initialize(self) -> None:
         self._connection.executescript(
@@ -1012,11 +1176,13 @@ class SQLiteStore:
             """
         )
         self._migrate_audit_event_schema()
+        self._connection.execute("BEGIN IMMEDIATE")
         with self._connection:
             has_schema_history = self._connection.execute(
                 "SELECT 1 FROM schema_migrations LIMIT 1"
             ).fetchone() is not None
             self._migrate_roadex_approval_fixture_schema()
+            self._migrate_collection_schema()
             if not has_schema_history:
                 self._record_schema_migration(
                     CURRENT_SCHEMA_VERSION,
@@ -1029,7 +1195,7 @@ class SQLiteStore:
                 if current_version is None or int(current_version) < CURRENT_SCHEMA_VERSION:
                     self._record_schema_migration(
                         CURRENT_SCHEMA_VERSION,
-                        "persist immutable package inspection evidence",
+                        "persist normalized collection schedules, leases, and triage",
                     )
             self._connection.execute(
                 """
@@ -3264,6 +3430,662 @@ class SQLiteStore:
     def list_admin_change_plans(self) -> tuple[AdminChangePlan, ...]:
         return tuple(_load_dataclass(AdminChangePlan, payload) for payload in self._list_payloads("admin_change_plans"))
 
+    # Collection persistence is normalized for scheduler queries and keeps a
+    # bounded compatibility payload for lossless model round-trips.
+    def save_collection_job(
+        self, job: CollectionJob, state: CollectionJobState | None = None
+    ) -> None:
+        if not isinstance(job, CollectionJob):
+            raise ValueError("collection job must be a CollectionJob")
+        if state is not None and state.job_id != job.id:
+            raise ValueError("collection job state belongs to a different job")
+        if state is None:
+            existing = self._connection.execute(
+                "SELECT payload FROM collection_job_states WHERE job_id=?", (job.id,)
+            ).fetchone()
+            if existing is not None:
+                state = _load_dataclass(CollectionJobState, str(existing["payload"]))
+            else:
+                state = CollectionJobState(
+                    job_id=job.id,
+                    next_due_at=datetime.now(UTC).isoformat(),
+                )
+        job_payload = _bounded_collection_dump(job)
+        state_payload = _bounded_collection_dump(state)
+        with self.agent_transaction():
+            self._connection.execute(
+                """
+                INSERT INTO collection_jobs (
+                    id, kind, owner_domain, resource_id, target_id, enabled,
+                    interval_seconds, jitter_seconds, timeout_seconds, priority,
+                    concurrency_key, retention_limit, repair_policy,
+                    max_backoff_seconds, failure_threshold, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    kind=excluded.kind, owner_domain=excluded.owner_domain,
+                    resource_id=excluded.resource_id, target_id=excluded.target_id,
+                    enabled=excluded.enabled, interval_seconds=excluded.interval_seconds,
+                    jitter_seconds=excluded.jitter_seconds, timeout_seconds=excluded.timeout_seconds,
+                    priority=excluded.priority, concurrency_key=excluded.concurrency_key,
+                    retention_limit=excluded.retention_limit, repair_policy=excluded.repair_policy,
+                    max_backoff_seconds=excluded.max_backoff_seconds,
+                    failure_threshold=excluded.failure_threshold, payload=excluded.payload
+                """,
+                (
+                    job.id,
+                    job.kind.value,
+                    job.owner_domain.value,
+                    job.resource_id,
+                    job.target_id,
+                    int(job.enabled),
+                    job.interval_seconds,
+                    job.jitter_seconds,
+                    job.timeout_seconds,
+                    job.priority,
+                    job.concurrency_key,
+                    job.retention_limit,
+                    job.repair_policy.value,
+                    job.max_backoff_seconds,
+                    job.failure_threshold,
+                    job_payload,
+                ),
+            )
+            self._save_collection_job_state_in_transaction(state, state_payload)
+
+    def save_collection_job_state(self, state: CollectionJobState) -> None:
+        if not isinstance(state, CollectionJobState):
+            raise ValueError("collection job state must be a CollectionJobState")
+        if self._connection.execute(
+            "SELECT 1 FROM collection_jobs WHERE id=?", (state.job_id,)
+        ).fetchone() is None:
+            raise KeyError(state.job_id)
+        with self.agent_transaction():
+            self._save_collection_job_state_in_transaction(
+                state, _bounded_collection_dump(state)
+            )
+
+    def load_collection_job(self, job_id: str) -> CollectionJob:
+        return _load_dataclass(CollectionJob, self._get_payload("collection_jobs", job_id))
+
+    def list_collection_jobs(self) -> tuple[CollectionJob, ...]:
+        return tuple(
+            _load_dataclass(CollectionJob, payload)
+            for payload in self._list_payloads("collection_jobs")
+        )
+
+    def load_collection_job_state(self, job_id: str) -> CollectionJobState:
+        return _load_dataclass(
+            CollectionJobState, self._get_collection_payload("collection_job_states", job_id)
+        )
+
+    def list_collection_job_states(self) -> tuple[CollectionJobState, ...]:
+        return tuple(
+            _load_dataclass(CollectionJobState, payload)
+            for payload in self._list_collection_payloads("collection_job_states")
+        )
+
+    def claim_due_collection_jobs(
+        self, now: str, worker: str, lease_expires_at: str, *, limit: int = 2
+    ) -> tuple[CollectionJob, ...]:
+        _collection_datetime(now, "current time")
+        _collection_datetime(lease_expires_at, "lease expiry")
+        if not isinstance(worker, str) or not worker.strip() or len(worker) > 160:
+            raise ValueError("lease owner must be a bounded non-blank identifier")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("lease limit must be a non-negative integer")
+        if limit == 0:
+            return ()
+
+        claimed: list[CollectionJob] = []
+        with self.agent_transaction():
+            rows = self._connection.execute(
+                """
+                SELECT j.payload AS job_payload, s.payload AS state_payload
+                FROM collection_jobs AS j
+                JOIN collection_job_states AS s ON s.job_id=j.id
+                WHERE j.enabled=1
+                  AND (s.lease_expires_at IS NULL OR julianday(s.lease_expires_at) <= julianday(?))
+                  AND (
+                      s.circuit_state <> 'open'
+                      OR (s.cooldown_until IS NOT NULL AND julianday(s.cooldown_until) <= julianday(?))
+                  )
+                  AND julianday(s.next_due_at) <= julianday(?)
+                ORDER BY j.priority DESC, julianday(s.next_due_at) ASC, j.id ASC
+                LIMIT ?
+                """,
+                (now, now, now, limit),
+            ).fetchall()
+            for row in rows:
+                job = _load_dataclass(CollectionJob, str(row["job_payload"]))
+                state = _load_dataclass(CollectionJobState, str(row["state_payload"]))
+                if state.lease_expires_at is not None:
+                    self._recover_expired_collection_lease_in_transaction(job, state, now)
+                    state = self.load_collection_job_state(job.id)
+                generation = state.lease_generation + 1
+                lease_id = (
+                    "lease.collection."
+                    + hashlib.sha256(
+                        f"{job.id}:{worker}:{now}:{generation}:{secrets.token_hex(12)}".encode()
+                    ).hexdigest()
+                )
+                claimed_state = replace(
+                    state,
+                    last_started_at=now,
+                    active_lease_id=lease_id,
+                    lease_owner=worker,
+                    lease_expires_at=lease_expires_at,
+                    lease_generation=generation,
+                )
+                self._save_collection_job_state_in_transaction(
+                    claimed_state, _bounded_collection_dump(claimed_state)
+                )
+                claimed.append(job)
+        return tuple(claimed)
+
+    def save_collection_run(self, run: CollectionRun) -> None:
+        if not isinstance(run, CollectionRun):
+            raise ValueError("collection run must be a CollectionRun")
+        with self.agent_transaction():
+            self._insert_collection_run_in_transaction(run)
+
+    def complete_collection_run(
+        self,
+        run: CollectionRun,
+        lease_id: str | None = None,
+        lease_generation: int | None = None,
+    ) -> None:
+        if not isinstance(run, CollectionRun):
+            raise ValueError("collection run must be a CollectionRun")
+        if lease_id is None or lease_generation is None:
+            raise ValueError("collection completion requires lease id and generation")
+        if isinstance(lease_generation, bool) or not isinstance(lease_generation, int):
+            raise ValueError("lease generation must be an integer")
+        with self.agent_transaction():
+            state = self.load_collection_job_state(run.job_id)
+            existing = self._connection.execute(
+                "SELECT payload FROM collection_runs WHERE id=?", (run.id,)
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload"]) == _bounded_collection_dump(run):
+                    return
+                raise ValueError("immutable collection run collision")
+            if (
+                state.active_lease_id != lease_id
+                or state.lease_generation != lease_generation
+                or state.lease_owner is None
+            ):
+                raise ValueError("stale collection lease")
+            job = self.load_collection_job(run.job_id)
+            self._insert_collection_run_in_transaction(run)
+            if run.outcome is CollectionOutcome.SUCCEEDED:
+                failures = 0
+                circuit_state = CircuitState.CLOSED
+                cooldown_until = None
+                next_due_at = next_success_due(job, run.completed_at)
+                self._resolve_collection_incident_in_transaction(job, run)
+            else:
+                failures = state.consecutive_failures + 1
+                circuit_state = circuit_after_failure(job, failures)
+                next_due_at = next_failure_due(job, run.completed_at, failures)
+                cooldown_until = next_due_at if circuit_state is CircuitState.OPEN else None
+                self._open_collection_incident_in_transaction(job, run)
+            updated_state = replace(
+                state,
+                next_due_at=next_due_at,
+                last_completed_at=run.completed_at,
+                last_outcome=run.outcome,
+                consecutive_failures=failures,
+                circuit_state=circuit_state,
+                cooldown_until=cooldown_until,
+                active_lease_id=None,
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+            self._save_collection_job_state_in_transaction(
+                updated_state, _bounded_collection_dump(updated_state)
+            )
+            if run.request_id is not None:
+                request = self._connection.execute(
+                    "SELECT payload FROM collection_requests WHERE id=?", (run.request_id,)
+                ).fetchone()
+                if request is not None:
+                    current_request = _load_dataclass(CollectionRequest, str(request["payload"]))
+                    if current_request.status == "pending":
+                        disposition = run.outcome.value
+                        terminal = replace(
+                            current_request,
+                            status="completed" if run.outcome is CollectionOutcome.SUCCEEDED else "failed",
+                            terminal_disposition=disposition,
+                        )
+                        self._update_collection_request_in_transaction(terminal)
+
+    def request_collection_run(
+        self,
+        job_id: str,
+        requester: str,
+        reason: str,
+        earliest_execution_at: str | None = None,
+        requested_at: str | None = None,
+    ) -> CollectionRequest:
+        if self._connection.execute(
+            "SELECT 1 FROM collection_jobs WHERE id=?", (job_id,)
+        ).fetchone() is None:
+            raise KeyError(job_id)
+        if earliest_execution_at is not None:
+            _collection_datetime(earliest_execution_at, "earliest execution")
+        requested_at = requested_at or datetime.now(UTC).isoformat()
+        _collection_datetime(requested_at, "requested at")
+        probe = CollectionRequest(
+            id="request.placeholder",
+            job_id=job_id,
+            requester=requester,
+            reason=reason,
+            requested_at=requested_at,
+            earliest_execution_at=earliest_execution_at,
+        )
+        request_id = "request.collection." + hashlib.sha256(
+            f"{job_id}:{requested_at}:{requester}:{reason}:{secrets.token_hex(12)}".encode()
+        ).hexdigest()[:40]
+        request = replace(probe, id=request_id)
+        with self.agent_transaction():
+            pending = self._connection.execute(
+                "SELECT payload FROM collection_requests WHERE job_id=? AND status='pending'",
+                (job_id,),
+            ).fetchone()
+            if pending is not None:
+                return _load_dataclass(CollectionRequest, str(pending["payload"]))
+            try:
+                self._insert_collection_request_in_transaction(request)
+            except sqlite3.IntegrityError as error:
+                pending = self._connection.execute(
+                    "SELECT payload FROM collection_requests WHERE job_id=? AND status='pending'",
+                    (job_id,),
+                ).fetchone()
+                if pending is not None:
+                    return _load_dataclass(CollectionRequest, str(pending["payload"]))
+                raise ValueError("collection request collision") from error
+        return request
+
+    def list_collection_runs(self) -> tuple[CollectionRun, ...]:
+        return tuple(
+            _load_dataclass(CollectionRun, payload)
+            for payload in self._list_collection_payloads("collection_runs")
+        )
+
+    def list_collection_requests(self) -> tuple[CollectionRequest, ...]:
+        return tuple(
+            _load_dataclass(CollectionRequest, payload)
+            for payload in self._list_collection_payloads("collection_requests")
+        )
+
+    def list_triage_incidents(self) -> tuple[TriageIncident, ...]:
+        return tuple(
+            _load_dataclass(TriageIncident, payload)
+            for payload in self._list_collection_payloads("triage_incidents")
+        )
+
+    def save_collection_incident(self, incident: TriageIncident) -> None:
+        if not isinstance(incident, TriageIncident):
+            raise ValueError("triage incident must be a TriageIncident")
+        with self.agent_transaction():
+            self._upsert_collection_incident_in_transaction(incident)
+
+    def save_repair_runbook(self, runbook: RepairRunbook) -> None:
+        if not isinstance(runbook, RepairRunbook):
+            raise ValueError("repair runbook must be a RepairRunbook")
+        payload = _bounded_collection_dump(runbook)
+        with self.agent_transaction():
+            existing = self._connection.execute(
+                "SELECT payload FROM repair_runbooks WHERE id=?", (runbook.id,)
+            ).fetchone()
+            if existing is not None:
+                current = _load_dataclass(RepairRunbook, str(existing["payload"]))
+                if (current.job_id, current.resource_id) != (runbook.job_id, runbook.resource_id):
+                    raise ValueError("repair runbook binding cannot change")
+                self._connection.execute(
+                    "UPDATE repair_runbooks SET failure_categories=?, risk_level=?, "
+                    "idempotency_contract=?, cooldown_seconds=?, approval_required=?, "
+                    "adapter_binding=?, payload=? WHERE id=?",
+                    (
+                        json.dumps(list(runbook.failure_categories), separators=(",", ":")),
+                        runbook.risk_level.value,
+                        runbook.idempotency_contract,
+                        runbook.cooldown_seconds,
+                        int(runbook.approval_required),
+                        runbook.adapter_binding,
+                        payload,
+                        runbook.id,
+                    ),
+                )
+            else:
+                self._connection.execute(
+                    "INSERT INTO repair_runbooks (id, job_id, resource_id, failure_categories, "
+                    "risk_level, idempotency_contract, cooldown_seconds, approval_required, "
+                    "adapter_binding, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        runbook.id,
+                        runbook.job_id,
+                        runbook.resource_id,
+                        json.dumps(list(runbook.failure_categories), separators=(",", ":")),
+                        runbook.risk_level.value,
+                        runbook.idempotency_contract,
+                        runbook.cooldown_seconds,
+                        int(runbook.approval_required),
+                        runbook.adapter_binding,
+                        payload,
+                    ),
+                )
+
+    def load_repair_runbook(self, runbook_id: str) -> RepairRunbook:
+        return _load_dataclass(
+            RepairRunbook, self._get_collection_payload("repair_runbooks", runbook_id)
+        )
+
+    def save_repair_attempt(self, attempt: RepairAttempt) -> None:
+        if not isinstance(attempt, RepairAttempt):
+            raise ValueError("repair attempt must be a RepairAttempt")
+        payload = _bounded_collection_dump(attempt)
+        with self.agent_transaction():
+            existing = self._connection.execute(
+                "SELECT payload FROM repair_attempts WHERE id=?", (attempt.id,)
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload"]) == payload:
+                    return
+                raise ValueError("immutable repair attempt collision")
+            try:
+                self._connection.execute(
+                    "INSERT INTO repair_attempts (id, incident_id, runbook_id, attempted_at, "
+                    "authorization_id, outcome, result_evidence_ids, verification_run_id, payload) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        attempt.id,
+                        attempt.incident_id,
+                        attempt.runbook_id,
+                        attempt.attempted_at,
+                        attempt.authorization_id,
+                        attempt.outcome,
+                        json.dumps(list(attempt.result_evidence_ids), separators=(",", ":")),
+                        attempt.verification_run_id,
+                        payload,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError("immutable repair attempt collision") from error
+
+    def list_repair_attempts(self) -> tuple[RepairAttempt, ...]:
+        return tuple(
+            _load_dataclass(RepairAttempt, payload)
+            for payload in self._list_collection_payloads("repair_attempts")
+        )
+
+    def prune_collection_runs(self, retain_per_job: int) -> int:
+        if isinstance(retain_per_job, bool) or not isinstance(retain_per_job, int) or retain_per_job < 1:
+            raise ValueError("retention must be at least one")
+        deleted = 0
+        with self.agent_transaction():
+            protected: set[str] = set()
+            for payload in self._list_collection_payloads("triage_incidents"):
+                incident = _load_dataclass(TriageIncident, payload)
+                if incident.status is TriageIncidentStatus.OPEN:
+                    protected.update(incident.evidence_ids)
+            protected.update(
+                attempt.verification_run_id
+                for attempt in self.list_repair_attempts()
+                if attempt.verification_run_id is not None
+            )
+            rows = self._connection.execute(
+                "SELECT id, job_id, started_at FROM collection_runs "
+                "ORDER BY job_id ASC, julianday(started_at) DESC, id DESC"
+            ).fetchall()
+            by_job: dict[str, list[sqlite3.Row]] = {}
+            for row in rows:
+                by_job.setdefault(str(row["job_id"]), []).append(row)
+            for job_rows in by_job.values():
+                for row in job_rows[retain_per_job:]:
+                    if str(row["id"]) in protected:
+                        continue
+                    self._connection.execute(
+                        "DELETE FROM collection_runs WHERE id=?", (str(row["id"]),)
+                    )
+                    deleted += 1
+        return deleted
+
+    def _save_collection_job_state_in_transaction(
+        self, state: CollectionJobState, payload: str
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO collection_job_states (
+                job_id, next_due_at, last_started_at, last_completed_at,
+                last_outcome, consecutive_failures, circuit_state, cooldown_until,
+                active_lease_id, lease_owner, lease_expires_at, lease_generation, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                next_due_at=excluded.next_due_at, last_started_at=excluded.last_started_at,
+                last_completed_at=excluded.last_completed_at, last_outcome=excluded.last_outcome,
+                consecutive_failures=excluded.consecutive_failures, circuit_state=excluded.circuit_state,
+                cooldown_until=excluded.cooldown_until, active_lease_id=excluded.active_lease_id,
+                lease_owner=excluded.lease_owner, lease_expires_at=excluded.lease_expires_at,
+                lease_generation=excluded.lease_generation, payload=excluded.payload
+            """,
+            (
+                state.job_id,
+                state.next_due_at,
+                state.last_started_at,
+                state.last_completed_at,
+                state.last_outcome.value if state.last_outcome is not None else None,
+                state.consecutive_failures,
+                state.circuit_state.value,
+                state.cooldown_until,
+                state.active_lease_id,
+                state.lease_owner,
+                state.lease_expires_at,
+                state.lease_generation,
+                payload,
+            ),
+        )
+
+    def _insert_collection_run_in_transaction(self, run: CollectionRun) -> None:
+        payload = _bounded_collection_dump(run)
+        existing = self._connection.execute(
+            "SELECT payload FROM collection_runs WHERE id=?", (run.id,)
+        ).fetchone()
+        if existing is not None:
+            if str(existing["payload"]) == payload:
+                return
+            raise ValueError("immutable collection run collision")
+        try:
+            self._connection.execute(
+                "INSERT INTO collection_runs (id, job_id, trigger, started_at, completed_at, "
+                "outcome, summary, evidence_ids, error_category, retry_disposition, request_id, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run.id,
+                    run.job_id,
+                    run.trigger,
+                    run.started_at,
+                    run.completed_at,
+                    run.outcome.value,
+                    run.summary,
+                    json.dumps(list(run.evidence_ids), separators=(",", ":")),
+                    run.error_category,
+                    run.retry_disposition,
+                    run.request_id,
+                    payload,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("immutable collection run collision") from error
+
+    def _insert_collection_request_in_transaction(self, request: CollectionRequest) -> None:
+        payload = _bounded_collection_dump(request)
+        self._connection.execute(
+            "INSERT INTO collection_requests (id, job_id, requester, reason, requested_at, "
+            "earliest_execution_at, status, terminal_disposition, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                request.id,
+                request.job_id,
+                request.requester,
+                request.reason,
+                request.requested_at,
+                request.earliest_execution_at,
+                request.status,
+                request.terminal_disposition,
+                payload,
+            ),
+        )
+
+    def _update_collection_request_in_transaction(self, request: CollectionRequest) -> None:
+        self._connection.execute(
+            "UPDATE collection_requests SET requester=?, reason=?, requested_at=?, "
+            "earliest_execution_at=?, status=?, terminal_disposition=?, payload=? WHERE id=?",
+            (
+                request.requester,
+                request.reason,
+                request.requested_at,
+                request.earliest_execution_at,
+                request.status,
+                request.terminal_disposition,
+                _bounded_collection_dump(request),
+                request.id,
+            ),
+        )
+
+    def _recover_expired_collection_lease_in_transaction(
+        self, job: CollectionJob, state: CollectionJobState, now: str
+    ) -> None:
+        generation = state.lease_generation
+        run_id = "run.collection.expired-lease." + hashlib.sha256(
+            f"{job.id}:{generation}".encode()
+        ).hexdigest()[:48]
+        run = CollectionRun(
+            id=run_id,
+            job_id=job.id,
+            trigger="lease_recovery",
+            started_at=state.lease_expires_at or now,
+            completed_at=now,
+            outcome=CollectionOutcome.FAILED,
+            summary="expired scheduler lease recovered",
+            error_category="expired_lease",
+            retry_disposition="reclaim_due",
+        )
+        self._insert_collection_run_in_transaction(run)
+        self._open_collection_incident_in_transaction(job, run)
+        recovered = replace(
+            state,
+            next_due_at=now,
+            last_completed_at=now,
+            last_outcome=CollectionOutcome.FAILED,
+            consecutive_failures=state.consecutive_failures + 1,
+            circuit_state=CircuitState.CLOSED,
+            cooldown_until=None,
+            active_lease_id=None,
+            lease_owner=None,
+            lease_expires_at=None,
+        )
+        self._save_collection_job_state_in_transaction(
+            recovered, _bounded_collection_dump(recovered)
+        )
+
+    def _open_collection_incident_in_transaction(
+        self, job: CollectionJob, run: CollectionRun
+    ) -> None:
+        resource_id = job.resource_id or job.target_id or job.id
+        existing_row = self._connection.execute(
+            "SELECT payload FROM triage_incidents WHERE job_id=? AND resource_id=? "
+            "AND status='open' ORDER BY generation DESC LIMIT 1",
+            (job.id, resource_id),
+        ).fetchone()
+        evidence_ids = tuple(dict.fromkeys((run.id, *run.evidence_ids)))[:64]
+        if existing_row is not None:
+            existing = _load_dataclass(TriageIncident, str(existing_row["payload"]))
+            incident = replace(
+                existing,
+                latest_failure_at=run.completed_at,
+                evidence_ids=tuple(dict.fromkeys((*existing.evidence_ids, *evidence_ids)))[:64],
+                status=TriageIncidentStatus.OPEN,
+                repair_state="pending",
+                resolution=None,
+            )
+        else:
+            max_generation_row = self._connection.execute(
+                "SELECT COALESCE(MAX(generation), 0) AS generation FROM triage_incidents "
+                "WHERE job_id=? AND resource_id=?",
+                (job.id, resource_id),
+            ).fetchone()
+            generation = int(max_generation_row["generation"]) + 1
+            incident_id = "incident.collection." + hashlib.sha256(
+                f"{job.id}:{resource_id}:{generation}".encode()
+            ).hexdigest()[:48]
+            incident = TriageIncident(
+                id=incident_id,
+                job_id=job.id,
+                resource_id=resource_id,
+                first_failure_at=run.completed_at,
+                latest_failure_at=run.completed_at,
+                severity=RiskLevel.MEDIUM,
+                owner_domain=job.owner_domain,
+                evidence_ids=evidence_ids,
+                generation=generation,
+            )
+        self._upsert_collection_incident_in_transaction(incident)
+
+    def _resolve_collection_incident_in_transaction(
+        self, job: CollectionJob, run: CollectionRun
+    ) -> None:
+        resource_id = job.resource_id or job.target_id or job.id
+        row = self._connection.execute(
+            "SELECT payload FROM triage_incidents WHERE job_id=? AND resource_id=? "
+            "AND status='open' ORDER BY generation DESC LIMIT 1",
+            (job.id, resource_id),
+        ).fetchone()
+        if row is None:
+            return
+        current = _load_dataclass(TriageIncident, str(row["payload"]))
+        incident = replace(
+            current,
+            evidence_ids=tuple(dict.fromkeys((*current.evidence_ids, run.id)))[:64],
+            status=TriageIncidentStatus.RESOLVED,
+            repair_state="verified",
+            resolution="fresh verification recovered target",
+        )
+        self._upsert_collection_incident_in_transaction(incident)
+
+    def _upsert_collection_incident_in_transaction(self, incident: TriageIncident) -> None:
+        payload = _bounded_collection_dump(incident)
+        self._connection.execute(
+            """
+            INSERT INTO triage_incidents (
+                id, job_id, resource_id, first_failure_at, latest_failure_at,
+                severity, owner_domain, evidence_ids, status, repair_state,
+                resolution, generation, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                job_id=excluded.job_id, resource_id=excluded.resource_id,
+                first_failure_at=excluded.first_failure_at, latest_failure_at=excluded.latest_failure_at,
+                severity=excluded.severity, owner_domain=excluded.owner_domain,
+                evidence_ids=excluded.evidence_ids, status=excluded.status,
+                repair_state=excluded.repair_state, resolution=excluded.resolution,
+                generation=excluded.generation, payload=excluded.payload
+            """,
+            (
+                incident.id,
+                incident.job_id,
+                incident.resource_id,
+                incident.first_failure_at,
+                incident.latest_failure_at,
+                incident.severity.value,
+                incident.owner_domain.value,
+                json.dumps(list(incident.evidence_ids), separators=(",", ":")),
+                incident.status.value,
+                incident.repair_state,
+                incident.resolution,
+                incident.generation,
+                payload,
+            ),
+        )
+
     def save_package_inspection_record(self, record: PackageInspectionRecord) -> None:
         payload = _dump(record)
         self._save_immutable_payload(
@@ -3744,9 +4566,42 @@ class SQLiteStore:
             raise KeyError(row_id)
         return str(row["payload"])
 
+    def _get_collection_payload(self, table: str, row_id: str) -> str:
+        key_column = "job_id" if table == "collection_job_states" else "id"
+        row = self._connection.execute(
+            f"SELECT payload FROM {table} WHERE {key_column} = ?", (row_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(row_id)
+        return str(row["payload"])
+
+    def _list_collection_payloads(self, table: str) -> Iterable[str]:
+        rows = self._connection.execute(
+            f"SELECT payload FROM {table} ORDER BY rowid"
+        ).fetchall()
+        return (str(row["payload"]) for row in rows)
+
     def _list_payloads(self, table: str) -> Iterable[str]:
         rows = self._connection.execute(f"SELECT payload FROM {table} ORDER BY id").fetchall()
         return (str(row["payload"]) for row in rows)
+
+def _collection_datetime(value: str, label: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be an ISO-8601 UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{label} must be an ISO-8601 UTC timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(None):
+        raise ValueError(f"{label} must be an ISO-8601 UTC timestamp")
+    return parsed.astimezone(UTC)
+
+
+def _bounded_collection_dump(value: Any) -> str:
+    payload = _dump(value)
+    if len(payload.encode("utf-8")) > MAX_COLLECTION_PAYLOAD_LENGTH:
+        raise ValueError("collection payload exceeds the bounded limit")
+    return payload
 
 
 def _dump(value: Any) -> str:

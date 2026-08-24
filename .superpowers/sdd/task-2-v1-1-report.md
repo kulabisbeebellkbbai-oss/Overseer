@@ -3,6 +3,8 @@
 Date: 2026-08-24
 Status: DONE
 Implementation commit: `78fc5cd` (`Integrate immutable package inspection evidence`)
+Review-fix commits: `99fb215` (`Make package evidence writes atomic`),
+`58e1902` (`Restore package migration regression coverage`)
 
 ## Scope and implementation
 
@@ -28,9 +30,12 @@ types. Persistence uses the current `_dump()` JSON serialization. On an
 existing ID, the stored serialized payload must match byte-for-byte; an exact
 retry is a no-op and a different payload raises the appropriate immutable
 collision `ValueError`. New records use plain `INSERT`; neither immutable
-package table uses `INSERT OR REPLACE`. The methods use the existing
-`_commit_agent_mutation()` boundary so they also participate correctly in an
-outer agent transaction.
+package table uses `INSERT OR REPLACE`. The shared
+`_save_immutable_payload()` helper wraps the check-and-insert in the existing
+`agent_transaction()` writer boundary: the outermost call uses `BEGIN
+IMMEDIATE`, nested calls participate without committing the outer transaction,
+and any residual `sqlite3.IntegrityError` is converted to the documented
+collision `ValueError` after an exact-payload re-read.
 
 ## TDD evidence
 
@@ -64,6 +69,34 @@ The tests cover content-addressed identity, exact-payload idempotency,
 same-ID/different-payload rejection, round trips, and v10-to-v11 migration
 preservation.
 
+### Review-fix RED/GREEN
+
+The independent review identified a SELECT-then-INSERT race and missing
+schema-v11 table-repair coverage. The new two-connection tests were run before
+the fix with:
+
+```text
+PYTHONPATH=src pytest -q tests/test_package_reconciliation.py
+```
+
+They produced `2 failed, 8 passed`: exact concurrent retries leaked
+`sqlite3.IntegrityError('UNIQUE constraint failed: ...id')`, and conflicting
+concurrent writes leaked the same exception instead of the documented
+`ValueError`.
+
+After `99fb215`, the atomic writer-boundary implementation produced:
+
+```text
+11 passed
+```
+
+The final 12 tests include exact concurrent retries and conflicting concurrent
+writes for both immutable record families, outer `agent_transaction()` rollback
+participation, the original v10-to-v11 migration regression, and v11 repair
+when either or both immutable tables are missing. `58e1902` restored the
+original migration regression as an additive test after the repair coverage was
+added.
+
 ## Schema and migration decisions
 
 - `CURRENT_SCHEMA_VERSION` advances from 10 to 11.
@@ -73,7 +106,10 @@ preservation.
   `maintenance_batch_id`.
 - The tables are created in the existing idempotent initialization DDL. The
   current-schema predicate also requires both tables, so a database claiming
-  v11 but missing either table is repaired by the existing initialization path.
+  v11 but missing either table is repaired by the existing initialization path;
+  regression coverage verifies one-table and both-table absence while retaining
+  migration history, ordinary data, and the ability to save both records after
+  repair.
 - Existing migration rows and ordering remain intact. A fresh database keeps
   the bootstrap description; a pre-v11 database receives v11 with description
   `persist immutable package inspection evidence`. The migration regression
@@ -131,7 +167,7 @@ dirty-state safety.
 Passed:
 
 - `PYTHONPATH=src pytest -q tests/test_package_reconciliation.py tests/test_core.py -k package`
-  — 30 passed, 359 deselected;
+  — 38 passed, 359 deselected;
 - `PYTHONPATH=src pytest -q tests/test_agent_store.py -k 'schema or migration' tests/test_roadex_approval_fixture.py`
   — 8 passed, 56 deselected;
 - `PYTHONPATH=src pytest -q tests/test_agent_store.py tests/test_roadex_approval_fixture.py`

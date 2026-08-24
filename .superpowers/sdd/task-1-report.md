@@ -5,6 +5,7 @@
 Implemented and committed Task 1 on the isolated worktree branch.
 
 - Implementation commit: `fabf774` — `Restore Overseer release baseline`
+- Follow-up repair commit: `ceb111b` — `Route claim cleanup approval through Sisko`
 - Worktree: `/home/god/Documents/Codex Workspace/Overseer/.worktrees/overseer-v1-1-autonomous-operations`
 - No live Overseer services, gateways, systemd state, integrations, or user data were changed.
 - `.superpowers/sdd/progress.md` was not modified.
@@ -45,6 +46,31 @@ Additional focused verification:
 - `pytest -q tests/test_agent_store.py`: `56 passed in 1.46s`
 - `pytest -q tests/test_agent_migration.py tests/test_codex_dispatch_activation.py tests/test_roadex_approval_fixture.py tests/test_psychlo_decision_reconcile.py`: passed during focused verification.
 
+## Follow-up repair evidence
+
+The two residual claim-cleanup tests were reproduced exactly before the repair:
+
+```text
+pytest -q tests/test_core.py::RuntimeTests::test_execute_claim_cleanup_handles_missing_release_evidence_and_blocked_claims tests/test_core.py::RuntimeTests::test_execute_claim_cleanup_re_evaluates_stale_queue_after_approval
+2 failed in 1.68s
+```
+
+The failures showed cleanup subjects being classified as `ApprovalLevel.ROLE`, then rejected by the exact-Claim ROLE authority checks. Tests were first strengthened to require `ApprovalLevel.SISKO`; that test-only RED run remained `2 failed in 0.93s`, with both assertions observing `role != sisko`.
+
+The bounded attribution check was run ten times:
+
+```text
+for run in $(seq 1 10); do pytest -q tests/test_usage_attribution.py::test_cross_process_delivery_intent_has_one_winner || exit $?; done
+```
+
+Result: `10/10` runs passed, each reporting `1 passed`; no speculative concurrency change was made.
+
+The repair changes `_claim_cleanup_approval_level` to always return `ApprovalLevel.SISKO`. This preserves Sisko as the administrative authority for cleanup mutations and leaves `ApprovalLevel.ROLE` reserved for exact still-requested Claims and their activation continuations. Affected verification after the repair:
+
+- Exact cleanup regressions: `2 passed in 0.53s`
+- `tests/test_claim_approval_continuation.py tests/test_claim_activation_group.py tests/test_usage_attribution.py::test_cross_process_delivery_intent_has_one_winner`: `28 passed in 1.60s`
+- `tests/test_core.py tests/test_claim_approval_continuation.py tests/test_claim_activation_group.py tests/test_usage_attribution.py`: `441 passed in 96.27s`
+
 ## Implementation and design decisions
 
 - Roadex fixture migration now checks for the exact version-3 row, rather than using `MAX(version)`. The fixture migration runs before the aggregate schema marker, yielding `[2, 3, 10]` for legacy v2 stores and `[3, 10]` for new stores. Savepoint rollback removes both fixture DDL and migration history on injected failure.
@@ -57,6 +83,7 @@ Additional focused verification:
 ## Files changed
 
 - `src/overseer/api.py`
+- `src/overseer/cli.py`
 - `src/overseer/store.py`
 - `tests/test_agent_migration.py`
 - `tests/test_agent_store.py`
@@ -68,20 +95,25 @@ Additional focused verification:
 
 ## Full-suite verification
 
-The required uninterrupted clean-worktree run was:
+The required uninterrupted clean-worktree run before the follow-up repair was:
 
 ```text
 pytest -q
 2025 passed, 31 skipped, 3 failed in 410.67s (0:06:50)
 ```
 
-The three residual failures are outside the Task 1 source scope:
+Those three failures were repaired or classified as follows:
 
-1. Two existing claim-cleanup tests exercise ROLE approvals whose stored subject is a cleanup record rather than an exact claim, conflicting with the existing `OverseerCoordinator.approve_request` enforcement in `src/overseer/service.py`.
-2. `tests/test_usage_attribution.py::test_cross_process_delivery_intent_has_one_winner` failed once in the full run with `[False, False]` instead of `[False, True]`; an immediate isolated rerun passed (`1 passed in 0.22s`).
+1. The two cleanup failures were fixed in `ceb111b` by classifying synthetic cleanup subjects as Sisko approvals.
+2. The attribution failure was a one-run flake; ten bounded focused reruns passed.
 
-The earlier pre-commit full run is not treated as final evidence because source-lineage tests correctly saw the dirty worktree. The authoritative full run above was completed after commit `fabf774` on the clean worktree.
+The earlier pre-commit full run is not treated as final evidence because source-lineage tests correctly saw the dirty worktree. The final authoritative clean-worktree run after `ceb111b` was:
+
+```text
+pytest -q
+2028 passed, 31 skipped in 406.93s (0:06:46)
+```
 
 ## Residual concerns
 
-Task 1 implementation and focused suites are complete. Full-suite release sign-off remains conditional on separately resolving the two pre-existing claim-cleanup approval-contract failures; the usage-attribution failure appears nondeterministic based on its passing isolated rerun.
+Task 1 implementation and full-suite verification are complete with zero failures. The report update follows the implementation commits and records the final clean-worktree evidence.

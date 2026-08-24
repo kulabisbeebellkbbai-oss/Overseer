@@ -185,3 +185,18 @@ passed
 ```
 
 Fix commit: `44cab95` (`Preserve collection leases during configuration saves`).
+
+### Clean post-commit full suite
+
+```text
+PYTHONPATH=src pytest -q
+completed successfully with no failures; pytest lastfailed cache: {}
+
+PYTHONPATH=src python3 -m compileall -q src/overseer
+passed
+
+git diff --check
+passed
+```
+
+The clean full-suite run was performed after both `44cab95` and `26d5e53`.

@@ -6,6 +6,7 @@ Implemented and committed Task 1 on the isolated worktree branch.
 
 - Implementation commit: `fabf774` — `Restore Overseer release baseline`
 - Follow-up repair commit: `ceb111b` — `Route claim cleanup approval through Sisko`
+- Independent review fix commit: `0725925` — `Enforce bound role approval identity`
 - Worktree: `/home/god/Documents/Codex Workspace/Overseer/.worktrees/overseer-v1-1-autonomous-operations`
 - No live Overseer services, gateways, systemd state, integrations, or user data were changed.
 - `.superpowers/sdd/progress.md` was not modified.
@@ -114,6 +115,44 @@ pytest -q
 2028 passed, 31 skipped in 406.93s (0:06:46)
 ```
 
+## Independent review correction
+
+Review finding: `_activate_bound_decision_claim` accepted an approved exact-subject record without proving that it was the required owner-role approval. The correction keeps exact approval id and subject binding, then fails closed unless the approval is `ApprovalLevel.ROLE`, its `owner_domain` equals `claim.owner_role`, its status is approved, and its `decided_by` equals `claim.owner_role.value`; activation remains limited to a requested claim. The pending-then-Dax-approved success path remains covered by `test_api_approves_and_activates_the_exact_structurally_bound_claim_before_delivering_outcome`.
+
+Tests were added first for wrong approval level, wrong owner domain, and wrong `decided_by`. The focused RED command was:
+
+```text
+pytest -q tests/test_psychlo_decision_reconcile.py
+3 failed, 24 passed in 1.65s
+```
+
+Each failure was the expected `DID NOT RAISE`: the malformed approved record activated and delivered before the production guard existed. After the production fix, the focused GREEN command was:
+
+```text
+pytest -q tests/test_psychlo_decision_reconcile.py
+27 passed in 1.65s
+```
+
+All affected focused tests then passed:
+
+```text
+pytest -q tests/test_psychlo_decision_reconcile.py tests/test_claim_approval_continuation.py tests/test_claim_activation_group.py
+54 passed in 2.65s
+```
+
+The implementation was committed before the clean full-suite run:
+
+```text
+0725925f186575fb9c60e9bf7dc0448035fecc5c Enforce bound role approval identity
+```
+
+The fresh full suite on that clean committed implementation completed with zero failures:
+
+```text
+pytest -q
+2031 passed, 31 skipped in 409.06s (0:06:49)
+```
+
 ## Residual concerns
 
-Task 1 implementation and full-suite verification are complete with zero failures. The report update follows the implementation commits and records the final clean-worktree evidence.
+Task 1 implementation and independent review correction are complete with zero failures. The report update follows the implementation commit and records the final clean-worktree evidence.

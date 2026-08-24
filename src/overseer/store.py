@@ -3543,6 +3543,16 @@ class SQLiteStore:
 
     # Collection persistence is normalized for scheduler queries and keeps a
     # bounded compatibility payload for lossless model round-trips.
+    def _load_collection_job_state_for_configuration(
+        self, job_id: str
+    ) -> CollectionJobState | None:
+        existing = self._connection.execute(
+            "SELECT payload FROM collection_job_states WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if existing is None:
+            return None
+        return _load_dataclass(CollectionJobState, str(existing["payload"]))
+
     def save_collection_job(
         self, job: CollectionJob, state: CollectionJobState | None = None
     ) -> None:
@@ -3550,19 +3560,8 @@ class SQLiteStore:
             raise ValueError("collection job must be a CollectionJob")
         if state is not None and state.job_id != job.id:
             raise ValueError("collection job state belongs to a different job")
-        if state is None:
-            existing = self._connection.execute(
-                "SELECT payload FROM collection_job_states WHERE job_id=?", (job.id,)
-            ).fetchone()
-            if existing is not None:
-                state = _load_dataclass(CollectionJobState, str(existing["payload"]))
-            else:
-                state = CollectionJobState(
-                    job_id=job.id,
-                    next_due_at=datetime.now(UTC).isoformat(),
-                )
         job_payload = _bounded_collection_dump(job)
-        state_payload = _bounded_collection_dump(state)
+        state_payload = _bounded_collection_dump(state) if state is not None else None
         with self.agent_transaction():
             existing_job = self._connection.execute(
                 "SELECT payload FROM collection_jobs WHERE id=?", (job.id,)
@@ -3620,7 +3619,21 @@ class SQLiteStore:
                     job_payload,
                 ),
             )
-            self._save_collection_job_state_in_transaction(state, state_payload)
+            if state is None:
+                # The writer transaction must own this read.  Configuration-only
+                # saves never rewrite an existing scheduler state, because it may
+                # have been claimed by another connection while this call began.
+                state = self._load_collection_job_state_for_configuration(job.id)
+                if state is None:
+                    state = CollectionJobState(
+                        job_id=job.id,
+                        next_due_at=datetime.now(UTC).isoformat(),
+                    )
+                    self._save_collection_job_state_in_transaction(
+                        state, _bounded_collection_dump(state)
+                    )
+            else:
+                self._save_collection_job_state_in_transaction(state, state_payload)
 
     def save_collection_job_state(self, state: CollectionJobState) -> None:
         if not isinstance(state, CollectionJobState):

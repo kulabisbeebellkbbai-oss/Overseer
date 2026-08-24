@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from queue import Queue
@@ -371,6 +372,88 @@ def test_claim_due_jobs_is_atomic_and_respects_limit(tmp_path: Path) -> None:
     with SQLiteStore(path) as store:
         states = [store.load_collection_job_state(job.id) for job in claimed]
         assert all(state.active_lease_id and state.lease_generation == 1 for state in states)
+
+
+def test_configuration_save_cannot_erase_concurrent_claim_lease(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "state.sqlite3")
+    with SQLiteStore(path) as seeded:
+        seeded.save_collection_job(sample_job(), sample_state())
+        assert seeded.claim_due_collection_jobs(NOW, "worker-a", LEASE_END, limit=1)
+
+    job = sample_job()
+    snapshot_ready = threading.Event()
+    release_snapshot = threading.Event()
+    claim_started = threading.Event()
+    claim_lock_acquired = threading.Event()
+    results: Queue[tuple[str, object]] = Queue()
+
+    def reseed_configuration() -> None:
+        with SQLiteStore(path) as config_store:
+            original_snapshot = config_store._load_collection_job_state_for_configuration
+
+            def coordinated_snapshot(job_id: str) -> CollectionJobState | None:
+                snapshot = original_snapshot(job_id)
+                snapshot_ready.set()
+                if not release_snapshot.wait(timeout=5):
+                    raise RuntimeError("snapshot coordination timed out")
+                return snapshot
+
+            config_store._load_collection_job_state_for_configuration = coordinated_snapshot
+            try:
+                config_store.save_collection_job(replace(job, priority=1))
+                results.put(("save", None))
+            except BaseException as error:  # pragma: no cover - surfaced below
+                results.put(("save-error", error))
+
+    def claim() -> None:
+        with SQLiteStore(path) as claim_store:
+            claim_started.set()
+            original_claim_transaction = claim_store.agent_transaction
+
+            @contextmanager
+            def observed_claim_transaction():
+                with original_claim_transaction():
+                    claim_lock_acquired.set()
+                    yield
+
+            claim_store.agent_transaction = observed_claim_transaction
+            try:
+                claimed = claim_store.claim_due_collection_jobs(
+                    NOW, "worker-b", LEASE_END, limit=1
+                )
+                results.put(("claim", claimed))
+            except BaseException as error:  # pragma: no cover - surfaced below
+                results.put(("claim-error", error))
+
+    save_thread = threading.Thread(target=reseed_configuration)
+    claim_thread: threading.Thread | None = None
+    save_thread.start()
+    try:
+        assert snapshot_ready.wait(timeout=5)
+        claim_thread = threading.Thread(target=claim)
+        claim_thread.start()
+        assert claim_started.wait(timeout=5)
+        assert not claim_lock_acquired.wait(timeout=0.5)
+    finally:
+        release_snapshot.set()
+        save_thread.join(timeout=5)
+        if claim_thread is not None:
+            claim_thread.join(timeout=5)
+
+    assert not save_thread.is_alive()
+    assert claim_thread is not None and not claim_thread.is_alive()
+    outcomes = [results.get_nowait() for _ in range(2)]
+    assert sorted(kind for kind, _ in outcomes) == ["claim", "save"]
+    assert next(value for kind, value in outcomes if kind == "claim") == ()
+
+    with SQLiteStore(path) as store:
+        state = store.load_collection_job_state(job.id)
+        assert state.active_lease_id is not None
+        assert state.lease_owner == "worker-a"
+        assert state.lease_expires_at == LEASE_END
+        assert state.lease_generation == 1
 
 
 def test_operator_requests_coalesce_per_job_across_connections(tmp_path: Path) -> None:

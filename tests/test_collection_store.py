@@ -153,6 +153,197 @@ def test_schema_v12_is_normalized_and_repairs_claimed_current_missing_tables(tmp
         ) == CURRENT_SCHEMA_VERSION == 12
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kind", CollectionJobKind.HOST_INSPECTION),
+        ("owner_domain", OwnerDomain.DAX),
+        ("resource_id", "service.other"),
+        ("target_id", "health.other"),
+    ],
+)
+def test_collection_job_identity_binding_is_immutable(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    with seeded_collection_store(tmp_path) as store:
+        job = store.load_collection_job("collection.health.api")
+        with pytest.raises(ValueError, match="immutable collection job binding"):
+            store.save_collection_job(replace(job, **{field: value}))
+
+        store.save_collection_job(replace(job, priority=1, interval_seconds=300))
+        assert store.load_collection_job(job.id).priority == 1
+        assert store.load_collection_job(job.id).interval_seconds == 300
+
+
+def test_legacy_duplicate_open_incident_generation_is_repaired_without_sqlite_error(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with seeded_collection_store(tmp_path) as store:
+        store._connection.execute("DROP INDEX idx_triage_open_generation")
+        store._connection.commit()
+        first = sample_incident(id="incident.legacy.first", generation=1)
+        second = sample_incident(id="incident.legacy.second", generation=1)
+        store.save_collection_incident(first)
+        store.save_collection_incident(second)
+
+    with SQLiteStore(path) as store:
+        incidents = store.list_triage_incidents()
+        assert sorted(incident.status.value for incident in incidents) == ["open", "resolved"]
+        assert store._schema_is_current()
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM triage_incidents WHERE job_id=? AND generation=? AND status='open'",
+            ("collection.health.api", 1),
+        ).fetchone()[0] == 1
+
+
+def test_complete_collection_run_nested_failure_rolls_back_when_outer_catches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with seeded_collection_store(tmp_path) as store:
+        claimed = store.claim_due_collection_jobs(NOW, "worker-a", LEASE_END, limit=1)[0]
+        state = store.load_collection_job_state(claimed.id)
+        run = sample_run(outcome=CollectionOutcome.FAILED, error_category="unavailable")
+
+        def fail_after_run_insert(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("injected incident failure")
+
+        monkeypatch.setattr(store, "_open_collection_incident_in_transaction", fail_after_run_insert)
+        with store.agent_transaction():
+            try:
+                store.complete_collection_run(
+                    run,
+                    lease_id=state.active_lease_id,
+                    lease_generation=state.lease_generation,
+                )
+            except RuntimeError as error:
+                assert str(error) == "injected incident failure"
+
+        assert store.list_collection_runs() == ()
+        assert store.list_triage_incidents() == ()
+        assert store.load_collection_job_state(claimed.id).active_lease_id == state.active_lease_id
+
+
+@pytest.mark.parametrize(
+    ("index_name", "table", "malformed_sql"),
+    [
+        (
+            "idx_collection_jobs_enabled_priority",
+            "collection_jobs",
+            "CREATE INDEX idx_collection_jobs_enabled_priority ON collection_jobs (priority)",
+        ),
+        (
+            "idx_collection_job_state_due",
+            "collection_job_states",
+            "CREATE INDEX idx_collection_job_state_due ON collection_job_states (lease_expires_at)",
+        ),
+        (
+            "idx_collection_runs_job_started",
+            "collection_runs",
+            "CREATE INDEX idx_collection_runs_job_started ON collection_runs (job_id, started_at)",
+        ),
+        (
+            "idx_collection_request_pending_job",
+            "collection_requests",
+            "CREATE INDEX idx_collection_request_pending_job ON collection_requests (job_id)",
+        ),
+        (
+            "idx_triage_open_generation",
+            "triage_incidents",
+            "CREATE INDEX idx_triage_open_generation ON triage_incidents (job_id)",
+        ),
+    ],
+)
+def test_reopen_repairs_same_named_scheduler_index_to_canonical_semantics(
+    tmp_path: Path, index_name: str, table: str, malformed_sql: str
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with seeded_collection_store(tmp_path) as store:
+        store._connection.execute(f"DROP INDEX {index_name}")
+        store._connection.execute(malformed_sql)
+        store._connection.commit()
+
+    with SQLiteStore(path) as store:
+        assert store._schema_is_current()
+        assert store._collection_index_is_canonical(index_name)
+        assert store._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is not None
+
+
+def test_repaired_pending_index_remains_race_safe_for_request_coalescing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with seeded_collection_store(tmp_path) as store:
+        store._connection.execute("DROP INDEX idx_collection_request_pending_job")
+        store._connection.execute(
+            "CREATE INDEX idx_collection_request_pending_job ON collection_requests (job_id)"
+        )
+        store._connection.commit()
+
+    with SQLiteStore(path) as store:
+        assert store._collection_index_is_canonical("idx_collection_request_pending_job")
+        first = store.request_collection_run("collection.health.api", "operator", "verify")
+        second = store.request_collection_run("collection.health.api", "operator", "verify again")
+        assert first.id == second.id
+        assert len(store.list_collection_requests()) == 1
+
+
+def test_repaired_incident_index_rejects_generation_collision_without_raw_sqlite_error(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with seeded_collection_store(tmp_path) as store:
+        store._connection.execute("DROP INDEX idx_triage_open_generation")
+        store._connection.execute(
+            "CREATE INDEX idx_triage_open_generation ON triage_incidents (job_id)"
+        )
+        store._connection.commit()
+
+    with SQLiteStore(path) as store:
+        assert store._collection_index_is_canonical("idx_triage_open_generation")
+        store.save_collection_incident(sample_incident(id="incident.first"))
+        with pytest.raises(ValueError, match="generation collision"):
+            store.save_collection_incident(sample_incident(id="incident.second"))
+
+
+def test_v11_fixture_migrates_to_v12_preserving_package_data_and_history(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    package_payload = '{"package":"preserved-v11"}'
+    with SQLiteStore(path) as store:
+        store._connection.execute(
+            "INSERT INTO package_inspection_records(id, payload) VALUES (?, ?)",
+            ("package.v11", package_payload),
+        )
+        for table in (
+            "collection_jobs",
+            "collection_job_states",
+            "collection_requests",
+            "collection_runs",
+            "triage_incidents",
+            "repair_runbooks",
+            "repair_attempts",
+        ):
+            store._connection.execute(f"DROP TABLE {table}")
+        store._connection.execute("DELETE FROM schema_migrations WHERE version=?", (12,))
+        store._connection.execute(
+            "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
+            (11, "schema v11 fixture", NOW),
+        )
+        store._connection.commit()
+
+    with SQLiteStore(path) as store:
+        integer_versions = [
+            row.version for row in store.list_schema_migrations() if isinstance(row.version, int)
+        ]
+        assert integer_versions == [3, 11, 12]
+        assert store._connection.execute(
+            "SELECT payload FROM package_inspection_records WHERE id=?", ("package.v11",)
+        ).fetchone()[0] == package_payload
+        assert store._schema_is_current()
+
+
 def test_claim_due_jobs_is_atomic_and_respects_limit(tmp_path: Path) -> None:
     with seeded_collection_store(tmp_path) as store:
         path = str(store.path)

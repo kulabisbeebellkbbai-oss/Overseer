@@ -82,6 +82,43 @@ from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, U
 
 CURRENT_SCHEMA_VERSION = 12
 MAX_COLLECTION_PAYLOAD_LENGTH = 65536
+_COLLECTION_INDEX_SPECS = {
+    "idx_collection_jobs_enabled_priority": {
+        "table": "collection_jobs",
+        "unique": 0,
+        "partial": 0,
+        "columns": (("enabled", 0), ("priority", 0)),
+        "sql": "CREATE INDEX idx_collection_jobs_enabled_priority ON collection_jobs (enabled, priority)",
+    },
+    "idx_collection_job_state_due": {
+        "table": "collection_job_states",
+        "unique": 0,
+        "partial": 0,
+        "columns": (("next_due_at", 0), ("lease_expires_at", 0)),
+        "sql": "CREATE INDEX idx_collection_job_state_due ON collection_job_states (next_due_at, lease_expires_at)",
+    },
+    "idx_collection_runs_job_started": {
+        "table": "collection_runs",
+        "unique": 0,
+        "partial": 0,
+        "columns": (("job_id", 0), ("started_at", 1)),
+        "sql": "CREATE INDEX idx_collection_runs_job_started ON collection_runs (job_id, started_at DESC)",
+    },
+    "idx_collection_request_pending_job": {
+        "table": "collection_requests",
+        "unique": 1,
+        "partial": 1,
+        "columns": (("job_id", 0),),
+        "sql": "CREATE UNIQUE INDEX idx_collection_request_pending_job ON collection_requests (job_id) WHERE status = 'pending'",
+    },
+    "idx_triage_open_generation": {
+        "table": "triage_incidents",
+        "unique": 1,
+        "partial": 1,
+        "columns": (("job_id", 0), ("generation", 0)),
+        "sql": "CREATE UNIQUE INDEX idx_triage_open_generation ON triage_incidents (job_id, generation) WHERE status = 'open'",
+    },
+}
 _AUDIT_EVENT_INSERT_TRIGGER = "audit_events_validate_normalized_insert"
 _AUDIT_EVENT_UPDATE_TRIGGER = "audit_events_validate_normalized_update"
 _AUDIT_EVENT_PAYLOAD_PREDICATE = """
@@ -584,6 +621,49 @@ class SQLiteStore:
             return "exact"
         return "missing_triggers"
 
+    def _collection_index_is_canonical(self, index_name: str) -> bool:
+        spec = _COLLECTION_INDEX_SPECS.get(index_name)
+        if spec is None:
+            return False
+        row = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            return False
+        index_rows = self._connection.execute(
+            f"PRAGMA index_list({spec['table']})"
+        ).fetchall()
+        index_row = next(
+            (item for item in index_rows if str(item[1]) == index_name), None
+        )
+        if index_row is None:
+            return False
+        if int(index_row[2]) != int(spec["unique"]) or int(index_row[4]) != int(spec["partial"]):
+            return False
+        columns = self._connection.execute(
+            "SELECT name, seqno FROM pragma_index_info(?) ORDER BY seqno",
+            (index_name,),
+        ).fetchall()
+        if tuple((str(item[0]), int(item[1])) for item in columns) != tuple(
+            (name, sequence) for sequence, (name, _descending) in enumerate(spec["columns"])
+        ):
+            return False
+        sort_columns = self._connection.execute(
+            "SELECT name, desc, key FROM pragma_index_xinfo(?) "
+            "WHERE key=1 ORDER BY seqno",
+            (index_name,),
+        ).fetchall()
+        if tuple((str(item[0]), int(item[1])) for item in sort_columns) != tuple(
+            (name, descending) for name, descending in spec["columns"]
+        ):
+            return False
+        if int(spec["partial"]):
+            return self._normalize_schema_sql(str(row["sql"])) == self._normalize_schema_sql(
+                str(spec["sql"])
+            )
+        return True
+
     def _schema_is_current(self) -> bool:
         if self._observation_schema_status() != "exact":
             return False
@@ -621,22 +701,10 @@ class SQLiteStore:
             "repair_attempts",
         }:
             return False
-        required_collection_indexes = {
-            "idx_collection_jobs_enabled_priority",
-            "idx_collection_job_state_due",
-            "idx_collection_runs_job_started",
-            "idx_collection_request_pending_job",
-            "idx_triage_open_generation",
-        }
-        collection_indexes = {
-            str(row[1])
-            for row in self._connection.execute(
-                "SELECT type, name FROM sqlite_master WHERE type='index' "
-                "AND name IN (?, ?, ?, ?, ?)",
-                tuple(sorted(required_collection_indexes)),
-            ).fetchall()
-        }
-        if collection_indexes != required_collection_indexes:
+        if not all(
+            self._collection_index_is_canonical(index_name)
+            for index_name in _COLLECTION_INDEX_SPECS
+        ):
             return False
         schema_current = self._connection.execute(
             "SELECT MAX(version) AS version FROM schema_migrations"
@@ -832,6 +900,48 @@ class SQLiteStore:
             self._connection.rollback()
             raise
 
+    def _repair_collection_index_rows_in_transaction(self) -> None:
+        for index_name in _COLLECTION_INDEX_SPECS:
+            self._connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+        pending_jobs: set[str] = set()
+        pending_rows = self._connection.execute(
+            "SELECT payload FROM collection_requests WHERE status='pending' "
+            "ORDER BY job_id ASC, id ASC"
+        ).fetchall()
+        for row in pending_rows:
+            request = _load_dataclass(CollectionRequest, str(row["payload"]))
+            if request.job_id not in pending_jobs:
+                pending_jobs.add(request.job_id)
+                continue
+            self._update_collection_request_in_transaction(
+                replace(
+                    request,
+                    status="coalesced",
+                    terminal_disposition="coalesced",
+                )
+            )
+
+        open_generations: set[tuple[str, int]] = set()
+        incident_rows = self._connection.execute(
+            "SELECT payload FROM triage_incidents WHERE status='open' "
+            "ORDER BY job_id ASC, generation ASC, id ASC"
+        ).fetchall()
+        for row in incident_rows:
+            incident = _load_dataclass(TriageIncident, str(row["payload"]))
+            key = (incident.job_id, incident.generation)
+            if key not in open_generations:
+                open_generations.add(key)
+                continue
+            self._upsert_collection_incident_in_transaction(
+                replace(
+                    incident,
+                    status=TriageIncidentStatus.RESOLVED,
+                    repair_state="coalesced",
+                    resolution="legacy duplicate incident generation coalesced",
+                )
+            )
+
     def _migrate_collection_schema(self) -> None:
         """Install the v12 normalized scheduler schema as one rollback unit."""
 
@@ -935,20 +1045,13 @@ class SQLiteStore:
                     verification_run_id TEXT,
                     payload TEXT NOT NULL CHECK(length(payload) <= {MAX_COLLECTION_PAYLOAD_LENGTH})
                 );
-                CREATE INDEX IF NOT EXISTS idx_collection_jobs_enabled_priority
-                ON collection_jobs (enabled, priority);
-                CREATE INDEX IF NOT EXISTS idx_collection_job_state_due
-                ON collection_job_states (next_due_at, lease_expires_at);
-                CREATE INDEX IF NOT EXISTS idx_collection_runs_job_started
-                ON collection_runs (job_id, started_at DESC);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_request_pending_job
-                ON collection_requests (job_id) WHERE status = 'pending';
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_triage_open_generation
-                ON triage_incidents (job_id, generation) WHERE status = 'open';
                 """
             for statement in schema_sql.split(";"):
                 if statement.strip():
                     self._connection.execute(statement)
+            self._repair_collection_index_rows_in_transaction()
+            for index_name, spec in _COLLECTION_INDEX_SPECS.items():
+                self._connection.execute(str(spec["sql"]))
         except Exception:
             self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
             self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -1532,8 +1635,11 @@ class SQLiteStore:
     @contextmanager
     def agent_transaction(self) -> Iterable[None]:
         outermost = self._agent_transaction_depth == 0
+        savepoint = f"agent_transaction_{self._agent_transaction_depth}"
         if outermost:
             self._connection.execute("BEGIN IMMEDIATE")
+        else:
+            self._connection.execute(f"SAVEPOINT {savepoint}")
         self._agent_transaction_depth += 1
         try:
             yield
@@ -1541,11 +1647,16 @@ class SQLiteStore:
             self._agent_transaction_depth -= 1
             if outermost:
                 self._connection.rollback()
+            else:
+                self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         else:
             self._agent_transaction_depth -= 1
             if outermost:
                 self._commit()
+            else:
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def _commit_agent_mutation(self) -> None:
         if self._agent_transaction_depth == 0:
@@ -3453,6 +3564,25 @@ class SQLiteStore:
         job_payload = _bounded_collection_dump(job)
         state_payload = _bounded_collection_dump(state)
         with self.agent_transaction():
+            existing_job = self._connection.execute(
+                "SELECT payload FROM collection_jobs WHERE id=?", (job.id,)
+            ).fetchone()
+            if existing_job is not None:
+                current_job = _load_dataclass(CollectionJob, str(existing_job["payload"]))
+                current_binding = (
+                    current_job.kind,
+                    current_job.owner_domain,
+                    current_job.resource_id,
+                    current_job.target_id,
+                )
+                requested_binding = (
+                    job.kind,
+                    job.owner_domain,
+                    job.resource_id,
+                    job.target_id,
+                )
+                if current_binding != requested_binding:
+                    raise ValueError("immutable collection job binding")
             self._connection.execute(
                 """
                 INSERT INTO collection_jobs (
@@ -4011,8 +4141,8 @@ class SQLiteStore:
         else:
             max_generation_row = self._connection.execute(
                 "SELECT COALESCE(MAX(generation), 0) AS generation FROM triage_incidents "
-                "WHERE job_id=? AND resource_id=?",
-                (job.id, resource_id),
+                "WHERE job_id=?",
+                (job.id,),
             ).fetchone()
             generation = int(max_generation_row["generation"]) + 1
             incident_id = "incident.collection." + hashlib.sha256(
@@ -4054,37 +4184,40 @@ class SQLiteStore:
 
     def _upsert_collection_incident_in_transaction(self, incident: TriageIncident) -> None:
         payload = _bounded_collection_dump(incident)
-        self._connection.execute(
-            """
-            INSERT INTO triage_incidents (
-                id, job_id, resource_id, first_failure_at, latest_failure_at,
-                severity, owner_domain, evidence_ids, status, repair_state,
-                resolution, generation, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                job_id=excluded.job_id, resource_id=excluded.resource_id,
-                first_failure_at=excluded.first_failure_at, latest_failure_at=excluded.latest_failure_at,
-                severity=excluded.severity, owner_domain=excluded.owner_domain,
-                evidence_ids=excluded.evidence_ids, status=excluded.status,
-                repair_state=excluded.repair_state, resolution=excluded.resolution,
-                generation=excluded.generation, payload=excluded.payload
-            """,
-            (
-                incident.id,
-                incident.job_id,
-                incident.resource_id,
-                incident.first_failure_at,
-                incident.latest_failure_at,
-                incident.severity.value,
-                incident.owner_domain.value,
-                json.dumps(list(incident.evidence_ids), separators=(",", ":")),
-                incident.status.value,
-                incident.repair_state,
-                incident.resolution,
-                incident.generation,
-                payload,
-            ),
-        )
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO triage_incidents (
+                    id, job_id, resource_id, first_failure_at, latest_failure_at,
+                    severity, owner_domain, evidence_ids, status, repair_state,
+                    resolution, generation, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    job_id=excluded.job_id, resource_id=excluded.resource_id,
+                    first_failure_at=excluded.first_failure_at, latest_failure_at=excluded.latest_failure_at,
+                    severity=excluded.severity, owner_domain=excluded.owner_domain,
+                    evidence_ids=excluded.evidence_ids, status=excluded.status,
+                    repair_state=excluded.repair_state, resolution=excluded.resolution,
+                    generation=excluded.generation, payload=excluded.payload
+                """,
+                (
+                    incident.id,
+                    incident.job_id,
+                    incident.resource_id,
+                    incident.first_failure_at,
+                    incident.latest_failure_at,
+                    incident.severity.value,
+                    incident.owner_domain.value,
+                    json.dumps(list(incident.evidence_ids), separators=(",", ":")),
+                    incident.status.value,
+                    incident.repair_state,
+                    incident.resolution,
+                    incident.generation,
+                    payload,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("triage incident generation collision") from error
 
     def save_package_inspection_record(self, record: PackageInspectionRecord) -> None:
         payload = _dump(record)

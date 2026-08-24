@@ -58,6 +58,7 @@ from .ids_review import HostSecurityIDSReviewPackage
 from .key_broker import KeyBrokerTokenGrant, KeyBrokerTokenRequest, KeyProviderRecord
 from .maintenance_schedule import MaintenanceSchedule
 from .ops_records import OperationRecord
+from .packages import PackageInspectionRecord, PackageReconciliationEvidence
 from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
@@ -66,7 +67,7 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 _AUDIT_EVENT_INSERT_TRIGGER = "audit_events_validate_normalized_insert"
 _AUDIT_EVENT_UPDATE_TRIGGER = "audit_events_validate_normalized_update"
 _AUDIT_EVENT_PAYLOAD_PREDICATE = """
@@ -580,7 +581,8 @@ class SQLiteStore:
                 "'roadex_approval_fixtures', 'psychlo_legacy_abandonment_execution_claims', "
                 "'claim_approval_continuations', 'claim_activation_groups', "
                 "'claim_approval_continuation_attempts', "
-                "'audit_event_normalization_state')"
+                "'audit_event_normalization_state', 'package_inspection_records', "
+                "'package_reconciliation_evidence')"
             ).fetchall()
         }
         if tables != {
@@ -592,6 +594,8 @@ class SQLiteStore:
             "claim_activation_groups",
             "claim_approval_continuation_attempts",
             "audit_event_normalization_state",
+            "package_inspection_records",
+            "package_reconciliation_evidence",
         }:
             return False
         schema_current = self._connection.execute(
@@ -894,6 +898,20 @@ class SQLiteStore:
                 plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS package_inspection_records (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS package_reconciliation_evidence (
+                id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL,
+                maintenance_batch_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_package_reconciliation_snapshot
+            ON package_reconciliation_evidence (snapshot_id);
+            CREATE INDEX IF NOT EXISTS idx_package_reconciliation_batch
+            ON package_reconciliation_evidence (maintenance_batch_id);
             CREATE TABLE IF NOT EXISTS psychlo_legacy_abandonment_execution_claims (
                 plan_id TEXT PRIMARY KEY,
                 action_id TEXT NOT NULL UNIQUE,
@@ -1011,7 +1029,7 @@ class SQLiteStore:
                 if current_version is None or int(current_version) < CURRENT_SCHEMA_VERSION:
                     self._record_schema_migration(
                         CURRENT_SCHEMA_VERSION,
-                        "index audit event type for responsive dashboard counts",
+                        "persist immutable package inspection evidence",
                     )
             self._connection.execute(
                 """
@@ -3245,6 +3263,71 @@ class SQLiteStore:
 
     def list_admin_change_plans(self) -> tuple[AdminChangePlan, ...]:
         return tuple(_load_dataclass(AdminChangePlan, payload) for payload in self._list_payloads("admin_change_plans"))
+
+    def save_package_inspection_record(self, record: PackageInspectionRecord) -> None:
+        payload = _dump(record)
+        existing = self._connection.execute(
+            "SELECT payload FROM package_inspection_records WHERE id = ?",
+            (record.id,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["payload"]) != payload:
+                raise ValueError("immutable package inspection collision")
+            return
+        self._connection.execute(
+            "INSERT INTO package_inspection_records (id, payload) VALUES (?, ?)",
+            (record.id, payload),
+        )
+        self._commit_agent_mutation()
+
+    def load_package_inspection_record(self, record_id: str) -> PackageInspectionRecord:
+        return _load_dataclass(
+            PackageInspectionRecord,
+            self._get_payload("package_inspection_records", record_id),
+        )
+
+    def list_package_inspection_records(self) -> tuple[PackageInspectionRecord, ...]:
+        return tuple(
+            _load_dataclass(PackageInspectionRecord, payload)
+            for payload in self._list_payloads("package_inspection_records")
+        )
+
+    def save_package_reconciliation_evidence(
+        self, evidence: PackageReconciliationEvidence
+    ) -> None:
+        payload = _dump(evidence)
+        existing = self._connection.execute(
+            "SELECT payload FROM package_reconciliation_evidence WHERE id = ?",
+            (evidence.id,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["payload"]) != payload:
+                raise ValueError(
+                    "immutable package reconciliation evidence collision"
+                )
+            return
+        self._connection.execute(
+            "INSERT INTO package_reconciliation_evidence "
+            "(id, snapshot_id, maintenance_batch_id, payload) VALUES (?, ?, ?, ?)",
+            (evidence.id, evidence.snapshot_id, evidence.maintenance_batch_id, payload),
+        )
+        self._commit_agent_mutation()
+
+    def load_package_reconciliation_evidence(
+        self, evidence_id: str
+    ) -> PackageReconciliationEvidence:
+        return _load_dataclass(
+            PackageReconciliationEvidence,
+            self._get_payload("package_reconciliation_evidence", evidence_id),
+        )
+
+    def list_package_reconciliation_evidence(
+        self,
+    ) -> tuple[PackageReconciliationEvidence, ...]:
+        return tuple(
+            _load_dataclass(PackageReconciliationEvidence, payload)
+            for payload in self._list_payloads("package_reconciliation_evidence")
+        )
 
     def save_admin_execution(self, result: AdminExecutionResult) -> None:
         self._connection.execute(

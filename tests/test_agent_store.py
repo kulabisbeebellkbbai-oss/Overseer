@@ -556,6 +556,7 @@ def test_existing_integer_schema_migration_rows_and_indexes_are_preserved(tmp_pa
             2,
             3,
             10,
+            CURRENT_SCHEMA_VERSION,
             "agent_driver_v1",
             "agent_driver_v2",
             "agent_driver_v3",

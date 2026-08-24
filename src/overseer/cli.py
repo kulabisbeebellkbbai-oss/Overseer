@@ -9755,10 +9755,9 @@ def _claim_cleanup_candidate_for_store(store: SQLiteStore, claim_id: str, checke
 
 
 def _claim_cleanup_approval_level(item: dict[str, object]) -> ApprovalLevel:
-    if item["approval_required"]:
-        return ApprovalLevel.SISKO
-    if item["cleanup_action"] in {"review_blocked_claim", "re_evaluate_stale_queue"}:
-        return ApprovalLevel.ROLE
+    # Cleanup mutates an existing claim's lifecycle and is administratively
+    # approved by Sisko. ROLE approval is reserved for the exact still-
+    # requested Claim, whose approval can create its activation continuation.
     return ApprovalLevel.SISKO
 
 

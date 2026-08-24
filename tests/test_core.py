@@ -12830,6 +12830,7 @@ class RuntimeTests(unittest.TestCase):
                 "sisko",
                 now="2026-07-18T20:30:00+00:00",
             )
+            self.assertEqual(requested["approval_level"], ApprovalLevel.SISKO.value)
             with self.assertRaises(ValueError):
                 execute_claim_cleanup_status(store_path, requested["approval_id"], "sisko")
             approve_claim_cleanup_status(
@@ -12930,6 +12931,7 @@ class RuntimeTests(unittest.TestCase):
                 "dax",
                 now="2026-07-18T20:45:00+00:00",
             )
+            self.assertEqual(blocked_requested["approval_level"], ApprovalLevel.SISKO.value)
             approve_claim_cleanup_status(
                 store_path,
                 blocked_requested["approval_id"],

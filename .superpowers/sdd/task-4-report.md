@@ -140,3 +140,48 @@ PYTHONPATH=src pytest -q
 
 - Scheduler execution/adapters/repair orchestration remain Task 5 scope and
   were intentionally not implemented here.
+
+## Re-review race correction
+
+The remaining Important finding was that `save_collection_job(job, state=None)`
+read scheduler state before acquiring the writer transaction, allowing a
+configuration save to overwrite a lease claimed by another connection.
+
+### RED
+
+The new deterministic two-connection regression was added first:
+
+```text
+PYTHONPATH=src pytest -q tests/test_collection_store.py::test_configuration_save_cannot_erase_concurrent_claim_lease
+```
+
+Result: failed with
+`AttributeError: 'SQLiteStore' object has no attribute '_load_collection_job_state_for_configuration'`.
+The missing helper represented the not-yet-implemented transaction-scoped
+state-preservation boundary.
+
+### GREEN
+
+The fix moves the state read into `BEGIN IMMEDIATE` and makes the
+`state=None` path insert-only: an existing state, including an active lease and
+generation, is never rewritten. Explicit state continues to use the existing
+state-update path. The regression pauses the in-transaction snapshot with
+events, verifies the second connection cannot acquire the writer transaction,
+then confirms its claim is excluded and the original generation-1 lease is
+preserved.
+
+```text
+PYTHONPATH=src pytest -q tests/test_collection_store.py::test_configuration_save_cannot_erase_concurrent_claim_lease
+1 passed in 0.77s
+
+PYTHONPATH=src pytest -q tests/test_collection_store.py tests/test_agent_store.py tests/test_roadex_approval_fixture.py tests/test_package_reconciliation.py tests/test_collection_policy.py
+135 passed in 4.25s
+
+PYTHONPATH=src python3 -m compileall -q src/overseer
+passed
+
+git diff --check
+passed
+```
+
+Fix commit: `44cab95` (`Preserve collection leases during configuration saves`).

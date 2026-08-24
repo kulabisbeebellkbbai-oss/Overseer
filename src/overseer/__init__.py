@@ -112,6 +112,28 @@ from .codex_projects import (
 )
 from .claim_continuation import ClaimActivationGroup, ClaimActivationGroupState
 from .agent_adapters.codex import CodexDriver, codex_adapter_factory
+from .collection_models import (
+    CircuitState,
+    CollectionJob,
+    CollectionJobKind,
+    CollectionJobState,
+    CollectionOutcome,
+    CollectionRequest,
+    CollectionRun,
+    RepairAttempt,
+    RepairPolicy,
+    RepairRunbook,
+    TriageIncident,
+)
+from .collection_policy import (
+    circuit_after_failure,
+    circuit_after_success,
+    deterministic_jitter,
+    job_is_due,
+    next_failure_delay,
+    next_failure_due,
+    next_success_due,
+)
 from .core import (
     ApprovalLevel,
     Claim,
@@ -294,6 +316,24 @@ __all__ = [
     "ProviderHealthObservation",
     "ProviderHealthState",
     "PrimaryDriver",
+    "CollectionJobKind",
+    "CollectionOutcome",
+    "CircuitState",
+    "RepairPolicy",
+    "CollectionJob",
+    "CollectionJobState",
+    "CollectionRequest",
+    "CollectionRun",
+    "TriageIncident",
+    "RepairRunbook",
+    "RepairAttempt",
+    "deterministic_jitter",
+    "next_success_due",
+    "next_failure_delay",
+    "next_failure_due",
+    "circuit_after_failure",
+    "circuit_after_success",
+    "job_is_due",
     "DryRunExecutor",
     "ExecutionMode",
     "ExecutionRequest",

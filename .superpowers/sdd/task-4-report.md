@@ -6,6 +6,8 @@
 - Base SHA: `c33de207e68e0fcdb666b8e6ba05b1b219cd04b9`
 - Implementation SHA: `078aa3a0d6f06646df1c421f3a3d582ee8d278c7`
 - Implementation commit: `Persist collection schedules and leases`
+- Review-fix SHA: `d07ecda`
+- Review-fix commit: `Fix collection persistence review findings`
 - Task 5 was not modified.
 - `collection_models.py` and `collection_policy.py` contracts were not changed.
 
@@ -32,6 +34,44 @@ PYTHONPATH=src pytest -q tests/test_collection_store.py
 ```
 
 Result: `11 passed`.
+
+## Independent review correction evidence
+
+The independent review returned CHANGES_REQUIRED for four areas: mutable job
+identity bindings, inconsistent incident generations, incomplete nested
+transaction rollback, and name-only scheduler-index validation/repair. New
+regressions were added before implementation.
+
+### Review RED
+
+```text
+PYTHONPATH=src pytest -q tests/test_collection_store.py
+11 failed, 12 passed
+```
+
+The failures covered all four identity fields, duplicate open incident
+generations, outer catch-and-commit partial-run leakage, and malformed
+same-named indexes.
+
+### Review GREEN
+
+```text
+PYTHONPATH=src pytest -q tests/test_collection_store.py
+25 passed
+```
+
+The fix makes saved job identity `(kind, owner_domain, resource_id,
+target_id)` immutable while leaving scheduling/policy fields tunable. Incident
+generation allocation is job-wide, legacy duplicate open generations are
+resolved without deleting incident history before the unique index is rebuilt,
+and collisions become bounded `ValueError`s. Nested `agent_transaction`
+scopes now use SQLite savepoints, so caught completion failures leave no run,
+state, request, or incident partials. `_schema_is_current` validates unique,
+partial, column, and sort semantics; repair drops/recreates every critical
+same-named index transactionally.
+
+The added v11 fixture preserves package evidence and ordered history `[3, 11,
+12]` while installing v12 scheduler persistence.
 
 ## Persistence and migration details
 
@@ -79,8 +119,8 @@ with a savepoint; injected migration failure rolls back the scheduler tables.
 ## Verification results
 
 ```text
-PYTHONPATH=src pytest -q tests/test_collection_store.py tests/test_agent_store.py tests/test_roadex_approval_fixture.py tests/test_package_reconciliation.py
-87 passed in 2.75s
+PYTHONPATH=src pytest -q tests/test_collection_store.py tests/test_agent_store.py tests/test_roadex_approval_fixture.py tests/test_package_reconciliation.py tests/test_collection_policy.py
+134 passed in 3.60s
 
 PYTHONPATH=src python3 -m compileall -q src/overseer
 passed
@@ -89,15 +129,14 @@ git diff --check
 passed
 ```
 
-The full repository run reached `2066 passed, 31 skipped`; 21 unrelated
-legacy-attestation tests failed because their source-lineage guard requires a
-clean `src` tree while this implementation worktree was intentionally dirty.
-Those failures are outside Task 4 and did not occur in the requested or
-relevant migration suites.
+Post-fix clean worktree full run:
+
+```text
+PYTHONPATH=src pytest -q
+2101 passed, 31 skipped in 408.61s (0:06:48)
+```
 
 ## Residual concerns
 
-- The existing repository-wide legacy-attestation suite must be rerun from a
-  clean committed checkout if full-suite green status is required.
 - Scheduler execution/adapters/repair orchestration remain Task 5 scope and
   were intentionally not implemented here.

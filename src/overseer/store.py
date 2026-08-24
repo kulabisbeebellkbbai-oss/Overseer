@@ -3266,19 +3266,17 @@ class SQLiteStore:
 
     def save_package_inspection_record(self, record: PackageInspectionRecord) -> None:
         payload = _dump(record)
-        existing = self._connection.execute(
-            "SELECT payload FROM package_inspection_records WHERE id = ?",
-            (record.id,),
-        ).fetchone()
-        if existing is not None:
-            if str(existing["payload"]) != payload:
-                raise ValueError("immutable package inspection collision")
-            return
-        self._connection.execute(
-            "INSERT INTO package_inspection_records (id, payload) VALUES (?, ?)",
-            (record.id, payload),
+        self._save_immutable_payload(
+            table="package_inspection_records",
+            record_id=record.id,
+            payload=payload,
+            insert_sql=(
+                "INSERT INTO package_inspection_records (id, payload) "
+                "VALUES (?, ?)"
+            ),
+            insert_values=(record.id, payload),
+            collision_message="immutable package inspection collision",
         )
-        self._commit_agent_mutation()
 
     def load_package_inspection_record(self, record_id: str) -> PackageInspectionRecord:
         return _load_dataclass(
@@ -3296,22 +3294,23 @@ class SQLiteStore:
         self, evidence: PackageReconciliationEvidence
     ) -> None:
         payload = _dump(evidence)
-        existing = self._connection.execute(
-            "SELECT payload FROM package_reconciliation_evidence WHERE id = ?",
-            (evidence.id,),
-        ).fetchone()
-        if existing is not None:
-            if str(existing["payload"]) != payload:
-                raise ValueError(
-                    "immutable package reconciliation evidence collision"
-                )
-            return
-        self._connection.execute(
-            "INSERT INTO package_reconciliation_evidence "
-            "(id, snapshot_id, maintenance_batch_id, payload) VALUES (?, ?, ?, ?)",
-            (evidence.id, evidence.snapshot_id, evidence.maintenance_batch_id, payload),
+        self._save_immutable_payload(
+            table="package_reconciliation_evidence",
+            record_id=evidence.id,
+            payload=payload,
+            insert_sql=(
+                "INSERT INTO package_reconciliation_evidence "
+                "(id, snapshot_id, maintenance_batch_id, payload) "
+                "VALUES (?, ?, ?, ?)"
+            ),
+            insert_values=(
+                evidence.id,
+                evidence.snapshot_id,
+                evidence.maintenance_batch_id,
+                payload,
+            ),
+            collision_message="immutable package reconciliation evidence collision",
         )
-        self._commit_agent_mutation()
 
     def load_package_reconciliation_evidence(
         self, evidence_id: str
@@ -3328,6 +3327,36 @@ class SQLiteStore:
             _load_dataclass(PackageReconciliationEvidence, payload)
             for payload in self._list_payloads("package_reconciliation_evidence")
         )
+
+    def _save_immutable_payload(
+        self,
+        *,
+        table: str,
+        record_id: str,
+        payload: str,
+        insert_sql: str,
+        insert_values: tuple[Any, ...],
+        collision_message: str,
+    ) -> None:
+        with self.agent_transaction():
+            existing = self._connection.execute(
+                f"SELECT payload FROM {table} WHERE id = ?",
+                (record_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload"]) != payload:
+                    raise ValueError(collision_message)
+                return
+            try:
+                self._connection.execute(insert_sql, insert_values)
+            except sqlite3.IntegrityError as error:
+                existing = self._connection.execute(
+                    f"SELECT payload FROM {table} WHERE id = ?",
+                    (record_id,),
+                ).fetchone()
+                if existing is not None and str(existing["payload"]) == payload:
+                    return
+                raise ValueError(collision_message) from error
 
     def save_admin_execution(self, result: AdminExecutionResult) -> None:
         self._connection.execute(

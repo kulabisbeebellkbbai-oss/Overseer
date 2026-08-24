@@ -28,7 +28,7 @@ from .roadex_approval_fixture import (
 
 from .codex_usage import CodexUsageTracker
 from .audit import ApprovalStatus
-from .core import ClaimStatus
+from .core import ApprovalLevel, ClaimStatus
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, sign_peer_response, verify_peer_request, MAX_BODY_BYTES
 from .store import SQLiteStore
 from .claim_continuation import (
@@ -1708,9 +1708,16 @@ def _activate_bound_decision_claim(store_path: str, request: dict[str, Any], dec
     try:
         claim = store.load_claim(claim_id)
         approval = store.load_approval(approval_id)
+        if approval.id != approval_id:
+            raise ValueError("decision resource claim approval id does not bind to the claim")
         if approval.subject_id != claim_id:
             raise ValueError("decision resource claim approval does not bind to the claim")
+        if approval.approval_level != ApprovalLevel.ROLE:
+            raise ValueError("decision resource claim approval level is not ROLE")
+        if approval.owner_domain != claim.owner_role:
+            raise ValueError("decision resource claim approval owner domain does not match claim owner role")
         approval_status = approval.status
+        approval_decided_by = approval.decided_by
         claim_status = claim.status
     finally:
         store.close()
@@ -1720,6 +1727,8 @@ def _activate_bound_decision_claim(store_path: str, request: dict[str, Any], dec
         )
     if approval_status != ApprovalStatus.APPROVED:
         raise ValueError("decision resource claim approval is not active")
+    if approval_decided_by != claim.owner_role.value:
+        raise ValueError("decision resource claim approval actor does not match claim owner role")
     if claim_status == ClaimStatus.REQUESTED:
         activate_claim_status(store_path, claim_id, approval_id)
     elif claim_status != ClaimStatus.ACTIVE:

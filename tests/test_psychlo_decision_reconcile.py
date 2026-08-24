@@ -8,12 +8,13 @@ import hashlib
 import json
 import socket
 import threading
+from dataclasses import replace
 
 import pytest
 
 from overseer.api import _decide_roadex_human, make_api_handler
 from overseer.cli import approve_claim_status, request_claim_status
-from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
+from overseer.core import ApprovalLevel, OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.psychlo_bridge import PsychloBridge, PsychloBridgeStore, sign_peer_message, verify_peer_response
 from overseer.store import SQLiteStore
 
@@ -125,6 +126,62 @@ def test_api_approves_and_activates_the_exact_structurally_bound_claim_before_de
     )
     assert replay["mutation_performed"] is False
     assert len(forwarded) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("approval_level", ApprovalLevel.HUMAN, "approval level is not ROLE"),
+        ("owner_domain", OwnerDomain.SISKO, "approval owner domain does not match claim owner role"),
+        ("decided_by", OwnerDomain.SISKO.value, "approval actor does not match claim owner role"),
+    ],
+)
+def test_bound_role_approval_identity_mismatch_cannot_activate_or_deliver_human_decision(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    primary_path = tmp_path / "primary.sqlite3"
+    resource_id = "resource.loopback.ephemeral.arcade.task7"
+    claim_id = "claim.arcade.task7.loopback.bound"
+    store = SQLiteStore(primary_path)
+    store.save_resource(Resource(id=resource_id, name="Arcade loopback", type=ResourceType.VIRTUAL_ASSET, owner_domain=OwnerDomain.DAX, risk_level=RiskLevel.LOW))
+    store.close()
+    requested = request_claim_status(
+        primary_path, claim_id, resource_id, "lease", "thread-arcade", "dax",
+        "one smoke test", "bind loopback", "low",
+        activation_group_id="group.claim.arcade.task7.loopback.bound",
+        lifecycle_id="lifecycle.arcade.task7",
+    )
+    approve_claim_status(primary_path, requested["approval_id"], OwnerDomain.DAX.value)
+
+    store = SQLiteStore(primary_path)
+    try:
+        approval = store.load_approval(requested["approval_id"])
+        store.save_approval(replace(approval, **{field: replacement}))
+    finally:
+        store.close()
+
+    bridge, forwarded = _bridge(tmp_path)
+    request = {**_request(), "resourceClaimId": claim_id}
+    bridge.stage_decision(request)
+
+    with pytest.raises(ValueError, match=message):
+        _decide_roadex_human(
+            str(primary_path),
+            {"plan_id": request["decisionId"], "decision": "approve", "decided_by": "human-user", "reason": "Approved exact claim."},
+            None,
+            bridge,
+        )
+
+    store = SQLiteStore(primary_path)
+    try:
+        assert store.load_claim(claim_id).status.value == "requested"
+    finally:
+        store.close()
+    assert forwarded == []
+    assert bridge.store.decision_record(request["decisionId"])["status"] == "pending"
 
 
 def test_reconcile_decision_returns_exact_pending_identity(tmp_path: Path) -> None:

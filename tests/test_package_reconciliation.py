@@ -262,3 +262,41 @@ def test_schema_v11_repairs_missing_package_tables_and_preserves_history_and_dat
             for row in store.list_schema_migrations()
             if isinstance(row.version, int)
         ) == CURRENT_SCHEMA_VERSION
+
+
+def test_package_evidence_migration_advances_from_schema_v10(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path) as store:
+        store._connection.execute(
+            "INSERT INTO resources(id, payload) VALUES (?, ?)",
+            ("resource.preserved", '{"preserved":true}'),
+        )
+        store._connection.execute("DELETE FROM schema_migrations")
+        store._connection.execute(
+            "INSERT INTO schema_migrations(version, description, applied_at) "
+            "VALUES (?, ?, ?)",
+            (10, "schema v10", "2026-08-24T00:00:00Z"),
+        )
+        store._connection.commit()
+
+    with SQLiteStore(path) as store:
+        tables = {
+            row[0]
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {
+            "package_inspection_records",
+            "package_reconciliation_evidence",
+        } <= tables
+        assert store._connection.execute(
+            "SELECT payload FROM resources WHERE id=?", ("resource.preserved",)
+        ).fetchone()[0] == '{"preserved":true}'
+        integer_versions = [
+            row.version
+            for row in store.list_schema_migrations()
+            if isinstance(row.version, int)
+        ]
+        assert integer_versions[-2:] == [10, CURRENT_SCHEMA_VERSION]
+        assert CURRENT_SCHEMA_VERSION == 11

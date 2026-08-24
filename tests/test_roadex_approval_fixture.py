@@ -57,7 +57,7 @@ class RoadexApprovalFixtureTests(unittest.TestCase):
                     second_history = store.list_schema_migrations()
 
             self.assertEqual(first_history, second_history)
-            self.assertEqual([row.version for row in first_history[:3]], [1, 2, 10])
+            self.assertEqual([row.version for row in first_history[:4]], [1, 2, 3, 10])
 
     def test_fixture_schema_migration_rolls_back_ddl_and_history_then_retries(self):
         with tempfile.TemporaryDirectory() as directory:

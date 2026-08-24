@@ -4232,7 +4232,7 @@ class OverseerApiTests(unittest.TestCase):
                     "/claims/approve",
                     {
                         "approval_id": requested["approval_id"],
-                        "decided_by": "sisko",
+                        "decided_by": "dax",
                     },
                 )
                 activated = server.post(
@@ -5695,7 +5695,7 @@ class OverseerApiClientTests(unittest.TestCase):
                 approved = client.approve_claim(
                     {
                         "approval_id": requested["approval_id"],
-                        "decided_by": "sisko",
+                        "decided_by": "dax",
                     }
                 )
                 activated = client.activate_claim(
@@ -5753,7 +5753,7 @@ class OverseerApiClientTests(unittest.TestCase):
                 approved = client.approve_claim(
                     {
                         "approval_id": requested["approval_id"],
-                        "decided_by": "sisko",
+                        "decided_by": "dax",
                     }
                 )
                 client.activate_claim({"claim_id": requested["claim"], "approval_id": approved["approval_id"]})
@@ -7263,7 +7263,7 @@ class HostInspectionTests(unittest.TestCase):
         self.assertIn("Evaluate this proposed Overseer security change before enforcement.", fake_runner.inputs[3])
         self.assertEqual(
             fake_runner.commands[4],
-            ("/usr/bin/tmux", "paste-buffer", "-b", "overseer-dispatch", "-t", "codex-intrusion-detection-019f09da"),
+            ("/usr/bin/tmux", "paste-buffer", "-p", "-b", "overseer-dispatch", "-t", "codex-intrusion-detection-019f09da"),
         )
         self.assertEqual(fake_runner.commands[5], ("/usr/bin/tmux", "send-keys", "-t", "codex-intrusion-detection-019f09da", "Enter"))
         self.assertEqual(fake_runner.commands[6], fake_runner.commands[2])
@@ -11435,16 +11435,18 @@ class SQLiteStoreTests(unittest.TestCase):
             reopened_migrations = reopened.list_schema_migrations()
             reopened.close()
 
-        self.assertEqual(len(migrations), 10)
-        self.assertEqual(migrations[0].version, CURRENT_SCHEMA_VERSION)
-        self.assertEqual(migrations[0].description, "bootstrap JSON payload store")
-        self.assertEqual(migrations[1].version, "agent_driver_v1")
-        self.assertEqual(migrations[2].version, "agent_driver_v2")
-        self.assertEqual(migrations[3].version, "agent_driver_v3")
-        self.assertEqual(migrations[4].version, "agent_driver_v4")
-        self.assertEqual(migrations[5].version, "agent_driver_v5")
+        self.assertEqual(len(migrations), 11)
+        self.assertEqual(migrations[0].version, overseer_store_module.ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION)
+        self.assertEqual(migrations[0].description, "persist non-operational Roadex approval fixtures")
+        self.assertEqual(migrations[1].version, CURRENT_SCHEMA_VERSION)
+        self.assertEqual(migrations[1].description, "bootstrap JSON payload store")
+        self.assertEqual(migrations[2].version, "agent_driver_v1")
+        self.assertEqual(migrations[3].version, "agent_driver_v2")
+        self.assertEqual(migrations[4].version, "agent_driver_v3")
+        self.assertEqual(migrations[5].version, "agent_driver_v4")
+        self.assertEqual(migrations[6].version, "agent_driver_v5")
         self.assertEqual(
-            migrations[1].description,
+            migrations[2].description,
             "persist provider-neutral agent driver lifecycle records",
         )
         self.assertEqual(reopened_migrations, migrations)
@@ -12248,7 +12250,7 @@ class RuntimeTests(unittest.TestCase):
                 activation_group_id="group.claim.cli.first",
                 lifecycle_id="lifecycle.claim.cli.first",
             )
-            approval = approve_claim_status(store_path, first["approval_id"], "sisko")
+            approval = approve_claim_status(store_path, first["approval_id"], "dax")
             activated = activate_claim_status(store_path, first["claim"], approval["approval_id"])
             second = request_claim_status(
                 store_path,
@@ -13012,14 +13014,14 @@ class RuntimeTests(unittest.TestCase):
                 activation_group_id="group.claim.cli.state",
                 lifecycle_id="lifecycle.claim.cli.state",
             )
-            approve_claim_status(store_path, requested["approval_id"], "sisko")
+            approve_claim_status(store_path, requested["approval_id"], "dax")
 
             status = list_state_status(store_path)
 
             self.assertEqual(status["resources"][0]["id"], "proxy.state.cli")
             self.assertEqual(status["resources"][0]["name"], "State CLI Proxy")
             self.assertEqual(status["resources"][0]["identifiers"], {})
-            self.assertEqual(status["schema_migrations"][0]["version"], CURRENT_SCHEMA_VERSION)
+            self.assertEqual(status["schema_migrations"][0]["version"], overseer_store_module.ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION)
             self.assertEqual(status["claims"][0]["status"], ClaimStatus.REQUESTED.value)
             self.assertEqual(status["approvals"][0]["status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(status["audit_events"][0]["subject_id"], "claim.cli.state")
@@ -13215,7 +13217,7 @@ class RuntimeTests(unittest.TestCase):
                 activation_group_id="group.claim.cli.gateway",
                 lifecycle_id="lifecycle.claim.cli.gateway",
             )
-            approval = approve_claim_status(store_path, requested["approval_id"], "sisko")
+            approval = approve_claim_status(store_path, requested["approval_id"], "dax")
             activate_claim_status(store_path, requested["claim"], approval["approval_id"])
             released = release_claim_status(
                 store_path,

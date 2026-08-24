@@ -998,6 +998,7 @@ class SQLiteStore:
             has_schema_history = self._connection.execute(
                 "SELECT 1 FROM schema_migrations LIMIT 1"
             ).fetchone() is not None
+            self._migrate_roadex_approval_fixture_schema()
             if not has_schema_history:
                 self._record_schema_migration(
                     CURRENT_SCHEMA_VERSION,
@@ -1012,7 +1013,6 @@ class SQLiteStore:
                         CURRENT_SCHEMA_VERSION,
                         "index audit event type for responsive dashboard counts",
                     )
-            self._migrate_roadex_approval_fixture_schema()
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_schema_migrations (
@@ -1257,10 +1257,11 @@ class SQLiteStore:
                 )
                 """
             )
-            highest = self._connection.execute(
-                "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone()[0]
-            if highest is None or int(highest) < ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION:
+            recorded = self._connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = ?",
+                (ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION,),
+            ).fetchone()
+            if recorded is None:
                 self._record_schema_migration(
                     ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION,
                     "persist non-operational Roadex approval fixtures",

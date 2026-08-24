@@ -1715,8 +1715,10 @@ def _activate_bound_decision_claim(store_path: str, request: dict[str, Any], dec
     finally:
         store.close()
     if approval_status == ApprovalStatus.PENDING:
-        approve_claim_status(store_path, approval_id, decided_by)
-    elif approval_status != ApprovalStatus.APPROVED:
+        raise ValueError(
+            "bound role claim requires owner-domain approval before Roadex human decision"
+        )
+    if approval_status != ApprovalStatus.APPROVED:
         raise ValueError("decision resource claim approval is not active")
     if claim_status == ClaimStatus.REQUESTED:
         activate_claim_status(store_path, claim_id, approval_id)

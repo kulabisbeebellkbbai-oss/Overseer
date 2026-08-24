@@ -11,6 +11,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -31,7 +32,7 @@ def _spec() -> CodexDispatchActivationSpec:
     source_commit = "a" * 40
     source_tree = "b" * 40
     source_module = "c" * 64
-    bootstrap_binding = {**activation._bootstrap_binding(), "sourceCommit": source_commit, "sourceTree": source_tree}
+    bootstrap_binding = {**_fixture_bootstrap_binding(), "sourceCommit": source_commit, "sourceTree": source_tree}
     return CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA,
         source_commit,
@@ -46,6 +47,12 @@ def _spec() -> CodexDispatchActivationSpec:
         launcher_size=int(bootstrap_binding["launcherSize"]),
         source_files=activation._reviewed_source_files(),
     )
+
+
+def _fixture_bootstrap_binding(source_commit: str | None = None, source_tree: str | None = None) -> dict[str, object]:
+    common_git_dir = Path(activation._git(("rev-parse", "--git-common-dir"))).resolve()
+    with patch.object(activation, "CANONICAL_SOURCE_ROOT", common_git_dir.parent):
+        return activation._bootstrap_binding(source_commit, source_tree)
 
 
 def _plan() -> object:
@@ -150,7 +157,7 @@ def test_bootstrap_rejects_unrelated_or_arbitrary_self_consistent_blob_before_ex
     head = activation._git(("rev-parse", "HEAD"))
     tree = activation._git(("rev-parse", "HEAD^{tree}"))
     spec = replace(_spec(), source_commit=head, source_tree_digest=tree,
-                   bootstrap_binding=activation._bootstrap_binding(head, tree))
+                   bootstrap_binding=_fixture_bootstrap_binding(head, tree))
     command = list(activation._isolated_launcher_command(spec, "probe", ()))
     config = json.loads(command[5])
     unrelated = subprocess.check_output(
@@ -181,7 +188,7 @@ def test_service_bootstrap_rejects_approved_manager_drift_before_launcher_import
     head = activation._git(("rev-parse", "HEAD"))
     tree = activation._git(("rev-parse", "HEAD^{tree}"))
     spec = replace(_spec(), source_commit=head, source_tree_digest=tree,
-                   bootstrap_binding=activation._bootstrap_binding(head, tree))
+                   bootstrap_binding=_fixture_bootstrap_binding(head, tree))
     drifted = {**spec.bus_peer_binding, "startTicks": int(spec.bus_peer_binding["startTicks"]) + 1}
     spec = replace(spec, bus_peer_binding=drifted)
     payload = (
@@ -360,7 +367,7 @@ def _isolated_probe_fixture(tmp_path: Path) -> tuple[Path, list[str]]:
     review = activation._review_digest(commit, tree, module, inventory)
     site_packages = activation.SERVICE_SITE_PACKAGES
     dependency = activation._dependency_digest(site_packages)
-    bootstrap_binding = {**activation._bootstrap_binding(), "sourceCommit": commit, "sourceTree": tree}
+    bootstrap_binding = {**_fixture_bootstrap_binding(), "sourceCommit": commit, "sourceTree": tree}
     spec = CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA, commit, tree, module, review, dependency, source_files=inventory,
         bootstrap_binding=bootstrap_binding,
@@ -433,7 +440,7 @@ def test_isolated_launcher_rejects_dependency_injection_before_import(tmp_path: 
             ("git", "-C", str(source_root), "ls-files", "--", "src"), text=True,
         ).splitlines() if item.endswith(activation.SOURCE_EXECUTABLE_SUFFIXES)
     ))
-    bootstrap_binding = {**activation._bootstrap_binding(),
+    bootstrap_binding = {**_fixture_bootstrap_binding(),
          "sourceCommit": arguments[arguments.index("--source-commit") + 1],
          "sourceTree": arguments[arguments.index("--source-tree") + 1]}
     spec = CodexDispatchActivationSpec(
@@ -929,8 +936,7 @@ def test_same_euid_fake_user_bus_peer_is_rejected():
 
 
 def test_live_staged_spec_captures_exact_current_user_manager_identity():
-    binding = _spec().bus_peer_binding
-    assert binding["peerPid"] == 1329
+    binding = activation._capture_user_bus_peer_binding()
     assert binding["peerUid"] == os.geteuid()
     assert binding["peerGid"] == os.getegid()
     assert binding["ppid"] == 1

@@ -12,7 +12,7 @@ import threading
 import pytest
 
 from overseer.api import _decide_roadex_human, make_api_handler
-from overseer.cli import request_claim_status
+from overseer.cli import approve_claim_status, request_claim_status
 from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.psychlo_bridge import PsychloBridge, PsychloBridgeStore, sign_peer_message, verify_peer_response
 from overseer.store import SQLiteStore
@@ -92,6 +92,15 @@ def test_api_approves_and_activates_the_exact_structurally_bound_claim_before_de
     request = {**_request(), "resourceClaimId": claim_id}
     bridge.stage_decision(request)
 
+    with pytest.raises(ValueError, match="owner-domain approval"):
+        _decide_roadex_human(
+            str(primary_path),
+            {"plan_id": request["decisionId"], "decision": "approve", "decided_by": "human-user", "reason": "Approved exact claim."},
+            None,
+            bridge,
+        )
+
+    approve_claim_status(primary_path, requested["approval_id"], OwnerDomain.DAX.value)
     result = _decide_roadex_human(
         str(primary_path),
         {"plan_id": request["decisionId"], "decision": "approve", "decided_by": "human-user", "reason": "Approved exact claim."},

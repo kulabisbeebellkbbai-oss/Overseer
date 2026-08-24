@@ -209,7 +209,7 @@ def test_legacy_facade_submits_whitespace_prompt_with_exact_tmux_sequence(
         ),
         ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
         ("/tmp/tmux", "load-buffer", "-b", "overseer-dispatch", "-"),
-        ("/tmp/tmux", "paste-buffer", "-b", "overseer-dispatch", "-t", "example"),
+        ("/tmp/tmux", "paste-buffer", "-p", "-b", "overseer-dispatch", "-t", "example"),
         ("/tmp/tmux", "send-keys", "-t", "example", "Enter"),
         ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
     ]

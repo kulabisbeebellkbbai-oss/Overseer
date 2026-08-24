@@ -199,7 +199,7 @@ def test_current_legacy_schema_recreates_claim_continuation_tables_on_reopen(tmp
             row.version for row in store.list_schema_migrations()
             if isinstance(row.version, int)
         ]
-        assert integer_versions == [4, CURRENT_SCHEMA_VERSION]
+        assert integer_versions == [3, 4, CURRENT_SCHEMA_VERSION]
 
 
 def test_dispatch_payload_excludes_raw_prompt_transcript(tmp_path: Path) -> None:
@@ -554,6 +554,7 @@ def test_existing_integer_schema_migration_rows_and_indexes_are_preserved(tmp_pa
         assert [row.version for row in store.list_schema_migrations()] == [
             1,
             2,
+            3,
             10,
             "agent_driver_v1",
             "agent_driver_v2",
@@ -600,6 +601,7 @@ def test_agent_migration_rolls_back_cleanly_and_retries(tmp_path: Path) -> None:
 
     with OverseerStore(path) as store:
         assert [row.version for row in store.list_schema_migrations()] == [
+            3,
             CURRENT_SCHEMA_VERSION,
             "agent_driver_v1",
             "agent_driver_v2",

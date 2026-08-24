@@ -293,6 +293,8 @@ SAFE_POST_PAYLOADS = {
         "intent": "exercise disposable UI workflow",
         "requested_action": "observe test resource",
         "risk_level": "low",
+        "activation_group_id": "group.claim.ui.full",
+        "lifecycle_id": "lifecycle.ui.full",
     },
     "/usage-limits": {
         "limit_id": "limit.ui.full",

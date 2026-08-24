@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 import json
+import sqlite3
 import subprocess
 from types import SimpleNamespace
 from dataclasses import replace
@@ -19,6 +20,7 @@ import overseer.admin as overseer_admin
 import overseer.cli as overseer_cli
 import overseer.documents as overseer_documents
 import overseer.knowledge as overseer_knowledge
+import overseer.store as overseer_store_module
 from overseer import (
     ApprovalLevel,
     ApprovalRequest,
@@ -2984,6 +2986,478 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertIn("health_efficiency", status["summaries"])
         self.assertIn("role_focus", compact_status)
         self.assertNotIn("summaries", compact_status)
+
+    def test_alert_count_uses_indexed_exact_event_type(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.z-alert",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="security.dashboard",
+                    summary="current alert",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            alert_count = store.count_audit_events(event_type=AuditEventType.ALERT)
+            plan = store._connection.execute(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM audit_events "
+                "WHERE event_type = ?",
+                (AuditEventType.ALERT.value,),
+            ).fetchall()
+            plan_details = " ".join(str(row["detail"]) for row in plan)
+            store.close()
+
+        self.assertEqual(alert_count, 1)
+        self.assertIn("idx_audit_events_event_type_v4", plan_details)
+
+    def test_audit_normalization_triggers_reject_missing_type(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            payload = (
+                '{"id":"audit.raw","event_type":"alert","owner_domain":"odo",'
+                '"subject_id":"security.dashboard","summary":"raw alert",'
+                '"risk_level":"high","evidence_ids":[],"occurred_at":null}'
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                store._connection.execute(
+                    "INSERT INTO audit_events (id, subject_id, payload) "
+                    "VALUES (?, ?, ?)",
+                    ("audit.raw", "security.dashboard", payload),
+                )
+            invalid_payloads = (
+                (payload.replace('"event_type":"alert"', '"event_type":"bogus"'), "bogus"),
+                (payload.replace('"owner_domain":"odo"', '"owner_domain":"bogus"'), "alert"),
+                (payload.replace('"risk_level":"high"', '"risk_level":"bogus"'), "alert"),
+            )
+            for index, (invalid_payload, normalized_type) in enumerate(
+                invalid_payloads
+            ):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store._connection.execute(
+                        "INSERT INTO audit_events "
+                        "(id, subject_id, payload, event_type) VALUES (?, ?, ?, ?)",
+                        (
+                            f"audit.invalid-enum-{index}",
+                            "security.dashboard",
+                            invalid_payload.replace(
+                                '"id":"audit.raw"',
+                                f'"id":"audit.invalid-enum-{index}"',
+                            ),
+                            normalized_type,
+                        ),
+                    )
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.normalized",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="security.dashboard",
+                    summary="normalized alert",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                store._connection.execute(
+                    "UPDATE audit_events SET event_type=NULL WHERE id=?",
+                    ("audit.normalized",),
+                )
+            store.close()
+
+    def test_audit_backfill_cas_preserves_concurrent_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.cas",
+                    event_type=AuditEventType.ALLOWED,
+                    owner_domain=OwnerDomain.SISKO,
+                    subject_id="dashboard.allowed",
+                    summary="old payload",
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store._connection.execute(
+                "DROP TRIGGER audit_events_validate_normalized_insert"
+            )
+            store._connection.execute(
+                "DROP TRIGGER audit_events_validate_normalized_update"
+            )
+            store._connection.execute("DROP INDEX idx_audit_events_event_type_v4")
+            store._connection.execute(
+                "UPDATE audit_events SET event_type=NULL WHERE id='audit.cas'"
+            )
+            store._connection.commit()
+            store.close()
+
+            replacement = (
+                '{"id":"audit.cas","event_type":"alert","owner_domain":"odo",'
+                '"subject_id":"security.dashboard","summary":"new payload",'
+                '"risk_level":"high","evidence_ids":[],"occurred_at":null}'
+            )
+            original_validator = overseer_store_module._validated_audit_event_type
+            replaced = False
+
+            def validate_with_replacement(payload: str) -> str | None:
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    with contextlib.closing(
+                        sqlite3.connect(store_path)
+                    ) as connection, connection:
+                        connection.execute(
+                            "UPDATE audit_events SET payload=?, event_type='alert' "
+                            "WHERE id='audit.cas'",
+                            (replacement,),
+                        )
+                return original_validator(payload)
+
+            with patch.object(
+                overseer_store_module,
+                "_validated_audit_event_type",
+                side_effect=validate_with_replacement,
+            ):
+                reopened = SQLiteStore(store_path)
+            alert_count = reopened.count_audit_events(
+                event_type=AuditEventType.ALERT
+            )
+            event = reopened.list_audit_events(valid_only=True)[0]
+            reopened.close()
+
+        self.assertTrue(replaced)
+        self.assertEqual(alert_count, 1)
+        self.assertEqual(event.summary, "new payload")
+
+    def test_compact_dashboard_counts_alert_beyond_audit_display_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            for index in range(2000):
+                store.save_audit_event(
+                    AuditEvent(
+                        id=f"audit.a-{index:04d}",
+                        event_type=AuditEventType.ALLOWED,
+                        owner_domain=OwnerDomain.SISKO,
+                        subject_id="dashboard.allowed",
+                        summary="allowed dashboard event",
+                        risk_level=RiskLevel.LOW,
+                    )
+                )
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.z-current-alert",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="security.dashboard",
+                    summary="current dashboard alert",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            store.close()
+
+            status = operator_dashboard_status(store_path, include_summaries=False)
+
+        self.assertEqual(status["attention"]["security_alerts"], 1)
+        self.assertEqual(status["role_focus"]["odo"]["alerts"], 1)
+
+    def test_alert_index_migration_tolerates_malformed_historical_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store._connection.execute("DROP INDEX idx_audit_events_event_type_v4")
+            store._connection.execute(
+                "DROP TRIGGER audit_events_validate_normalized_insert"
+            )
+            store._connection.execute(
+                "DROP TRIGGER audit_events_validate_normalized_update"
+            )
+            store._connection.executemany(
+                "INSERT INTO audit_events (id, subject_id, payload) VALUES (?, ?, ?)",
+                (
+                    ("audit.malformed", "security.dashboard", "{malformed"),
+                    ("audit.empty", "security.dashboard", "{}"),
+                    ("audit.null", "security.dashboard", "null"),
+                    (
+                        "",
+                        "security.dashboard",
+                        '{"id":"","event_type":"alert","owner_domain":"odo",'
+                        '"subject_id":"security.dashboard","summary":"empty id",'
+                        '"risk_level":"high","evidence_ids":[],"occurred_at":null}',
+                    ),
+                    (
+                        "audit.deep",
+                        "security.dashboard",
+                        "[" * 10000 + "]" * 10000,
+                    ),
+                    (
+                        "audit.invalid-type",
+                        "security.dashboard",
+                        '{"id":7,"event_type":"alert","owner_domain":"odo",'
+                        '"subject_id":"security.dashboard","summary":"bad type",'
+                        '"risk_level":"high","evidence_ids":[],"occurred_at":null}',
+                    ),
+                    (
+                        "audit.duplicate",
+                        "security.dashboard",
+                        '{"id":"audit.duplicate","event_type":"allowed",'
+                        '"event_type":"alert","owner_domain":"odo",'
+                        '"subject_id":"security.dashboard","summary":"duplicate key",'
+                        '"risk_level":"high","evidence_ids":[],"occurred_at":null}',
+                    ),
+                ),
+            )
+            store._connection.execute(
+                "UPDATE audit_events SET event_type='alert' "
+                "WHERE id='audit.invalid-type'"
+            )
+            store._connection.commit()
+            store.close()
+
+            reopened = SQLiteStore(store_path)
+            alert_count = reopened.count_audit_events(
+                event_type=AuditEventType.ALERT
+            )
+            index = reopened._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+                ("idx_audit_events_event_type_v4",),
+            ).fetchone()
+            reopened.close()
+            status = operator_dashboard_status(store_path, include_summaries=False)
+
+        self.assertEqual(alert_count, 1)
+        self.assertIsNotNone(index)
+        self.assertEqual(status["attention"]["security_alerts"], 1)
+
+    def test_alert_index_retry_clears_stale_type_on_malformed_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store._connection.execute(
+                "DROP TRIGGER audit_events_validate_normalized_insert"
+            )
+            store._connection.execute(
+                "DROP TRIGGER audit_events_validate_normalized_update"
+            )
+            store._connection.execute(
+                "INSERT INTO audit_events (id, subject_id, payload, event_type) "
+                "VALUES (?, ?, ?, ?)",
+                ("audit.stale-malformed", "security.dashboard", "{malformed", "alert"),
+            )
+            store._connection.execute(
+                "UPDATE audit_event_normalization_state "
+                "SET generation=9, state='backfilling' WHERE id=1"
+            )
+            store._connection.commit()
+            store.close()
+
+            reopened = SQLiteStore(store_path)
+            row = reopened._connection.execute(
+                "SELECT event_type FROM audit_events WHERE id=?",
+                ("audit.stale-malformed",),
+            ).fetchone()
+            alert_count = reopened.count_audit_events(
+                event_type=AuditEventType.ALERT
+            )
+            reopened.close()
+
+        self.assertIsNone(row["event_type"])
+        self.assertEqual(alert_count, 0)
+
+    def test_audit_indexed_reads_fail_closed_while_backfill_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.partial",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="security.dashboard",
+                    summary="partial backfill",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            store._connection.execute(
+                "UPDATE audit_event_normalization_state "
+                "SET state='backfilling' WHERE id=1"
+            )
+            store._connection.commit()
+
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "audit event normalization is incomplete",
+            ):
+                store.count_audit_events(event_type=AuditEventType.ALERT)
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "audit event normalization is incomplete",
+            ):
+                store.list_audit_events(valid_only=True)
+            store.close()
+
+    def test_alert_index_upgrade_uses_new_safe_index_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.reconcile-alert",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="security.dashboard",
+                    summary="reconcile normalized type",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            store._connection.execute("DROP INDEX idx_audit_events_event_type_v4")
+            store._connection.execute(
+                "DROP TRIGGER audit_events_validate_normalized_insert"
+            )
+            store._connection.execute(
+                "DROP TRIGGER audit_events_validate_normalized_update"
+            )
+            store._connection.execute(
+                "UPDATE audit_events SET event_type='allowed' "
+                "WHERE id='audit.reconcile-alert'"
+            )
+            store._connection.execute("DELETE FROM schema_migrations")
+            store._connection.execute(
+                "INSERT INTO schema_migrations (version, description, applied_at) "
+                "VALUES (9, 'partial normalized audit migration', "
+                "'2026-08-24T00:00:00+00:00')"
+            )
+            store._connection.execute(
+                "CREATE INDEX idx_audit_events_event_type ON audit_events "
+                "(json_extract(payload, '$.event_type'))"
+            )
+            store._connection.execute(
+                "CREATE INDEX idx_audit_events_event_type_v3 ON audit_events "
+                "(length(payload))"
+            )
+            store._connection.execute(
+                "CREATE INDEX idx_audit_events_event_type_v4 ON audit_events "
+                "(length(payload))"
+            )
+            store._connection.commit()
+            store.close()
+
+            reopened = SQLiteStore(store_path)
+            plan = reopened._connection.execute(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM audit_events "
+                "WHERE event_type = ?",
+                (AuditEventType.ALERT.value,),
+            ).fetchall()
+            plan_details = " ".join(str(row["detail"]) for row in plan)
+            schema_current = reopened._schema_is_current()
+            alert_count = reopened.count_audit_events(
+                event_type=AuditEventType.ALERT
+            )
+            old_v3 = reopened._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                ("idx_audit_events_event_type_v3",),
+            ).fetchone()
+            reopened.close()
+
+        self.assertTrue(schema_current)
+        self.assertEqual(alert_count, 1)
+        self.assertIsNone(old_v3)
+        self.assertIn("idx_audit_events_event_type_v4", plan_details)
+
+    def test_alert_index_repair_serializes_concurrent_store_opens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store._connection.execute("DROP INDEX idx_audit_events_event_type_v4")
+            store._connection.execute(
+                "CREATE INDEX idx_audit_events_event_type_v4 ON audit_events "
+                "(length(payload))"
+            )
+            store._connection.commit()
+            store.close()
+
+            barrier = threading.Barrier(2)
+            errors: list[Exception] = []
+
+            def reopen() -> None:
+                try:
+                    barrier.wait()
+                    opened = SQLiteStore(store_path)
+                    opened.close()
+                except Exception as error:
+                    errors.append(error)
+
+            threads = [threading.Thread(target=reopen) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            verified = SQLiteStore(store_path)
+            schema_current = verified._schema_is_current()
+            verified.close()
+
+        self.assertEqual(errors, [])
+        self.assertTrue(schema_current)
+
+    def test_audit_backfill_marker_recovers_after_partial_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            for index in range(2):
+                store.save_audit_event(
+                    AuditEvent(
+                        id=f"audit.marker-{index}",
+                        event_type=AuditEventType.ALERT,
+                        owner_domain=OwnerDomain.ODO,
+                        subject_id="security.dashboard",
+                        summary="marker recovery",
+                        risk_level=RiskLevel.HIGH,
+                    )
+                )
+            store._connection.execute(
+                "UPDATE audit_event_normalization_state SET state='backfilling' "
+                "WHERE id=1"
+            )
+            store._connection.commit()
+            store.close()
+
+            original_validator = overseer_store_module._validated_audit_event_type
+            calls = 0
+
+            def fail_during_backfill(payload: str) -> str | None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("injected backfill failure")
+                return original_validator(payload)
+
+            with patch.object(
+                overseer_store_module,
+                "_validated_audit_event_type",
+                side_effect=fail_during_backfill,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected backfill failure"):
+                    SQLiteStore(store_path)
+
+            with contextlib.closing(
+                sqlite3.connect(store_path)
+            ) as connection:
+                interrupted_state = connection.execute(
+                    "SELECT state FROM audit_event_normalization_state WHERE id=1"
+                ).fetchone()[0]
+            recovered = SQLiteStore(store_path)
+            recovered_state = recovered._connection.execute(
+                "SELECT state FROM audit_event_normalization_state WHERE id=1"
+            ).fetchone()[0]
+            alert_count = recovered.count_audit_events(
+                event_type=AuditEventType.ALERT
+            )
+            recovered.close()
+
+        self.assertEqual(interrupted_state, "backfilling")
+        self.assertEqual(recovered_state, "complete")
+        self.assertEqual(alert_count, 2)
 
 
 class OverseerApiTests(unittest.TestCase):

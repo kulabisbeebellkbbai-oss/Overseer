@@ -2339,7 +2339,7 @@ def operator_dashboard_compact_status(store_path: str | Path, service_name: str 
         resources = store.list_resources()
         claims = store.list_claims()
         approvals = store.list_approvals()
-        audit_events = store.list_audit_events(limit=2000)
+        audit_events = store.list_audit_events(limit=2000, valid_only=True)
         alert_total = store.count_audit_events(event_type=AuditEventType.ALERT)
         usage_limits = store.list_usage_limits()
         physical_identities = store.list_physical_identities()

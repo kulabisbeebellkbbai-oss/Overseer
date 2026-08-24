@@ -66,7 +66,69 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 10
+_AUDIT_EVENT_INSERT_TRIGGER = "audit_events_validate_normalized_insert"
+_AUDIT_EVENT_UPDATE_TRIGGER = "audit_events_validate_normalized_update"
+_AUDIT_EVENT_PAYLOAD_PREDICATE = """
+CASE WHEN json_valid(NEW.payload) THEN (
+    json_type(NEW.payload) = 'object'
+    AND (SELECT COUNT(*) FROM json_each(NEW.payload)) = 8
+    AND (SELECT COUNT(DISTINCT key) FROM json_each(NEW.payload)) = 8
+    AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.payload)
+        WHERE key NOT IN (
+            'id','event_type','owner_domain','subject_id','summary',
+            'risk_level','evidence_ids','occurred_at'
+        )
+    )
+    AND json_type(NEW.payload, '$.id') = 'text'
+    AND json_type(NEW.payload, '$.event_type') = 'text'
+    AND json_type(NEW.payload, '$.owner_domain') = 'text'
+    AND json_type(NEW.payload, '$.subject_id') = 'text'
+    AND json_type(NEW.payload, '$.summary') = 'text'
+    AND json_type(NEW.payload, '$.risk_level') = 'text'
+    AND json_type(NEW.payload, '$.evidence_ids') = 'array'
+    AND NOT EXISTS (
+        SELECT 1 FROM json_each(json_extract(NEW.payload, '$.evidence_ids'))
+        WHERE type <> 'text'
+    )
+    AND json_type(NEW.payload, '$.occurred_at') IN ('text','null')
+    AND json_extract(NEW.payload, '$.event_type') IN (
+        'requested','alert','allowed','queued','blocked','escalated',
+        'quarantined','approved','rejected','executed','verified','released'
+    )
+    AND json_extract(NEW.payload, '$.owner_domain') IN (
+        'sisko','kira','obrien','odo','odo_ids','odo_firewall','quark','dax',
+        'julian','ezri'
+    )
+    AND json_extract(NEW.payload, '$.risk_level') IN (
+        'low','medium','high','critical'
+    )
+) ELSE 0 END
+"""
+_AUDIT_EVENT_VALID_PREDICATE = f"""
+CASE WHEN COALESCE(({_AUDIT_EVENT_PAYLOAD_PREDICATE}), 0) = 1 THEN
+    NEW.event_type = json_extract(NEW.payload, '$.event_type')
+ELSE 0 END
+"""
+_AUDIT_EVENT_INSERT_TRIGGER_SQL = f"""
+CREATE TRIGGER {_AUDIT_EVENT_INSERT_TRIGGER}
+BEFORE INSERT ON audit_events
+WHEN COALESCE(({_AUDIT_EVENT_VALID_PREDICATE}), 0) = 0
+BEGIN SELECT RAISE(ABORT, 'invalid normalized audit event'); END
+"""
+_AUDIT_EVENT_UPDATE_TRIGGER_SQL = f"""
+CREATE TRIGGER {_AUDIT_EVENT_UPDATE_TRIGGER}
+BEFORE UPDATE OF payload, event_type ON audit_events
+WHEN COALESCE((
+    ({_AUDIT_EVENT_VALID_PREDICATE})
+    OR (
+        NEW.event_type IS NULL
+        AND COALESCE(({_AUDIT_EVENT_PAYLOAD_PREDICATE}), 0) = 0
+    )
+), 0) = 0
+BEGIN SELECT RAISE(ABORT, 'invalid normalized audit event'); END
+"""
 ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION = 3
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
@@ -243,9 +305,13 @@ class SQLiteStore:
             raise
         self._connection.row_factory = sqlite3.Row
         self._agent_transaction_depth = 0
-        self._configure_connection()
-        self._initialize_with_lock_retry()
-        self._harden_database_files()
+        try:
+            self._configure_connection()
+            self._initialize_with_lock_retry()
+            self._harden_database_files()
+        except BaseException:
+            self._connection.close()
+            raise
 
     def _prepare_database_file(self) -> tuple[int, int]:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK
@@ -513,7 +579,8 @@ class SQLiteStore:
                 "AND name IN ('schema_migrations', 'agent_schema_migrations', "
                 "'roadex_approval_fixtures', 'psychlo_legacy_abandonment_execution_claims', "
                 "'claim_approval_continuations', 'claim_activation_groups', "
-                "'claim_approval_continuation_attempts')"
+                "'claim_approval_continuation_attempts', "
+                "'audit_event_normalization_state')"
             ).fetchall()
         }
         if tables != {
@@ -524,6 +591,7 @@ class SQLiteStore:
             "claim_approval_continuations",
             "claim_activation_groups",
             "claim_approval_continuation_attempts",
+            "audit_event_normalization_state",
         }:
             return False
         schema_current = self._connection.execute(
@@ -533,11 +601,55 @@ class SQLiteStore:
             "SELECT 1 FROM agent_schema_migrations WHERE version = ?",
             (AGENT_DRIVER_SCHEMA_V9,),
         ).fetchone()
+        audit_index = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            ("idx_audit_events_event_type_v4",),
+        ).fetchone()
+        obsolete_audit_index = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+            ("idx_audit_events_event_type_v3",),
+        ).fetchone()
+        audit_triggers = {
+            str(row["name"]): str(row["sql"])
+            for row in self._connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name IN (?, ?)",
+                (_AUDIT_EVENT_INSERT_TRIGGER, _AUDIT_EVENT_UPDATE_TRIGGER),
+            ).fetchall()
+        }
+        audit_columns = {
+            str(row[1]): (str(row[2]).upper(), int(row[3]), row[4], int(row[5]))
+            for row in self._connection.execute("PRAGMA table_info(audit_events)").fetchall()
+        }
+        expected_audit_index_sql = """
+            CREATE INDEX idx_audit_events_event_type_v4
+            ON audit_events (event_type)
+        """
+        audit_normalization = self._connection.execute(
+            "SELECT generation, state FROM audit_event_normalization_state "
+            "WHERE id=1"
+        ).fetchone()
         return (
             schema_current is not None
             and schema_current["version"] is not None
             and int(schema_current["version"]) >= CURRENT_SCHEMA_VERSION
             and agent_current is not None
+            and audit_columns.get("event_type") == ("TEXT", 0, None, 0)
+            and audit_normalization is not None
+            and int(audit_normalization["generation"]) == CURRENT_SCHEMA_VERSION
+            and str(audit_normalization["state"]) == "complete"
+            and audit_index is not None
+            and obsolete_audit_index is None
+            and self._normalize_schema_sql(str(audit_index["sql"]))
+            == self._normalize_schema_sql(expected_audit_index_sql)
+            and self._normalize_schema_sql(
+                audit_triggers.get(_AUDIT_EVENT_INSERT_TRIGGER)
+            )
+            == self._normalize_schema_sql(_AUDIT_EVENT_INSERT_TRIGGER_SQL)
+            and self._normalize_schema_sql(
+                audit_triggers.get(_AUDIT_EVENT_UPDATE_TRIGGER)
+            )
+            == self._normalize_schema_sql(_AUDIT_EVENT_UPDATE_TRIGGER_SQL)
         )
 
     def close(self) -> None:
@@ -572,6 +684,109 @@ class SQLiteStore:
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.close()
+
+    def _migrate_audit_event_schema(self) -> None:
+        # Install/repair the normalized schema under a short exclusive writer
+        # transaction. Historical payload parsing happens in bounded batches
+        # below so concurrent store users are not locked out for the full
+        # backfill.
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                str(row[1]): (str(row[2]).upper(), int(row[3]), row[4], int(row[5]))
+                for row in self._connection.execute("PRAGMA table_info(audit_events)").fetchall()
+            }
+            event_type_column = columns.get("event_type")
+            if event_type_column is None:
+                self._connection.execute(
+                    "ALTER TABLE audit_events ADD COLUMN event_type TEXT"
+                )
+            elif event_type_column != ("TEXT", 0, None, 0):
+                raise sqlite3.DatabaseError(
+                    "audit event_type column schema is incompatible"
+                )
+            self._connection.execute(
+                "INSERT INTO audit_event_normalization_state "
+                "(id, generation, state) VALUES (1, ?, 'backfilling') "
+                "ON CONFLICT(id) DO UPDATE SET generation=excluded.generation, "
+                "state=excluded.state",
+                (CURRENT_SCHEMA_VERSION,),
+            )
+
+            # Schema v8 briefly used an application-defined expression index.
+            # Remove it so standard SQLite integrity tooling remains usable.
+            self._connection.execute(
+                "DROP INDEX IF EXISTS idx_audit_events_event_type_v3"
+            )
+            existing = self._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                ("idx_audit_events_event_type_v4",),
+            ).fetchone()
+            expected = self._normalize_schema_sql(
+                "CREATE INDEX idx_audit_events_event_type_v4 "
+                "ON audit_events (event_type)"
+            )
+            if existing is not None and self._normalize_schema_sql(
+                str(existing["sql"])
+            ) != expected:
+                self._connection.execute("DROP INDEX idx_audit_events_event_type_v4")
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_events_event_type_v4 "
+                "ON audit_events (event_type)"
+            )
+            for trigger_name, trigger_sql in (
+                (_AUDIT_EVENT_INSERT_TRIGGER, _AUDIT_EVENT_INSERT_TRIGGER_SQL),
+                (_AUDIT_EVENT_UPDATE_TRIGGER, _AUDIT_EVENT_UPDATE_TRIGGER_SQL),
+            ):
+                self._connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+                self._connection.execute(trigger_sql)
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+        last_rowid = 0
+        while True:
+            rows = self._connection.execute(
+                "SELECT rowid AS audit_rowid, id, payload, event_type "
+                "FROM audit_events WHERE rowid > ? ORDER BY rowid LIMIT 1000",
+                (last_rowid,),
+            ).fetchall()
+            if not rows:
+                break
+            updates: list[tuple[str | None, str, str, str | None]] = []
+            for row in rows:
+                payload = str(row["payload"])
+                expected_type = _validated_audit_event_type(payload)
+                if row["event_type"] != expected_type:
+                    updates.append(
+                        (expected_type, str(row["id"]), payload, row["event_type"])
+                    )
+            if updates:
+                self._connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._connection.executemany(
+                        "UPDATE audit_events SET event_type=? "
+                        "WHERE id=? AND payload=? AND event_type IS ?",
+                        updates,
+                    )
+                    self._connection.commit()
+                except Exception:
+                    self._connection.rollback()
+                    raise
+            last_rowid = int(rows[-1]["audit_rowid"])
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                "UPDATE audit_event_normalization_state SET state='complete' "
+                "WHERE id=1 AND generation=?",
+                (CURRENT_SCHEMA_VERSION,),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def initialize(self) -> None:
         self._connection.executescript(
@@ -619,7 +834,13 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS audit_events (
                 id TEXT PRIMARY KEY,
                 subject_id TEXT NOT NULL,
-                payload TEXT NOT NULL
+                payload TEXT NOT NULL,
+                event_type TEXT
+            );
+            CREATE TABLE IF NOT EXISTS audit_event_normalization_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                generation INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('backfilling','complete'))
             );
             CREATE TABLE IF NOT EXISTS usage_limits (
                 id TEXT PRIMARY KEY,
@@ -772,6 +993,7 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_id ON roadex_approval_bindings (source_id);
             """
         )
+        self._migrate_audit_event_schema()
         with self._connection:
             has_schema_history = self._connection.execute(
                 "SELECT 1 FROM schema_migrations LIMIT 1"
@@ -788,7 +1010,7 @@ class SQLiteStore:
                 if current_version is None or int(current_version) < CURRENT_SCHEMA_VERSION:
                     self._record_schema_migration(
                         CURRENT_SCHEMA_VERSION,
-                        "persist claim activation and exact-owner approval continuation records",
+                        "index audit event type for responsive dashboard counts",
                     )
             self._migrate_roadex_approval_fixture_schema()
             self._connection.execute(
@@ -3257,8 +3479,9 @@ class SQLiteStore:
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(
-            "INSERT OR REPLACE INTO audit_events (id, subject_id, payload) VALUES (?, ?, ?)",
-            (event.id, event.subject_id, _dump(event)),
+            "INSERT OR REPLACE INTO audit_events "
+            "(id, subject_id, payload, event_type) VALUES (?, ?, ?, ?)",
+            (event.id, event.subject_id, _dump(event), event.event_type.value),
         )
         self._commit_agent_mutation()
 
@@ -3269,9 +3492,14 @@ class SQLiteStore:
         event_type: AuditEventType | str | None = None,
         owner_domain: OwnerDomain | str | None = None,
         limit: int | None = None,
+        valid_only: bool = False,
     ) -> tuple[AuditEvent, ...]:
+        if valid_only:
+            self._require_audit_event_normalization_complete()
         clauses: list[str] = []
         params: list[object] = []
+        if valid_only:
+            clauses.append("event_type IS NOT NULL")
         if subject_prefix:
             clauses.append("subject_id LIKE ?")
             params.append(f"{subject_prefix}%")
@@ -3290,7 +3518,13 @@ class SQLiteStore:
             sql += " LIMIT ?"
             params.append(max(0, int(limit)))
         rows = self._connection.execute(sql, tuple(params)).fetchall()
-        return tuple(_load_dataclass(AuditEvent, str(row["payload"])) for row in rows)
+        events: list[AuditEvent] = []
+        for row in rows:
+            payload = str(row["payload"])
+            if valid_only and _validated_audit_event_type(payload) is None:
+                continue
+            events.append(_load_dataclass(AuditEvent, payload))
+        return tuple(events)
 
     def count_audit_events(
         self,
@@ -3300,14 +3534,16 @@ class SQLiteStore:
         owner_domain: OwnerDomain | str | None = None,
         risk_level: RiskLevel | str | None = None,
     ) -> int:
+        if event_type is not None:
+            self._require_audit_event_normalization_complete()
         clauses: list[str] = []
         params: list[object] = []
         if subject_prefix:
             clauses.append("subject_id LIKE ?")
             params.append(f"{subject_prefix}%")
         if event_type:
-            clauses.append("payload LIKE ?")
-            params.append(f'%"event_type":"{AuditEventType(event_type).value}"%')
+            clauses.append("event_type = ?")
+            params.append(AuditEventType(event_type).value)
         if owner_domain:
             owner_value = OwnerDomain(owner_domain).value
             clauses.append("payload LIKE ?")
@@ -3321,6 +3557,20 @@ class SQLiteStore:
             sql += " WHERE " + " AND ".join(clauses)
         row = self._connection.execute(sql, tuple(params)).fetchone()
         return int(row["count"] if row is not None else 0)
+
+    def _require_audit_event_normalization_complete(self) -> None:
+        row = self._connection.execute(
+            "SELECT generation, state FROM audit_event_normalization_state "
+            "WHERE id=1"
+        ).fetchone()
+        if (
+            row is None
+            or int(row["generation"]) != CURRENT_SCHEMA_VERSION
+            or str(row["state"]) != "complete"
+        ):
+            raise sqlite3.OperationalError(
+                "audit event normalization is incomplete"
+            )
 
     def _upsert(self, table: str, row_id: str, payload: str) -> None:
         self._connection.execute(f"INSERT OR REPLACE INTO {table} (id, payload) VALUES (?, ?)", (row_id, payload))
@@ -3450,6 +3700,55 @@ def _is_safe_evidence_key(normalized_key: str | None) -> bool:
 
 def _load_dataclass(cls: type[Any], payload: str) -> Any:
     return dataclass_from_jsonable(cls, json.loads(payload))
+
+
+def _validated_audit_event_type(payload: str) -> str | None:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    try:
+        raw = json.loads(payload, object_pairs_hook=unique_object)
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "id",
+        "event_type",
+        "owner_domain",
+        "subject_id",
+        "summary",
+        "risk_level",
+        "evidence_ids",
+        "occurred_at",
+    }:
+        return None
+    if not all(
+        isinstance(raw[key], str)
+        for key in (
+            "id",
+            "event_type",
+            "owner_domain",
+            "subject_id",
+            "summary",
+            "risk_level",
+        )
+    ):
+        return None
+    if not isinstance(raw["evidence_ids"], list) or not all(
+        isinstance(item, str) for item in raw["evidence_ids"]
+    ):
+        return None
+    if raw["occurred_at"] is not None and not isinstance(raw["occurred_at"], str):
+        return None
+    try:
+        event = _load_dataclass(AuditEvent, payload)
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        return None
+    return event.event_type.value
 
 
 # The provider-neutral driver design uses this descriptive name.  Retain

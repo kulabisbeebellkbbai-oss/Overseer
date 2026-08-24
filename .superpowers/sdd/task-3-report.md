@@ -134,3 +134,80 @@ The full-suite clean-tree guard result should be refreshed by the controller
 after the code commit if release-level evidence is required. Task 3's exact
 focused tests, compile check, and diff check are clean; no Task 3-specific
 failure remains.
+
+## Independent review correction
+
+The independent Task 3 review returned `CHANGES_REQUIRED`. All seven findings
+were corrected in code commit `78906c2` (`Harden collection policy model
+contracts`) without adding persistence, scheduler, repair execution, API, or
+service behavior.
+
+1. Added and publicly re-exported `TriageIncidentStatus` with `OPEN` and
+   `RESOLVED` values. `TriageIncident.status` is distinct from the bounded
+   `repair_state`, directly supporting Task 4's normalized partial index
+   `WHERE status = 'open'` and later resolution.
+2. Added required `job_id` and `resource_id` fields to `RepairRunbook`, with
+   bounded identifier validation for exact Task 5 binding checks.
+3. Made `active_lease_id`, `lease_owner`, and `lease_expires_at` an all-or-none
+   group. `job_is_due` continues to suppress work while the bound lease expiry
+   is strictly in the future; the regression test covers both suppression and
+   the expiry boundary.
+4. Restricted `circuit_after_success` to `CircuitState.HALF_OPEN`. It now
+   closes the circuit, clears failures and cooldown, and records
+   `CollectionOutcome.SUCCEEDED`; CLOSED and OPEN misuse are rejected.
+5. `TriageIncident` now rejects `latest_failure_at` earlier than
+   `first_failure_at` after normalized UTC timestamp comparison.
+6. Replaced the local-only hash-seed assertion with a bounded portable
+   subprocess test using two distinct `PYTHONHASHSEED` values and the same
+   SHA-256 jitter call.
+7. Added lifecycle, runbook-binding, partial-lease, active-lease, circuit
+   transition, timestamp-order, and bounded-repair-state tests.
+
+### Correction TDD evidence
+
+RED command:
+
+```text
+pytest -q tests/test_collection_policy.py
+```
+
+The newly added review tests failed during collection with the expected
+missing public contract:
+
+```text
+ImportError: cannot import name 'TriageIncidentStatus' from 'overseer'
+```
+
+GREEN command and result:
+
+```text
+pytest -q tests/test_collection_policy.py
+.................................                                        [100%]
+33 passed in 0.77s
+```
+
+The suite includes the subprocess hash-seed check and all review regression
+cases. Additional verification after the code commit:
+
+```text
+python3 -m compileall -q src/overseer/collection_models.py src/overseer/collection_policy.py
+# clean; no output
+
+git diff --check
+# clean; no output
+
+pytest -q
+2076 passed, 31 skipped in 433.35s (0:07:13)
+```
+
+### Compatibility preflight
+
+Task 4's brief was checked for the normalized `triage_incidents.status`,
+`lease_expires_at`, and `job_id`/`resource_id` persistence/query contracts.
+Task 5's brief is present at `.superpowers/sdd/task-5-brief.md`; its exact
+runbook-binding rejection requirement was checked against the new fields.
+No Task 4 persistence or Task 5 scheduler/repair implementation was added.
+
+The earlier pre-commit full-suite concern is superseded by the clean
+post-commit result above. The report update is intentionally a separate
+imperative report commit after code commit `78906c2`.

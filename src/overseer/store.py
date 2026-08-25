@@ -62,6 +62,7 @@ from .collection_models import (
     TriageIncident,
     TriageIncidentStatus,
 )
+from .collection_deadline import current_collection_deadline, require_collection_time
 from .collection_policy import circuit_after_failure, next_failure_due, next_success_due
 from .core import ApprovalLevel, Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
 from .crew import CrewMessage
@@ -345,28 +346,58 @@ class SQLiteStore:
     ) -> None:
         if isinstance(timeout_seconds, bool) or float(timeout_seconds) <= 0:
             raise ValueError("SQLite timeout must be positive")
-        self._sqlite_timeout_seconds = float(timeout_seconds)
+        self._collection_deadline = current_collection_deadline()
+        remaining = require_collection_time(self._collection_deadline)
+        self._sqlite_timeout_seconds = (
+            min(float(timeout_seconds), remaining)
+            if remaining is not None
+            else float(timeout_seconds)
+        )
         self.path = Path(path)
+        owned_verified_fd: int | None = None
+        if self._collection_deadline is not None and verified_fd is None:
+            flags = os.O_RDWR | os.O_NONBLOCK
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            try:
+                owned_verified_fd = os.open(self.path, flags)
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "collection persistence requires a pre-existing SQLite store"
+                ) from error
+            verified_fd = owned_verified_fd
         if verified_fd is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._database_identity = self._prepare_database_file()
         else:
-            status = os.fstat(verified_fd)
-            self._validate_artifact_status(self.path, status)
-            self._database_identity = (status.st_dev, status.st_ino)
+            try:
+                status = os.fstat(verified_fd)
+                self._validate_artifact_status(self.path, status)
+                self._database_identity = (status.st_dev, status.st_ino)
+            except BaseException:
+                if owned_verified_fd is not None:
+                    os.close(owned_verified_fd)
+                    owned_verified_fd = None
+                raise
         self._sidecar_identities: dict[str, tuple[int, int]] = {}
         self._compromised_sidecars: set[str] = set()
-        if verified_fd is None:
-            self._connection = sqlite3.connect(
-                self.path,
-                timeout=self._sqlite_timeout_seconds,
-            )
-        else:
-            self._connection = sqlite3.connect(
-                f"file:/proc/self/fd/{verified_fd}?mode=rw",
-                uri=True,
-                timeout=self._sqlite_timeout_seconds,
-            )
+        try:
+            if verified_fd is None:
+                self._connection = sqlite3.connect(
+                    self.path,
+                    timeout=self._sqlite_timeout_seconds,
+                )
+            else:
+                self._connection = sqlite3.connect(
+                    f"file:/proc/self/fd/{verified_fd}?mode=rw",
+                    uri=True,
+                    timeout=self._sqlite_timeout_seconds,
+                )
+        finally:
+            if owned_verified_fd is not None:
+                os.close(owned_verified_fd)
         try:
             self._harden_database_files()
         except Exception:
@@ -375,8 +406,15 @@ class SQLiteStore:
         self._connection.row_factory = sqlite3.Row
         self._agent_transaction_depth = 0
         try:
-            self._configure_connection()
-            self._initialize_with_lock_retry()
+            if self._collection_deadline is None:
+                self._configure_connection()
+                self._initialize_with_lock_retry()
+            else:
+                if not self._schema_is_current():
+                    raise RuntimeError(
+                        "collection persistence requires a pre-migrated SQLite store"
+                    )
+                self._configure_connection(allow_journal_mode_change=False)
             self._harden_database_files()
         except BaseException:
             self._connection.close()
@@ -504,7 +542,7 @@ class SQLiteStore:
             stashed.append((sidecar, quarantine))
         return stashed
 
-    def _configure_connection(self) -> None:
+    def _configure_connection(self, *, allow_journal_mode_change: bool = True) -> None:
         busy_timeout_ms = max(1, int(self._sqlite_timeout_seconds * 1000))
         self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         try:
@@ -515,9 +553,15 @@ class SQLiteStore:
             # state: a completed commit must survive an OS crash or power loss.
             journal_mode = self._connection.execute("PRAGMA journal_mode").fetchone()[0]
             if str(journal_mode).lower() != "wal":
+                if not allow_journal_mode_change:
+                    raise RuntimeError(
+                        "collection persistence requires a preconfigured WAL SQLite store"
+                    )
                 self._connection.execute("PRAGMA journal_mode = WAL")
             self._connection.execute("PRAGMA synchronous = FULL")
         except sqlite3.OperationalError:
+            if not allow_journal_mode_change:
+                raise
             pass
         self._harden_database_files()
 
@@ -807,7 +851,9 @@ class SQLiteStore:
             raise failure
 
     def _commit(self) -> None:
+        require_collection_time(self._collection_deadline)
         self._harden_database_files()
+        require_collection_time(self._collection_deadline)
         self._connection.commit()
         self._harden_database_files()
 
@@ -1660,6 +1706,7 @@ class SQLiteStore:
     def agent_transaction(self) -> Iterable[None]:
         outermost = self._agent_transaction_depth == 0
         savepoint = f"agent_transaction_{self._agent_transaction_depth}"
+        require_collection_time(self._collection_deadline)
         if outermost:
             self._connection.execute("BEGIN IMMEDIATE")
         else:

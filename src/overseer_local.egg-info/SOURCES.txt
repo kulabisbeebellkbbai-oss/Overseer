@@ -25,6 +25,7 @@ src/overseer/codex_projects.py
 src/overseer/codex_usage.py
 src/overseer/codex_usage_mcp.py
 src/overseer/collection_adapters.py
+src/overseer/collection_deadline.py
 src/overseer/collection_models.py
 src/overseer/collection_policy.py
 src/overseer/collection_scheduler.py

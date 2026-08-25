@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +26,7 @@ from overseer import (
     TriageIncident,
     TriageIncidentStatus,
 )
+from overseer.collection_deadline import collection_deadline_scope
 from overseer.store import CURRENT_SCHEMA_VERSION
 
 
@@ -152,6 +155,91 @@ def test_schema_v12_is_normalized_and_repairs_claimed_current_missing_tables(tmp
         assert max(
             row.version for row in store.list_schema_migrations() if isinstance(row.version, int)
         ) == CURRENT_SCHEMA_VERSION == 12
+
+
+def test_collection_context_refuses_to_initialize_or_migrate_a_store(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE preserved_marker (id TEXT PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with collection_deadline_scope(time.monotonic() + 5.0):
+        with pytest.raises(RuntimeError, match="pre-migrated SQLite store"):
+            SQLiteStore(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    finally:
+        connection.close()
+    assert tables == {"preserved_marker"}
+    assert journal_mode == "delete"
+
+
+def test_collection_context_does_not_create_a_missing_store(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+
+    with collection_deadline_scope(time.monotonic() + 5.0):
+        with pytest.raises(RuntimeError, match="pre-existing SQLite store"):
+            SQLiteStore(path)
+
+    assert not path.exists()
+
+
+def test_collection_context_does_not_recreate_a_store_removed_during_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path):
+        pass
+    original_open = os.open
+    removed = False
+
+    def racing_open(open_path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal removed
+        if Path(open_path) == path and not removed:
+            removed = True
+            path.unlink()
+        return original_open(open_path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    with collection_deadline_scope(time.monotonic() + 5.0):
+        with pytest.raises(RuntimeError, match="pre-existing SQLite store"):
+            SQLiteStore(path)
+
+    assert removed is True
+    assert not path.exists()
+
+
+def test_collection_context_refuses_to_reconfigure_a_non_wal_store(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path):
+        pass
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    finally:
+        connection.close()
+
+    with collection_deadline_scope(time.monotonic() + 5.0):
+        with pytest.raises(RuntimeError, match="preconfigured WAL SQLite store"):
+            SQLiteStore(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        connection.close()
 
 
 def test_dashboard_projection_round_trip_is_bounded(tmp_path: Path) -> None:

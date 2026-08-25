@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
+import subprocess
 import threading
 import time
-import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
@@ -26,6 +27,7 @@ from overseer.collection_adapters import (
     PackageInspectionCollectionAdapter,
     StorePathCallbackAdapter,
 )
+from overseer.collection_deadline import CollectionDeadlineExceeded
 from overseer.health import HealthEvidence, HealthStatus, HealthTarget, ProbeType
 from overseer.host import HostCommandObservation, HostInspectionSnapshot
 from overseer.packages import FirmwarePreflightAdapter, PackageInspectionSnapshot, PackageUpdate
@@ -186,6 +188,31 @@ def test_timeout_opens_incident_and_applies_backoff(tmp_path: Path) -> None:
     finally:
         release.set()
         scheduler.shutdown()
+
+
+def test_worker_deadline_exception_is_recorded_as_timeout_when_future_finishes_first(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    job = _job("deadline-exception", timeout=1)
+    _seed(path, (job,))
+
+    class DeadlineRejectedAdapter:
+        def collect(self, _job: CollectionJob, _store_path: str) -> CollectionExecution:
+            raise CollectionDeadlineExceeded("collection deadline exceeded before persistence")
+
+    scheduler = _scheduler(path, DeadlineRejectedAdapter(), max_workers=1)
+    try:
+        cycle = scheduler.run_ready_once()
+    finally:
+        scheduler.shutdown()
+
+    assert cycle.failed == 1
+    assert cycle.timed_out == 1
+    with SQLiteStore(path) as store:
+        run = store.list_collection_runs()[0]
+        assert run.outcome is CollectionOutcome.TIMED_OUT
+        assert run.error_category == "timeout"
 
 
 def test_bounded_firmware_preflight_timeout_releases_the_worker_slot(tmp_path: Path) -> None:
@@ -395,6 +422,115 @@ def test_package_collection_preserves_updates_but_strips_raw_stderr(tmp_path: Pa
         assert "PACKAGE_BODY_MARKER" not in repr(record)
         assert "PACKAGE_SECRET" not in repr(record)
         assert record.stderr == ""
+
+
+@pytest.mark.parametrize("adapter_kind", ["health", "host", "package"])
+def test_timed_out_builtin_persistent_adapters_cannot_commit_after_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    adapter_kind: str,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    base_job = _job(f"deadline-{adapter_kind}", key=adapter_kind, timeout=1)
+    save_entered = threading.Event()
+    allow_save = threading.Event()
+
+    if adapter_kind == "health":
+        job = base_job
+        target = HealthTarget(
+            id=job.target_id or "target",
+            resource_id=job.resource_id or "resource",
+            name="deadline health",
+            probe_type=ProbeType.HTTP,
+            target="https://example.test/health",
+        )
+
+        class Probe:
+            def probe(self, received: HealthTarget) -> HealthEvidence:
+                return HealthEvidence(
+                    id="health.deadline",
+                    resource_id=received.resource_id,
+                    target=received.target,
+                    probe_type=received.probe_type,
+                    observed_status=HealthStatus.HEALTHY,
+                    owner_domain=received.owner_domain,
+                )
+
+        adapter = HealthProbeCollectionAdapter(lambda _timeout: Probe())
+        save_name = "save_health_evidence"
+        persisted = lambda store: store.list_health_evidence()
+    elif adapter_kind == "host":
+        job = replace(base_job, kind=CollectionJobKind.HOST_INSPECTION)
+        snapshot = HostInspectionSnapshot(
+            id="host.deadline",
+            captured_at=NOW,
+            hostname="deadline-host",
+            os_release={},
+            observations=(),
+        )
+        adapter = HostInspectionCollectionAdapter(
+            lambda _timeout: SimpleNamespace(inspect=lambda: snapshot)
+        )
+        save_name = "save_host_snapshot"
+        persisted = lambda store: store.list_host_snapshots()
+    else:
+        job = replace(base_job, kind=CollectionJobKind.PACKAGE_INSPECTION)
+        snapshot = PackageInspectionSnapshot(
+            id="package.deadline",
+            captured_at=NOW,
+            command=("apt", "list", "--upgradable"),
+            exit_code=0,
+            updates=(),
+            stderr="",
+        )
+        adapter = PackageInspectionCollectionAdapter(
+            lambda _timeout: SimpleNamespace(inspect=lambda: snapshot)
+        )
+        save_name = "save_package_inspection_record"
+        persisted = lambda store: store.list_package_inspection_records()
+
+    _seed(path, (job,))
+    if adapter_kind == "health":
+        with SQLiteStore(path) as store:
+            store.save_health_target(target)
+
+    original_save = getattr(SQLiteStore, save_name)
+
+    def delayed_save(store, *args, **kwargs):
+        save_entered.set()
+        assert allow_save.wait(5)
+        return original_save(store, *args, **kwargs)
+
+    monkeypatch.setattr(SQLiteStore, save_name, delayed_save)
+    registry = CollectionAdapterRegistry()
+    registry.register(job.kind, "deadline", adapter)
+    scheduler = CollectionScheduler(
+        path,
+        registry,
+        max_workers=1,
+        clock=lambda: NOW,
+        adapter_ids={job.id: "deadline"},
+    )
+    try:
+        cycle = scheduler.run_ready_once()
+        assert save_entered.is_set()
+        assert cycle.timed_out == 1
+
+        lock = sqlite3.connect(path, isolation_level=None, timeout=0.0)
+        try:
+            lock.execute("BEGIN IMMEDIATE")
+            allow_save.set()
+            time.sleep(0.1)
+            lock.rollback()
+        finally:
+            lock.close()
+        scheduler.shutdown()
+
+        with SQLiteStore(path) as store:
+            assert persisted(store) == ()
+    finally:
+        allow_save.set()
+        scheduler.shutdown()
 
 
 def test_callback_body_marker_is_not_written_to_collection_run(tmp_path: Path) -> None:

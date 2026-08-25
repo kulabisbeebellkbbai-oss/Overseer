@@ -16,6 +16,7 @@ from .collection_adapters import (
     CollectionExecution,
     default_collection_adapter_registry,
 )
+from .collection_deadline import CollectionDeadlineExceeded, collection_deadline_scope
 from .collection_models import (
     CircuitState,
     CollectionJob,
@@ -190,7 +191,8 @@ class CollectionScheduler:
                 work.started = True
                 work.started_at = self._now(None)
                 work.deadline = time.monotonic() + work.job.timeout_seconds
-        return adapter.collect(work.job, self.store_path)  # type: ignore[attr-defined]
+        with collection_deadline_scope(work.deadline):
+            return adapter.collect(work.job, self.store_path)  # type: ignore[attr-defined]
 
     def _on_future_done(self, lease_id: str) -> None:
         with self._lock:
@@ -257,6 +259,12 @@ class CollectionScheduler:
             execution = work.future.result()
             if not isinstance(execution, CollectionExecution):
                 raise TypeError("collection adapter returned an invalid execution")
+        except CollectionDeadlineExceeded:
+            execution = CollectionExecution(
+                CollectionOutcome.TIMED_OUT,
+                "collection deadline exceeded before persistence",
+                failure_category="timeout",
+            )
         except BaseException:
             execution = CollectionExecution(
                 CollectionOutcome.FAILED,

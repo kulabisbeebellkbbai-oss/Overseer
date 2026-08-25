@@ -36,6 +36,7 @@ semantics.
 - No host scheduler or socket listener is modified by the runtime unit.
 - Runtime state is read from an explicit SQLite store path.
 - The runtime writes a heartbeat and advances only due scheduler jobs on each cycle; the scheduler bounds workers, leases, timeouts, evidence, and status projections.
+- Scheduler deadlines cross the worker/store boundary: SQLite lock waits are clamped to remaining collection time and expired workers cannot commit evidence after the run is recorded as timed out.
 - Configured health probes are read-only adapters owned by independent `health_probe` jobs. Legacy collector flags are deprecated family selectors and are not used by the service unit.
 - Runtime health evidence, runs, requests, incidents, and repair attempts are retained within explicit store limits.
 - Host inspection snapshots are read-only command and file observations owned by a scheduled `host_inspection` job.

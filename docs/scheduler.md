@@ -31,6 +31,7 @@ The API and dashboard consume these records and never execute a collector inline
 - Codex project resume starts or reuses the durable tmux session that `codex-projects` would use for the same conversation.
 - Capacity, Git, and firmware inspection run only as bounded scheduled jobs; dashboard GETs read their durable SQLite projections.
 - The firmware callback uses a process boundary so timeout can terminate EFI traversal or a blocked projection write without retaining a scheduler worker; firmware and preflight projections commit as one SQLite transaction.
+- Every scheduler worker propagates its absolute monotonic deadline into SQLite persistence. Store lock waits use only the remaining budget, and a commit that reaches the deadline rolls back instead of publishing late evidence.
 - All inputs must come from already captured usage-limit, maintenance, or operator-provided state.
 
 ## Operations

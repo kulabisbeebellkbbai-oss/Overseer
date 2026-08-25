@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 from overseer.cli import main
 from overseer.collection_models import CollectionJob, CollectionJobKind, CollectionOutcome, TriageIncident
+from overseer.collection_scheduler import CollectionScheduler
 from overseer.config import config_from_mapping
 from overseer.core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 from overseer.health import HealthTarget, ProbeType
@@ -796,6 +798,69 @@ def test_scheduled_storage_collection_updates_dashboard_projection(
     assert projected["growth_sample_count"] == 1
     assert projected["mounts"][0]["use_percent"] == "40%"
     assert projected["capacity_summary"]["free_bytes"] == 600
+
+
+def test_timed_out_storage_collection_cannot_persist_after_its_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "project"
+    store_path = root / "state" / "overseer.sqlite3"
+    store_path.parent.mkdir(parents=True)
+    seed_default_collection_jobs(store_path, families=("storage",))
+    with SQLiteStore(store_path) as store:
+        job = store.load_collection_job("collection.storage.capacity")
+        state = store.load_collection_job_state(job.id)
+        store.save_collection_job(
+            job.__class__(**{**job.__dict__, "timeout_seconds": 1}),
+            state.__class__(**{**state.__dict__, "next_due_at": "2026-08-25T12:00:00+00:00"}),
+        )
+
+    monkeypatch.setattr(
+        "overseer.storage_evidence._df_rows",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "overseer.storage_evidence._capacity_summary",
+        lambda: {"mount": "/", "status": "ok"},
+    )
+    save_entered = threading.Event()
+    allow_save = threading.Event()
+    original_save = SQLiteStore.save_dashboard_projection
+
+    def delayed_save(store, projection_id, payload):
+        save_entered.set()
+        assert allow_save.wait(5)
+        return original_save(store, projection_id, payload)
+
+    monkeypatch.setattr(SQLiteStore, "save_dashboard_projection", delayed_save)
+    scheduler = CollectionScheduler(
+        store_path,
+        runtime_collection_adapter_registry(),
+        max_workers=1,
+        clock=lambda: "2026-08-25T12:00:00+00:00",
+    )
+    try:
+        cycle = scheduler.run_ready_once()
+        assert save_entered.is_set()
+        assert cycle.timed_out == 1
+
+        lock = sqlite3.connect(store_path, isolation_level=None, timeout=0.0)
+        try:
+            lock.execute("BEGIN IMMEDIATE")
+            allow_save.set()
+            time.sleep(0.1)
+            lock.rollback()
+        finally:
+            lock.close()
+        scheduler.shutdown()
+
+        with SQLiteStore(store_path) as store:
+            with pytest.raises(KeyError):
+                store.load_dashboard_projection("dashboard.storage.capacity")
+    finally:
+        allow_save.set()
+        scheduler.shutdown()
 
 
 def test_legacy_runtime_family_selector_seeds_only_selected_families_plus_freshness(tmp_path: Path) -> None:

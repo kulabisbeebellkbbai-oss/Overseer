@@ -84,13 +84,13 @@ def test_overseer_api_unit_imports_the_reviewed_release_without_changing_its_lis
     unit = API_UNIT_PATH.read_text(encoding="utf-8")
 
     assert "WorkingDirectory=@OVERSEER_INSTALL@" in unit
-    assert "Environment=PYTHONPATH=@OVERSEER_INSTALL@/src" in unit
+    assert 'Environment="PYTHONPATH=@OVERSEER_INSTALL@/src"' in unit
     assert "Environment=PYTHONDONTWRITEBYTECODE=1" in unit
-    assert "ExecStartPre=/usr/bin/test -d @OVERSEER_INSTALL@/src" in unit
+    assert 'ExecStartPre=/usr/bin/test -d "@OVERSEER_INSTALL@/src"' in unit
     assert (
-        "ExecStart=@OVERSEER_PYTHON@ -m overseer.cli serve-api "
-        "--store @OVERSEER_STORE@ --host 127.0.0.1 --port 8766 "
-        "--auth-token-file @OVERSEER_API_TOKEN_FILE@"
+        'ExecStart="@OVERSEER_PYTHON@" -m overseer.cli serve-api '
+        '--store "@OVERSEER_STORE@" --host 127.0.0.1 --port 8766 '
+        '--auth-token-file "@OVERSEER_API_TOKEN_FILE@"'
     ) in unit
     assert "EnvironmentFile=" not in unit
     assert "Wants=" not in unit
@@ -102,11 +102,11 @@ def test_overseer_api_unit_imports_the_reviewed_release_without_changing_its_lis
 
 def test_overseer_api_unit_passes_disposable_systemd_verify(tmp_path: Path) -> None:
     unit = API_UNIT_PATH.read_text(encoding="utf-8")
-    install_path = tmp_path / "install"
+    install_path = tmp_path / "install with spaces"
     (install_path / "src").mkdir(parents=True)
-    store_path = tmp_path / "state" / "overseer.sqlite3"
+    store_path = tmp_path / "state with spaces" / "overseer.sqlite3"
     store_path.parent.mkdir()
-    token_path = tmp_path / "api-token"
+    token_path = tmp_path / "api token with spaces"
     token_path.write_text("not-a-live-secret\n", encoding="utf-8")
     disposable_unit = tmp_path / "overseer-api.service"
     disposable_unit.write_text(
@@ -125,6 +125,7 @@ def test_overseer_api_unit_passes_disposable_systemd_verify(tmp_path: Path) -> N
     )
 
     assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
 
 
 def test_v11_runbook_preserves_exact_state_without_secret_argv_or_globs() -> None:
@@ -184,3 +185,5 @@ def test_v11_runbook_preserves_exact_state_without_secret_argv_or_globs() -> Non
     assert 'OVERSEER_PSYCHLO_COORDINATION_TIMER=overseer-psychlo-coordination-tick.timer' in operations
     assert 'psychlo-coordination-timer.before.txt' in operations
     assert 'test "$OVERSEER_PSYCHLO_COORDINATION_TIMER_LOAD_STATE" = not-found' in operations
+    assert 'test ! -s "$OVERSEER_EVIDENCE_DIR/systemd-verify.stderr"' in operations
+    assert 'test ! -s "$OVERSEER_ACTIVATION_OUTPUT/systemd-verify.stderr"' in operations

@@ -146,6 +146,19 @@ def _seed_collection_projections(path: Path, count: int = 24) -> None:
 
 
 class PerformanceRegressionTests(unittest.TestCase):
+    def test_scheduler_dashboard_contract_stays_projection_only(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        for endpoint in (
+            'collectionsStatus: "/collections/status"',
+            'collectionsJobs: "/collections/jobs"',
+            'collectionsRuns: "/collections/runs"',
+            'collectionsIncidents: "/collections/incidents"',
+        ):
+            self.assertIn(endpoint, OPERATOR_CONSOLE_HTML)
+        self.assertIn("mapEndpointEntries(endpointEntries, 4)", OPERATOR_CONSOLE_HTML)
+        self.assertNotIn('postJson("/health/probes/run"', OPERATOR_CONSOLE_HTML)
+
     def test_operator_console_html_loads_within_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             with LocalApiHarness(Path(directory) / "overseer.sqlite3") as server:

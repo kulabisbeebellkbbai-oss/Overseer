@@ -119,7 +119,6 @@ EXPECTED_VIEWS = {
     "health": {
         "title": "Diagnostics Lab",
         "actions": {
-            "run-health-probes",
             "register-health-target",
             "stage-journal-access-request",
             "execute-journal-access-request",
@@ -259,7 +258,6 @@ ACTION_ROUTES = {
     "enqueue-remote-test-job": ("POST", "/usage/remote-testing/jobs"),
     "collect-remote-test-results": ("POST", "/usage/remote-testing/results"),
     "run-package-maintenance-cycle": ("POST", "/maintenance/package-maintenance-cycle"),
-    "run-health-probes": ("POST", "/health/probes/run"),
     "send-crew-message": ("POST", "/crew/messages"),
     "stage-backup-execution-request": ("POST", "/storage/backup-execution-requests"),
     "stage-backup-cleanup-request": ("POST", "/storage/cleanup-requests"),
@@ -1001,6 +999,21 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn('document.body.dataset.loadState = "loading";', OPERATOR_CONSOLE_HTML)
         self.assertIn('document.body.dataset.loadState = failures.length ? "partial" : "ready";', OPERATOR_CONSOLE_HTML)
         self.assertIn('document.body.dataset.loadFailures = String(failures.length);', OPERATOR_CONSOLE_HTML)
+
+    def test_scheduler_controls_are_queue_only_and_protected_prefix_aware(self):
+        self.assertIn('collectionsStatus: "/collections/status"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('collectionsJobs: "/collections/jobs"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('collectionsRuns: "/collections/runs"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('collectionsIncidents: "/collections/incidents"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson(`/collections/jobs/${jobId}/run`', OPERATOR_CONSOLE_HTML)
+        self.assertNotIn('postJson("/health/probes/run"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('const target = `${apiBase}${path}`', OPERATOR_CONSOLE_HTML)
+        self.assertIn("request_id", OPERATOR_CONSOLE_HTML)
+        self.assertIn("earliest_execution_at", OPERATOR_CONSOLE_HTML)
+        self.assertIn("coalesced", OPERATOR_CONSOLE_HTML)
+        self.assertIn("cooldown_until", OPERATOR_CONSOLE_HTML)
+        self.assertIn("data-collection-run-job", OPERATOR_CONSOLE_HTML)
+        self.assertIn('type="button"', OPERATOR_CONSOLE_HTML)
 
     def test_documents_folder_navigation_preserves_selected_folder(self):
         self.assertIn('documentsFolder: "Overseer"', OPERATOR_CONSOLE_HTML)

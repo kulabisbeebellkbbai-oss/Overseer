@@ -156,6 +156,43 @@ shape. If the runner cannot consume a fixture plan id, the correct result is
 `blocked`; do not use a real maintenance, security, firewall, or package plan as
 the smoke target.
 
+## Autonomous Operations Scheduler Acceptance
+
+Task 8 treats the dashboard as a bounded scheduler projection. The browser must
+load these authenticated GET projections through the same base path as the
+console:
+
+- `/collections/status`
+- `/collections/jobs`
+- `/collections/runs`
+- `/collections/incidents`
+
+Use a disposable prefix-aware API harness before any protected deployment. The
+harness should serve the console at `/Overseer/ui`, accept the test bearer
+token, and return bounded fixtures containing a scheduler heartbeat, active and
+pending counts, an overdue job, an open circuit with cooldown, a lease,
+freshness/data-age fields, a retry/backoff disposition, and an incident with
+repair disposition. Verify that the console requests `/Overseer/collections/...`
+and never calls `POST /Overseer/health/probes/run`.
+
+In the harness, click one per-job `Run now` control and one filtered `Run now`
+control. Confirm that each request is a queue-only
+`POST /Overseer/collections/jobs/{job_id}/run` with the bounded
+`requested_by`/`reason` payload. Confirm the response renders request ID,
+`queued` or `coalesced`, earliest execution, and circuit/cooldown state; repeat
+the click while the request is pending and verify the same job control is
+disabled. Confirm the 30-second refresh and focus/visibility/manual refresh
+triggers issue GET projections only and coalesce through one refresh promise.
+
+At `390x844`, `820x1180`, and `1440x1000`, verify automatic mode, every forced
+mode, no horizontal overflow, visible focus restoration after a scheduler
+rerender, readable tables, 44px controls, reduced-motion behavior, and the
+top-right auto/desktop/tablet/mobile control with saved/effective mode
+announcement. Explicitly test the automatic boundaries at 700/701/1024/1025px
+and reload persistence. Cancel controls must remain `type="button"` and must
+not submit their surrounding forms. Browser MCP acceptance is controller-owned;
+this runbook does not claim that acceptance from static or Node-backed tests.
+
 ## Interpreting Results
 
 - Direct `/ui` passes but `/Overseer/ui` cannot find `#token`: backend or gateway is not serving the console at the protected path.

@@ -705,6 +705,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     body[data-layout-effective="desktop"] .span-6 { grid-column: span 6; }
     body[data-layout-effective="desktop"] .span-8 { grid-column: span 8; }
     #driver .action-btn { min-height: 44px; }
+    .scheduler-panel .action-btn, .scheduler-panel select { min-height: 44px; }
     .nav button[data-view="driver"],
     #driver input, #driver select { min-height: 44px; }
     body[data-layout-effective="desktop"] aside { width: min(294px, 28vw); }
@@ -841,6 +842,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       ,agentDispatches: "/agent-dispatches"
       ,agentUsage: "/agent-usage"
       ,roadexHumanDecisions: "/roadex/human-decisions"
+      ,collectionsStatus: "/collections/status"
+      ,collectionsJobs: "/collections/jobs"
+      ,collectionsRuns: "/collections/runs"
+      ,collectionsIncidents: "/collections/incidents"
     };
     const requiredEndpointKeys = new Set(["auth"]);
     const protectedGatewayPath = window.location.pathname === "/Overseer" || window.location.pathname.startsWith("/Overseer/");
@@ -854,7 +859,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       documentsQuery: "Overseer",
       loadErrors: [],
       lastAction: null,
-      lastUpdatedAt: null
+      lastUpdatedAt: null,
+      lastUiRefreshAt: null,
+      pendingCollectionRuns: new Set()
     };
     state.driverSelection = {};
     const AUTO_REFRESH_MS = 30000;
@@ -869,6 +876,55 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function nextLayoutMode(mode) {
       return LAYOUT_MODES[(LAYOUT_MODES.indexOf(mode) + 1) % LAYOUT_MODES.length] || "auto";
     }
+    function resolveLayoutMode(preference, width) {
+      return preference === "auto" ? viewportLayout(width) : LAYOUT_MODES.includes(preference) ? preference : "auto";
+    }
+    function formatAgeSeconds(ageSeconds) {
+      if (ageSeconds === null || ageSeconds === undefined || ageSeconds === "") return "unknown";
+      const age = Number(ageSeconds);
+      if (!Number.isFinite(age) || age < 0) return "unknown";
+      if (age < 60) return `${Math.floor(age)}s`;
+      if (age < 3600) return `${Math.floor(age / 60)}m`;
+      return `${Math.floor(age / 3600)}h`;
+    }
+    function collectionAgeLabel(observedAt, ageSeconds) {
+      return `observed ${observedAt || "unknown"} · age ${formatAgeSeconds(ageSeconds)}`;
+    }
+    function circuitBadge(circuit) {
+      const state = typeof circuit === "string" ? circuit : circuit?.state;
+      const cooldown = typeof circuit === "object" ? circuit?.cooldown_until : null;
+      return `${state || "unknown"}${cooldown ? ` · cooldown ${cooldown}` : ""}`;
+    }
+    function collectionRunPayload(jobId) {
+      return {requested_by: "operator", reason: "operator requested dashboard run"};
+    }
+    function requestIsPending(job, pendingJobIds) {
+      return Boolean(job?.pending_request) || Boolean(pendingJobIds?.has(job?.id));
+    }
+    function captureFocusTarget(element) {
+      if (!element) return null;
+      return {
+        id: element.id || "",
+        collectionRunJob: element.dataset?.collectionRunJob || "",
+        view: element.dataset?.view || ""
+      };
+    }
+    function restoreFocusTarget(focusTarget, targetDocument = document) {
+      if (!focusTarget) return null;
+      let target = focusTarget.id ? targetDocument.getElementById(focusTarget.id) : null;
+      if (!target && focusTarget.collectionRunJob) {
+        const candidates = targetDocument.querySelectorAll?.("[data-collection-run-job]") || [];
+        target = Array.from(candidates).find((item) => item.dataset?.collectionRunJob === focusTarget.collectionRunJob) || null;
+      }
+      if (!target && focusTarget.view) {
+        const candidates = targetDocument.querySelectorAll?.("[data-view]") || [];
+        target = Array.from(candidates).find((item) => item.dataset?.view === focusTarget.view) || null;
+      }
+      if (target) {
+        target.focus({preventScroll: true});
+      }
+      return target;
+    }
     function readLayoutMode() {
       try {
         const mode = localStorage.getItem("overseerLayoutMode");
@@ -879,7 +935,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     let layoutMode = readLayoutMode();
     function applyLayoutMode() {
-      const effective = layoutMode === "auto" ? viewportLayout(window.innerWidth) : layoutMode;
+      const effective = resolveLayoutMode(layoutMode, window.innerWidth);
       document.body.dataset.layoutPreference = layoutMode;
       document.body.dataset.layoutEffective = effective;
       document.body.setAttribute("data-layout-effective", effective);
@@ -923,6 +979,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       button.addEventListener("click", () => selectView(button.dataset.view));
     });
     document.addEventListener("click", async (event) => {
+      const collectionRunButton = event.target.closest("[data-collection-run-job]");
+      if (collectionRunButton) {
+        event.preventDefault();
+        await queueCollectionRun(collectionRunButton.dataset.collectionRunJob, collectionRunButton);
+        return;
+      }
+      const filteredRunButton = event.target.closest("[data-collection-run-filter]");
+      if (filteredRunButton) {
+        event.preventDefault();
+        const jobId = document.getElementById("scheduler-run-filter")?.value || "";
+        await queueCollectionRun(jobId, filteredRunButton);
+        return;
+      }
       const fillTarget = event.target.closest("[data-fill]");
       if (fillTarget) {
         event.preventDefault();
@@ -1039,6 +1108,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       }
       try {
         state.lastUpdatedAt = new Date();
+        state.lastUiRefreshAt = state.lastUpdatedAt;
         updateRefreshStatus();
         render();
         document.body.dataset.loadState = failures.length ? "partial" : "ready";
@@ -1054,13 +1124,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function updateRefreshStatus() {
       const updated = document.getElementById("updated");
-      if (!state.lastUpdatedAt) return;
-      const ageSeconds = Math.max(0, Math.floor((Date.now() - state.lastUpdatedAt.getTime()) / 1000));
+      if (!state.lastUiRefreshAt) return;
+      const ageSeconds = Math.max(0, Math.floor((Date.now() - state.lastUiRefreshAt.getTime()) / 1000));
       const ageLabel = ageSeconds < 60
         ? `${ageSeconds}s ago`
         : `${Math.floor(ageSeconds / 60)}m ago`;
       const pollingLabel = document.hidden ? "auto refresh paused" : "auto refresh on";
-      updated.textContent = `Updated ${state.lastUpdatedAt.toLocaleString()} · ${ageLabel} · ${pollingLabel}`;
+      updated.textContent = `Last UI refresh ${state.lastUiRefreshAt.toLocaleString()} · ${ageLabel} · ${pollingLabel} · evidence ages are observed separately`;
     }
     function formatEndpointError(failure) {
       return `${failure.path}: ${failure.message}`;
@@ -1134,6 +1204,38 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       } catch (err) {
         status.textContent = err.message;
         status.className = "panel action-status error";
+      }
+    }
+    async function queueCollectionRun(rawJobId, source) {
+      const requestedJobId = String(rawJobId || "").trim();
+      if (!requestedJobId) {
+        const emptySelectionStatus = document.getElementById("action-status");
+        emptySelectionStatus.hidden = false;
+        emptySelectionStatus.className = "panel action-status error";
+        emptySelectionStatus.textContent = "Select a scheduler job before using Run now";
+        return;
+      }
+      if (state.pendingCollectionRuns.has(requestedJobId)) return;
+      state.pendingCollectionRuns.add(requestedJobId);
+      const jobId = encodeURIComponent(requestedJobId);
+      if (source) {
+        source.disabled = true;
+        source.setAttribute("aria-busy", "true");
+      }
+      const status = document.getElementById("action-status");
+      status.hidden = false;
+      status.className = "panel action-status pending";
+      status.textContent = `Queueing ${jobId}...`;
+      try {
+        const result = await postJson(`/collections/jobs/${jobId}/run`, collectionRunPayload(requestedJobId));
+        state.lastAction = {action: "queue-collection-run", result, at: new Date().toLocaleString()};
+        await refresh();
+      } catch (err) {
+        state.pendingCollectionRuns.delete(requestedJobId);
+        status.className = "panel action-status error";
+        status.textContent = err.message;
+      } finally {
+        if (source) source.removeAttribute("aria-busy");
       }
     }
     function applyActionResult(action, result) {
@@ -1231,7 +1333,6 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "request-admin-restore") return await requestAdminRestore();
       if (action === "approve-admin-restore") return await approveAdminRestore();
       if (action === "unarchive-admin-history") return await unarchiveAdminHistory();
-      if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       if (action === "register-health-target") return await registerHealthTarget();
       if (action === "stage-journal-access-request") return await stageJournalAccessRequest();
       if (action === "execute-journal-access-request") return await executeJournalAccessRequest();
@@ -2177,6 +2278,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       });
     }
     function render() {
+      const focusTarget = captureFocusTarget(document.activeElement);
       const dashboard = state.data.dashboard || {};
       const overall = dashboard.overall_status || "loading";
       const overallEl = document.getElementById("overall");
@@ -2193,6 +2295,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       renderEzri();
       renderAudit();
       renderActionStatus();
+      restoreFocusTarget(focusTarget);
     }
     function renderActionStatus() {
       const status = document.getElementById("action-status");
@@ -2200,6 +2303,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       status.className = "panel action-status good";
       status.hidden = false;
       const result = state.lastAction.result || {};
+      if (state.lastAction.action === "queue-collection-run") {
+        const circuit = result.circuit || {};
+        status.className = `panel action-status ${result.status === "coalesced" ? "warn" : "pending"}`;
+        status.innerHTML = `<div class="toolbar"><h3>Run now queued</h3><span class="pill ${result.status === "coalesced" ? "warn" : "pending"}">${safe(result.status || "queued")}</span></div><div class="list"><div class="row"><span>Request ID</span><strong>${safe(result.request_id || result.request?.id || "unknown")}</strong></div><div class="row"><span>Earliest execution</span><strong>${safe(result.earliest_execution_at || "scheduler decides")}</strong></div><div class="row"><span>Circuit / cooldown</span><strong>${safe(circuitBadge(circuit))}</strong></div></div><p class="muted">Queue-only request; no collection ran in the browser.</p>`;
+        return;
+      }
       const detail = result.count ?? result.targets ?? result.resources ?? result.plans ?? result.status ?? "complete";
       status.innerHTML = `<div class="toolbar"><h3>${safe(labelize(state.lastAction.action))}</h3><span class="pill good">${safe(detail)}</span></div><p class="muted">${safe(state.lastAction.at)}</p>`;
     }
@@ -2232,6 +2341,43 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         </div>` : ""}
       </article>`;
     }
+    function renderCollectionScheduler(status, jobsProjection, runsProjection, incidentsProjection, runtime) {
+      const jobs = jobsProjection.jobs || status.jobs || [];
+      const runs = runsProjection.runs || [];
+      const incidents = incidentsProjection.incidents || [];
+      const runsByJob = Object.fromEntries(runs.map((run) => [run.job_id, run]));
+      const overdueJobs = jobs.filter((job) => job.enabled !== false && Number(job.due_age_seconds) > 0).length;
+      const heartbeat = runtime.service || {};
+      const schedulerTone = heartbeat.freshness?.status === "ok" ? "good" : heartbeat.last_tick_at ? "warn" : "inactive";
+      const jobOptions = jobs.map((job) => `<option value="${safe(job.id)}">${safe(job.id)}</option>`).join("");
+      const rows = jobs.map((job) => {
+        const pending = requestIsPending(job, state.pendingCollectionRuns);
+        if (!pending) state.pendingCollectionRuns.delete(job.id);
+        const lastRun = runsByJob[job.id] || {};
+        const circuit = circuitBadge({state: job.circuit_state, cooldown_until: job.cooldown_until});
+        const lease = job.active_lease ? `${job.active_lease.id} · until ${job.active_lease.expires_at || "unknown"}` : "none";
+        const tone = stateTone(job.circuit_state || job.last_outcome || (job.enabled ? "enabled" : "disabled"));
+        return `<tr><td>${safe(job.id)}<br><span class="muted">${safe(job.kind || "job")} · ${safe(job.owner_domain || "unassigned")}</span></td><td><span class="pill ${job.enabled ? "good" : "inactive"}">${job.enabled ? "enabled" : "disabled"}</span><br><span class="muted">next ${safe(job.next_due_at || "unknown")}</span></td><td><span class="pill ${tone}">${safe(circuit)}</span><br><span class="muted">failures ${safe(job.consecutive_failures ?? 0)}</span></td><td>${safe(lease)}<br><span class="muted">backoff ${safe(lastRun.retry_disposition || "none")}</span></td><td>${safe(collectionAgeLabel(job.last_completed_at, job.data_age_seconds))}<br><span class="muted">due age ${safe(formatAgeSeconds(job.due_age_seconds))}</span></td><td><button type="button" class="action-btn" data-collection-run-job="${safe(job.id)}"${pending ? " disabled" : ""} aria-label="Run now ${safe(job.id)}" title="${pending ? "A request for this job is already pending" : "Queue this job for the scheduler"}">${pending ? "Queued" : "Run now"}</button></td></tr>`;
+      }).join("");
+      const incidentRows = incidents.map((incident) => ({
+        ...incident,
+        disposition: incident.resolution || incident.repair_state || "pending"
+      }));
+      return `<div class="panel span-12 scheduler-panel" aria-labelledby="scheduler-title">
+        <div class="toolbar"><div><h3 id="scheduler-title">Autonomous Operations Scheduler</h3><p class="muted">Bounded projections and queue-only operator requests.</p></div><div class="actions"><label for="scheduler-run-filter">Filtered Run Now</label><select id="scheduler-run-filter" aria-label="Scheduler job for filtered Run Now"><option value="">Choose a job</option>${jobOptions}</select><button type="button" class="action-btn" data-collection-run-filter="true">Run now</button></div></div>
+        <div class="grid">
+          ${metric("Scheduler heartbeat", heartbeat.last_tick_at ? collectionAgeLabel(heartbeat.last_tick_at, null) : "unknown", heartbeat.freshness?.status || "no heartbeat evidence", "span-4", schedulerTone)}
+          ${metric("Active jobs", status.active_count, "leased workers", "span-4", status.active_count ? "pending" : "good")}
+          ${metric("Pending requests", status.pending_request_count, "queue-only requests", "span-4", status.pending_request_count ? "warn" : "good")}
+          ${metric("Overdue jobs", overdueJobs, "due age above zero", "span-4", overdueJobs ? "warn" : "good")}
+          ${metric("Open circuits", status.circuit_count, "circuit state open", "span-4", status.circuit_count ? "bad" : "good")}
+          ${metric("Incidents", status.open_incident_count, "open triage incidents", "span-4", status.open_incident_count ? "bad" : "good")}
+        </div>
+        <div class="table-scroll"><table aria-label="Scheduler jobs"><thead><tr><th>Job</th><th>Schedule</th><th>Circuit / cooldown</th><th>Lease / backoff</th><th>Evidence freshness</th><th>Queue action</th></tr></thead><tbody>${rows || `<tr><td colspan="6" class="muted">No scheduler jobs are projected.</td></tr>`}</tbody></table></div>
+        <div class="panel span-12"><div class="toolbar"><h3>Incident / repair disposition</h3><span class="pill ${incidents.length ? "bad" : "good"}">${incidents.length} projected</span></div>${table("Bounded Incidents", incidentRows, ["id", "job_id", "severity", "status", "repair_state", "disposition", "generation"], {limit: 12})}</div>
+        <div class="panel span-12"><div class="toolbar"><h3>Recent scheduler runs</h3><span class="pill">${runs.length}</span></div>${table("Run evidence", runs, ["id", "job_id", "trigger", "outcome", "completed_at", "retry_disposition", "request_id"], {limit: 12})}</div>
+      </div>`;
+    }
     function renderOverview() {
       const focus = (state.data.dashboard || {}).role_focus || {};
       const attention = (state.data.dashboard || {}).attention || {};
@@ -2244,10 +2390,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const dispatches = (state.data.crewMessages || {}).recent_dispatches || [];
       const humanDecisions = (state.data.roadexHumanDecisions || {}).items || [];
       const psychlo = state.data.psychloStatus || {};
+      const collectionsStatus = state.data.collectionsStatus || {};
+      const collectionsJobs = state.data.collectionsJobs || {};
+      const collectionsRuns = state.data.collectionsRuns || {};
+      const collectionsIncidents = state.data.collectionsIncidents || {};
       document.getElementById("overview").innerHTML = `
         <div class="grid">
           ${stationIntro("Sisko", "Strategic Operations", "Command routing, runtime cadence, and crew dispatch.", ["authorizations", "crew queue", "runtime"])}
           ${humanDecisions.length ? humanDecisions.map(roadexHumanDecisionCard).join("") : `<div class="panel span-12 good"><div class="toolbar"><h3>Roadex final human decisions</h3><span class="pill good">clear</span></div><p class="muted">No Roadex decisions currently require independent human action.</p></div>`}
+          ${renderCollectionScheduler(collectionsStatus, collectionsJobs, collectionsRuns, collectionsIncidents, runtime)}
           <div class="panel span-12"><div class="toolbar"><h3>Psychlo 1.0 Bridge</h3><span class="pill ${psychlo.configured ? "good" : "inactive"}">${psychlo.configured ? "configured" : "not configured"}</span></div>${kv("Immutable projections", psychlo.projections || {})}<p class="muted">External executions remain separate from normal rounds; bridge status is read-only.</p></div>
           ${metric("Sisko", attention.pending_authorizations, "pending authorizations", "span-3", attention.pending_authorizations ? "warn" : "good", "admin")}
           ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good", "security")}
@@ -2366,7 +2517,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             ${driverAction("handoff-agent", "Manual Handoff", "handoff_import", selectedIncomingProvider)}
             ${driverAction("failover-agent", "Controlled Failover", "handoff_import", selectedIncomingProvider, failoverBlocker)}
             <button class="action-btn" data-action="recover-agent-failover"${blockedFailoverExecution ? "" : " disabled"} title="${safe(blockedFailoverExecution?.blocker || "No recovery required")}">Recover Failover</button>
-            <button class="action-btn" data-disabled-action="cancel-agent" disabled title="${safe(cancelTitle)}" aria-describedby="agent-cancel-blocker">Cancel</button>
+            <button type="button" class="action-btn" data-disabled-action="cancel-agent" disabled title="${safe(cancelTitle)}" aria-describedby="agent-cancel-blocker">Cancel</button>
           </div></div>
           <div id="agent-cancel-blocker" class="panel span-12 inactive">${safe(cancelTitle)}${blockerText ? `; ${safe(blockerText)}` : ""}</div>
           <div id="agent-failover-blockers" class="panel span-12 inactive">Evaluate controlled failover to view exact blockers.</div>
@@ -2487,7 +2638,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-4">
-            <div class="toolbar"><h3>Cancel Plan</h3><button class="action-btn" data-action="cancel-admin-change">Cancel</button></div>
+            <div class="toolbar"><h3>Cancel Plan</h3><button type="button" class="action-btn" data-action="cancel-admin-change">Cancel</button></div>
             <div class="form-grid">
               <div class="field span-6"><label for="admin-cancel-plan-id">Plan ID</label><input id="admin-cancel-plan-id"></div>
               <div class="field span-3"><label for="admin-canceled-by">By</label><input id="admin-canceled-by" value="sisko"></div>
@@ -3092,7 +3243,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       document.getElementById("health").innerHTML = `
         <div class="grid">
           ${stationIntro("Julian", "Diagnostics Lab", "Service health, probe failures, and runtime freshness.", ["probes", "MCP checks", "HTML and JSON"])}
-          <div class="section-head"><h3>Health Actions</h3><div class="actions"><button class="action-btn" data-action="run-health-probes">Run Probes</button></div></div>
+          <div class="section-head"><h3>Health Evidence</h3><div class="actions"><span class="pill">Scheduler queue only</span><button type="button" class="action-btn" data-view-target="overview">View scheduler</button></div></div>
           ${metric("Targets", health.targets, "registered", "span-3", "", "health")}
           ${metric("Unhealthy", health.unhealthy, "targets", "span-3", health.unhealthy ? "bad" : "good", "health")}
           ${metric("Recovery", health.recovery_required, "required", "span-3", health.recovery_required ? "warn" : "good", "health")}
@@ -3621,11 +3772,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Export an IDS review prompt", page: "Security", owner: "Odo IDS", action: "export-ids-review-prompt", source, query: "Export an IDS review prompt"},
         {workflow: "Dispatch an IDS review package", page: "Security", owner: "Odo IDS", action: "dispatch-ids-review-package", source, query: "Dispatch an IDS review package"},
         {workflow: "Record an IDS review result", page: "Security", owner: "Odo IDS", action: "record-ids-review-result", source, query: "Record an IDS review result"},
-        {workflow: "View logs from an unhealthy service", page: "Health", owner: "Julian", action: "run-health-probes", source, query: "View logs from an unhealthy service"},
+        {workflow: "View logs from an unhealthy service", page: "Health", owner: "Julian", action: "open Health", source, query: "View logs from an unhealthy service"},
         {workflow: "Stage system journal access request", page: "Health", owner: "Julian", action: "stage-journal-access-request", source, query: "Stage system journal access request"},
         {workflow: "Execute approved system journal capture", page: "Health", owner: "Julian", action: "execute-journal-access-request", source, query: "Execute approved system journal capture"},
         {workflow: "Capture metric history snapshot", page: "Health", owner: "Julian", action: "capture-metric-history", source, query: "Capture metric history snapshot"},
-        {workflow: "Run health probes", page: "Health", owner: "Julian", action: "run-health-probes", source, query: "Run health probes"},
+        {workflow: "Queue a health collection", page: "Health", owner: "Julian", action: "open scheduler", source, query: "Queue a health collection"},
         {workflow: "Register a health target", page: "Health", owner: "Julian", action: "register-health-target", source, query: "Register a health target"},
         {workflow: "Check an exhausted limit refresh", page: "Usage", owner: "Quark", action: "open Usage", source, query: "Check an exhausted limit refresh"},
         {workflow: "Record a usage limit", page: "Usage", owner: "Quark", action: "record-usage-limit", source, query: "Record a usage limit"},

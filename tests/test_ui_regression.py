@@ -200,6 +200,69 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
         self.assertIn('body[data-layout-effective="desktop"] main { padding-top: 60px; }', OPERATOR_CONSOLE_HTML)
         self.assertIn('#driver .action-btn { min-height: 44px; }', OPERATOR_CONSOLE_HTML)
 
+    def test_collection_dashboard_uses_scheduler_queue_instead_of_direct_probe(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn('collectionsStatus: "/collections/status"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('collectionsJobs: "/collections/jobs"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('collectionsRuns: "/collections/runs"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('collectionsIncidents: "/collections/incidents"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson(`/collections/jobs/${jobId}/run`', OPERATOR_CONSOLE_HTML)
+        self.assertNotIn('postJson("/health/probes/run"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("mapEndpointEntries(endpointEntries, 4)", OPERATOR_CONSOLE_HTML)
+        for label in (
+            "Scheduler heartbeat",
+            "Active jobs",
+            "Pending requests",
+            "Overdue jobs",
+            "Open circuits",
+            "Run now",
+            "Incident / repair disposition",
+        ):
+            self.assertIn(label, OPERATOR_CONSOLE_HTML)
+
+    def test_scheduler_helpers_and_refresh_coalescing_execute_in_node(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        helper_start = OPERATOR_CONSOLE_HTML.index("    const LAYOUT_MODES")
+        helper_end = OPERATOR_CONSOLE_HTML.index("    let layoutMode", helper_start)
+        refresh_start = OPERATOR_CONSOLE_HTML.index("    function refresh()")
+        refresh_end = OPERATOR_CONSOLE_HTML.index("    async function performRefresh()", refresh_start)
+        script = OPERATOR_CONSOLE_HTML[helper_start:helper_end] + OPERATOR_CONSOLE_HTML[refresh_start:refresh_end] + r'''
+const localStorage = {value: "auto", getItem() { return this.value; }, setItem(_, value) { this.value = value; }};
+if (viewportLayout(700) !== "mobile" || viewportLayout(701) !== "tablet" || viewportLayout(1024) !== "tablet" || viewportLayout(1025) !== "desktop") process.exit(2);
+if (nextLayoutMode("mobile") !== "auto" || nextLayoutMode("auto") !== "desktop") process.exit(3);
+if (resolveLayoutMode("auto", 700) !== "mobile" || resolveLayoutMode("desktop", 390) !== "desktop") process.exit(4);
+if (collectionAgeLabel("2026-08-24T11:58:00Z", 2) !== "observed 2026-08-24T11:58:00Z · age 2s") process.exit(5);
+if (collectionAgeLabel(null, null) !== "observed unknown · age unknown") process.exit(6);
+if (circuitBadge({state:"open", cooldown_until:"2026-08-24T12:10:00Z"}) !== "open · cooldown 2026-08-24T12:10:00Z") process.exit(7);
+const payload = collectionRunPayload("collection.health.api");
+if (payload.requested_by !== "operator" || payload.reason !== "operator requested dashboard run") process.exit(8);
+if (!requestIsPending({pending_request:{id:"request.collection.1"}}, new Set())) process.exit(9);
+if (!requestIsPending({id:"collection.health.api", pending_request:null}, new Set(["collection.health.api"]))) process.exit(10);
+const focus = captureFocusTarget({id:"scheduler-run-filter", dataset:{collectionRunJob:"collection.health.api"}});
+const focused = {focus(){ this.didFocus = true; }};
+const fakeDocument = {getElementById(id) { return id === focus.id ? focused : null; }, querySelector() { return null; }};
+if (restoreFocusTarget(focus, fakeDocument) !== focused || !focused.didFocus) process.exit(11);
+let refreshPromise = null;
+let refreshCalls = 0;
+function performRefresh() { refreshCalls += 1; return Promise.resolve("ready"); }
+const first = refresh();
+const second = refresh();
+if (first !== second) process.exit(12);
+Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(13); });
+'''
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rerender_contract_preserves_focus_and_non_submit_cancel(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn("captureFocusTarget(document.activeElement)", OPERATOR_CONSOLE_HTML)
+        self.assertIn("restoreFocusTarget(focusTarget)", OPERATOR_CONSOLE_HTML)
+        self.assertIn('<button type="button" class="action-btn" data-action="cancel-admin-change">Cancel</button>', OPERATOR_CONSOLE_HTML)
+        self.assertIn('<button type="button" class="action-btn" data-disabled-action="cancel-agent"', OPERATOR_CONSOLE_HTML)
+
     def test_sisko_page_has_roadex_final_human_decision_card(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
 

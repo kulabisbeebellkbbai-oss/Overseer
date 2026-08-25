@@ -46,6 +46,7 @@ src/overseer/key_broker.py
 src/overseer/knowledge.py
 src/overseer/live_health.py
 src/overseer/maintenance.py
+src/overseer/maintenance_projections.py
 src/overseer/maintenance_schedule.py
 src/overseer/metric_history.py
 src/overseer/observability_trends.py

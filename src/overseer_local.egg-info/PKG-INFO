@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: overseer-local
-Version: 0.1.0
+Version: 1.1.0
 Summary: Local resource manager for service health, asset checkout, maintenance, security, and usage-limit coordination.
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
@@ -12,9 +12,11 @@ Requires-Dist: starlette>=0.27
 
 Overseer is a local resource manager for coordinating shared machine services, physical assets, virtual assets, usage-limited services, maintenance, updates, and security actions across multiple Codex projects or threads.
 
+The current source release is Overseer `1.1.0`.
+
 Its purpose is to prevent conflicting work by tracking ownership, checkout state, locks, limits, health, and safe timing for resources such as the Protected Gateway, USB and serial devices, emulators, VMs, gateways, proxies, MCP services, hosted pages, update pipelines, storage arrays, and power-sensitive assets.
 
-The first release should include a working initial slice for every major domain:
+The release includes a working slice for every major domain:
 
 - physical asset checkout
 - virtual asset checkout

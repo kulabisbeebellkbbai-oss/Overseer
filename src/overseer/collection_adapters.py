@@ -252,7 +252,12 @@ class HostInspectionCollectionAdapter:
     collection_job_kind = CollectionJobKind.HOST_INSPECTION
 
     def __init__(self, inspection_adapter_factory: Callable[[float], HostInspectionAdapter] | None = None) -> None:
-        self.inspection_adapter_factory = inspection_adapter_factory or (lambda timeout: HostInspectionAdapter(timeout_seconds=timeout))
+        self.inspection_adapter_factory = inspection_adapter_factory or (
+            lambda timeout: HostInspectionAdapter(
+                timeout_seconds=timeout,
+                collect_firewall_commands=False,
+            )
+        )
 
     def collect(self, job: CollectionJob, store_path: str) -> CollectionExecution:
         snapshot = _scheduler_host_snapshot(self.inspection_adapter_factory(job.timeout_seconds).inspect())

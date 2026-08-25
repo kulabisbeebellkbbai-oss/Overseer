@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from .collection_deadline import require_collection_time
 from .core import OwnerDomain, Resource, ResourceType, RiskLevel
 
 
@@ -73,12 +74,17 @@ class HostInspectionAdapter:
 
     def inspect(self, captured_at: str | None = None) -> HostInspectionSnapshot:
         captured = captured_at or datetime.now(UTC).isoformat()
-        hostname = self.command_runner(("hostname",), self.timeout_seconds).stdout.strip()
-        established_tcp = self.command_runner(("ss", "-tnp"), self.timeout_seconds)
+        def run(command: tuple[str, ...]) -> HostCommandObservation:
+            remaining = require_collection_time()
+            timeout = min(self.timeout_seconds, remaining) if remaining is not None else self.timeout_seconds
+            return self.command_runner(command, timeout)
+
+        hostname = run(("hostname",)).stdout.strip()
+        established_tcp = run(("ss", "-tnp"))
         observations = [
-            self.command_runner(("uname", "-a"), self.timeout_seconds),
-            self.command_runner(("systemctl", "--user", "list-units", "--type=service", "--state=running", "--no-pager"), self.timeout_seconds),
-            self.command_runner(("ss", "-ltnp"), self.timeout_seconds),
+            run(("uname", "-a")),
+            run(("systemctl", "--user", "list-units", "--type=service", "--state=running", "--no-pager")),
+            run(("ss", "-ltnp")),
             HostCommandObservation(
                 name="ss-established",
                 command=established_tcp.command,
@@ -86,14 +92,14 @@ class HostInspectionAdapter:
                 stdout=established_tcp.stdout,
                 stderr=established_tcp.stderr,
             ),
-            self.command_runner(("df", "-h", "--output=source,size,used,avail,pcent,target"), self.timeout_seconds),
+            run(("df", "-h", "--output=source,size,used,avail,pcent,target")),
         ]
         if self.collect_firewall_commands:
             observations.extend(
                 (
-                    _named_observation("firewalld-state", self.command_runner(("firewall-cmd", "--state"), self.timeout_seconds)),
-                    _named_observation("firewalld-active-zones", self.command_runner(("firewall-cmd", "--get-active-zones"), self.timeout_seconds)),
-                    _named_observation("firewalld-public-zone", self.command_runner(("firewall-cmd", "--zone=public", "--list-all"), self.timeout_seconds)),
+                    _named_observation("firewalld-state", run(("firewall-cmd", "--state"))),
+                    _named_observation("firewalld-active-zones", run(("firewall-cmd", "--get-active-zones"))),
+                    _named_observation("firewalld-public-zone", run(("firewall-cmd", "--zone=public", "--list-all"))),
                 )
             )
         return HostInspectionSnapshot(

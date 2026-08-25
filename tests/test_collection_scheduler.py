@@ -27,9 +27,9 @@ from overseer.collection_adapters import (
     PackageInspectionCollectionAdapter,
     StorePathCallbackAdapter,
 )
-from overseer.collection_deadline import CollectionDeadlineExceeded
+from overseer.collection_deadline import CollectionDeadlineExceeded, collection_deadline_scope
 from overseer.health import HealthEvidence, HealthStatus, HealthTarget, ProbeType
-from overseer.host import HostCommandObservation, HostInspectionSnapshot
+from overseer.host import HostCommandObservation, HostInspectionAdapter, HostInspectionSnapshot
 from overseer.packages import FirmwarePreflightAdapter, PackageInspectionSnapshot, PackageUpdate
 
 NOW = "2026-08-24T12:00:00+00:00"
@@ -399,6 +399,37 @@ def test_host_collection_persists_projection_without_full_observations(tmp_path:
         assert saved.observation("ss").exit_code == 0
         assert saved.observation("ss").stdout == ""
         assert saved.observation("ss").stderr == ""
+
+
+def test_host_inspection_commands_share_the_absolute_collection_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_timeouts: list[float] = []
+    monotonic_values = iter((1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+    monkeypatch.setattr(
+        "overseer.collection_deadline.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    def runner(command, timeout_seconds):
+        observed_timeouts.append(timeout_seconds)
+        return HostCommandObservation(
+            name=command[0],
+            command=tuple(command),
+            exit_code=0,
+            stdout="deadline-host" if tuple(command) == ("hostname",) else "",
+            stderr="",
+        )
+
+    with collection_deadline_scope(10.0):
+        HostInspectionAdapter(
+            command_runner=runner,
+            file_reader=lambda _path: "ID=debian\n",
+            timeout_seconds=5.0,
+            collect_firewall_commands=False,
+        ).inspect(NOW)
+
+    assert observed_timeouts == [5.0, 5.0, 5.0, 5.0, 5.0, 4.0]
 
 
 def test_package_collection_preserves_updates_but_strips_raw_stderr(tmp_path: Path) -> None:

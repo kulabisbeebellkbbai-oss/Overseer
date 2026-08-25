@@ -124,6 +124,7 @@ def test_default_collection_seeding_fails_closed_for_external_action_families(tm
         for item in result["disabled"]
         if item["job_id"] in unsafe_ids
     )
+    assert jobs["collection.host.inspection"].timeout_seconds == 5
 
 
 def test_legacy_action_flags_do_not_authorize_unsafe_jobs(tmp_path: Path) -> None:

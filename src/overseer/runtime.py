@@ -42,7 +42,7 @@ DEFAULT_COLLECTION_INTERVALS = {
     CollectionJobKind.FIRMWARE_INSPECTION: 21600,
 }
 DEFAULT_COLLECTION_TIMEOUTS = {
-    CollectionJobKind.HOST_INSPECTION: 1,
+    CollectionJobKind.HOST_INSPECTION: 5,
     CollectionJobKind.PHYSICAL_DISCOVERY: 5,
     CollectionJobKind.VIRTUAL_DISCOVERY: 5,
     CollectionJobKind.CREW_DISPATCH: 5,

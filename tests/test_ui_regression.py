@@ -247,7 +247,9 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
         helper_end = OPERATOR_CONSOLE_HTML.index("    let layoutMode", helper_start)
         refresh_start = OPERATOR_CONSOLE_HTML.index("    function refresh()")
         refresh_end = OPERATOR_CONSOLE_HTML.index("    async function performRefresh()", refresh_start)
-        script = OPERATOR_CONSOLE_HTML[helper_start:helper_end] + OPERATOR_CONSOLE_HTML[refresh_start:refresh_end] + r'''
+        queue_start = OPERATOR_CONSOLE_HTML.index("    async function queueCollectionRun")
+        queue_end = OPERATOR_CONSOLE_HTML.index("    function applyActionResult", queue_start)
+        script = OPERATOR_CONSOLE_HTML[helper_start:helper_end] + OPERATOR_CONSOLE_HTML[refresh_start:refresh_end] + OPERATOR_CONSOLE_HTML[queue_start:queue_end] + r'''
 const localStorage = {value: "auto", getItem() { return this.value; }, setItem(_, value) { this.value = value; }};
 if (viewportLayout(700) !== "mobile" || viewportLayout(701) !== "tablet" || viewportLayout(1024) !== "tablet" || viewportLayout(1025) !== "desktop") process.exit(2);
 if (nextLayoutMode("mobile") !== "auto" || nextLayoutMode("auto") !== "desktop") process.exit(3);
@@ -282,6 +284,52 @@ const first = refresh();
 const second = refresh();
 if (first !== second) process.exit(17);
 Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(18); });
+(async () => {
+  globalThis.state = {pendingCollectionRuns:new Set(), lastAction:null};
+  const body = {};
+  let activeElement = null;
+  let releasePost;
+  const actionStatus = {id:"action-status", hidden:false, focus(){ activeElement = this; }};
+  const renderedJobButton = {disabled:true, dataset:{collectionRunJob:"collection.health.api"}};
+  const renderedFilterButton = {disabled:true, dataset:{collectionRunFilter:"true"}};
+  globalThis.document = {
+    body,
+    get activeElement() { return activeElement; },
+    getElementById(id) { return id === "action-status" ? actionStatus : null; },
+    querySelectorAll(selector) {
+      if (selector === "[data-collection-run-job]") return [renderedJobButton];
+      if (selector === "[data-collection-run-filter]") return [renderedFilterButton];
+      return [];
+    }
+  };
+  function makeSource(dataset) {
+    const source = {id:"", dataset, _disabled:false, setAttribute(){}, removeAttribute(){}, focus(){ activeElement = this; }};
+    Object.defineProperty(source, "disabled", {get(){ return this._disabled; }, set(value){ this._disabled = value; if (value && activeElement === this) activeElement = body; }});
+    return source;
+  }
+  globalThis.postJson = function() {
+    return new Promise((resolve) => { releasePost = () => resolve({status:"queued", request:{id:"request.focus"}, circuit:{state:"closed"}}); });
+  };
+  globalThis.refresh = function() { actionStatus.hidden = false; return Promise.resolve(); };
+  state.pendingCollectionRuns = new Set();
+  state.lastAction = null;
+  const jobSource = makeSource({collectionRunJob:"collection.health.api"});
+  activeElement = jobSource;
+  const jobPromise = queueCollectionRun("collection.health.api", jobSource);
+  await Promise.resolve();
+  if (document.activeElement !== body) process.exit(19);
+  releasePost();
+  await jobPromise;
+  if (document.activeElement !== actionStatus) process.exit(20);
+  const filterSource = makeSource({collectionRunFilter:"true"});
+  activeElement = filterSource;
+  const filterPromise = queueCollectionRun("collection.usage.quota", filterSource);
+  await Promise.resolve();
+  if (document.activeElement !== body) process.exit(21);
+  releasePost();
+  await filterPromise;
+  if (document.activeElement !== actionStatus) process.exit(22);
+})().catch(() => process.exit(23));
 '''
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -313,8 +361,26 @@ Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(1
         self.assertIn('body[data-layout-effective="desktop"] .shell { grid-template-columns: 96px minmax(224px, 1fr); }', OPERATOR_CONSOLE_HTML)
         self.assertIn('id="action-status" class="panel action-status" role="status" aria-live="polite" tabindex="-1" hidden', OPERATOR_CONSOLE_HTML)
         self.assertIn('collectionRunFilter: element.dataset?.collectionRunFilter || ""', OPERATOR_CONSOLE_HTML)
-        self.assertIn('id="action-status" class="panel action-status" role="status" aria-live="polite" tabindex="-1" hidden', OPERATOR_CONSOLE_HTML)
-        self.assertIn('collectionRunFilter: element.dataset?.collectionRunFilter || ""', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.metric > * { min-width: 0; max-width: 100%; }', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.metric .value {', OPERATOR_CONSOLE_HTML)
+        self.assertIn('word-break: break-word;', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.table-scroll {', OPERATOR_CONSOLE_HTML)
+
+    def test_scheduler_long_projection_values_have_wrapping_fixtures(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        helper_start = OPERATOR_CONSOLE_HTML.index("    const LAYOUT_MODES")
+        helper_end = OPERATOR_CONSOLE_HTML.index("    let layoutMode", helper_start)
+        script = OPERATOR_CONSOLE_HTML[helper_start:helper_end] + r'''
+const timestamp = "2026-08-24T12:34:56.123456+00:00";
+const requestId = "request.collection.health.api.20260824T123456.123456.operator-dashboard";
+const cooldown = "2026-08-24T23:59:59.123456+00:00";
+if (!collectionAgeLabel(timestamp, null).includes(timestamp)) process.exit(2);
+if (!circuitBadge({state:"open", cooldown_until:cooldown}).includes(cooldown)) process.exit(3);
+if (requestId.length < 60) process.exit(4);
+'''
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_sisko_page_has_roadex_final_human_decision_card(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML

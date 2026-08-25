@@ -284,10 +284,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       display: grid;
       gap: 6px;
       min-height: 104px;
+      min-width: 0;
       padding-left: 24px;
       text-align: left;
       color: var(--text);
     }
+    .metric > * { min-width: 0; max-width: 100%; }
     button.metric,
     button.crew-card,
     .cell-link {
@@ -308,6 +310,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       font-size: 30px;
       line-height: 1;
       font-weight: 780;
+      min-width: 0;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .cell-link {
       border: 0;
@@ -1246,6 +1252,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         return;
       }
       if (state.pendingCollectionRuns.has(requestedJobId)) return;
+      const focusTarget = captureFocusTarget(source || document.activeElement);
       state.pendingCollectionRuns.add(requestedJobId);
       const jobId = encodeURIComponent(requestedJobId);
       if (source) {
@@ -1260,10 +1267,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         const result = await postJson(`/collections/jobs/${jobId}/run`, collectionRunPayload(requestedJobId));
         state.lastAction = {action: "queue-collection-run", result, at: new Date().toLocaleString()};
         await refresh();
+        restoreFocusTarget(focusTarget);
       } catch (err) {
         state.pendingCollectionRuns.delete(requestedJobId);
         status.className = "panel action-status error";
         status.textContent = err.message;
+        restoreFocusTarget(focusTarget);
       } finally {
         if (source) source.removeAttribute("aria-busy");
       }

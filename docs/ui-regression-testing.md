@@ -194,11 +194,19 @@ control. Confirm that each request is a queue-only
 the click while the request is pending and verify the same job control is
 disabled. Confirm the 30-second refresh and focus/visibility/manual refresh
 triggers issue GET projections only and coalesce through one refresh promise.
+For both per-job and filtered Run Now, verify the focused trigger is captured
+before the browser disables it, because Chromium moves focus to `body` when a
+focused button becomes disabled. After the 202 response and projection
+rerender, the controller must observe `document.activeElement ===
+#action-status` (or the still-focusable nearby scheduler control when the
+trigger remains enabled), not `body`.
 
 At `390x844`, `820x1180`, and `1440x1000`, verify automatic mode, every forced
 mode, no horizontal overflow (including forced desktop at 390px), visible focus
 restoration after a scheduler rerender, preserved selected filtered-job state,
 readable tables, 44px controls including scheduler Run Now targets,
+and long observed timestamps, request IDs, and circuit cooldown values wrapping
+inside metric/panel bounds,
 reduced-motion behavior, and the top-right auto/desktop/tablet/mobile control
 with saved/effective mode announcement. Explicitly test the automatic boundaries at 700/701/1024/1025px
 and reload persistence. Cancel controls must remain `type="button"` and must

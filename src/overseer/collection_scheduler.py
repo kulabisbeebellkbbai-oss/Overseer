@@ -285,7 +285,7 @@ class CollectionScheduler:
             evidence_ids=execution.evidence_ids,
             error_category=(execution.failure_category if execution.failure_category in {
                 "", "timeout", "unavailable", "contract_mismatch", "authentication",
-                "resource_conflict", "policy_blocked", "adapter_error", "internal_error",
+                "resource_conflict", "policy_blocked", "stale", "adapter_error", "internal_error",
             } else "adapter_error"),
             retry_disposition="backoff" if execution.outcome is not CollectionOutcome.SUCCEEDED else "none",
             request_id=work.request_id,

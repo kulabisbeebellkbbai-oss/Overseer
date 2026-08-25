@@ -26,6 +26,17 @@ from overseer.quark_scheduler_cli import build_parser
 import overseer.quark_scheduler_cli as quark_scheduler_cli
 
 
+def test_quark_scheduler_timer_bootstraps_after_timer_activation() -> None:
+    timer = (
+        Path(__file__).resolve().parents[1]
+        / "systemd"
+        / "overseer-quark-scheduler.timer"
+    ).read_text(encoding="utf-8")
+
+    assert "OnActiveSec=3min" in timer
+    assert "OnUnitActiveSec=15min" in timer
+
+
 def _agent_work(
     work_id: str,
     project: str,

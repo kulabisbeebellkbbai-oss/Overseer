@@ -215,6 +215,34 @@ def test_worker_deadline_exception_is_recorded_as_timeout_when_future_finishes_f
         assert run.error_category == "timeout"
 
 
+def test_stale_failure_category_is_preserved_for_run_and_incident(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    job = _job("stale-projection")
+    _seed(path, (job,))
+
+    class StaleProjection:
+        def collect(self, _job: CollectionJob, _store_path: str) -> CollectionExecution:
+            return CollectionExecution(
+                CollectionOutcome.FAILED,
+                "external projection is stale",
+                failure_category="stale",
+            )
+
+    scheduler = _scheduler(path, StaleProjection(), max_workers=1)
+    try:
+        cycle = scheduler.run_ready_once()
+    finally:
+        scheduler.shutdown()
+
+    assert cycle.failed == 1
+    with SQLiteStore(path) as store:
+        run = store.list_collection_runs()[0]
+        incident = store.list_triage_incidents()[0]
+    assert run.error_category == "stale"
+    assert incident.status.value == "open"
+    assert run.id in incident.evidence_ids
+
+
 def test_bounded_firmware_preflight_timeout_releases_the_worker_slot(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     first = replace(_job("firmware-preflight", key="firmware"), priority=10)

@@ -83,7 +83,7 @@ class CodexAppServerClient:
                 process,
                 1,
                 "initialize",
-                {"clientInfo": {"name": "overseer-codex-usage", "version": "1.1.0"}, "capabilities": {}},
+                {"clientInfo": {"name": "overseer-codex-usage", "version": "1.1.1"}, "capabilities": {}},
             )
             self._receive(process, 1)
             rate_limits = self._read_rate_limits(process)
@@ -115,7 +115,7 @@ class CodexAppServerClient:
             env={key: value for key, value in os.environ.items() if key in _APP_SERVER_ENVIRONMENT_ALLOWLIST},
         )
         try:
-            self._send(process, 1, "initialize", {"clientInfo": {"name": "overseer-codex-meter", "version": "1.1.0"}, "capabilities": {}})
+            self._send(process, 1, "initialize", {"clientInfo": {"name": "overseer-codex-meter", "version": "1.1.1"}, "capabilities": {}})
             self._receive(process, 1)
             return self._read_rate_limits(process)
         finally:
@@ -154,7 +154,7 @@ class CodexAppServerClient:
                 process,
                 1,
                 "initialize",
-                {"clientInfo": {"name": "overseer-codex-dispatch", "version": "1.1.0"}, "capabilities": {}},
+                {"clientInfo": {"name": "overseer-codex-dispatch", "version": "1.1.1"}, "capabilities": {}},
             )
             self._receive(process, 1)
             self._send(process, 2, "thread/read", {"threadId": thread_id, "includeTurns": True})

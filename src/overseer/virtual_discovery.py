@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
+from .collection_deadline import require_collection_time
 from .core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
-from .host import HostInspectionAdapter, HostInspectionSnapshot
+from .host import CommandRunner, HostInspectionAdapter, HostInspectionSnapshot, run_read_only_command
 
 
 @dataclass(frozen=True)
@@ -17,11 +19,21 @@ class TcpListener:
 
 
 class ListenerVirtualDiscoveryAdapter:
-    def __init__(self, host_inspection_adapter: HostInspectionAdapter | None = None) -> None:
-        self.host_inspection_adapter = host_inspection_adapter or HostInspectionAdapter()
+    def __init__(
+        self,
+        host_inspection_adapter: HostInspectionAdapter | None = None,
+        *,
+        command_runner: CommandRunner | None = None,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout seconds must be positive")
+        self.host_inspection_adapter = host_inspection_adapter
+        self.command_runner = command_runner or run_read_only_command
+        self.timeout_seconds = float(timeout_seconds)
 
     def discover(self, snapshot: HostInspectionSnapshot | None = None) -> tuple[Resource, ...]:
-        inspected = snapshot or self.host_inspection_adapter.inspect()
+        inspected = snapshot or self._inspect_listeners()
         try:
             ss_output = inspected.observation("ss").stdout
         except KeyError:
@@ -31,6 +43,25 @@ class ListenerVirtualDiscoveryAdapter:
             resource = resource_from_tcp_listener(listener, inspected.id, inspected.captured_at)
             resources[resource.id] = resource
         return tuple(resources[key] for key in sorted(resources))
+
+    def _inspect_listeners(self) -> HostInspectionSnapshot:
+        if self.host_inspection_adapter is not None:
+            return self.host_inspection_adapter.inspect()
+        remaining = require_collection_time()
+        timeout = min(self.timeout_seconds, remaining) if remaining is not None else self.timeout_seconds
+        observation = self.command_runner(("ss", "-ltn"), timeout)
+        if observation.exit_code == 124:
+            raise TimeoutError("listener discovery command timed out")
+        if observation.exit_code != 0:
+            raise RuntimeError("listener discovery command failed")
+        captured_at = datetime.now(UTC).isoformat()
+        return HostInspectionSnapshot(
+            id=f"listeners.{_safe_id(captured_at)}",
+            captured_at=captured_at,
+            hostname="",
+            os_release={},
+            observations=(observation,),
+        )
 
 
 def parse_tcp_listeners(ss_output: str) -> tuple[TcpListener, ...]:
@@ -70,7 +101,6 @@ def resource_from_tcp_listener(listener: TcpListener, snapshot_id: str, captured
             "protocol": "tcp",
             "bind_scope": bind_scope,
             "snapshot_id": snapshot_id,
-            "process_hint": listener.evidence,
         },
         exclusive_groups=frozenset({f"tcp.{listener.port}", f"tcp.{_safe_id(listener.address)}.{listener.port}"}),
         last_verified_at=captured_at,

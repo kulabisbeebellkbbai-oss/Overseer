@@ -9,12 +9,14 @@ from pathlib import Path
 
 import pytest
 
+from overseer import runtime as runtime_module
 from overseer.cli import main
 from overseer.collection_models import CollectionJob, CollectionJobKind, CollectionOutcome, TriageIncident
 from overseer.collection_scheduler import CollectionScheduler
 from overseer.config import config_from_mapping
 from overseer.core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 from overseer.health import HealthTarget, ProbeType
+from overseer.host import HostCommandObservation
 from overseer.runtime import OverseerRuntime, runtime_collection_adapter_registry, seed_default_collection_jobs
 from overseer.store import SQLiteStore
 
@@ -342,7 +344,7 @@ def test_external_freshness_queries_exact_user_systemd_units_without_starting_th
         if unit.endswith(".timer"):
             return type("Result", (), {
                 "returncode": 0,
-                "stdout": "ActiveState=active\nSubState=waiting\nResult=success\nLastTriggerUSecRealtime=2026-08-24 12:00:00 UTC\nNextElapseUSecRealtime=2026-08-24 12:05:00 UTC\n",
+                "stdout": "ActiveState=active\nSubState=waiting\nResult=success\nLastTriggerUSec=Sat 2026-08-24 12:00:00 UTC\nNextElapseUSecMonotonic=6d 15h 34min 39s\n",
                 "stderr": "secret=must-not-persist",
             })()
         return type("Result", (), {
@@ -351,7 +353,7 @@ def test_external_freshness_queries_exact_user_systemd_units_without_starting_th
             "stderr": "",
         })()
 
-    registry = runtime_collection_adapter_registry(systemd_runner=runner, now=lambda: "2026-08-24T12:01:00+00:00")
+    registry = runtime_collection_adapter_registry(systemd_runner=runner, now=lambda: "2026-08-24T12:07:00+00:00")
     with SQLiteStore(path) as store:
         job = store.load_collection_job("collection.freshness.psychlo-usage")
     execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
@@ -360,11 +362,58 @@ def test_external_freshness_queries_exact_user_systemd_units_without_starting_th
     assert all(command[0][0:3] == ("systemctl", "--user", "show") for command in calls)
     assert {command[-1] for command, _ in calls} == {
         "overseer-psychlo-usage.timer",
-        "overseer-psychlo-usage.service",
+        "overseer-psychlo-cycle.service",
     }
     assert all("start" not in command and "enable" not in command for command, _ in calls)
     assert all(timeout == 5 for _, timeout in calls)
+    assert all("LastTriggerUSec" in command[-2] for command, _ in calls)
+    assert all("NextElapseUSecMonotonic" in command[-2] for command, _ in calls)
     assert "secret" not in repr(execution)
+
+
+def test_external_freshness_systemd_runner_forces_utc_timestamps(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def run(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setenv("OVERSEER_PRIVATE_FIXTURE", "must-not-propagate")
+    monkeypatch.setattr(runtime_module.subprocess, "run", run)
+
+    runtime_module._systemd_runner(("systemctl", "--user", "show", "example.timer"), 5)
+
+    assert captured["env"]["TZ"] == "UTC"
+    assert "OVERSEER_PRIVATE_FIXTURE" not in captured["env"]
+
+
+def test_external_freshness_uses_remaining_shared_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    remaining = iter((4.0, 1.0))
+    calls: list[float] = []
+
+    def runner(command: tuple[str, ...], timeout_seconds: float):
+        calls.append(timeout_seconds)
+        if command[-1].endswith(".timer"):
+            stdout = "ActiveState=active\nSubState=waiting\nResult=success\nLastTriggerUSec=Sat 2026-08-24 12:00:00 UTC\nNextElapseUSecMonotonic=1min\n"
+        else:
+            stdout = "ActiveState=inactive\nSubState=dead\nResult=success\n"
+        return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    monkeypatch.setattr(runtime_module, "require_collection_time", lambda: next(remaining))
+    registry = runtime_collection_adapter_registry(systemd_runner=runner, now=lambda: "2026-08-24T12:01:00+00:00")
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.freshness.psychlo-usage")
+
+    execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
+
+    assert execution.outcome is CollectionOutcome.SUCCEEDED
+    assert calls == [4.0, 1.0]
 
 
 def test_external_freshness_unavailable_and_timeout_are_bounded(tmp_path: Path) -> None:
@@ -421,6 +470,61 @@ def test_external_freshness_marks_old_last_trigger_failed(tmp_path: Path) -> Non
     execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
     assert execution.outcome is CollectionOutcome.FAILED
     assert execution.failure_category == "stale"
+
+
+def test_external_freshness_fails_when_psychlo_cycle_stage_fails(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+
+    def failed_cycle(command: tuple[str, ...], timeout_seconds: float):
+        del timeout_seconds
+        if command[-1].endswith(".timer"):
+            stdout = "ActiveState=active\nSubState=waiting\nResult=success\nLastTriggerUSec=Sat 2026-08-24 12:00:00 UTC\nNextElapseUSecMonotonic=1min\n"
+        else:
+            assert command[-1] == "overseer-psychlo-cycle.service"
+            stdout = "ActiveState=failed\nSubState=failed\nResult=exit-code\n"
+        return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    registry = runtime_collection_adapter_registry(
+        systemd_runner=failed_cycle,
+        now=lambda: "2026-08-24T12:01:00+00:00",
+    )
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.freshness.psychlo-usage")
+
+    execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
+
+    assert execution.outcome is CollectionOutcome.FAILED
+    assert execution.failure_category == "unavailable"
+
+
+def test_virtual_discovery_runs_only_one_bounded_listener_command(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    calls: list[tuple[tuple[str, ...], float]] = []
+
+    def runner(command, timeout_seconds):
+        calls.append((tuple(command), timeout_seconds))
+        return HostCommandObservation(
+            name="ss",
+            command=tuple(command),
+            exit_code=0,
+            stdout="LISTEN 0 4096 127.0.0.1:8787 0.0.0.0:*",
+        )
+
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.discovery.virtual")
+
+    registry = runtime_collection_adapter_registry(virtual_listener_runner=runner)
+    execution = registry.resolve(job, "virtual-discovery").collect(job, str(path))
+
+    assert execution.outcome is CollectionOutcome.SUCCEEDED
+    assert calls == [(('ss', '-ltn'), job.timeout_seconds)]
+    with SQLiteStore(path) as store:
+        resource = store.load_resource("listener.tcp.127-0-0-1.8787")
+        assert store.load_latest_host_snapshot() is None
+    assert resource.identifiers["snapshot_id"].startswith("listeners.")
+    assert "process_hint" not in resource.identifiers
 
 
 def test_git_status_is_an_independent_scheduled_projection(tmp_path: Path) -> None:

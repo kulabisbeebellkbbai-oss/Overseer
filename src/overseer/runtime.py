@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from collections.abc import Callable
@@ -17,14 +18,16 @@ from .collection_adapters import (
     StorePathCallbackAdapter,
     default_collection_adapter_registry,
 )
+from .collection_deadline import require_collection_time
 from .collection_models import CollectionJob, CollectionJobKind, CollectionOutcome
 from .collection_scheduler import CollectionScheduler
 from .core import OwnerDomain
 from .health import HealthTarget
-from .host import HostInspectionAdapter, assess_host_security
+from .host import CommandRunner, HostInspectionAdapter, assess_host_security
 from .live_health import RoutedHealthProbeAdapter
 from .runtime_state import RuntimeHeartbeat
 from .store import SQLiteStore
+from .virtual_discovery import ListenerVirtualDiscoveryAdapter
 
 DEFAULT_RUNTIME_MAX_IDLE_SECONDS = 30.0
 DEFAULT_COLLECTION_INTERVALS = {
@@ -79,18 +82,35 @@ SYSTEMD_FRESHNESS_PROPERTIES = (
     "ActiveState",
     "SubState",
     "Result",
+    "LastTriggerUSec",
     "LastTriggerUSecRealtime",
     "NextElapseUSecRealtime",
+    "NextElapseUSecMonotonic",
 )
 EXTERNAL_FRESHNESS_UNITS = {
     "overseer-psychlo-usage.service": (
         "overseer-psychlo-usage.timer",
-        "overseer-psychlo-usage.service",
+        "overseer-psychlo-cycle.service",
     ),
     "overseer-quark-scheduler.service": (
         "overseer-quark-scheduler.timer",
         "overseer-quark-scheduler.service",
     ),
+}
+SYSTEMD_ENVIRONMENT_ALLOWLIST = frozenset(
+    {
+        "DBUS_SESSION_BUS_ADDRESS",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_MESSAGES",
+        "PATH",
+        "XDG_RUNTIME_DIR",
+    }
+)
+EXTERNAL_FRESHNESS_MAX_AGE_SECONDS = {
+    "overseer-psychlo-usage.service": 960,
+    "overseer-quark-scheduler.service": 960,
 }
 COLLECTION_FAMILIES = frozenset(
     {
@@ -121,12 +141,19 @@ def _store_path(value: str | Any) -> str:
 
 
 def _systemd_runner(command: tuple[str, ...], timeout_seconds: float) -> object:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in SYSTEMD_ENVIRONMENT_ALLOWLIST
+    }
+    environment["TZ"] = "UTC"
     return subprocess.run(
         command,
         capture_output=True,
         text=True,
         timeout=timeout_seconds,
         check=False,
+        env=environment,
     )
 
 
@@ -179,15 +206,21 @@ def _freshness_projection_status(
     )
     for queried_unit in units:
         try:
-            result = runner((*command, queried_unit), timeout_seconds)
+            remaining = require_collection_time()
+            bounded_timeout = min(timeout_seconds, remaining) if remaining is not None else timeout_seconds
+            result = runner((*command, queried_unit), bounded_timeout)
         except (TimeoutError, subprocess.TimeoutExpired):
             return {"outcome": CollectionOutcome.BLOCKED.value, "failure_category": "timeout"}
         if getattr(result, "returncode", 1) != 0:
             return {"outcome": CollectionOutcome.BLOCKED.value, "failure_category": "unavailable"}
         observations[queried_unit] = _systemd_properties(result)
     timer, service = (observations[units[0]], observations[units[1]])
-    last_trigger = _systemd_timestamp(timer.get("LastTriggerUSecRealtime", ""))
-    next_trigger = _systemd_timestamp(timer.get("NextElapseUSecRealtime", ""))
+    last_trigger = _systemd_timestamp(
+        timer.get("LastTriggerUSec", "") or timer.get("LastTriggerUSecRealtime", "")
+    )
+    next_realtime = timer.get("NextElapseUSecRealtime", "").strip()
+    next_monotonic = timer.get("NextElapseUSecMonotonic", "").strip()
+    has_next_trigger = bool(next_realtime) or next_monotonic not in {"", "infinity"}
     current = (now or (lambda: datetime.now(UTC)))()
     if isinstance(current, str):
         current = datetime.fromisoformat(current.replace("Z", "+00:00"))
@@ -197,9 +230,13 @@ def _freshness_projection_status(
         timer.get("SubState"),
         timer.get("Result"),
         service.get("Result"),
-    } <= {"active", "waiting", "success"} or last_trigger is None or next_trigger is None:
+    } <= {"active", "waiting", "success"} or last_trigger is None or not has_next_trigger:
         return {"outcome": CollectionOutcome.FAILED.value, "failure_category": "unavailable"}
-    if (current - last_trigger).total_seconds() > max(job.interval_seconds + job.timeout_seconds, 1):
+    max_age_seconds = EXTERNAL_FRESHNESS_MAX_AGE_SECONDS.get(
+        unit,
+        max(job.interval_seconds + job.timeout_seconds, 1),
+    )
+    if (current - last_trigger).total_seconds() > max_age_seconds:
         return {"outcome": CollectionOutcome.FAILED.value, "failure_category": "stale"}
     evidence_id = f"freshness.{job.id.replace('collection.freshness.', '')}"
     return {
@@ -215,6 +252,7 @@ def runtime_collection_adapter_registry(
     git_projection_collector: Callable[..., object] | None = None,
     storage_projection_collector: Callable[..., object] | None = None,
     firmware_projection_collector: Callable[..., object] | None = None,
+    virtual_listener_runner: CommandRunner | None = None,
 ) -> CollectionAdapterRegistry:
     """Build the exact bounded callback bindings used by seeded jobs."""
     # Importing the CLI lazily avoids the CLI/runtime module cycle at import time.
@@ -250,7 +288,15 @@ def runtime_collection_adapter_registry(
         (CollectionJobKind.PHYSICAL_DISCOVERY, "storage-discovery"): lambda job, path, timeout: discover_storage_status(
             store_path=path, limit=25, timeout_seconds=timeout
         ),
-        (CollectionJobKind.VIRTUAL_DISCOVERY, "virtual-discovery"): lambda job, path, timeout: discover_virtual_listeners_status(path, limit=25, timeout_seconds=timeout),
+        (CollectionJobKind.VIRTUAL_DISCOVERY, "virtual-discovery"): lambda job, path, timeout: discover_virtual_listeners_status(
+            path,
+            adapter=ListenerVirtualDiscoveryAdapter(
+                command_runner=virtual_listener_runner,
+                timeout_seconds=timeout,
+            ),
+            limit=25,
+            timeout_seconds=timeout,
+        ),
         (CollectionJobKind.CREW_DISPATCH, "crew-dispatch"): lambda job, path, timeout: dispatch_crew_messages_status(path, dispatched_by="sisko", limit=1, timeout_seconds=timeout),
         (CollectionJobKind.USAGE_CONTINUATION, "usage-continuation"): lambda job, path, timeout: dispatch_usage_continuations_status(path, dispatched_by="quark", limit=1, timeout_seconds=timeout),
         (CollectionJobKind.KNOWLEDGE_CAPTURE, "knowledge-capture"): lambda job, path, timeout: knowledge_capture_status(path, limit=1, timeout_seconds=timeout),

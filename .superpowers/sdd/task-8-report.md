@@ -138,11 +138,11 @@ The independent browser UI findings were fixed in implementation commit
   scheduler controls. The CSS regression explicitly rejects page-level
   overflow masking and checks the narrow forced-desktop contract.
 
-Correction verification:
+Correction verification for `524e744` (`Restore scheduler focus and contain metrics`):
 
 ```text
 $ PYTHONPATH=src pytest -q tests/test_ui_regression.py tests/test_ui_full_regression.py tests/test_performance_regression.py
-46 passed in 20.68s
+47 passed in 20.40s
 $ PYTHONPATH=src python3 -m compileall -q src/overseer tests/test_ui_regression.py tests/test_ui_full_regression.py tests/test_performance_regression.py
 passed
 $ PYTHONPATH=src python3 -c 'from overseer.ui import OPERATOR_CONSOLE_HTML; print(OPERATOR_CONSOLE_HTML)' | awk '/^  <script>$/{inside=1; next} /^  <\/script>$/{inside=0} inside' | node --check
@@ -151,8 +151,34 @@ $ git diff --check
 passed
 ```
 
-The report commit follows `dfda11d`. Controller Playwright acceptance remains
+The report commit follows `524e744`. Controller Playwright acceptance remains
 pending and is not claimed here; it must rerun against the repaired disposable
 fixture at `/Overseer/ui`, including per-job and filtered focus restoration,
 selected-filter persistence, forced-desktop 390px overflow/content bounds,
 and the exact protected-prefix GET matrix.
+
+## Follow-up browser correction
+
+The real Playwright rerun against the clean prefixed fixture exposed a timing
+gap in `dfda11d`: Chromium moved focus to `body` as soon as the focused Run Now
+button was disabled, before `refresh()` could render the pending projection.
+The rerender therefore captured BODY and the prior fallback had no trigger to
+restore.
+
+The follow-up fix captures `captureFocusTarget(source ||
+document.activeElement)` before setting `source.disabled`, then explicitly
+calls `restoreFocusTarget(focusTarget)` after the successful refresh (and on
+the error path). The Node fixture models the browser transition to BODY and
+asserts `document.activeElement` ends at the focusable `#action-status` for
+both a per-job trigger and a distinct filtered trigger.
+
+The same correction adds intrinsic metric containment for real scheduler data:
+metric grid children and `.metric .value` have `min-width: 0`, bounded width,
+`overflow-wrap: anywhere`, and `word-break: break-word`. Long observed
+timestamps, request IDs, and cooldown values are exercised by Node fixtures;
+table overflow remains confined to `.table-scroll`.
+
+The follow-up source/test/docs commit is `524e744`. The report commit follows
+after this verification. Controller Playwright acceptance remains controller-owned and
+must confirm zero document overflow at 390px in auto/mobile and forced desktop,
+with readable metric content bounds and `#action-status` focus.

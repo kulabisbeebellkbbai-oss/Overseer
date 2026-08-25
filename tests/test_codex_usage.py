@@ -220,13 +220,14 @@ def test_structured_turn_submission_is_bound_and_confirmed_before_ack(monkeypatc
     assert phases == ["prepared", "paste-intent", "submit-intent", "submitted"]
     assert [method for _, method, _ in client.sent] == [
         "initialize",
+        "initialized",
         "thread/read",
         "thread/resume",
         "thread/read",
         "turn/start",
         "thread/read",
     ]
-    assert client.sent[4][2] == {
+    assert client.sent[5][2] == {
         "threadId": thread_id,
         "input": [{"type": "text", "text": prompt}],
         "clientUserMessageId": client_message_id,
@@ -243,6 +244,28 @@ def test_structured_turn_submission_is_bound_and_confirmed_before_ack(monkeypatc
         "PATH",
         "TMPDIR",
     }
+
+
+def test_app_server_wire_omits_jsonrpc_header_and_supports_notifications():
+    process = type("Process", (), {})()
+    process.stdin = io.StringIO()
+
+    CodexAppServerClient._send(
+        process,
+        1,
+        "initialize",
+        {"clientInfo": {"name": "overseer", "title": "Overseer", "version": "1.1.2"}},
+    )
+    CodexAppServerClient._send(process, None, "initialized", {})
+
+    assert [json.loads(line) for line in process.stdin.getvalue().splitlines()] == [
+        {
+            "id": 1,
+            "method": "initialize",
+            "params": {"clientInfo": {"name": "overseer", "title": "Overseer", "version": "1.1.2"}},
+        },
+        {"method": "initialized", "params": {}},
+    ]
 
 
 def test_structured_thread_validation_rejects_non_list_items():

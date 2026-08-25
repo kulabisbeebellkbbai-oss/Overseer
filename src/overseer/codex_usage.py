@@ -83,9 +83,17 @@ class CodexAppServerClient:
                 process,
                 1,
                 "initialize",
-                {"clientInfo": {"name": "overseer-codex-usage", "version": "1.1.1"}, "capabilities": {}},
+                {
+                    "clientInfo": {
+                        "name": "overseer-codex-usage",
+                        "title": "Overseer Codex Usage",
+                        "version": "1.1.2",
+                    },
+                    "capabilities": {},
+                },
             )
             self._receive(process, 1)
+            self._send(process, None, "initialized", {})
             rate_limits = self._read_rate_limits(process)
             self._send(process, 3, "account/usage/read", {})
             try:
@@ -115,8 +123,21 @@ class CodexAppServerClient:
             env={key: value for key, value in os.environ.items() if key in _APP_SERVER_ENVIRONMENT_ALLOWLIST},
         )
         try:
-            self._send(process, 1, "initialize", {"clientInfo": {"name": "overseer-codex-meter", "version": "1.1.1"}, "capabilities": {}})
+            self._send(
+                process,
+                1,
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "overseer-codex-meter",
+                        "title": "Overseer Codex Meter",
+                        "version": "1.1.2",
+                    },
+                    "capabilities": {},
+                },
+            )
             self._receive(process, 1)
+            self._send(process, None, "initialized", {})
             return self._read_rate_limits(process)
         finally:
             if process.poll() is None:
@@ -154,9 +175,17 @@ class CodexAppServerClient:
                 process,
                 1,
                 "initialize",
-                {"clientInfo": {"name": "overseer-codex-dispatch", "version": "1.1.1"}, "capabilities": {}},
+                {
+                    "clientInfo": {
+                        "name": "overseer-codex-dispatch",
+                        "title": "Overseer Codex Dispatch",
+                        "version": "1.1.2",
+                    },
+                    "capabilities": {},
+                },
             )
             self._receive(process, 1)
+            self._send(process, None, "initialized", {})
             self._send(process, 2, "thread/read", {"threadId": thread_id, "includeTurns": True})
             baseline = self._require_idle_thread(self._receive(process, 2), thread_id, client_message_id)
             self._send(process, 3, "thread/resume", {"threadId": thread_id, "cwd": cwd})
@@ -269,10 +298,13 @@ class CodexAppServerClient:
         }
 
     @staticmethod
-    def _send(process: subprocess.Popen[str], request_id: int, method: str, params: dict[str, Any]) -> None:
+    def _send(process: subprocess.Popen[str], request_id: int | None, method: str, params: dict[str, Any]) -> None:
         if process.stdin is None:
             raise RuntimeError("codex_app_server_stdin_unavailable")
-        process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
+        message: dict[str, Any] = {"method": method, "params": params}
+        if request_id is not None:
+            message["id"] = request_id
+        process.stdin.write(json.dumps(message) + "\n")
         process.stdin.flush()
 
     def _response_queue(self, process: subprocess.Popen[str]) -> queue.Queue[str | None]:

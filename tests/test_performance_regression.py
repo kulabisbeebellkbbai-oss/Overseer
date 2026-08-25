@@ -1,9 +1,13 @@
 import tempfile
+import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
+from overseer.collection_scheduler import CollectionScheduler
 from tests.test_ui_full_regression import SAFE_POST_PAYLOADS
+from tests.test_collection_api import seed_job
 from tests.test_ui_regression import LocalApiHarness
 
 
@@ -32,6 +36,11 @@ GET_ENDPOINT_BUDGETS = {
     "/Overseer/host/security/listener-review-queue": 2.5,
     "/Overseer/host/security/source-review-queue": 2.5,
     "/Overseer/git/status": 2.5,
+    "/Overseer/collections/status": 1.0,
+    "/Overseer/collections/jobs?limit=12": 1.0,
+    "/Overseer/collections/runs?limit=12": 1.0,
+    "/Overseer/collections/incidents?limit=12": 1.0,
+    "/Overseer/collections/runbooks?limit=12": 1.0,
 }
 
 GET_ENDPOINT_ALLOWED_STATUSES = {
@@ -90,6 +99,40 @@ class PerformanceRegressionTests(unittest.TestCase):
                         response, elapsed = _timed(lambda endpoint=endpoint, payload=payload: server.post_json(endpoint, payload))
                         self.assertIsInstance(response, dict)
                         self.assertLess(elapsed, budget)
+
+    def test_collection_run_queue_does_not_wait_for_blocking_adapter(self):
+        class BlockingFakeAdapter:
+            def __init__(self):
+                self.started = threading.Event()
+
+            def run(self):
+                self.started.set()
+                threading.Event().wait(10)
+
+        blocking_adapter = BlockingFakeAdapter()
+
+        def blocked_scheduler_entry(*args, **kwargs):
+            blocking_adapter.run()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            seed_job(store_path)
+            with LocalApiHarness(store_path) as server:
+                with patch.object(
+                    CollectionScheduler, "run_ready_once", blocked_scheduler_entry
+                ):
+                    response, elapsed = _timed(
+                        lambda: server.post_json(
+                            "/Overseer/collections/jobs/collection.health.api/run",
+                            {
+                                "requested_by": "performance-test",
+                                "reason": "bounded queue timing",
+                            },
+                        )
+                    )
+            self.assertIn(response["status"], {"queued", "coalesced"})
+            self.assertFalse(blocking_adapter.started.is_set())
+            self.assertLess(elapsed, 1.0)
 
 
 if __name__ == "__main__":

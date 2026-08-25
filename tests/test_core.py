@@ -5587,7 +5587,7 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["profile"]["name"], "client-profile")
             self.assertFalse(status["profile"]["block_warnings_until_accepted"])
 
-    def test_client_runs_stored_health_probes(self):
+    def test_client_queues_stored_health_probe_compatibility_request(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
             store = SQLiteStore(store_path)
@@ -5606,9 +5606,9 @@ class OverseerApiClientTests(unittest.TestCase):
                 client = OverseerApiClient(server.url, auth_token="client-secret")
                 status = client.run_health_probes(timeout_seconds=2, retention_per_target=1)
 
-            self.assertEqual(status["targets"], 1)
-            self.assertEqual(status["healthy"], 1)
-            self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
+            self.assertEqual(status["status"], "accepted")
+            self.assertEqual(status["request_count"], 0)
+            self.assertEqual(status["requests"], [])
 
     def test_probe_stored_health_status_probes_persisted_manual_targets(self):
         with tempfile.TemporaryDirectory() as directory:

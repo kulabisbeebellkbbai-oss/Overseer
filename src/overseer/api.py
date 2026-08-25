@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from json import JSONDecodeError
 from http import HTTPStatus
@@ -27,8 +28,9 @@ from .roadex_approval_fixture import (
 )
 
 from .codex_usage import CodexUsageTracker
-from .audit import ApprovalStatus
-from .core import ApprovalLevel, ClaimStatus
+from .audit import ApprovalStatus, AuditEvent, AuditEventType
+from .collection_models import CollectionJobKind
+from .core import ApprovalLevel, ClaimStatus, RiskLevel
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, sign_peer_response, verify_peer_request, MAX_BODY_BYTES
 from .store import SQLiteStore
 from .claim_continuation import (
@@ -77,6 +79,10 @@ from .cli import (
     claim_cleanup_plan_status,
     claim_review_status,
     command_summary_status,
+    collection_incidents_status,
+    collection_jobs_status,
+    collection_runs_status,
+    collection_scheduler_status,
     create_host_security_source_review_status,
     crew_messages_status,
     checkpoint_agent_status,
@@ -148,6 +154,7 @@ from .cli import (
     persistence_security_status,
     record_usage_limit_status,
     request_claim_status,
+    request_collection_run_status,
     request_claim_cleanup_status,
     request_key_broker_token_status,
     recover_agent_status,
@@ -322,6 +329,359 @@ def _strip_protected_gateway_prefix(path: str) -> str:
     return path
 
 
+COLLECTION_MAX_API_LIMIT = 500
+COLLECTION_MAX_REASON_LENGTH = 2048
+COLLECTION_MAX_ACTOR_LENGTH = 160
+COLLECTION_MAX_LEGACY_TIMEOUT_SECONDS = 300
+COLLECTION_MAX_LEGACY_RETENTION = 100
+
+
+def _collection_identifier(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-blank string")
+    if len(value) > COLLECTION_MAX_ACTOR_LENGTH:
+        raise ValueError(f"{label} exceeds the {COLLECTION_MAX_ACTOR_LENGTH}-character limit")
+    return value
+
+
+def _collection_query(
+    query: dict[str, list[str]],
+    *,
+    allow_status: set[str] | None = None,
+) -> tuple[str | None, str | None, int]:
+    allowed = {"job_id", "status", "limit"}
+    unknown = set(query) - allowed
+    if unknown:
+        raise ValueError(f"unsupported collection query field: {sorted(unknown)[0]}")
+
+    def one(name: str) -> str | None:
+        values = query.get(name, [])
+        if len(values) > 1:
+            raise ValueError(f"collection query field {name} must occur once")
+        return values[0] if values else None
+
+    job_id = one("job_id")
+    if job_id is not None:
+        _collection_identifier(job_id, "job_id")
+    status = one("status")
+    if status is not None:
+        if allow_status is None or status not in allow_status:
+            raise ValueError("collection status filter is invalid")
+    raw_limit = one("limit")
+    if raw_limit is None:
+        limit = 100
+    elif not raw_limit.isdigit():
+        raise ValueError("collection limit must be an integer")
+    else:
+        limit = int(raw_limit)
+    if not 1 <= limit <= COLLECTION_MAX_API_LIMIT:
+        raise ValueError(f"collection limit must be between 1 and {COLLECTION_MAX_API_LIMIT}")
+    return job_id, status, limit
+
+
+def _collection_query_call(query: dict[str, list[str]], allow_status: set[str] | None, callback):
+    job_id, status, limit = _collection_query(query, allow_status=allow_status)
+    return callback(job_id, status, limit)
+
+
+def _collection_control_payload(
+    payload: object,
+    *,
+    fields: set[str],
+    require_reason: bool = True,
+) -> tuple[str, str | None]:
+    if not isinstance(payload, dict) or set(payload) != fields:
+        expected = ", ".join(sorted(fields))
+        raise ValueError(f"exact collection control fields are required: {expected}")
+    requested_by = _collection_identifier(payload.get("requested_by"), "requested_by")
+    reason = payload.get("reason")
+    if require_reason:
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > COLLECTION_MAX_REASON_LENGTH:
+            raise ValueError("reason must be a bounded non-blank string")
+    elif reason is not None and (not isinstance(reason, str) or len(reason) > COLLECTION_MAX_REASON_LENGTH):
+        raise ValueError("reason must be a bounded string")
+    return requested_by, reason
+
+
+def _collection_job_projection(
+    store_path: str,
+    *,
+    job_id: str | None,
+    status: str | None,
+    limit: int,
+) -> dict[str, object]:
+    projection = collection_jobs_status(store_path, limit=COLLECTION_MAX_API_LIMIT)
+    rows = list(projection.get("jobs", []))
+    if job_id is not None:
+        rows = [row for row in rows if row.get("id") == job_id]
+    if status == "enabled":
+        rows = [row for row in rows if row.get("enabled") is True]
+    elif status == "disabled":
+        rows = [row for row in rows if row.get("enabled") is False]
+    total = len(rows)
+    rows = rows[:limit]
+    projection.update(
+        {
+            "jobs": rows,
+            "job_count": len(rows),
+            "total_count": total,
+            "returned_count": len(rows),
+            "truncated": total > len(rows),
+            "limit": limit,
+            "job_id": job_id,
+            "filter": status,
+        }
+    )
+    return projection
+
+
+def _collection_scheduler_projection(
+    store_path: str,
+    *,
+    job_id: str | None,
+    status: str | None,
+    limit: int,
+) -> dict[str, object]:
+    projection = collection_scheduler_status(store_path, limit=limit)
+    if job_id is not None or status in {"enabled", "disabled"}:
+        jobs = _collection_job_projection(
+            store_path, job_id=job_id, status=status, limit=limit
+        )
+        projection["jobs"] = jobs["jobs"]
+        projection["jobs_total_count"] = jobs["total_count"]
+        projection["jobs_returned_count"] = jobs["returned_count"]
+        projection["jobs_truncated"] = jobs["truncated"]
+    return projection
+
+
+def _collection_run_projection(
+    store_path: str,
+    *,
+    job_id: str | None,
+    status: str | None,
+    limit: int,
+) -> dict[str, object]:
+    projection = collection_runs_status(store_path, job_id=job_id, limit=COLLECTION_MAX_API_LIMIT)
+    rows = list(projection.get("runs", []))
+    if status is not None:
+        rows = [row for row in rows if row.get("outcome") == status]
+    total = len(rows)
+    rows = rows[:limit]
+    projection.update(
+        {
+            "runs": rows,
+            "run_count": len(rows),
+            "total_count": total,
+            "returned_count": len(rows),
+            "truncated": total > len(rows),
+            "limit": limit,
+        }
+    )
+    return projection
+
+
+def _collection_incidents_for_api(
+    store_path: str,
+    *,
+    job_id: str | None,
+    status: str | None,
+    limit: int,
+) -> dict[str, object]:
+    projection = collection_incidents_status(
+        store_path, status=status, limit=COLLECTION_MAX_API_LIMIT
+    )
+    rows = list(projection.get("incidents", []))
+    if job_id is not None:
+        rows = [row for row in rows if row.get("job_id") == job_id]
+    total = len(rows)
+    rows = rows[:limit]
+    projection.update(
+        {
+            "incidents": rows,
+            "incident_count": len(rows),
+            "total_count": total,
+            "returned_count": len(rows),
+            "truncated": total > len(rows),
+            "limit": limit,
+            "job_id": job_id,
+        }
+    )
+    return projection
+
+
+def _collection_runbook_projection(
+    store_path: str,
+    *,
+    job_id: str | None,
+    limit: int,
+) -> dict[str, object]:
+    with SQLiteStore(store_path) as store:
+        runbooks = [
+            item
+            for item in store.list_repair_runbooks()
+            if job_id is None or item.job_id == job_id
+        ]
+    runbooks.sort(key=lambda item: item.id)
+    rows = [
+        {
+            "id": item.id,
+            "job_id": item.job_id,
+            "resource_id": item.resource_id,
+            "failure_categories": list(item.failure_categories),
+            "risk_level": item.risk_level.value,
+            "cooldown_seconds": item.cooldown_seconds,
+            "approval_required": item.approval_required,
+        }
+        for item in runbooks[:limit]
+    ]
+    return {
+        "status": "ok",
+        "runbooks": rows,
+        "runbook_count": len(rows),
+        "job_id": job_id,
+        "total_count": len(runbooks),
+        "returned_count": len(rows),
+        "truncated": len(runbooks) > len(rows),
+        "limit": limit,
+    }
+
+
+def _collection_runbooks_for_api(
+    store_path: str, job_id: str | None, status: str | None, limit: int
+) -> dict[str, object]:
+    if status is not None:
+        raise ValueError("collection runbooks do not support status filtering")
+    return _collection_runbook_projection(store_path, job_id=job_id, limit=limit)
+
+
+def _collection_run_request_projection(
+    store_path: str,
+    job_id: str,
+    requested_by: str,
+    reason: str,
+) -> dict[str, object]:
+    result = request_collection_run_status(store_path, job_id, requested_by, reason)
+    request_id = str(result["request"]["id"])
+    with SQLiteStore(store_path) as store:
+        request = next(
+            item for item in store.list_collection_requests() if item.id == request_id
+        )
+        state = store.load_collection_job_state(job_id)
+    return {
+        "status": result["status"],
+        "request_id": request.id,
+        "earliest_execution_at": request.earliest_execution_at,
+        "circuit": {
+            "state": state.circuit_state.value if state else None,
+            "cooldown_until": state.cooldown_until if state else None,
+        },
+        "request": {
+            "id": request.id,
+            "job_id": request.job_id,
+            "requested_by": request.requester,
+            "requested_at": request.requested_at,
+            "status": request.status,
+        },
+        "inline_execution": False,
+    }
+
+
+def _collection_policy_update(
+    store_path: str,
+    job_id: str,
+    enabled: bool,
+    requested_by: str,
+    reason: str,
+) -> dict[str, object]:
+    with SQLiteStore(store_path) as store:
+        jobs = {item.id: item for item in store.list_collection_jobs()}
+        job = jobs.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        store.save_collection_job(replace(job, enabled=enabled))
+        state = store.load_collection_job_state(job_id)
+        now = datetime.now(UTC).isoformat()
+        audit_id = "audit.collection.policy." + hashlib.sha256(
+            f"{job_id}:{enabled}:{requested_by}:{now}".encode()
+        ).hexdigest()[:40]
+        store.save_audit_event(
+            AuditEvent(
+                id=audit_id,
+                event_type=AuditEventType.EXECUTED,
+                owner_domain=job.owner_domain,
+                subject_id=job_id,
+                summary="collection_job_enabled_policy_updated",
+                risk_level=RiskLevel.LOW,
+                occurred_at=now,
+            )
+        )
+    return {
+        "status": "resumed" if enabled else "suspended",
+        "job": {"id": job_id, "enabled": enabled},
+        "active_lease": (
+            {
+                "id": state.active_lease_id,
+                "owner": state.lease_owner,
+                "expires_at": state.lease_expires_at,
+                "generation": state.lease_generation,
+            }
+            if state and state.active_lease_id
+            else None
+        ),
+        "audit_id": audit_id,
+        "inline_execution": False,
+    }
+
+
+def _legacy_health_probe_requests(
+    store_path: str, payload: object
+) -> dict[str, object]:
+    if not isinstance(payload, dict) or set(payload) - {"timeout_seconds", "retention_per_target"}:
+        raise ValueError("exact deprecated health probe fields are required")
+    timeout = payload.get("timeout_seconds")
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not 0 < timeout <= COLLECTION_MAX_LEGACY_TIMEOUT_SECONDS
+    ):
+        raise ValueError("timeout_seconds must be between 0 and 300")
+    retention = payload.get("retention_per_target")
+    if retention is not None and (
+        isinstance(retention, bool)
+        or not isinstance(retention, int)
+        or not 1 <= retention <= COLLECTION_MAX_LEGACY_RETENTION
+    ):
+        raise ValueError("retention_per_target must be between 1 and 100")
+    with SQLiteStore(store_path) as store:
+        jobs = sorted(
+            item.id
+            for item in store.list_collection_jobs()
+            if item.enabled and item.kind is CollectionJobKind.HEALTH_PROBE
+        )
+    requests = []
+    for job_id in jobs:
+        item = _collection_run_request_projection(
+            store_path,
+            job_id,
+            "legacy.health.probes",
+            "deprecated health probe compatibility request",
+        )
+        requests.append(
+            {
+                "id": item["request_id"],
+                "job_id": job_id,
+                "status": item["status"],
+                "earliest_execution_at": item["earliest_execution_at"],
+            }
+        )
+    return {
+        "status": "accepted",
+        "request_count": len(requests),
+        "requests": requests,
+        "inline_execution": False,
+    }
+
+
 def _project_path_for_store(store_path: str) -> Path:
     store_parent = Path(store_path).resolve().parent
     if store_parent.name == "state":
@@ -416,6 +776,61 @@ def make_api_handler(
                         "account_id": auth_context.get("account_id"),
                         "token_id": auth_context.get("token_id"),
                     }
+                )
+                return
+            if path == "/collections/status":
+                self._handle(
+                    lambda: _collection_query_call(
+                        query,
+                        {"open", "resolved", "enabled", "disabled"},
+                        lambda job_id, status, limit: _collection_scheduler_projection(
+                            store_path, job_id=job_id, status=status, limit=limit
+                        ),
+                    )
+                )
+                return
+            if path == "/collections/jobs":
+                self._handle(
+                    lambda: _collection_query_call(
+                        query,
+                        {"enabled", "disabled"},
+                        lambda job_id, status, limit: _collection_job_projection(
+                            store_path, job_id=job_id, status=status, limit=limit
+                        ),
+                    )
+                )
+                return
+            if path == "/collections/runs":
+                self._handle(
+                    lambda: _collection_query_call(
+                        query,
+                        {"succeeded", "failed", "blocked", "timed_out"},
+                        lambda job_id, status, limit: _collection_run_projection(
+                            store_path, job_id=job_id, status=status, limit=limit
+                        ),
+                    )
+                )
+                return
+            if path == "/collections/incidents":
+                self._handle(
+                    lambda: _collection_query_call(
+                        query,
+                        {"open", "resolved"},
+                        lambda job_id, status, limit: _collection_incidents_for_api(
+                            store_path, job_id=job_id, status=status, limit=limit
+                        )
+                    )
+                )
+                return
+            if path == "/collections/runbooks":
+                self._handle(
+                    lambda: _collection_query_call(
+                        query,
+                        None,
+                        lambda job_id, status, limit: _collection_runbooks_for_api(
+                            store_path, job_id, status, limit
+                        ),
+                    )
                 )
                 return
             if path == "/storage/control/authorizations":
@@ -823,6 +1238,63 @@ def make_api_handler(
             auth_context = self._authorize_request("POST", raw_path, path)
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
+                return
+            collection_control = (
+                path == "/health/probes/run"
+                or re.fullmatch(r"/collections/jobs/[^/]+/(run|suspend|resume)", path)
+            )
+            if collection_control and auth_context.get("auth_type") != "admin_token":
+                self._write_json(
+                    {"error": "control routes require admin authorization"},
+                    HTTPStatus.FORBIDDEN,
+                )
+                return
+            collection_match = re.fullmatch(
+                r"/collections/jobs/([^/]+)/(run|suspend|resume)", path
+            )
+            if collection_match:
+                job_id, operation = collection_match.groups()
+
+                def collection_control_result():
+                    payload = self._read_json()
+                    if operation == "run":
+                        requested_by, reason = _collection_control_payload(
+                            payload,
+                            fields={"requested_by", "reason"},
+                        )
+                        return _collection_run_request_projection(
+                            store_path, job_id, requested_by, reason or ""
+                        )
+                    requested_by, reason = _collection_control_payload(
+                        payload,
+                        fields={"requested_by", "reason"},
+                    )
+                    return _collection_policy_update(
+                        store_path,
+                        job_id,
+                        operation == "resume",
+                        requested_by,
+                        reason or "",
+                    )
+
+                self._handle_collection_control(
+                    collection_control_result,
+                    status=HTTPStatus.ACCEPTED if operation == "run" else HTTPStatus.OK,
+                )
+                return
+            if path == "/health/probes/run":
+                self._handle_collection_control(
+                    lambda: _legacy_health_probe_requests(store_path, self._read_json()),
+                    status=HTTPStatus.ACCEPTED,
+                    headers={
+                        "Deprecation": "true",
+                        "Link": (
+                            "</Overseer/collections/jobs>; rel=\"successor\""
+                            if raw_path.startswith(f"{PROTECTED_GATEWAY_PREFIX}/")
+                            else "</collections/jobs>; rel=\"successor\""
+                        ),
+                    },
+                )
                 return
             if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path in {"/roadex/human-decisions/decide", "/roadex/approval-fixtures/stage", "/roadex/psychlo/policy-exception-decision"}) and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
@@ -1434,6 +1906,26 @@ def make_api_handler(
                     {"error": str(error)},
                     HTTPStatus.CONFLICT,
                     headers=response_headers,
+                )
+
+        def _handle_collection_control(
+            self,
+            handler,
+            *,
+            status: HTTPStatus,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            try:
+                self._write_json(handler(), status, headers=headers)
+            except KeyError as error:
+                self._write_json(
+                    {"error": f"missing record: {error.args[0]}"},
+                    HTTPStatus.NOT_FOUND,
+                    headers=headers,
+                )
+            except (TypeError, JSONDecodeError, ValueError, EOFError, AttributeError) as error:
+                self._write_json(
+                    {"error": str(error)}, HTTPStatus.BAD_REQUEST, headers=headers
                 )
 
         def _handle_psychlo_peer(self, kind: str) -> None:

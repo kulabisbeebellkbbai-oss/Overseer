@@ -131,6 +131,85 @@ class OverseerApiClient:
     def health_efficiency(self) -> dict[str, Any]:
         return self._get("/health-efficiency")
 
+    def collection_status(
+        self,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self._get(
+            _collection_path(
+                "/collections/status", job_id=job_id, status=status, limit=limit
+            )
+        )
+
+    def collection_jobs(
+        self,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self._get(
+            _collection_path(
+                "/collections/jobs", job_id=job_id, status=status, limit=limit
+            )
+        )
+
+    def collection_runs(
+        self,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self._get(
+            _collection_path(
+                "/collections/runs", job_id=job_id, status=status, limit=limit
+            )
+        )
+
+    def collection_incidents(
+        self,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self._get(
+            _collection_path(
+                "/collections/incidents", job_id=job_id, status=status, limit=limit
+            )
+        )
+
+    def collection_runbooks(
+        self,
+        job_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self._get(_collection_path("/collections/runbooks", job_id=job_id, limit=limit))
+
+    def request_collection_run(
+        self, job_id: str, requested_by: str, reason: str
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/collections/jobs/{quote(job_id, safe='')}/run",
+            {"requested_by": requested_by, "reason": reason},
+        )
+
+    def suspend_collection_job(
+        self, job_id: str, requested_by: str, reason: str
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/collections/jobs/{quote(job_id, safe='')}/suspend",
+            {"requested_by": requested_by, "reason": reason},
+        )
+
+    def resume_collection_job(
+        self, job_id: str, requested_by: str, reason: str
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/collections/jobs/{quote(job_id, safe='')}/resume",
+            {"requested_by": requested_by, "reason": reason},
+        )
+
     def run_health_probes(
         self,
         timeout_seconds: float | None = None,
@@ -960,6 +1039,15 @@ class OverseerApiClient:
     def _read(self, request: Request) -> dict[str, Any]:
         with urlopen(request, timeout=self.timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
+
+
+def _collection_path(path: str, **filters: object) -> str:
+    query = {
+        key: value
+        for key, value in filters.items()
+        if value is not None
+    }
+    return f"{path}?{urlencode(query)}" if query else path
 
 
 def _load_token(token_file: str | None) -> str | None:

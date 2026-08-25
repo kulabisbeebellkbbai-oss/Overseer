@@ -260,3 +260,40 @@ gateway, original checkout, or another project.
   `overseer-task8-1440x1000.png`.
 
 Task 8 is browser-accepted and ready for independent review.
+
+## Independent-review dashboard compatibility correction
+
+Independent review found one stale assertion in
+`OverseerApiTests.test_loopback_api_serves_operator_console_without_token`:
+the established dashboard regression still required the intentionally removed
+`data-action="run-health-probes"` control. Reproduction before editing produced
+the expected RED:
+
+```text
+$ PYTHONPATH=src pytest -q tests/test_core.py -k 'loopback_api_serves_operator_console_without_token'
+1 failed, 384 deselected in 1.04s
+AssertionError: 'data-action="run-health-probes"' not found
+```
+
+Correction commit `c918635` (`Update dashboard scheduler expectations`) changes
+only `tests/test_core.py`. The compatibility test now requires all four
+scheduler projections, the per-job and filtered queue-only controls, and the
+encoded scheduler queue POST. It explicitly rejects both the removed direct
+probe control and `postJson("/health/probes/run"`. Production UI/API behavior
+was unchanged. Dedicated deprecated-route coverage remains in
+`tests/test_collection_api.py` and `tests/test_ui_full_regression.py`.
+
+GREEN verification:
+
+```text
+$ PYTHONPATH=src pytest -q tests/test_core.py -k 'operator_console or git_status or documents_routes'
+6 passed, 379 deselected in 2.40s
+$ PYTHONPATH=src pytest -q tests/test_ui_regression.py tests/test_ui_full_regression.py tests/test_performance_regression.py
+47 passed in 20.66s
+$ git diff --check
+passed
+```
+
+The report commit follows `c918635`. The earlier disposable-harness browser
+acceptance remains valid; this correction changes tests and report evidence
+only.

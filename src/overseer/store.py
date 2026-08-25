@@ -2983,10 +2983,16 @@ class SQLiteStore:
         return _load_dataclass(HostInspectionSnapshot, self._get_payload("host_snapshots", snapshot_id))
 
     def list_host_snapshots(self, *, limit: int | None = None) -> tuple[HostInspectionSnapshot, ...]:
-        sql = "SELECT payload FROM host_snapshots ORDER BY id"
+        sql = (
+            "SELECT payload FROM host_snapshots "
+            "ORDER BY julianday(json_extract(payload, '$.captured_at')) ASC, id ASC"
+        )
         params: tuple[object, ...] = ()
         if limit is not None:
-            sql = "SELECT payload FROM host_snapshots ORDER BY id DESC LIMIT ?"
+            sql = (
+                "SELECT payload FROM host_snapshots "
+                "ORDER BY julianday(json_extract(payload, '$.captured_at')) DESC, id DESC LIMIT ?"
+            )
             params = (max(0, int(limit)),)
         rows = self._connection.execute(sql, params).fetchall()
         return tuple(_load_dataclass(HostInspectionSnapshot, str(row["payload"])) for row in rows)
@@ -2996,7 +3002,10 @@ class SQLiteStore:
         return int(row["count"] if row is not None else 0)
 
     def load_latest_host_snapshot(self) -> HostInspectionSnapshot | None:
-        row = self._connection.execute("SELECT payload FROM host_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        row = self._connection.execute(
+            "SELECT payload FROM host_snapshots "
+            "ORDER BY julianday(json_extract(payload, '$.captured_at')) DESC, id DESC LIMIT 1"
+        ).fetchone()
         if row is None:
             return None
         return _load_dataclass(HostInspectionSnapshot, str(row["payload"]))

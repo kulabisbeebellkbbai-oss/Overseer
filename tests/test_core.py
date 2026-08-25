@@ -6757,6 +6757,35 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(state["host_snapshots"][0]["id"], snapshot.id)
         self.assertEqual(state["host_snapshots"][0]["observation_count"], 8)
 
+    def test_latest_host_snapshot_orders_by_capture_time_not_identifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            older = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout="host-a" if tuple(command) == ("hostname",) else "ok",
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:00:00+00:00")
+            older = replace(older, id="host.zzz-older")
+            newer = replace(
+                older,
+                id="host.000-newer",
+                captured_at="2026-07-18T17:00:00+00:00",
+            )
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(newer)
+            store.save_host_snapshot(older)
+
+            latest = store.load_latest_host_snapshot()
+            latest_page = store.list_host_snapshots(limit=1)
+            store.close()
+
+        self.assertEqual(latest.id, newer.id)
+        self.assertEqual(tuple(item.id for item in latest_page), (newer.id,))
+
     def test_host_security_assessment_flags_non_loopback_listeners(self):
         snapshot = HostInspectionAdapter(
             command_runner=lambda command, timeout_seconds: HostCommandObservation(

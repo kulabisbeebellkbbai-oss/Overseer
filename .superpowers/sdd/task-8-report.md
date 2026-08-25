@@ -182,3 +182,41 @@ The follow-up source/test/docs commit is `524e744`. The report commit follows
 after this verification. Controller Playwright acceptance remains controller-owned and
 must confirm zero document overflow at 390px in auto/mobile and forced desktop,
 with readable metric content bounds and `#action-status` focus.
+
+## Follow-up filtered-selection and overview containment correction
+
+The next disposable-fixture rerun found that the fresh-load filtered Run Now
+button stayed disabled after selecting `collection.usage.quota`: the delegated
+change handler updated `state.selectedCollectionRunJob` and returned without
+updating the already-rendered button. `selectCollectionRunJob()` now updates
+the state and synchronizes the filtered control immediately. It enables only
+an existing, non-pending projected job, and keeps empty, unknown, projection-
+pending, and locally pending jobs disabled. The existing queue path remains
+queue-only and restores focus to the focusable `#action-status` after rerender.
+
+The same correction extends intrinsic containment to `.metric` and
+`.crew-card` children and their row content with bounded width and wrapping.
+This addresses overview long text such as `executable plans` and Odo Firewall
+crew content under forced desktop at 390px without page-level overflow hiding;
+local `.table-scroll` overflow remains unchanged.
+
+The source/test/docs correction commit and final report commit are recorded
+below after verification. Controller Playwright acceptance remains
+controller-owned and must confirm the real 390px document bounds in every
+forced mode.
+
+Correction verification for `2d1bc5d` (`Sync filtered scheduler controls`):
+
+```text
+$ PYTHONPATH=src pytest -q tests/test_ui_regression.py tests/test_ui_full_regression.py tests/test_performance_regression.py
+47 passed in 20.36s
+$ PYTHONPATH=src python3 -m compileall -q src/overseer tests/test_ui_regression.py tests/test_ui_full_regression.py tests/test_performance_regression.py
+passed
+$ PYTHONPATH=src python3 -c 'from overseer.ui import OPERATOR_CONSOLE_HTML; print(OPERATOR_CONSOLE_HTML)' | awk '/^  <script>$/{inside=1; next} /^  <\/script>$/{inside=0} inside' | node --check
+passed
+$ git diff --check
+passed
+```
+
+The final report commit follows `2d1bc5d`; controller Playwright acceptance is
+still pending and is not claimed here.

@@ -125,6 +125,11 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /health-summary`
 - `GET /health/codex-usage`
 - `GET /health-efficiency`
+- `GET /collections/status`
+- `GET /collections/jobs`
+- `GET /collections/runs`
+- `GET /collections/incidents`
+- `GET /collections/runbooks`
 - `GET /host/security`
 - `GET /host/security/findings`
 - `GET /host/security/triage`
@@ -173,6 +178,9 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /virtual/restore-requests`
 - `POST /health-targets`
 - `POST /health/probes/run`
+- `POST /collections/jobs/{job_id}/run`
+- `POST /collections/jobs/{job_id}/suspend`
+- `POST /collections/jobs/{job_id}/resume`
 - `POST /observability/metric-history/capture`
 - `POST /host/inspect`
 - `POST /host/security/listener-review-queue/remediation-plans`
@@ -222,7 +230,28 @@ latest Codex Usage MCP snapshot, including quota windows, used and remaining
 percentages, reset times, account token totals, posture, and forecast warnings.
 It does not refresh the upstream provider or start scheduled work.
 `POST /health-targets` records or updates a Julian health target for an existing resource. Required fields are `target_id`, `resource_id`, `name`, `probe_type`, and `target`; optional fields are `owner_domain`, `expected_status`, `expected_content_type`, and `latency_warn_ms`. It does not run probes or mutate host state.
-`POST /health/probes/run` probes health targets already persisted in the API store and records Julian health evidence. Optional fields: `timeout_seconds`, `retention_per_target`.
+`POST /health/probes/run` is a deprecated compatibility route. In v1.1 it
+queues/coalesces scheduler requests for enabled health jobs, returns request
+IDs, and never runs a probe inline. New callers should use
+`POST /collections/jobs/{job_id}/run`.
+
+## v1.1 collection scheduler contract
+
+The authenticated collection GET routes return bounded durable projections of
+job definitions, data age, next due time, active lease, backoff/circuit state,
+pending request, run outcomes, incidents, and repair disposition. They support
+the documented bounded `limit` plus the applicable `job_id` or `status` filter.
+
+`POST /collections/jobs/{job_id}/run` requires the administrator bearer token
+and JSON `requested_by` plus `reason`. It writes only a durable queue request;
+the response reports `queued` or `coalesced`, request ID, earliest execution,
+and circuit cooldown. Suspend/resume changes scheduler policy and audit state
+but does not interrupt an active worker. Protected gateway callers retain the
+existing `/Overseer` prefix and authentication contract.
+
+Collection status reads and queue requests are bounded and do not contact a
+probe adapter during the HTTP request. See `docs/v1.1-operations.md` for
+runtime installation, migration, failure/repair, and rollback gates.
 `POST /health/journal-access-requests` stages a Julian read-only system-journal access operation record without reading privileged logs.
 `POST /health/journal-access-requests/execute` executes only a staged journal access record that has been transitioned to `in_progress`. It runs bounded `journalctl` reads without `sudo`, writes redacted evidence under ignored `local-secrets/journal-captures`, and returns a persisted `blocked` result when approval or journal access is missing.
 `POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.

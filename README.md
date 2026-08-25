@@ -33,6 +33,7 @@ regression never runs live provider prompts.
 - `tests/` - automated tests
 - `assets/` - static or generated project assets
 - `docs/` - project summary, role map, gates, and design notes
+- `systemd/overseer.service` - source-controlled v1.1 autonomous runtime template
 
 ## Development Commands
 
@@ -57,12 +58,13 @@ regression never runs live provider prompts.
 - `PYTHONPATH=src python3 -m overseer.cli inspect-packages` - inspect apt package update availability without installing, upgrading, or refreshing package indexes.
 - `PYTHONPATH=src python3 -m overseer.cli security-summary --store state/overseer.sqlite3` - summarize security surfaces, alert audit events, host findings, protective admin plans, and IDS review gates.
 - `PYTHONPATH=src python3 -m overseer.cli health-efficiency --store state/overseer.sqlite3` - summarize service health status, probe types, owner routing, recovery requirements, and latest failures.
-- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once` - run one foreground runtime tick against an explicit store.
-- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --probe-health-targets --health-evidence-retention-per-target 5` - run one tick, probe configured health targets, and retain bounded evidence per target.
-- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --inspect-host` - run one tick and capture read-only host admin evidence.
-- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-crew-messages` - run one tick and let Sisko dispatch open crew messages without executing host changes.
-- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-usage-continuations` - run one tick and let Quark dispatch ready usage-limited continuation handoffs without resuming threads.
-- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --capture-knowledge-events` - run one tick and let Ezri capture crew messages and audit events into Documents notes.
+- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once` - run one scheduler-backed cycle against an explicit disposable or diagnostic store.
+- `PYTHONPATH=src python3 -m overseer.cli collection-jobs --store state/overseer.sqlite3` - read bounded durable job definitions and state.
+- `PYTHONPATH=src python3 -m overseer.cli collection-scheduler-status --store state/overseer.sqlite3` - read heartbeat, leases, pending requests, circuits, and incidents.
+- `PYTHONPATH=src python3 -m overseer.cli collection-runs --store state/overseer.sqlite3 --limit 50` - read recent bounded collection runs.
+- `PYTHONPATH=src python3 -m overseer.cli collection-incidents --store state/overseer.sqlite3 --status open` - read open triage incidents.
+- `PYTHONPATH=src python3 -m overseer.cli request-collection-run --store state/overseer.sqlite3 --job-id collection.health.example --requested-by operator --reason "verify after incident"` - queue or coalesce a run without collecting inline.
+- `PYTHONPATH=src python3 -m overseer.cli seed-collection-jobs --store state/overseer.sqlite3` - idempotently seed scheduler-owned jobs.
 - `PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3` - read the stored runtime heartbeat for the local service.
 - `PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3` - read runtime heartbeat plus latest host-inspection freshness, stale-state assessment, security finding counts, and persisted freshness alert IDs.
 - `PYTHONPATH=src python3 -m overseer.cli persistence-security --store state/overseer.sqlite3` - inspect SQLite store file ownership and permissions without creating or changing files.
@@ -145,6 +147,14 @@ regression never runs live provider prompts.
 GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pull requests.
 
 ## Current Status
+
+Overseer v1.1 runs collectors on independent durable schedules. The dashboard
+and API read scheduler projections; run-now controls only queue/coalesce a
+request. The source unit uses `OVERSEER_PYTHON`, `OVERSEER_INSTALL`, and
+`OVERSEER_STORE` from a 0600 environment file and is not installed or activated
+by this repository task. See [v1.1 operations](docs/v1.1-operations.md) for
+defaults, failure/repair states, migration, canary, rollback, and the exact
+activation gate.
 
 - Approved project summary: `docs/project-summary.md`
 - DS9-inspired agent role map: `docs/agents.md`

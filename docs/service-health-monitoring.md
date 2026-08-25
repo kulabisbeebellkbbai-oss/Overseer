@@ -2,6 +2,11 @@
 
 Julian owns service health and efficiency. Health work records exact failing paths, maps failures to owner domains, and requires recovery evidence before incidents close.
 
+In v1.1, Julian's health targets are durable scheduler jobs. Collection runs
+are independent and bounded; the UI/API reads the latest durable projection.
+They do not trigger a live probe during a status refresh. A queue-only run
+request is coalesced when one is already pending for the target.
+
 ## Health Targets
 
 Health targets represent things Overseer can check without mutating state:
@@ -81,6 +86,12 @@ An incident can close only when:
 - recovery evidence links to the original failure,
 - affected claims have release conditions satisfied,
 - audit log records the close action.
+
+Scheduler failures also retain a capped retry/backoff state, circuit cooldown,
+triage incident, and repair disposition. `triage_only` is the default. Only an
+exact low-risk runbook on a `preapproved_low_risk` job may execute automatically;
+service, package, identity, device, network, firewall, gateway, IDS, or
+external-project changes remain approval-gated.
 
 ## First Slice
 

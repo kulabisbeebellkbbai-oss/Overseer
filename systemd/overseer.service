@@ -1,0 +1,18 @@
+[Unit]
+Description=Overseer v1.1 autonomous operations runtime
+After=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/overseer/runtime.env
+Environment=PYTHONPATH=${OVERSEER_INSTALL}/src
+ExecStart=${OVERSEER_PYTHON} -m overseer.cli run --store ${OVERSEER_STORE}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

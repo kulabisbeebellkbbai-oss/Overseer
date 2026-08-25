@@ -1,6 +1,8 @@
 # Runtime
 
-The runtime entrypoint can run a single foreground tick against an explicit SQLite store, and this workstation has an approved user systemd service installed for continuous local operation.
+The runtime entrypoint runs a scheduler-backed cycle against an explicit SQLite
+store. In v1.1, the source-controlled user-service template runs this command
+continuously; installing or activating it is a separate approval-gated task.
 
 ## Primary driver lifecycle
 
@@ -29,30 +31,29 @@ semantics.
 
 ## Boundaries
 
-- The user systemd unit is local machine state and is not committed to the repository.
-- The service uses a no-space symlink at `/home/god/.local/share/overseer/project` because systemd rejected the workspace path with spaces as a working directory.
-- No host scheduler is modified.
+- The source template is `systemd/overseer.service`; it is not installed or activated by this repository task.
+- The service reads `OVERSEER_PYTHON`, `OVERSEER_INSTALL`, and `OVERSEER_STORE` from `%h/.config/overseer/runtime.env`.
+- No host scheduler or socket listener is modified by the runtime unit.
 - Runtime state is read from an explicit SQLite store path.
-- The runtime writes a heartbeat on each tick and reports stored resource, usage-limit, health-target, health-evidence, physical-identity, runtime-heartbeat, and audit counts.
-- Configured health probes are read-only HTTP requests and run only when `--probe-health-targets` is supplied.
-- Runtime health evidence is pruned per target with `--health-evidence-retention-per-target`.
-- Host inspection snapshots are read-only command and file observations and run only when `--inspect-host` is supplied.
+- The runtime writes a heartbeat and advances only due scheduler jobs on each cycle; the scheduler bounds workers, leases, timeouts, evidence, and status projections.
+- Configured health probes are read-only adapters owned by independent `health_probe` jobs. Legacy collector flags are deprecated family selectors and are not used by the service unit.
+- Runtime health evidence, runs, requests, incidents, and repair attempts are retained within explicit store limits.
+- Host inspection snapshots are read-only command and file observations owned by a scheduled `host_inspection` job.
 - Each host inspection automatically lets Odo advance security findings to the next safe gate: stage remediation plans, prepare IDS/firewall review packages, queue exact Sisko approval requests, or execute only plans that have no approval gate.
-- Station audits run only when `--audit-station` is supplied. The audit lets each crew domain perform safe discovery or staging, route unknown or unplanned resources to Odo, and continue unrelated work while exact approval-gated items wait.
-- Knowledge capture writes crew-message and audit-event notes through Ezri's Documents API only when `--capture-knowledge-events` is supplied.
-- Enabling host inspection in the installed user service changes the service runtime command and requires an explicit approved admin plan before restart.
+- Station audits are owned by scheduled `station_audit` jobs. The audit lets each crew domain perform safe discovery or staging, route unknown or unplanned resources to Odo, and continue unrelated work while exact approval-gated items wait.
+- Knowledge capture is owned by scheduled `knowledge_capture` jobs and writes crew-message and audit-event notes through Ezri's Documents API only within its existing integration boundary.
+- Changing the installed user service command, environment, or store requires an explicit approved admin plan before migration or restart.
 
 ## CLI
 
 ```bash
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
-PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --probe-health-targets --health-evidence-retention-per-target 5
-PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --inspect-host
-PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-crew-messages
-PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-usage-continuations
-PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --capture-knowledge-events
-PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --audit-station --station-audit-interval-ticks 1
-PYTHONPATH=src python3 -m overseer.cli audit-station --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli collection-jobs --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli collection-scheduler-status --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli collection-runs --store state/overseer.sqlite3 --limit 50
+PYTHONPATH=src python3 -m overseer.cli collection-incidents --store state/overseer.sqlite3 --status open
+PYTHONPATH=src python3 -m overseer.cli request-collection-run --store state/overseer.sqlite3 --job-id collection.health.example --requested-by operator --reason "verify after incident"
+PYTHONPATH=src python3 -m overseer.cli seed-collection-jobs --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli daemon-migration-plan --store state/overseer.sqlite3
@@ -64,15 +65,15 @@ PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sql
 
 `runtime-status` is the monitor-friendly surface for Julian and Odo. It reports the service heartbeat, latest host inspection snapshot id and capture time, freshness state, and current high/warning host security finding counts without requiring consumers to parse raw snapshots.
 
-When `--inspect-host` is enabled, Odo does not wait for an operator crew message to work the security queue. The runtime stages listener remediation plans from the latest snapshot, prepares IDS/firewall advisory packages when those gates apply, and creates exact Sisko messages tied to the plan IDs. Firewall, IDS, route, bind, service, and other high-risk changes remain blocked until the applicable IDS, Sisko, and human approval gates are satisfied. Plans with no approval gate may execute automatically after policy and adapter checks pass.
+When the scheduled `host_inspection` job runs, Odo does not wait for an operator crew message to work the security queue. The runtime stages listener remediation plans from the latest snapshot, prepares IDS/firewall advisory packages when those gates apply, and creates exact Sisko messages tied to the plan IDs. Firewall, IDS, route, bind, service, and other high-risk changes remain blocked until the applicable IDS, Sisko, and human approval gates are satisfied. Plans with no approval gate may execute automatically after policy and adapter checks pass.
 
-`--dispatch-crew-messages` lets Sisko drain open crew requests on each runtime tick. Dispatchers may inspect local state, refresh inventories, run health probes, create usage-continuation requests, stage claims, stage remediation plans, approve exact Sisko-targeted plan IDs, or execute no-approval plans after policy checks pass.
+The scheduled `crew_dispatch` job lets Sisko drain open crew requests when due. Dispatchers may inspect local state, refresh inventories, queue health verification, create usage-continuation requests, stage claims, stage remediation plans, approve exact Sisko-targeted plan IDs, or execute no-approval plans after policy checks pass.
 
-`--dispatch-usage-continuations` lets Quark persist dispatch handoff records for usage-limited work that is ready on each runtime tick. It does not resume Codex threads; use `dispatch-usage-continuations --resume-codex-projects` for an explicit live resume action.
+The scheduled `usage_continuation` job lets Quark persist dispatch handoff records for usage-limited work that is ready. It does not resume Codex threads; use `dispatch-usage-continuations --resume-codex-projects` for an explicit live resume action.
 
-`--capture-knowledge-events` lets Ezri write deterministic Documents notes for persisted crew messages and audit events. It uses the same local Obsidian env file as the Documents CLI and records captured/failed counts in the runtime tick output.
+The scheduled `knowledge_capture` job lets Ezri write deterministic Documents notes for persisted crew messages and audit events. It uses the same local Obsidian env file as the Documents CLI and records captured/failed counts in the durable run projection.
 
-`--audit-station` lets the command crew run periodic station operations without waiting for a user prompt. Kira refreshes physical and storage identities, Dax refreshes listener-backed virtual assets, Julian refreshes service resources and health targets, O'Brien stages package maintenance plans, Quark imports Codex project thread resources, and Ezri captures knowledge events. Storage-risk, incomplete, exposed, or unknown resources are routed to Odo for security verification. Package/update plans and other high-risk work are staged but remain paused at their exact approval gates.
+The scheduled `station_audit` job lets the command crew run periodic station operations without waiting for a user prompt. Kira refreshes physical and storage identities, Dax refreshes listener-backed virtual assets, Julian refreshes service resources and health targets, O'Brien stages package maintenance plans, Quark imports Codex project thread resources, and Ezri captures knowledge events. Storage-risk, incomplete, exposed, or unknown resources are routed to Odo for security verification. Package/update plans and other high-risk work are staged but remain paused at their exact approval gates.
 
 `daemon-migration-plan` is a read-only Sisko gate for foreground-to-daemon migration. `request-daemon-migration` and `approve-daemon-migration` record the approval state required before changing user service enablement or runtime commands; they do not edit systemd state or restart services.
 
@@ -85,24 +86,17 @@ Default freshness thresholds:
 
 `alerts-summary` reports persisted alert audit events only, grouped by risk and owner domain.
 
-## Local User Service
+## Source User-Service Template
 
-Installed local unit:
+The checked-in template is not an installed unit. Required environment-file
+permissions, disposable-store canary steps, exact activation approval, live
+verification, rollback, and forensic preservation are documented in
+`docs/v1.1-operations.md`.
 
-```text
-/home/god/.config/systemd/user/overseer.service
-```
-
-Runtime command:
-
-```bash
-/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3 --probe-health-targets --health-evidence-retention-per-target 5 --inspect-host --dispatch-crew-messages --dispatch-usage-continuations --audit-station --station-audit-interval-ticks 120
-```
-
-Operator commands:
+The post-approval status commands are:
 
 ```bash
 systemctl --user status overseer.service --no-pager
 journalctl --user -u overseer.service --no-pager -n 80
-systemctl --user disable --now overseer.service
+PYTHONPATH=src python3 -m overseer.cli collection-scheduler-status --store "$OVERSEER_STORE"
 ```

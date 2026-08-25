@@ -1203,3 +1203,39 @@ emulator-targeted UI work is complete.
 3. Click an approval id to fill Admin approval fields when follow-up action is
    needed.
 4. Verify final decisions have matching audit evidence.
+
+## v1.1 Autonomous Operations
+
+### Review Scheduler State
+
+1. Open the Operations or Health view and review scheduler heartbeat, active
+   jobs, pending requests, overdue jobs, open circuits, and incidents.
+2. Use `collection-jobs` for per-job interval, timeout, data age, lease,
+   circuit, and repair policy details.
+3. Use `collection-runs` and `collection-incidents` to correlate an outcome to
+   bounded evidence and the owning domain.
+4. Treat the dashboard as a durable projection: refreshing it cannot start a
+   probe or create an unbounded request stream.
+
+### Queue A Verification Run
+
+1. Select the exact job ID and record the reason in the operator change record.
+2. Use the per-job Run now control or `request-collection-run`.
+3. Confirm the result is `queued` or `coalesced`, with a request ID and earliest
+   execution time; do not expect probe evidence in the response.
+4. Recheck the run and incident projections after the scheduler executes.
+
+### Triage And Repair
+
+1. For a failed or timed-out run, identify the owner, failure category,
+   backoff, circuit state, and incident generation.
+2. Allow only a declared `preapproved_low_risk` runbook to perform its exact
+   bounded action. Require verification evidence before closing the incident.
+3. Keep `triage_only` work waiting for owner/operator action.
+4. Route restarts, package, permission, identity, device, VM/container,
+   network, firewall, gateway, IDS, and external-project changes through the
+   existing exact approval, claim, audit, rollback, and verification gates.
+
+The source template, disposable-store canary, Psychlo/Quark timer ownership,
+activation approval, rollback, and forensic-preservation procedure are in
+`docs/v1.1-operations.md`.

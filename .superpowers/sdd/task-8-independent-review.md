@@ -51,3 +51,42 @@ Residual risk after that correction: browser acceptance is recorded from a
 disposable prefixed harness in the Task 8 report; it should be retained as a
 required pre-activation check rather than treating it as evidence about a live
 gateway deployment.
+
+## Re-review after dashboard compatibility correction
+
+Reviewed correction range: `c58b867..16647db`, specifically implementation
+commit `c918635` and its report commit `16647db`.
+
+### Findings
+
+No blocking or important findings remain.
+
+The previous finding is resolved at `tests/test_core.py:4040-4048`. The
+operator-console test now requires all four scheduler projections, per-job and
+filtered queue controls, and the encoded queue request. It explicitly rejects
+the obsolete direct-probe action and browser `POST /health/probes/run`.
+
+Deprecated API compatibility remains independently covered in
+`tests/test_collection_api.py`: it verifies direct and `/Overseer` prefixed
+routes, `202`, `Deprecation: true`, the successor link, queue-only behavior,
+bounded/truncated enqueue results, and preserved deprecation headers on a
+bounded internal error.
+
+### Re-review verification
+
+- `PYTHONPATH=src pytest -q tests/test_core.py -k 'operator_console or git_status or documents_routes'` — `6 passed, 379 deselected`.
+- `PYTHONPATH=src pytest -q tests/test_ui_regression.py tests/test_ui_full_regression.py tests/test_performance_regression.py` — `47 passed`.
+- `PYTHONPATH=src pytest -q tests/test_collection_api.py -k 'health_probes_run or deprecated or successor'` — `2 passed, 16 deselected`.
+- `git diff --check c58b867..16647db` — passed.
+
+### Final assessment
+
+**Approved.** The correction resolves the sole prior Important finding without
+restoring direct browser collection or weakening deprecated API compatibility.
+The correction diff is limited to the stale regression assertion and Task 8
+documentation; no live service, gateway, API implementation, or external
+project was modified.
+
+Residual risk: the recorded browser pass uses a disposable prefixed harness,
+so it remains a pre-activation requirement rather than proof of a live gateway
+deployment.

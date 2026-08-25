@@ -98,3 +98,61 @@ Pending controller execution; not run or claimed here.
 - `tests/test_performance_regression.py`
 - `docs/ui-regression-testing.md`
 - `.superpowers/sdd/task-8-report.md`
+
+## Browser evidence correction
+
+The controller's disposable prefix-aware run reported three dashboard load
+failures. Local read-only reproduction against the same API handler showed the
+route contracts were valid and the fixture was incomplete:
+
+- `/Overseer/runtime-status` returned `404 {"error":"missing record: overseer"}`
+  when the heartbeat existed under `runtime.overseer.browser`. The supported
+  runtime projection loads the heartbeat record named `overseer`.
+- `/Overseer/host/security/listener-review-queue` and
+  `/Overseer/host/security/source-review-queue` returned `400
+  {"error":"no host snapshots are available"}` when no host inspection
+  snapshot was seeded. These are the supported read-only queue routes; they do
+  not require a replacement query contract. The disposable harness must seed
+  the expected heartbeat and a host snapshot before browser acceptance.
+
+No endpoint names, protected-prefix joining, API handlers, live services, or
+external systems were changed. A regression test now statically enforces the
+exact runtime, Odo queue, scheduler projection, and `/Overseer` base-path
+registrations.
+
+The independent browser UI findings were fixed in implementation commit
+`dfda11d` (`Preserve scheduler focus and narrow layouts`):
+
+- Per-job and filtered Run Now rerenders capture their trigger identity. When
+  the trigger becomes disabled, focus moves to the programmatically focusable
+  live action-status destination (`role="status"`, `aria-live="polite"`,
+  `tabindex="-1"`). Node-backed DOM-shaped tests assert the resulting
+  `document.activeElement` for both trigger paths.
+- Filtered Run Now preserves `state.selectedCollectionRunJob` across projection
+  rerenders and keeps the selected option and pending disablement.
+- A null `earliest_execution_at` with an open circuit now renders the circuit
+  cooldown (`cooldown until ...`) or `blocked by open circuit`, rather than
+  incorrectly saying only `scheduler decides`.
+- Forced desktop at the narrow 390px viewport uses intrinsic min-content
+  constraints, bounded scheduler pills, local table scrolling, and 44px
+  scheduler controls. The CSS regression explicitly rejects page-level
+  overflow masking and checks the narrow forced-desktop contract.
+
+Correction verification:
+
+```text
+$ PYTHONPATH=src pytest -q tests/test_ui_regression.py tests/test_ui_full_regression.py tests/test_performance_regression.py
+46 passed in 20.68s
+$ PYTHONPATH=src python3 -m compileall -q src/overseer tests/test_ui_regression.py tests/test_ui_full_regression.py tests/test_performance_regression.py
+passed
+$ PYTHONPATH=src python3 -c 'from overseer.ui import OPERATOR_CONSOLE_HTML; print(OPERATOR_CONSOLE_HTML)' | awk '/^  <script>$/{inside=1; next} /^  <\/script>$/{inside=0} inside' | node --check
+passed
+$ git diff --check
+passed
+```
+
+The report commit follows `dfda11d`. Controller Playwright acceptance remains
+pending and is not claimed here; it must rerun against the repaired disposable
+fixture at `/Overseer/ui`, including per-job and filtered focus restoration,
+selected-filter persistence, forced-desktop 390px overflow/content bounds,
+and the exact protected-prefix GET matrix.

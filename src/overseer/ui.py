@@ -289,7 +289,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       text-align: left;
       color: var(--text);
     }
-    .metric > * { min-width: 0; max-width: 100%; }
+    .metric > *,
+    .crew-card > *,
+    .crew-card .list,
+    .crew-card .row > * {
+      min-width: 0;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
     button.metric,
     button.crew-card,
     .cell-link {
@@ -522,6 +530,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .row:last-child { border-bottom: 0; }
     .crew-card {
       min-height: 190px;
+      min-width: 0;
       padding-left: 24px;
     }
     .crew-card:nth-of-type(3n + 1) { box-shadow: inset 7px 0 0 var(--lcars-amber), 0 14px 32px rgba(0, 0, 0, 0.22); }
@@ -922,6 +931,17 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function requestIsPending(job, pendingJobIds) {
       return Boolean(job?.pending_request) || Boolean(pendingJobIds?.has(job?.id));
     }
+    function selectCollectionRunJob(jobId, targetDocument = document) {
+      const selectedJobId = String(jobId || "");
+      state.selectedCollectionRunJob = selectedJobId;
+      const jobs = state.data.collectionsJobs?.jobs || [];
+      const selectedJob = jobs.find((job) => job.id === selectedJobId);
+      const filteredRunButton = targetDocument.querySelector?.("[data-collection-run-filter]");
+      if (filteredRunButton) {
+        filteredRunButton.disabled = !selectedJobId || !selectedJob || requestIsPending(selectedJob, state.pendingCollectionRuns);
+      }
+      return selectedJobId;
+    }
     function captureFocusTarget(element) {
       if (!element) return null;
       return {
@@ -1045,7 +1065,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     });
     document.addEventListener("change", (event) => {
       if (event.target.closest("#scheduler-run-filter")) {
-        state.selectedCollectionRunJob = event.target.value || "";
+        selectCollectionRunJob(event.target.value);
         return;
       }
       if (!event.target.closest("#driver")) return;

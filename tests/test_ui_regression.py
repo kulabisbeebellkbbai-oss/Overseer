@@ -283,7 +283,28 @@ function performRefresh() { refreshCalls += 1; return Promise.resolve("ready"); 
 const first = refresh();
 const second = refresh();
 if (first !== second) process.exit(17);
-Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(18); });
+        Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(18); });
+const selectionState = {
+  data: {collectionsJobs: {jobs: [
+    {id:"collection.health.api"},
+    {id:"collection.usage.quota", pending_request:{id:"request.usage"}}
+  ]}},
+  pendingCollectionRuns: new Set(),
+  selectedCollectionRunJob: ""
+};
+globalThis.state = selectionState;
+const filteredSelectionButton = {disabled:true};
+const selectionDocument = {querySelector(selector) { return selector === "[data-collection-run-filter]" ? filteredSelectionButton : null; }};
+if (selectCollectionRunJob("collection.health.api", selectionDocument) !== "collection.health.api") process.exit(24);
+if (state.selectedCollectionRunJob !== "collection.health.api" || filteredSelectionButton.disabled) process.exit(25);
+if (selectCollectionRunJob("collection.usage.quota", selectionDocument) !== "collection.usage.quota") process.exit(26);
+if (state.selectedCollectionRunJob !== "collection.usage.quota" || !filteredSelectionButton.disabled) process.exit(27);
+if (selectCollectionRunJob("", selectionDocument) !== "") process.exit(28);
+if (state.selectedCollectionRunJob !== "" || !filteredSelectionButton.disabled) process.exit(29);
+state.pendingCollectionRuns.add("collection.health.api");
+if (selectCollectionRunJob("collection.health.api", selectionDocument) !== "collection.health.api" || !filteredSelectionButton.disabled) process.exit(30);
+state.pendingCollectionRuns.clear();
+if (selectCollectionRunJob("collection.missing", selectionDocument) !== "collection.missing" || !filteredSelectionButton.disabled) process.exit(31);
 (async () => {
   globalThis.state = {pendingCollectionRuns:new Set(), lastAction:null};
   const body = {};
@@ -346,7 +367,7 @@ Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(1
         from overseer.ui import OPERATOR_CONSOLE_HTML
 
         self.assertIn('selectedCollectionRunJob: ""', OPERATOR_CONSOLE_HTML)
-        self.assertIn('state.selectedCollectionRunJob = event.target.value', OPERATOR_CONSOLE_HTML)
+        self.assertIn('selectCollectionRunJob(event.target.value)', OPERATOR_CONSOLE_HTML)
         self.assertIn('const selectedJobId = jobs.some((job) => job.id === state.selectedCollectionRunJob)', OPERATOR_CONSOLE_HTML)
         self.assertIn('job.id === selectedJobId ? " selected" : ""', OPERATOR_CONSOLE_HTML)
         self.assertNotIn('body[data-layout-effective="desktop"] { overflow-x: hidden; }', OPERATOR_CONSOLE_HTML)
@@ -361,7 +382,11 @@ Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(1
         self.assertIn('body[data-layout-effective="desktop"] .shell { grid-template-columns: 96px minmax(224px, 1fr); }', OPERATOR_CONSOLE_HTML)
         self.assertIn('id="action-status" class="panel action-status" role="status" aria-live="polite" tabindex="-1" hidden', OPERATOR_CONSOLE_HTML)
         self.assertIn('collectionRunFilter: element.dataset?.collectionRunFilter || ""', OPERATOR_CONSOLE_HTML)
-        self.assertIn('.metric > * { min-width: 0; max-width: 100%; }', OPERATOR_CONSOLE_HTML)
+        self.assertIn('selectCollectionRunJob(event.target.value)', OPERATOR_CONSOLE_HTML)
+        self.assertIn('function selectCollectionRunJob(jobId, targetDocument = document)', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.metric > *,', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.crew-card > *,', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.crew-card .row > * {', OPERATOR_CONSOLE_HTML)
         self.assertIn('.metric .value {', OPERATOR_CONSOLE_HTML)
         self.assertIn('word-break: break-word;', OPERATOR_CONSOLE_HTML)
         self.assertIn('.table-scroll {', OPERATOR_CONSOLE_HTML)

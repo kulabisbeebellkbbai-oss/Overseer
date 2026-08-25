@@ -201,12 +201,18 @@ rerender, the controller must observe `document.activeElement ===
 #action-status` (or the still-focusable nearby scheduler control when the
 trigger remains enabled), not `body`.
 
+After a fresh load, verify the filtered control is disabled with an empty
+selection, becomes enabled immediately when a non-pending job is selected,
+and stays disabled for pending or empty selections without requiring a
+refresh. The selected option must survive the queue response and rerender.
+
 At `390x844`, `820x1180`, and `1440x1000`, verify automatic mode, every forced
 mode, no horizontal overflow (including forced desktop at 390px), visible focus
 restoration after a scheduler rerender, preserved selected filtered-job state,
 readable tables, 44px controls including scheduler Run Now targets,
 and long observed timestamps, request IDs, and circuit cooldown values wrapping
-inside metric/panel bounds,
+inside metric/panel bounds, including overview metric and crew-card child text
+under forced desktop at 390px,
 reduced-motion behavior, and the top-right auto/desktop/tablet/mobile control
 with saved/effective mode announcement. Explicitly test the automatic boundaries at 700/701/1024/1025px
 and reload persistence. Cancel controls must remain `type="button"` and must

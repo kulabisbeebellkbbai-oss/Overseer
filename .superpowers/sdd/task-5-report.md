@@ -99,6 +99,40 @@ and repair correction commit is `ca73052`; the prior implementation/report
 checkpoints remain `7e8353d` and `e86aafd`, respectively. The report commit is
 the separate commit immediately following this code checkpoint.
 
+## Follow-up re-review coverage
+
+The remaining re-review gap was covered by
+`test_timed_out_key_blocks_due_replacement_until_worker_exit`. It uses a
+same-key A/B pair and events only:
+
+- A starts, times out, and remains blocked; its exact persisted lease remains
+  active.
+- B is made due while A is still blocked. A scheduler entry reports zero
+  claims and zero starts; the adapter invocation list remains `[A]`, B has no
+  lease, and there is no overlap or replacement lease.
+- Releasing A and waiting for its worker-exit completion callback clears A's
+  exact lease. Only then does the next scheduler entry start B, leaving two
+  collection runs and no active B lease.
+
+This was test-only: no production code changed. The imperative test commit is
+`be9bede` (`Cover timeout replacement key retention`). Fresh verification
+after that commit:
+
+```text
+PYTHONPATH=src pytest -q tests/test_collection_scheduler.py tests/test_collection_repair.py
+23 passed in 4.36s
+
+PYTHONPATH=src pytest -q tests/test_collection_scheduler.py tests/test_collection_store.py tests/test_collection_policy.py
+74 passed in 5.60s
+
+PYTHONPATH=src python3 -m compileall -q src/overseer
+git diff --check
+```
+
+Because this follow-up was test-only, the full suite was not rerun. The prior
+clean post-production-change result remains `2124 passed, 31 skipped in
+412.08s (0:06:52)`.
+
 ### Evidence boundary
 
 Scheduler health persistence now projects evidence to a bounded target surface
@@ -254,4 +288,6 @@ lease, immutability, migration, and retention behavior intact.
 - No live service, gateway, network, firewall, IDS, USB device, external
   project, branch, original checkout, or other worktree was touched.
 - The code commit is `ca73052`; this report is the separate Task 5 report
-  commit created immediately after the verified code checkpoint.
+  commit created immediately after the verified code checkpoint. Follow-up
+  coverage is in test commit `be9bede`; this report update is committed after
+  that test checkpoint.

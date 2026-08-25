@@ -3023,20 +3023,23 @@ def request_collection_run_status(
     reason: str,
 ) -> dict[str, object]:
     with SQLiteStore(store_path) as store:
-        before = {
-            request.id
-            for request in store.list_collection_requests()
-            if request.job_id == job_id and request.status == "pending"
-        }
-        request = store.request_collection_run(job_id, requested_by, reason)
+        request, status = store.request_collection_run_with_status(
+            job_id, requested_by, reason
+        )
+        state = store.load_collection_job_state(job_id)
     return {
-        "status": "coalesced" if request.id in before else "queued",
+        "status": status,
         "request": {
             "id": request.id,
             "job_id": request.job_id,
             "requested_by": request.requester,
             "requested_at": request.requested_at,
             "status": request.status,
+        },
+        "earliest_execution_at": request.earliest_execution_at,
+        "circuit": {
+            "state": state.circuit_state.value,
+            "cooldown_until": state.cooldown_until,
         },
         "inline_execution": False,
         "mutation_performed": True,

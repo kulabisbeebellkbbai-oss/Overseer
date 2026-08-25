@@ -8,7 +8,6 @@ import os
 import re
 import secrets
 from contextlib import contextmanager
-from dataclasses import replace
 from datetime import UTC, datetime
 from json import JSONDecodeError
 from http import HTTPStatus
@@ -28,9 +27,9 @@ from .roadex_approval_fixture import (
 )
 
 from .codex_usage import CodexUsageTracker
-from .audit import ApprovalStatus, AuditEvent, AuditEventType
+from .audit import ApprovalStatus
 from .collection_models import CollectionJobKind
-from .core import ApprovalLevel, ClaimStatus, RiskLevel
+from .core import ApprovalLevel, ClaimStatus
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, sign_peer_response, verify_peer_request, MAX_BODY_BYTES
 from .store import SQLiteStore
 from .claim_continuation import (
@@ -334,6 +333,7 @@ COLLECTION_MAX_REASON_LENGTH = 2048
 COLLECTION_MAX_ACTOR_LENGTH = 160
 COLLECTION_MAX_LEGACY_TIMEOUT_SECONDS = 300
 COLLECTION_MAX_LEGACY_RETENTION = 100
+COLLECTION_LEGACY_HEALTH_MAX_JOBS = 50
 
 
 def _collection_identifier(value: object, label: str) -> str:
@@ -344,13 +344,49 @@ def _collection_identifier(value: object, label: str) -> str:
     return value
 
 
+def _decode_collection_path_segment(value: str) -> str:
+    """Decode exactly one URL path segment with strict percent/UTF-8 checks."""
+    encoded = bytearray()
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "%":
+            if index + 2 >= len(value) or not re.fullmatch(
+                r"[0-9A-Fa-f]{2}", value[index + 1 : index + 3]
+            ):
+                raise ValueError("job_id contains an invalid percent escape")
+            encoded.append(int(value[index + 1 : index + 3], 16))
+            index += 3
+            continue
+        try:
+            encoded.extend(character.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise ValueError("job_id contains invalid UTF-8") from error
+        index += 1
+    try:
+        decoded = bytes(encoded).decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ValueError("job_id contains invalid UTF-8") from error
+    return _collection_identifier(decoded, "job_id")
+
+
+def _collection_control_route(path: str) -> tuple[str, str] | None:
+    prefix = "/collections/jobs/"
+    if not path.startswith(prefix):
+        return None
+    match = re.fullmatch(r"/collections/jobs/([^/]+)/(run|suspend|resume)", path)
+    if match is None:
+        raise ValueError("collection job control path is invalid")
+    return _decode_collection_path_segment(match.group(1)), match.group(2)
+
+
 def _collection_query(
     query: dict[str, list[str]],
     *,
+    fields: set[str],
     allow_status: set[str] | None = None,
 ) -> tuple[str | None, str | None, int]:
-    allowed = {"job_id", "status", "limit"}
-    unknown = set(query) - allowed
+    unknown = set(query) - fields
     if unknown:
         raise ValueError(f"unsupported collection query field: {sorted(unknown)[0]}")
 
@@ -379,8 +415,15 @@ def _collection_query(
     return job_id, status, limit
 
 
-def _collection_query_call(query: dict[str, list[str]], allow_status: set[str] | None, callback):
-    job_id, status, limit = _collection_query(query, allow_status=allow_status)
+def _collection_query_call(
+    query: dict[str, list[str]],
+    fields: set[str],
+    allow_status: set[str] | None,
+    callback,
+):
+    job_id, status, limit = _collection_query(
+        query, fields=fields, allow_status=allow_status
+    )
     return callback(job_id, status, limit)
 
 
@@ -561,27 +604,13 @@ def _collection_run_request_projection(
     reason: str,
 ) -> dict[str, object]:
     result = request_collection_run_status(store_path, job_id, requested_by, reason)
-    request_id = str(result["request"]["id"])
-    with SQLiteStore(store_path) as store:
-        request = next(
-            item for item in store.list_collection_requests() if item.id == request_id
-        )
-        state = store.load_collection_job_state(job_id)
+    request = result["request"]
     return {
         "status": result["status"],
-        "request_id": request.id,
-        "earliest_execution_at": request.earliest_execution_at,
-        "circuit": {
-            "state": state.circuit_state.value if state else None,
-            "cooldown_until": state.cooldown_until if state else None,
-        },
-        "request": {
-            "id": request.id,
-            "job_id": request.job_id,
-            "requested_by": request.requester,
-            "requested_at": request.requested_at,
-            "status": request.status,
-        },
+        "request_id": request["id"],
+        "earliest_execution_at": result["earliest_execution_at"],
+        "circuit": result["circuit"],
+        "request": request,
         "inline_execution": False,
     }
 
@@ -594,29 +623,12 @@ def _collection_policy_update(
     reason: str,
 ) -> dict[str, object]:
     with SQLiteStore(store_path) as store:
-        jobs = {item.id: item for item in store.list_collection_jobs()}
-        job = jobs.get(job_id)
-        if job is None:
-            raise KeyError(job_id)
-        store.save_collection_job(replace(job, enabled=enabled))
-        state = store.load_collection_job_state(job_id)
-        now = datetime.now(UTC).isoformat()
-        audit_id = "audit.collection.policy." + hashlib.sha256(
-            f"{job_id}:{enabled}:{requested_by}:{now}".encode()
-        ).hexdigest()[:40]
-        store.save_audit_event(
-            AuditEvent(
-                id=audit_id,
-                event_type=AuditEventType.EXECUTED,
-                owner_domain=job.owner_domain,
-                subject_id=job_id,
-                summary="collection_job_enabled_policy_updated",
-                risk_level=RiskLevel.LOW,
-                occurred_at=now,
-            )
+        _job, state, changed, audit_id = store.set_collection_job_enabled(
+            job_id, enabled
         )
     return {
         "status": "resumed" if enabled else "suspended",
+        "changed": changed,
         "job": {"id": job_id, "enabled": enabled},
         "active_lease": (
             {
@@ -653,29 +665,26 @@ def _legacy_health_probe_requests(
     ):
         raise ValueError("retention_per_target must be between 1 and 100")
     with SQLiteStore(store_path) as store:
-        jobs = sorted(
-            item.id
-            for item in store.list_collection_jobs()
-            if item.enabled and item.kind is CollectionJobKind.HEALTH_PROBE
-        )
-    requests = []
-    for job_id in jobs:
-        item = _collection_run_request_projection(
-            store_path,
-            job_id,
+        total, queued = store.request_enabled_collection_runs(
+            CollectionJobKind.HEALTH_PROBE.value,
             "legacy.health.probes",
             "deprecated health probe compatibility request",
+            COLLECTION_LEGACY_HEALTH_MAX_JOBS,
         )
-        requests.append(
-            {
-                "id": item["request_id"],
-                "job_id": job_id,
-                "status": item["status"],
-                "earliest_execution_at": item["earliest_execution_at"],
-            }
-        )
+    requests = [
+        {
+            "id": item.id,
+            "job_id": item.job_id,
+            "status": status,
+            "earliest_execution_at": item.earliest_execution_at,
+        }
+        for item, status in queued
+    ]
     return {
         "status": "accepted",
+        "total_count": total,
+        "returned_count": len(requests),
+        "truncated": total > len(requests),
         "request_count": len(requests),
         "requests": requests,
         "inline_execution": False,
@@ -782,7 +791,8 @@ def make_api_handler(
                 self._handle(
                     lambda: _collection_query_call(
                         query,
-                        {"open", "resolved", "enabled", "disabled"},
+                        {"job_id", "limit"},
+                        None,
                         lambda job_id, status, limit: _collection_scheduler_projection(
                             store_path, job_id=job_id, status=status, limit=limit
                         ),
@@ -793,6 +803,7 @@ def make_api_handler(
                 self._handle(
                     lambda: _collection_query_call(
                         query,
+                        {"job_id", "status", "limit"},
                         {"enabled", "disabled"},
                         lambda job_id, status, limit: _collection_job_projection(
                             store_path, job_id=job_id, status=status, limit=limit
@@ -804,6 +815,7 @@ def make_api_handler(
                 self._handle(
                     lambda: _collection_query_call(
                         query,
+                        {"job_id", "status", "limit"},
                         {"succeeded", "failed", "blocked", "timed_out"},
                         lambda job_id, status, limit: _collection_run_projection(
                             store_path, job_id=job_id, status=status, limit=limit
@@ -815,6 +827,7 @@ def make_api_handler(
                 self._handle(
                     lambda: _collection_query_call(
                         query,
+                        {"job_id", "status", "limit"},
                         {"open", "resolved"},
                         lambda job_id, status, limit: _collection_incidents_for_api(
                             store_path, job_id=job_id, status=status, limit=limit
@@ -826,6 +839,7 @@ def make_api_handler(
                 self._handle(
                     lambda: _collection_query_call(
                         query,
+                        {"job_id", "limit"},
                         None,
                         lambda job_id, status, limit: _collection_runbooks_for_api(
                             store_path, job_id, status, limit
@@ -1239,9 +1253,8 @@ def make_api_handler(
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
-            collection_control = (
-                path == "/health/probes/run"
-                or re.fullmatch(r"/collections/jobs/[^/]+/(run|suspend|resume)", path)
+            collection_control = path == "/health/probes/run" or path.startswith(
+                "/collections/jobs/"
             )
             if collection_control and auth_context.get("auth_type") != "admin_token":
                 self._write_json(
@@ -1249,11 +1262,13 @@ def make_api_handler(
                     HTTPStatus.FORBIDDEN,
                 )
                 return
-            collection_match = re.fullmatch(
-                r"/collections/jobs/([^/]+)/(run|suspend|resume)", path
-            )
+            try:
+                collection_match = _collection_control_route(path)
+            except ValueError as error:
+                self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                return
             if collection_match:
-                job_id, operation = collection_match.groups()
+                job_id, operation = collection_match
 
                 def collection_control_result():
                     payload = self._read_json()
@@ -1874,6 +1889,8 @@ def make_api_handler(
                 self._write_json({"error": str(error)}, HTTPStatus.FORBIDDEN)
             except (AgentManagerError, AgentAdapterUnavailableError) as error:
                 self._write_json({"error": str(error)}, HTTPStatus.CONFLICT)
+            except Exception:
+                self._write_json({"error": "internal_error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
         def _handle_json(
             self,
@@ -1926,6 +1943,16 @@ def make_api_handler(
             except (TypeError, JSONDecodeError, ValueError, EOFError, AttributeError) as error:
                 self._write_json(
                     {"error": str(error)}, HTTPStatus.BAD_REQUEST, headers=headers
+                )
+            except (AgentManagerError, AgentAdapterUnavailableError) as error:
+                self._write_json(
+                    {"error": str(error)}, HTTPStatus.CONFLICT, headers=headers
+                )
+            except Exception:
+                self._write_json(
+                    {"error": "internal_error"},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    headers=headers,
                 )
 
         def _handle_psychlo_peer(self, kind: str) -> None:

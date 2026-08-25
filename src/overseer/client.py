@@ -134,13 +134,10 @@ class OverseerApiClient:
     def collection_status(
         self,
         job_id: str | None = None,
-        status: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
         return self._get(
-            _collection_path(
-                "/collections/status", job_id=job_id, status=status, limit=limit
-            )
+            _collection_path("/collections/status", job_id=job_id, limit=limit)
         )
 
     def collection_jobs(

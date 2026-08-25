@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -9,8 +10,14 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+import overseer.api as api_module
 from overseer.api import make_api_handler
-from overseer.collection_models import CollectionJob, CollectionJobKind, CollectionJobState
+from overseer.collection_models import (
+    CircuitState,
+    CollectionJob,
+    CollectionJobKind,
+    CollectionJobState,
+)
 from overseer.collection_scheduler import CollectionScheduler
 from overseer.core import OwnerDomain
 from overseer.client import OverseerApiClient
@@ -217,13 +224,20 @@ def test_deprecated_health_probe_route_only_enqueues_and_sets_successor_headers(
         lambda *_: pytest.fail("deprecated route probed inline"),
     )
     with ApiHarness(store_path) as api:
-        status, body, headers = api.post("/Overseer/health/probes/run", {})
-    assert status == 202
-    assert headers["Deprecation"] == "true"
-    assert headers["Link"] == "</Overseer/collections/jobs>; rel=\"successor\""
-    assert body["request_count"] == 1
-    assert len(body["requests"]) == 1
-    assert "reason" not in json.dumps(body)
+        for route, successor in (
+            ("/health/probes/run", "</collections/jobs>; rel=\"successor\""),
+            (
+                "/Overseer/health/probes/run",
+                "</Overseer/collections/jobs>; rel=\"successor\"",
+            ),
+        ):
+            status, body, headers = api.post(route, {})
+            assert status == 202
+            assert headers["Deprecation"] == "true"
+            assert headers["Link"] == successor
+            assert body["request_count"] == 1
+            assert len(body["requests"]) == 1
+            assert "reason" not in json.dumps(body)
 
 
 def test_client_collection_methods_preserve_prefix_and_filters(tmp_path: Path) -> None:
@@ -239,3 +253,169 @@ def test_client_collection_methods_preserve_prefix_and_filters(tmp_path: Path) -
         assert client.request_collection_run(
             "collection.health.api", "operator", "client request"
         )["status"] in {"queued", "coalesced"}
+
+
+def test_encoded_unicode_slash_job_id_round_trips_direct_and_prefix(tmp_path: Path) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    job_id = "collection.health/東京"
+    seed_job(store_path, job_id)
+    with ApiHarness(store_path) as api:
+        for base_url in (api.url, f"{api.url}/Overseer"):
+            client = OverseerApiClient(base_url=base_url, auth_token=api.token)
+            result = client.collection_jobs(job_id=job_id, limit=1)
+            assert result["returned_count"] == 1
+            assert result["jobs"][0]["id"] == job_id
+            queued = client.request_collection_run(job_id, "operator", "encoded id")
+            assert queued["status"] in {"queued", "coalesced"}
+
+
+@pytest.mark.parametrize("encoded_id", ["bad%ZZ", "bad%FF", "a" * 161])
+def test_malformed_or_overlong_encoded_job_id_is_a_bounded_bad_request(
+    tmp_path: Path, encoded_id: str
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path)
+    with ApiHarness(store_path) as api:
+        status, body, _ = api.post(
+            f"/Overseer/collections/jobs/{encoded_id}/run",
+            {"requested_by": "operator", "reason": "invalid id"},
+        )
+    assert status == 400
+    assert "secret" not in json.dumps(body).lower()
+
+
+def test_suspend_resume_retries_are_noops_and_preserve_one_deterministic_audit(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    state = CollectionJobState(
+        job_id="collection.health.api",
+        next_due_at="2026-08-24T12:00:00+00:00",
+        last_completed_at="2026-08-24T11:59:00+00:00",
+        last_outcome="failed",
+        consecutive_failures=2,
+        circuit_state=CircuitState.OPEN,
+        cooldown_until="2026-08-24T12:10:00+00:00",
+        active_lease_id="lease.api",
+        lease_owner="scheduler.local",
+        lease_expires_at="2026-08-24T12:05:00+00:00",
+        lease_generation=7,
+    )
+    seed_job(store_path, state=state)
+    with SQLiteStore(store_path) as store:
+        pending = store.request_collection_run(
+            "collection.health.api", "operator", "retain this request"
+        )
+        before_state = store.load_collection_job_state("collection.health.api")
+    with ApiHarness(store_path) as api:
+        first_status, first, _ = api.post(
+            "/collections/jobs/collection.health.api/suspend",
+            {"requested_by": "operator", "reason": "pause"},
+        )
+        second_status, second, _ = api.post(
+            "/collections/jobs/collection.health.api/suspend",
+            {"requested_by": "operator", "reason": "pause retry"},
+        )
+    with SQLiteStore(store_path) as store:
+        after_state = store.load_collection_job_state("collection.health.api")
+        requests = store.list_collection_requests()
+        audits = store.list_audit_events(subject_prefix="collection.health.api")
+    assert first_status == second_status == 200
+    assert first["changed"] is True
+    assert second["changed"] is False
+    assert first["audit_id"] == second["audit_id"]
+    assert after_state == before_state
+    assert requests == (pending,)
+    assert len(audits) == 1
+
+
+def test_concurrent_identical_resume_controls_create_one_transition_and_audit(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path, enabled=False)
+    with ApiHarness(store_path) as api:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda _: api.post(
+                        "/Overseer/collections/jobs/collection.health.api/resume",
+                        {"requested_by": "operator", "reason": "resume"},
+                    ),
+                    (1, 2),
+                )
+            )
+    assert [item[0] for item in results] == [200, 200]
+    assert sorted(item[1]["changed"] for item in results) == [False, True]
+    assert len({item[1]["audit_id"] for item in results}) == 1
+    with SQLiteStore(store_path) as store:
+        assert store.load_collection_job("collection.health.api").enabled is True
+        assert len(store.list_audit_events(subject_prefix="collection.health.api")) == 1
+
+
+def test_deprecated_health_enqueue_is_fixed_bounded_and_reports_truncation(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    job_ids = [f"collection.health.{index:03d}" for index in range(60)]
+    for job_id in job_ids:
+        seed_job(store_path, job_id)
+    with ApiHarness(store_path) as api:
+        status, body, headers = api.post("/health/probes/run", {})
+    assert status == 202
+    assert headers["Deprecation"] == "true"
+    assert body["total_count"] == 60
+    assert body["returned_count"] < body["total_count"]
+    assert body["truncated"] is True
+    assert len(body["requests"]) == body["returned_count"]
+    assert "deprecated health probe compatibility request" not in json.dumps(body)
+    with SQLiteStore(store_path) as store:
+        assert len(store.list_collection_requests()) == body["returned_count"]
+
+
+def test_collection_query_schemas_reject_ignored_status_and_unknown_fields(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path)
+    with ApiHarness(store_path) as api:
+        assert api.get("/collections/status?status=open")[0] == 400
+        assert api.get("/collections/status?status=enabled")[0] == 400
+        assert api.get("/collections/runbooks?status=open")[0] == 400
+        assert api.get("/collections/jobs?status=open")[0] == 400
+        assert api.get("/collections/jobs?unexpected=1")[0] == 400
+
+
+def test_collection_get_maps_unexpected_errors_to_bounded_500(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("database secret should not escape")
+
+    monkeypatch.setattr(api_module, "collection_jobs_status", fail)
+    with ApiHarness(store_path) as api:
+        status, body, _ = api.get("/Overseer/collections/jobs")
+    assert status == 500
+    assert body == {"error": "internal_error"}
+    assert "secret" not in json.dumps(body)
+
+
+def test_collection_control_preserves_deprecation_headers_on_internal_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path)
+    monkeypatch.setattr(
+        api_module,
+        "_legacy_health_probe_requests",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("secret")),
+    )
+    with ApiHarness(store_path) as api:
+        status, body, headers = api.post("/Overseer/health/probes/run", {})
+    assert status == 500
+    assert body == {"error": "internal_error"}
+    assert headers["Deprecation"] == "true"
+    assert "secret" not in json.dumps(body)

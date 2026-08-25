@@ -3647,6 +3647,50 @@ class SQLiteStore:
                 state, _bounded_collection_dump(state)
             )
 
+    def set_collection_job_enabled(
+        self, job_id: str, enabled: bool
+    ) -> tuple[CollectionJob, CollectionJobState, bool, str | None]:
+        """Atomically apply an idempotent enabled-policy transition and audit it."""
+        if not isinstance(enabled, bool):
+            raise ValueError("collection enabled policy must be a boolean")
+        with self.agent_transaction():
+            job = self.load_collection_job(job_id)
+            state = self.load_collection_job_state(job_id)
+            from_enabled = int(not enabled)
+            to_enabled = int(enabled)
+            summary = f"collection_job_enabled_policy_{from_enabled}_to_{to_enabled}"
+            if job.enabled is enabled:
+                existing_audit = self._connection.execute(
+                    "SELECT id FROM audit_events WHERE subject_id=? AND payload LIKE ? "
+                    "ORDER BY rowid DESC LIMIT 1",
+                    (job.id, f'%"summary":"{summary}"%'),
+                ).fetchone()
+                return job, state, False, str(existing_audit["id"]) if existing_audit else None
+            updated = replace(job, enabled=enabled)
+            self.save_collection_job(updated)
+            occurrence = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) AS count FROM audit_events "
+                    "WHERE subject_id=? AND payload LIKE ?",
+                    (job.id, f'%"summary":"{summary}"%'),
+                ).fetchone()["count"]
+            )
+            transition = f"{job.id}:{from_enabled}:{to_enabled}:{occurrence}"
+            audit_id = "audit.collection.policy." + hashlib.sha256(
+                transition.encode("utf-8")
+            ).hexdigest()[:40]
+            self.save_audit_event(
+                AuditEvent(
+                    id=audit_id,
+                    event_type=AuditEventType.EXECUTED,
+                    owner_domain=job.owner_domain,
+                    subject_id=job.id,
+                    summary=summary,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            return updated, state, True, audit_id
+
     def load_collection_job(self, job_id: str) -> CollectionJob:
         return _load_dataclass(CollectionJob, self._get_payload("collection_jobs", job_id))
 
@@ -3908,22 +3952,24 @@ class SQLiteStore:
             )
             return True
 
-    def request_collection_run(
+    def _request_collection_run_in_transaction(
         self,
         job_id: str,
         requester: str,
         reason: str,
+        requested_at: str,
         earliest_execution_at: str | None = None,
-        requested_at: str | None = None,
-    ) -> CollectionRequest:
+    ) -> tuple[CollectionRequest, str]:
         if self._connection.execute(
             "SELECT 1 FROM collection_jobs WHERE id=?", (job_id,)
         ).fetchone() is None:
             raise KeyError(job_id)
-        if earliest_execution_at is not None:
-            _collection_datetime(earliest_execution_at, "earliest execution")
-        requested_at = requested_at or datetime.now(UTC).isoformat()
-        _collection_datetime(requested_at, "requested at")
+        pending = self._connection.execute(
+            "SELECT payload FROM collection_requests WHERE job_id=? AND status='pending'",
+            (job_id,),
+        ).fetchone()
+        if pending is not None:
+            return _load_dataclass(CollectionRequest, str(pending["payload"])), "coalesced"
         probe = CollectionRequest(
             id="request.placeholder",
             job_id=job_id,
@@ -3936,24 +3982,89 @@ class SQLiteStore:
             f"{job_id}:{requested_at}:{requester}:{reason}:{secrets.token_hex(12)}".encode()
         ).hexdigest()[:40]
         request = replace(probe, id=request_id)
-        with self.agent_transaction():
+        try:
+            self._insert_collection_request_in_transaction(request)
+        except sqlite3.IntegrityError as error:
             pending = self._connection.execute(
                 "SELECT payload FROM collection_requests WHERE job_id=? AND status='pending'",
                 (job_id,),
             ).fetchone()
             if pending is not None:
-                return _load_dataclass(CollectionRequest, str(pending["payload"]))
-            try:
-                self._insert_collection_request_in_transaction(request)
-            except sqlite3.IntegrityError as error:
-                pending = self._connection.execute(
-                    "SELECT payload FROM collection_requests WHERE job_id=? AND status='pending'",
-                    (job_id,),
-                ).fetchone()
-                if pending is not None:
-                    return _load_dataclass(CollectionRequest, str(pending["payload"]))
-                raise ValueError("collection request collision") from error
+                return _load_dataclass(CollectionRequest, str(pending["payload"])), "coalesced"
+            raise ValueError("collection request collision") from error
+        return request, "queued"
+
+    def request_collection_run(
+        self,
+        job_id: str,
+        requester: str,
+        reason: str,
+        earliest_execution_at: str | None = None,
+        requested_at: str | None = None,
+    ) -> CollectionRequest:
+        request, _status = self.request_collection_run_with_status(
+            job_id,
+            requester,
+            reason,
+            earliest_execution_at,
+            requested_at,
+        )
         return request
+
+    def request_collection_run_with_status(
+        self,
+        job_id: str,
+        requester: str,
+        reason: str,
+        earliest_execution_at: str | None = None,
+        requested_at: str | None = None,
+    ) -> tuple[CollectionRequest, str]:
+        if earliest_execution_at is not None:
+            _collection_datetime(earliest_execution_at, "earliest execution")
+        requested_at = requested_at or datetime.now(UTC).isoformat()
+        _collection_datetime(requested_at, "requested at")
+        with self.agent_transaction():
+            request, status = self._request_collection_run_in_transaction(
+                job_id,
+                requester,
+                reason,
+                requested_at,
+                earliest_execution_at,
+            )
+        return request, status
+
+    def request_enabled_collection_runs(
+        self,
+        kind: str,
+        requester: str,
+        reason: str,
+        limit: int,
+    ) -> tuple[int, tuple[tuple[CollectionRequest, str], ...]]:
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError("collection job kind is required")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("collection request limit must be between 1 and 100")
+        requested_at = datetime.now(UTC).isoformat()
+        with self.agent_transaction():
+            total = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) AS count FROM collection_jobs "
+                    "WHERE enabled=1 AND kind=?",
+                    (kind,),
+                ).fetchone()["count"]
+            )
+            rows = self._connection.execute(
+                "SELECT id FROM collection_jobs WHERE enabled=1 AND kind=? "
+                "ORDER BY id LIMIT ?",
+                (kind, limit),
+            ).fetchall()
+            requests = tuple(
+                self._request_collection_run_in_transaction(
+                    str(row["id"]), requester, reason, requested_at
+                )
+                for row in rows
+            )
+        return total, requests
 
     def list_collection_runs(self) -> tuple[CollectionRun, ...]:
         return tuple(

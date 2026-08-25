@@ -104,7 +104,11 @@ WORKFLOW_TEMPLATES: tuple[dict[str, object], ...] = (
 )
 
 
-def operations_gap_coverage_status(store_path: str | Path) -> dict[str, object]:
+def operations_gap_coverage_status(
+    store_path: str | Path,
+    *,
+    collect_live: bool = True,
+) -> dict[str, object]:
     """Return a broad, read-only system-operations surface map.
 
     The payload intentionally favors status, evidence pointers, and staged next
@@ -128,6 +132,7 @@ def operations_gap_coverage_status(store_path: str | Path) -> dict[str, object]:
         usage_requests = store.list_usage_continuation_requests()
         operation_records = store.list_operation_records()
         latest_snapshot = store.load_latest_host_snapshot()
+        package_records = store.list_package_inspection_records()
     finally:
         store.close()
 
@@ -140,19 +145,25 @@ def operations_gap_coverage_status(store_path: str | Path) -> dict[str, object]:
         "service_details": _service_detail_rows(resources, targets, health, admin_plans, executions),
         "service_actions": _service_action_rows(resources, admin_plans),
         "log_evidence": _log_evidence_rows(targets, evidence),
-        "host_resources": host_resource_status(),
-        "software_inventory": software_inventory_status(),
+        "host_resources": host_resource_status() if collect_live else _projected_host_resource_status(latest_snapshot),
+        "software_inventory": software_inventory_status() if collect_live else _projected_software_inventory_status(package_records),
         "security_drift": _security_drift_rows(latest_snapshot, admin_plans, audits),
-        "network": network_status(latest_snapshot),
-        "storage_backup": storage_backup_status(),
+        "network": network_status(latest_snapshot) if collect_live else _projected_network_status(resources, latest_snapshot),
+        "storage_backup": storage_backup_status() if collect_live else _projected_storage_backup_status(physical, operation_records),
         "physical_lifecycle": _physical_lifecycle_rows(physical, claims),
         "virtual_runtime": _virtual_runtime_rows(resources, claims),
         "observability": _observability_rows(health, evidence),
         "usage_costs": _usage_cost_rows(usage_limits, usage_requests),
-        "compliance": _compliance_rows(approvals, admin_plans, audits),
-        "documentation": documentation_coverage_status(),
-        "identity_access": identity_access_status(),
+        "compliance": _compliance_rows(approvals, admin_plans, audits) if collect_live else _projected_compliance_rows(approvals, admin_plans, audits),
+        "documentation": documentation_coverage_status() if collect_live else _projected_documentation_coverage_status(operation_records),
+        "identity_access": identity_access_status() if collect_live else _projected_identity_access_status(resources, operation_records),
     }
+
+
+def operations_gap_coverage_projection_status(store_path: str | Path) -> dict[str, object]:
+    """Return the broad operations dashboard solely from durable store rows."""
+
+    return operations_gap_coverage_status(store_path, collect_live=False)
 
 
 def record_operation_status(
@@ -338,6 +349,25 @@ def host_resource_status() -> dict[str, object]:
     }
 
 
+def _projected_host_resource_status(latest_snapshot: Any | None) -> dict[str, object]:
+    return {
+        "load_1m": "",
+        "load_5m": "",
+        "load_15m": "",
+        "memory_total_mb": None,
+        "memory_available_mb": None,
+        "swap_total_mb": None,
+        "swap_free_mb": None,
+        "root_total_gb": None,
+        "root_free_gb": None,
+        "processes": None,
+        "thermal_zones": None,
+        "snapshot_id": latest_snapshot.id if latest_snapshot else "",
+        "captured_at": latest_snapshot.captured_at if latest_snapshot else "",
+        "source": "scheduled_host_snapshot",
+    }
+
+
 def software_inventory_status() -> dict[str, object]:
     dpkg = _run_read_only(("dpkg-query", "-W", "-f=${binary:Package}\n"), timeout_seconds=1)
     apt_holds = _run_read_only(("apt-mark", "showhold"), timeout_seconds=1)
@@ -355,6 +385,25 @@ def software_inventory_status() -> dict[str, object]:
     }
 
 
+def _projected_software_inventory_status(records: Sequence[Any]) -> dict[str, object]:
+    latest = sorted(records, key=lambda item: (item.captured_at, item.id))[-1] if records else None
+    return {
+        "dpkg_available": latest.succeeded() if latest else None,
+        "dpkg_packages": None,
+        "held_packages": None,
+        "pip_available": None,
+        "pip_packages": None,
+        "npm_available": None,
+        "flatpak_available": None,
+        "flatpak_apps": None,
+        "updates": len(latest.updates) if latest else 0,
+        "evidence_id": latest.id if latest else "",
+        "captured_at": latest.captured_at if latest else "",
+        "inventory_scope": "scheduled package inspection",
+        "next_step": "review scheduled package evidence and stage approved maintenance when required",
+    }
+
+
 def network_status(latest_snapshot: Any | None) -> dict[str, object]:
     routes = _run_read_only(("ip", "route", "show"), timeout_seconds=1)
     addresses = _run_read_only(("ip", "-brief", "addr"), timeout_seconds=1)
@@ -367,6 +416,23 @@ def network_status(latest_snapshot: Any | None) -> dict[str, object]:
         "listener_rows": _line_count(listeners),
         "gateway_routes": len([line for line in listeners.splitlines() if "LISTEN" in line]),
         "next_step": "add protected-gateway upstream inventory and request/status trend storage",
+    }
+
+
+def _projected_network_status(resources: Sequence[Any], latest_snapshot: Any | None) -> dict[str, object]:
+    virtual = [resource for resource in resources if resource.type == ResourceType.VIRTUAL_ASSET]
+    return {
+        "interfaces": None,
+        "routes": None,
+        "dns_servers": None,
+        "listener_rows": len(virtual),
+        "gateway_routes": sum(
+            1 for resource in virtual if resource.identifiers.get("bind_scope") == "all_interfaces"
+        ),
+        "snapshot_id": latest_snapshot.id if latest_snapshot else "",
+        "captured_at": latest_snapshot.captured_at if latest_snapshot else "",
+        "source": "scheduled_virtual_discovery",
+        "next_step": "review scheduled listener resources and request a bounded network diagnostic when needed",
     }
 
 
@@ -387,6 +453,22 @@ def storage_backup_status() -> dict[str, object]:
         "root_usage": _root_usage_row(),
         "restore_tests": 0,
         "next_step": "add backup job registry, restore-test records, SMART health, inode trends, and cleanup recommendations",
+    }
+
+
+def _projected_storage_backup_status(
+    physical: Sequence[Any],
+    operation_records: Sequence[OperationRecord],
+) -> dict[str, object]:
+    backup_records = [record for record in operation_records if record.kind == OperationRecordKind.STORAGE_BACKUP]
+    return {
+        "mount_rows": len([identity for identity in physical if identity.has_storage_risk()]),
+        "findmnt_available": None,
+        "backup_markers": len(backup_records),
+        "root_usage": {"mount": "/", "total_gb": None, "used_gb": None, "free_gb": None},
+        "restore_tests": sum(1 for record in backup_records if "restore" in record.subject.lower()),
+        "source": "scheduled_physical_discovery",
+        "next_step": "review scheduled storage identities and persisted backup or restore records",
     }
 
 
@@ -422,6 +504,38 @@ def identity_access_status() -> dict[str, object]:
         "public_ssh_keys": len(ssh_keys),
         "service_accounts": len([line for line in passwd.splitlines() if "/usr/sbin/nologin" in line or "/bin/false" in line]),
         "next_step": "add redacted user/group/sudoers/authorized_keys review and credential rotation workflow",
+    }
+
+
+def _projected_documentation_coverage_status(
+    operation_records: Sequence[OperationRecord],
+) -> dict[str, object]:
+    records = [record for record in operation_records if record.kind == OperationRecordKind.DOCUMENT_FRESHNESS]
+    return {
+        "docs_count": len(records),
+        "expected_runbooks": None,
+        "present_runbooks": None,
+        "missing_runbooks": [],
+        "source": "persisted_document_freshness_records",
+        "next_step": "review scheduled knowledge-capture and document-freshness records",
+    }
+
+
+def _projected_identity_access_status(
+    resources: Sequence[Any],
+    operation_records: Sequence[OperationRecord],
+) -> dict[str, object]:
+    records = [record for record in operation_records if record.kind == OperationRecordKind.IDENTITY_ACCESS]
+    services = [resource for resource in resources if resource.type == ResourceType.SERVICE]
+    return {
+        "local_users": None,
+        "local_groups": None,
+        "sudoers_present": None,
+        "public_ssh_keys": None,
+        "service_accounts": len(services),
+        "review_records": len(records),
+        "source": "persisted_identity_access_records",
+        "next_step": "review persisted identity evidence or stage a bounded access inspection",
     }
 
 
@@ -729,6 +843,22 @@ def _compliance_rows(approvals: Sequence[Any], plans: Sequence[Any], audits: Seq
         },
         {"area": "post-change validation", "status": "partial", "evidence": sum(1 for plan in plans if plan.verification_steps), "next_step": "link verification checklist to every execution"},
         {"area": "audit evidence", "status": "present", "evidence": len(audits), "next_step": "add compliance matrix"},
+    ]
+
+
+def _projected_compliance_rows(
+    approvals: Sequence[Any],
+    plans: Sequence[Any],
+    audits: Sequence[Any],
+) -> list[dict[str, object]]:
+    pending = [approval for approval in approvals if approval.status == ApprovalStatus.PENDING]
+    warnings = [approval for approval in approvals if "policy.warning" in approval.subject_id]
+    return [
+        {"area": "approval policy", "status": "attention" if pending else "ok", "evidence": len(pending), "next_step": "review pending approvals"},
+        {"area": "policy warning exceptions", "status": "attention" if warnings else "ok", "evidence": len(warnings), "next_step": "review accepted-risk expiry"},
+        {"area": "desired state drift", "status": "scheduled", "evidence": 0, "next_step": "review persisted station-audit records"},
+        {"area": "post-change validation", "status": "partial", "evidence": sum(1 for plan in plans if plan.verification_steps), "next_step": "link verification checklist to every execution"},
+        {"area": "audit evidence", "status": "present", "evidence": len(audits), "next_step": "review the durable compliance matrix"},
     ]
 
 

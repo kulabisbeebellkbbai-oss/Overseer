@@ -42,6 +42,58 @@ def backup_operations_status(project_root: str | Path) -> dict[str, object]:
     }
 
 
+def backup_operations_projection_status(project_root: str | Path) -> dict[str, object]:
+    """Return persisted backup workflow rows without DNS or host readiness probes."""
+
+    root = Path(project_root)
+    data = _read_registry(root)
+    local_profiles = [_projected_mediastore_profile()]
+    targets = _provider_target_rows(root, local_profiles)
+    return {
+        "root": str(root),
+        "jobs": data["jobs"],
+        "job_count": len(data["jobs"]),
+        "restore_tests": data["restore_tests"],
+        "restore_test_count": len(data["restore_tests"]),
+        "backup_requests": data["backup_requests"],
+        "backup_request_count": len(data["backup_requests"]),
+        "restore_requests": data["restore_requests"],
+        "restore_request_count": len(data["restore_requests"]),
+        "cleanup_requests": data["cleanup_requests"],
+        "cleanup_request_count": len(data["cleanup_requests"]),
+        "provider_targets": targets,
+        "provider_classes": _provider_class_rows(),
+        "provider_readiness": [_provider_readiness_row(row) for row in targets],
+        "provider_standard": "3-2-1 backups with restore testing, immutable retention where supported, encryption, and monitored offsite copies",
+        "provider_local_profiles": local_profiles,
+        "collection_mode": "durable_projection",
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def _projected_mediastore_profile() -> dict[str, object]:
+    return {
+        "id": "backup-profile.nas.mediastore",
+        "name": "MediaStore",
+        "provider_class": "network_nas",
+        "share": MEDIASTORE_SHARE,
+        "credential_reference": str(MEDIASTORE_CREDENTIAL_PATH),
+        "credential_status": "not_collected_inline",
+        "credential_mode": "not_collected_inline",
+        "username_status": "not_collected_inline",
+        "smb_helper_status": "not_collected_inline",
+        "name_resolution_status": "not_collected_inline",
+        "resolved_addresses": [],
+        "mount_path": str(MEDIASTORE_MOUNT_PATH),
+        "mounted": False,
+        "connection_status": "not_collected_inline",
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+        "next_step": "review scheduled provider readiness evidence before staging a connection test",
+    }
+
+
 def backup_provider_readiness_status(project_root: str | Path) -> dict[str, object]:
     root = Path(project_root)
     local_profiles = _local_provider_profiles(root)

@@ -8,7 +8,7 @@ The API and dashboard consume these records and never execute a collector inline
 ## Responsibilities
 
 - rank due collection work under bounded priority and concurrency
-- run independent health, host, discovery, dispatch, knowledge, package, and freshness jobs
+- run independent health, host, discovery, dispatch, knowledge, package, firmware, freshness, Git, and storage-capacity jobs
 - retain per-job next-due, jitter, timeout, lease, outcome, and data-age state
 - coalesce duplicate run requests and expose earliest execution time
 - apply capped backoff and circuit cooldown after failures
@@ -29,7 +29,8 @@ The API and dashboard consume these records and never execute a collector inline
 - No arbitrary service is started automatically.
 - No persisted continuation request wakes a thread by itself; resume only happens during an explicit dispatch run with codex-projects resume enabled.
 - Codex project resume starts or reuses the durable tmux session that `codex-projects` would use for the same conversation.
-- No live capacity probe is performed.
+- Capacity, Git, and firmware inspection run only as bounded scheduled jobs; dashboard GETs read their durable SQLite projections.
+- The firmware callback uses a process boundary so timeout can terminate EFI traversal or a blocked projection write without retaining a scheduler worker; firmware and preflight projections commit as one SQLite transaction.
 - All inputs must come from already captured usage-limit, maintenance, or operator-provided state.
 
 ## Operations

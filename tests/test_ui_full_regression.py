@@ -737,10 +737,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "backup-schedule",
             "backup-status",
             "backup-target",
-            "storage-growth-notes",
             "storage-growth-requested-by",
-            "storage-growth-retention",
-            "storage-growth-snapshot-id",
             "claim-action",
             "claim-activate-approval-id",
             "claim-activate-id",
@@ -961,7 +958,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("credential_status", OPERATOR_CONSOLE_HTML)
         self.assertIn("smb_helper_status", OPERATOR_CONSOLE_HTML)
         self.assertIn("name_resolution_status", OPERATOR_CONSOLE_HTML)
-        self.assertIn("Storage Growth Snapshot", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Scheduled Capacity Refresh", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Queue Capacity Refresh", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Queue-only. The scheduler coalesces duplicate requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Storage Risk Alerts", OPERATOR_CONSOLE_HTML)
         self.assertIn("Storage Encryption Trust", OPERATOR_CONSOLE_HTML)
         self.assertIn("Removable Media Review", OPERATOR_CONSOLE_HTML)

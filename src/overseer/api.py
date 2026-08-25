@@ -117,10 +117,7 @@ from .cli import (
     host_security_sources_status,
     host_security_source_reviews_status,
     host_security_triage_status,
-    inspect_firmware_preflight_status,
-    inspect_firmware_status,
     inspect_host_status,
-    inspect_packages_status,
     issue_key_broker_token_status,
     handoff_agent_status,
     key_broker_status,
@@ -188,7 +185,7 @@ from .backup_ops import (
     approve_backup_execution_request_status,
     approve_backup_cleanup_request_status,
     approve_restore_execution_request_status,
-    backup_operations_status,
+    backup_operations_projection_status,
     execute_backup_execution_request_status,
     execute_backup_cleanup_request_status,
     execute_restore_execution_request_status,
@@ -199,7 +196,7 @@ from .backup_ops import (
     stage_restore_execution_request_status,
 )
 from .documentation_evidence import documentation_evidence_status
-from .git import git_status_status
+from .git import git_status_projection_status
 from .image_scanning import (
     approve_image_scan_request_status,
     execute_image_scan_request_status,
@@ -217,12 +214,17 @@ from .identity_ops import (
 from .incident_lifecycle import incident_lifecycle_status
 from .knowledge import knowledge_capture_status
 from .maintenance_schedule import maintenance_schedules_status, record_maintenance_schedule_status
+from .maintenance_projections import (
+    firmware_preflight_projection,
+    firmware_status_projection,
+    package_status_projection,
+)
 from .metric_history import capture_metric_history_status, metric_history_status
 from .observability_trends import observability_trends_status
 from .ops import (
     list_operation_records_status,
     operation_workflow_catalog_status,
-    operations_gap_coverage_status,
+    operations_gap_coverage_projection_status,
     record_operation_status,
     stage_operation_workflow_status,
     transition_operation_record_status,
@@ -239,12 +241,12 @@ from .remote_testing import (
     revoke_remote_testing_token_status,
     validate_remote_testing_token,
 )
-from .service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
+from .service_evidence import execute_journal_access_request_status, service_evidence_projection_status, stage_journal_access_request_status
 from .security_evidence import security_evidence_status
-from .software_evidence import software_evidence_status
-from .storage_evidence import capture_storage_growth_snapshot_status, storage_evidence_status
+from .software_evidence import software_evidence_projection_status
+from .storage_evidence import storage_evidence_projection_status
 from .usage_evidence import usage_evidence_status
-from .virtual_evidence import virtual_evidence_status
+from .virtual_evidence import virtual_evidence_projection_status
 from .virtual_ops import (
     approve_virtual_destroy_request_status,
     approve_virtual_restore_request_status,
@@ -671,6 +673,24 @@ def _collection_run_request_projection(
     }
 
 
+def _storage_growth_collection_request(
+    store_path: str,
+    payload: dict[str, Any],
+) -> dict[str, object]:
+    requested_by = str(payload.get("requested_by") or "kira")
+    result = _collection_run_request_projection(
+        store_path,
+        "collection.storage.capacity",
+        requested_by,
+        "refresh the scheduled storage capacity projection",
+    )
+    return {
+        **result,
+        "collection_job_id": "collection.storage.capacity",
+        "deprecated_inline_capture": False,
+    }
+
+
 def _collection_policy_update(
     store_path: str,
     job_id: str,
@@ -966,7 +986,7 @@ def make_api_handler(
                 self._handle(lambda: incident_lifecycle_status(store_path))
                 return
             if path == "/operations/gap-coverage":
-                self._handle(lambda: operations_gap_coverage_status(store_path))
+                self._handle(lambda: operations_gap_coverage_projection_status(store_path))
                 return
             if path == "/operations/records":
                 self._handle(
@@ -985,16 +1005,16 @@ def make_api_handler(
                 self._handle(lambda: maintenance_summary_status(store_path))
                 return
             if path == "/maintenance/package-status":
-                self._handle(lambda: inspect_packages_status())
+                self._handle(lambda: package_status_projection(store_path))
                 return
             if path == "/maintenance/firmware-status":
-                self._handle(lambda: inspect_firmware_status())
+                self._handle(lambda: firmware_status_projection(store_path))
                 return
             if path == "/maintenance/firmware-preflight":
-                self._handle(lambda: inspect_firmware_preflight_status())
+                self._handle(lambda: firmware_preflight_projection(store_path))
                 return
             if path == "/maintenance/software-evidence":
-                self._handle(lambda: software_evidence_status(store_path))
+                self._handle(lambda: software_evidence_projection_status(store_path))
                 return
             if path == "/maintenance/advisories":
                 self._handle(lambda: advisory_status(store_path))
@@ -1006,7 +1026,7 @@ def make_api_handler(
                 self._handle(lambda: health_summary_status(store_path))
                 return
             if path == "/health/service-evidence":
-                self._handle(lambda: service_evidence_status(store_path, _query_first(query, "resource_id")))
+                self._handle(lambda: service_evidence_projection_status(store_path, _query_first(query, "resource_id")))
                 return
             if path == "/health/codex-usage":
                 self._handle(codex_usage_health_status)
@@ -1048,7 +1068,7 @@ def make_api_handler(
                 self._handle(lambda: documentation_evidence_status(_project_path_for_store(store_path)))
                 return
             if path == "/git/status":
-                self._handle(lambda: git_status_status(_project_path_for_store(store_path)))
+                self._handle(lambda: git_status_projection_status(store_path, _project_path_for_store(store_path)))
                 return
             if path == "/documents/notes":
                 self._handle(lambda: documents_list_notes_status(folder=_query_first(query, "folder") or ""))
@@ -1070,16 +1090,16 @@ def make_api_handler(
                 self._handle(lambda: physical_summary_status(store_path))
                 return
             if path == "/storage/evidence":
-                self._handle(lambda: storage_evidence_status(_project_path_for_store(store_path)))
+                self._handle(lambda: storage_evidence_projection_status(store_path, _project_path_for_store(store_path)))
                 return
             if path == "/storage/backup-operations":
-                self._handle(lambda: backup_operations_status(_project_path_for_store(store_path)))
+                self._handle(lambda: backup_operations_projection_status(_project_path_for_store(store_path)))
                 return
             if path == "/virtual-summary":
                 self._handle(lambda: virtual_summary_status(store_path))
                 return
             if path == "/virtual/evidence":
-                self._handle(lambda: virtual_evidence_status(store_path))
+                self._handle(lambda: virtual_evidence_projection_status(store_path))
                 return
             if path == "/virtual/operations":
                 self._handle(lambda: virtual_operations_status(_project_path_for_store(store_path)))
@@ -1613,7 +1633,7 @@ def make_api_handler(
                 self._handle_json(lambda payload: execute_backup_execution_request_status(_project_path_for_store(store_path), **_backup_execution_execute_args(payload)))
                 return
             if path == "/storage/growth-snapshots/capture":
-                self._handle_json(lambda payload: capture_storage_growth_snapshot_status(_project_path_for_store(store_path), **_storage_growth_capture_args(payload)))
+                self._handle_json(lambda payload: _storage_growth_collection_request(store_path, payload))
                 return
             if path == "/storage/restore-execution-requests":
                 self._handle_json(lambda payload: stage_restore_execution_request_status(_project_path_for_store(store_path), **_restore_execution_request_args(payload)))
@@ -3376,15 +3396,6 @@ def _metric_history_capture_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "snapshot_id": str(payload.get("snapshot_id") or ""),
         "requested_by": str(payload.get("requested_by") or "julian"),
-        "notes": str(payload.get("notes") or ""),
-        "max_snapshots": int(payload.get("max_snapshots") or 250),
-    }
-
-
-def _storage_growth_capture_args(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "snapshot_id": str(payload.get("snapshot_id") or ""),
-        "requested_by": str(payload.get("requested_by") or "kira"),
         "notes": str(payload.get("notes") or ""),
         "max_snapshots": int(payload.get("max_snapshots") or 250),
     }

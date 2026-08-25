@@ -6,6 +6,8 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -154,6 +156,37 @@ class FirmwarePreflightSnapshot:
 
 PackageCommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+FIRMWARE_PREFLIGHT_HELPER = r"""
+import json
+import os
+import sys
+
+root = sys.argv[1]
+limit = int(sys.argv[2])
+payload = {"accessible": False, "entries": [], "error": "", "truncated": False}
+try:
+    entries = []
+    truncated = False
+    with os.scandir(root) as scanner:
+        for entry in scanner:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            if len(entries) >= limit:
+                truncated = True
+                break
+            entries.append([entry.name, int(entry.stat(follow_symlinks=False).st_size)])
+    payload = {
+        "accessible": True,
+        "entries": entries,
+        "error": "efivarfs entry limit reached" if truncated else "",
+        "truncated": truncated,
+    }
+except FileNotFoundError:
+    payload["error"] = "efivarfs path is not present"
+except OSError as error:
+    payload["error"] = "efivarfs inspection failed: " + type(error).__name__
+sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+"""
 
 
 class AptPackageInspectionAdapter:
@@ -190,13 +223,21 @@ class AptPackageInspectionAdapter:
 
 
 class FwupdFirmwareInspectionAdapter:
-    def __init__(self, command_runner: PackageCommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        command_runner: PackageCommandRunner | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> None:
         self.command_runner = command_runner or self._run
+        self.timeout_seconds = timeout_seconds
 
     def inspect(self, captured_at: str | None = None) -> FirmwareInspectionSnapshot:
         observed_at = captured_at or datetime.now(UTC).isoformat()
         command = ("fwupdmgr", "get-upgrades", "--no-reboot-check")
-        completed = self.command_runner(command)
+        try:
+            completed = self.command_runner(command, self.timeout_seconds)  # type: ignore[misc]
+        except TypeError:
+            completed = self.command_runner(command)
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
         updates, no_update_devices = parse_fwupd_upgrades(stdout) if completed.returncode == 0 else ((), ())
@@ -211,9 +252,18 @@ class FwupdFirmwareInspectionAdapter:
         )
 
     @staticmethod
-    def _run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    def _run(
+        command: Sequence[str],
+        timeout_seconds: float = 30.0,
+    ) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
+            return subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
         except FileNotFoundError as exc:
             return subprocess.CompletedProcess(command, 127, "", str(exc))
         except subprocess.TimeoutExpired as exc:
@@ -221,48 +271,102 @@ class FwupdFirmwareInspectionAdapter:
 
 
 class FirmwarePreflightAdapter:
-    def __init__(self, efivar_path: str | Path = "/sys/firmware/efi/efivars") -> None:
+    def __init__(
+        self,
+        efivar_path: str | Path = "/sys/firmware/efi/efivars",
+        *,
+        timeout_seconds: float = 5.0,
+        max_entries: int = 512,
+        deadline: float | None = None,
+        command_runner: PackageCommandRunner | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self.efivar_path = Path(efivar_path)
+        self.timeout_seconds = max(0.01, float(timeout_seconds))
+        self.max_entries = max(1, min(int(max_entries), 4096))
+        self.deadline = deadline
+        self.command_runner = command_runner or self._run
+        self.clock = clock or time.monotonic
 
     def inspect(self, captured_at: str | None = None) -> FirmwarePreflightSnapshot:
         observed_at = captured_at or datetime.now(UTC).isoformat()
+        timeout_seconds = self.timeout_seconds
+        if self.deadline is not None:
+            timeout_seconds = min(timeout_seconds, self.deadline - self.clock())
+        if timeout_seconds <= 0:
+            return self._failure(observed_at, "efivarfs inspection timed out")
+        command = (
+            sys.executable,
+            "-I",
+            "-c",
+            FIRMWARE_PREFLIGHT_HELPER,
+            str(self.efivar_path),
+            str(self.max_entries),
+        )
         try:
-            if not self.efivar_path.exists():
-                return FirmwarePreflightSnapshot(
-                    id=f"firmware-preflight.{_snapshot_suffix(observed_at)}",
-                    captured_at=observed_at,
-                    efivar_path=str(self.efivar_path),
-                    efivar_accessible=False,
-                    efivars=(),
-                    error="efivarfs path is not present",
-                )
+            try:
+                completed = self.command_runner(command, timeout_seconds)  # type: ignore[misc]
+            except TypeError:
+                completed = self.command_runner(command)
+        except subprocess.TimeoutExpired:
+            return self._failure(observed_at, "efivarfs inspection timed out")
+        except (FileNotFoundError, OSError):
+            return self._failure(observed_at, "efivarfs inspection unavailable")
+        if self.deadline is not None and self.clock() >= self.deadline:
+            return self._failure(observed_at, "efivarfs inspection timed out")
+        if completed.returncode != 0:
+            return self._failure(observed_at, "efivarfs inspection unavailable")
+        try:
+            payload = json.loads(completed.stdout or "")
+            raw_entries = payload.get("entries")
+            if not isinstance(payload, dict) or not isinstance(raw_entries, list):
+                raise ValueError("invalid firmware preflight payload")
             entries = tuple(
                 sorted(
                     (
-                        EfivarEntry(name=entry.name, size_bytes=entry.stat().st_size)
-                        for entry in self.efivar_path.iterdir()
-                        if entry.is_file()
+                        EfivarEntry(name=str(item[0])[:512], size_bytes=max(0, int(item[1])))
+                        for item in raw_entries[: self.max_entries]
+                        if isinstance(item, list) and len(item) == 2
                     ),
                     key=lambda item: item.size_bytes,
                     reverse=True,
                 )
             )
-            return FirmwarePreflightSnapshot(
-                id=f"firmware-preflight.{_snapshot_suffix(observed_at)}",
-                captured_at=observed_at,
-                efivar_path=str(self.efivar_path),
-                efivar_accessible=True,
-                efivars=entries,
-            )
-        except OSError as exc:
-            return FirmwarePreflightSnapshot(
-                id=f"firmware-preflight.{_snapshot_suffix(observed_at)}",
-                captured_at=observed_at,
-                efivar_path=str(self.efivar_path),
-                efivar_accessible=False,
-                efivars=(),
-                error=str(exc),
-            )
+            accessible = bool(payload.get("accessible"))
+            error = str(payload.get("error") or "")[:512]
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return self._failure(observed_at, "efivarfs inspection returned invalid evidence")
+        return FirmwarePreflightSnapshot(
+            id=f"firmware-preflight.{_snapshot_suffix(observed_at)}",
+            captured_at=observed_at,
+            efivar_path=str(self.efivar_path),
+            efivar_accessible=accessible,
+            efivars=entries,
+            error=error,
+        )
+
+    def _failure(self, observed_at: str, error: str) -> FirmwarePreflightSnapshot:
+        return FirmwarePreflightSnapshot(
+            id=f"firmware-preflight.{_snapshot_suffix(observed_at)}",
+            captured_at=observed_at,
+            efivar_path=str(self.efivar_path),
+            efivar_accessible=False,
+            efivars=(),
+            error=error,
+        )
+
+    @staticmethod
+    def _run(
+        command: Sequence[str],
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
 
 
 def parse_apt_upgradable(output: str) -> tuple[PackageUpdate, ...]:

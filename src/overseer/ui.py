@@ -190,7 +190,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .icon-btn, .action-btn {
       border: 2px solid #000;
       border-radius: 16px 4px 4px 16px;
-      min-height: 36px;
+      min-height: 44px;
       background: var(--lcars-amber);
       color: #050506;
       cursor: pointer;
@@ -203,7 +203,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       color: #050506;
     }
     .icon-btn {
-      width: 38px;
+      width: 44px;
       display: grid;
       place-items: center;
     }
@@ -1559,10 +1559,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     async function captureStorageGrowthSnapshot() {
       return await postJson("/storage/growth-snapshots/capture", {
-        snapshot_id: value("storage-growth-snapshot-id"),
-        requested_by: value("storage-growth-requested-by") || "kira",
-        notes: value("storage-growth-notes"),
-        max_snapshots: Number(value("storage-growth-retention") || 250)
+        requested_by: value("storage-growth-requested-by") || "kira"
       });
     }
     async function stageRestoreExecutionRequest() {
@@ -2923,12 +2920,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-6">
-            <div class="toolbar"><h3>Storage Growth Snapshot</h3><button class="action-btn" data-action="capture-storage-growth-snapshot">Capture Growth</button></div>
+            <div class="toolbar"><h3>Scheduled Capacity Refresh</h3><button class="action-btn" data-action="capture-storage-growth-snapshot">Queue Capacity Refresh</button></div>
             <div class="form-grid">
-              <div class="field span-3"><label for="storage-growth-snapshot-id">Snapshot ID</label><input id="storage-growth-snapshot-id" placeholder="optional"></div>
-              <div class="field span-2"><label for="storage-growth-requested-by">Requested By</label><input id="storage-growth-requested-by" value="kira"></div>
-              <div class="field span-1"><label for="storage-growth-retention">Retention</label><input id="storage-growth-retention" type="number" min="1" value="250"></div>
-              <div class="field span-6"><label for="storage-growth-notes">Notes</label><input id="storage-growth-notes" value="capture filesystem growth evidence"></div>
+              <div class="field span-4"><label for="storage-growth-requested-by">Requested By</label><input id="storage-growth-requested-by" value="kira"></div>
+              <div class="field span-8"><label>Collection mode</label><p class="muted">Queue-only. The scheduler coalesces duplicate requests and runs the bounded capacity collector when its lease is available.</p></div>
             </div>
           </div>
           <div class="panel span-6">${table("Storage And Backup", [operations.storage_backup || {}], ["mount_rows", "backup_markers", "restore_tests", "next_step"])}</div>

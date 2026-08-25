@@ -28,6 +28,8 @@ def service_evidence_status(
     store_path: str | Path,
     resource_id: str | None = None,
     log_tail_lines: int = 20,
+    *,
+    collect_live: bool = True,
 ) -> dict[str, object]:
     """Return service detail evidence without changing host state."""
 
@@ -44,6 +46,7 @@ def service_evidence_status(
         evidence = store.list_health_evidence()
         plans = [plan for plan in store.list_admin_change_plans() if not plan.archived]
         executions = store.list_admin_executions()
+        latest_host_snapshot = store.load_latest_host_snapshot()
     finally:
         store.close()
 
@@ -59,14 +62,41 @@ def service_evidence_status(
         "services": len(resources),
         "dependency_graph": _dependency_graph(resources, resources_by_id, health_by_resource),
         "items": [
-            _service_detail(resource, targets, evidence, plans, executions, health_by_resource, resources_by_id, log_tail_lines)
-            | {"system_journal_captures": _system_journal_capture_rows(project_root, resource.id)}
+            _service_detail(
+                resource,
+                targets,
+                evidence,
+                plans,
+                executions,
+                health_by_resource,
+                resources_by_id,
+                log_tail_lines,
+                collect_live,
+                latest_host_snapshot,
+            )
+            | {
+                "system_journal_captures": (
+                    _system_journal_capture_rows(project_root, resource.id)
+                    if collect_live
+                    else []
+                )
+            }
             for resource in resources
         ],
-        "journal_access": _journal_access_status(resources),
+        "journal_access": _journal_access_status(resources, collect_live=collect_live),
+        "collection_mode": "live_diagnostic" if collect_live else "durable_projection",
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
+
+
+def service_evidence_projection_status(
+    store_path: str | Path,
+    resource_id: str | None = None,
+) -> dict[str, object]:
+    """Compose the dashboard surface exclusively from durable Overseer state."""
+
+    return service_evidence_status(store_path, resource_id, collect_live=False)
 
 
 def stage_journal_access_request_status(
@@ -215,6 +245,8 @@ def _service_detail(
     health_by_resource: Mapping[str, Any],
     resources_by_id: Mapping[str, Resource],
     log_tail_lines: int,
+    collect_live: bool,
+    latest_host_snapshot: Any | None,
 ) -> dict[str, object]:
     unit = _systemd_unit_for(resource)
     health = health_by_resource.get(resource.id)
@@ -233,7 +265,11 @@ def _service_detail(
         "risk": resource.risk_level.value,
         "unit": unit or "",
         "journal_scope": _journal_scope(resource),
-        "systemd": _systemd_show(unit) if unit else {"available": False, "reason": "no unit identifier"},
+        "systemd": (
+            _systemd_show(unit)
+            if unit and collect_live
+            else _projected_systemd_status(unit, latest_host_snapshot)
+        ),
         "dependencies": sorted(resource.dependencies),
         "dependency_health": _dependency_health_rows(resource, resources_by_id, health_by_resource),
         "config_paths": _redacted_paths(resource.identifiers.get("config_paths", ())),
@@ -242,8 +278,16 @@ def _service_detail(
         "health_error": _redact_text(health.error if health else "missing health target or evidence"),
         "health_targets": [_health_target_row(target) for target in resource_targets],
         "recent_evidence": [_health_evidence_row(item) for item in sorted(resource_evidence, key=lambda value: value.captured_at or value.id, reverse=True)[:10]],
-        "log_evidence": _log_evidence(resource_targets, log_tail_lines),
-        "journal_excerpt": _journal_excerpt(unit, log_tail_lines) if unit else {"available": False, "reason": "no unit identifier", "sample": []},
+        "log_evidence": (
+            _log_evidence(resource_targets, log_tail_lines)
+            if collect_live
+            else _stored_log_evidence(resource_targets, resource_evidence)
+        ),
+        "journal_excerpt": (
+            _journal_excerpt(unit, log_tail_lines)
+            if unit and collect_live
+            else _projected_journal_excerpt(unit)
+        ),
         "system_journal_request": _system_journal_request_row(resource, unit) if unit and _journal_scope(resource) == "system" else {},
         "admin_plans": [_admin_plan_row(plan) for plan in service_plans],
         "executions": len(service_executions),
@@ -353,10 +397,19 @@ def _journal_scope(resource: Resource) -> str:
     return "user" if resource.id.startswith("svc.systemd-user.") else "system"
 
 
-def _journal_access_status(resources: Sequence[Resource]) -> dict[str, object]:
-    journalctl_available = shutil.which("journalctl") is not None
-    user_access = _journal_access_probe(("journalctl", "--user", "-n", "0", "--no-pager")) if journalctl_available else _missing_command_probe()
-    system_access = _journal_access_probe(("journalctl", "-n", "0", "--no-pager")) if journalctl_available else _missing_command_probe()
+def _journal_access_status(
+    resources: Sequence[Resource],
+    *,
+    collect_live: bool = True,
+) -> dict[str, object]:
+    if collect_live:
+        journalctl_available: bool | None = shutil.which("journalctl") is not None
+        user_access = _journal_access_probe(("journalctl", "--user", "-n", "0", "--no-pager")) if journalctl_available else _missing_command_probe()
+        system_access = _journal_access_probe(("journalctl", "-n", "0", "--no-pager")) if journalctl_available else _missing_command_probe()
+    else:
+        journalctl_available = None
+        user_access = _projected_journal_access_probe()
+        system_access = _projected_journal_access_probe()
     system_requests = []
     for resource in resources:
         unit = _systemd_unit_for(resource)
@@ -368,8 +421,72 @@ def _journal_access_status(resources: Sequence[Resource]) -> dict[str, object]:
         "system_journal_access": system_access,
         "system_access_currently_available": system_access["available"],
         "system_review_requests": system_requests,
+        "source": "live_diagnostic" if collect_live else "durable_projection",
         "next_step": "stage journal access request for any system service needing privileged log evidence",
     }
+
+
+def _projected_journal_access_probe() -> dict[str, object]:
+    return {
+        "available": False,
+        "exit_code": None,
+        "reason": "journal access is not probed by dashboard requests",
+    }
+
+
+def _projected_systemd_status(unit: str, latest_host_snapshot: Any | None) -> dict[str, object]:
+    if not unit:
+        return {"available": False, "reason": "no unit identifier", "source": "durable_projection"}
+    return {
+        "available": False,
+        "unit": unit,
+        "active_state": "unknown",
+        "sub_state": "unknown",
+        "source": "scheduled_host_snapshot",
+        "snapshot_id": latest_host_snapshot.id if latest_host_snapshot else "",
+        "captured_at": latest_host_snapshot.captured_at if latest_host_snapshot else "",
+        "reason": "use scheduled health evidence for current service state",
+    }
+
+
+def _projected_journal_excerpt(unit: str) -> dict[str, object]:
+    return {
+        "available": False,
+        "unit": unit,
+        "sample": [],
+        "source": "durable_projection",
+        "reason": "journal excerpts are collected only by deliberate approved diagnostics",
+    }
+
+
+def _stored_log_evidence(
+    targets: Sequence[HealthTarget],
+    evidence: Sequence[HealthEvidence],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for target in targets:
+        if target.probe_type != ProbeType.LOG:
+            continue
+        matching = [
+            item
+            for item in evidence
+            if item.resource_id == target.resource_id and item.target == target.target
+        ]
+        latest = sorted(matching, key=lambda item: item.captured_at or item.id)[-1] if matching else None
+        rows.append(
+            {
+                "target_id": target.id,
+                "path": _redact_path(target.target),
+                "readable": latest is not None,
+                "lines": 0,
+                "sample": [],
+                "status": latest.observed_status.value if latest else HealthStatus.UNKNOWN.value,
+                "captured_at": latest.captured_at if latest else None,
+                "error": _redact_text(latest.observed_error) if latest else "missing scheduled health evidence",
+                "source": "scheduled_health_evidence",
+            }
+        )
+    return rows
 
 
 def _journal_access_probe(command: tuple[str, ...]) -> dict[str, object]:

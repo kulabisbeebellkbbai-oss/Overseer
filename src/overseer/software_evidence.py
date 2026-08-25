@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import UTC, datetime
 
 from .advisories import advisory_status
+from .store import SQLiteStore
 
 
 def software_evidence_status(store_path: str | Path | None = None) -> dict[str, object]:
@@ -27,6 +28,43 @@ def software_evidence_status(store_path: str | Path | None = None) -> dict[str, 
         "release_notes": _release_note_rows(),
         "patch_readiness": _patch_readiness_rows(advisories),
         "advisories": advisories,
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def software_evidence_projection_status(store_path: str | Path) -> dict[str, object]:
+    """Return scheduled package evidence without inspecting the host inline."""
+
+    with SQLiteStore(store_path) as store:
+        records = sorted(
+            store.list_package_inspection_records(),
+            key=lambda item: (item.captured_at, item.id),
+            reverse=True,
+        )
+    latest = records[0] if records else None
+    advisories = advisory_status(store_path)
+    return {
+        "package_managers": [
+            {"manager": manager, "available": None, "source": "scheduled_package_inspection"}
+            for manager in ("apt", "dpkg-query", "pip", "pip3", "npm", "flatpak", "snap", "cargo")
+        ],
+        "apt": {
+            "available": latest.succeeded() if latest else None,
+            "held_packages": [],
+            "source_count": None,
+            "metadata_files": None,
+            "metadata_age_days": None,
+            "status": "ready" if latest and latest.succeeded() else "awaiting_scheduled_inspection",
+            "updates": len(latest.updates) if latest else 0,
+            "captured_at": latest.captured_at if latest else "",
+            "evidence_id": latest.id if latest else "",
+        },
+        "provenance": [],
+        "release_notes": [],
+        "patch_readiness": _patch_readiness_rows(advisories),
+        "advisories": advisories,
+        "collection_mode": "durable_projection",
         "mutation_performed": False,
         "host_mutation_performed": False,
     }

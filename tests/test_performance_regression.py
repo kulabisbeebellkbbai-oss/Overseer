@@ -3,6 +3,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from overseer.collection_adapters import CollectionAdapterRegistry, CollectionExecution
 from overseer.collection_models import (
@@ -59,6 +60,19 @@ GET_ENDPOINT_ALLOWED_STATUSES = {
     "/Overseer/host/security/listener-review-queue": {200, 400},
     "/Overseer/host/security/source-review-queue": {200, 400},
 }
+
+HOST_COLLECTION_FREE_ENDPOINTS = (
+    "/Overseer/operations/gap-coverage",
+    "/Overseer/health/service-evidence",
+    "/Overseer/maintenance/package-status",
+    "/Overseer/maintenance/firmware-status",
+    "/Overseer/maintenance/firmware-preflight",
+    "/Overseer/maintenance/software-evidence",
+    "/Overseer/storage/evidence",
+    "/Overseer/storage/backup-operations",
+    "/Overseer/virtual/evidence",
+    "/Overseer/git/status",
+)
 
 SAFE_POST_BUDGETS = {
     "/Overseer/resources": 1.0,
@@ -178,6 +192,42 @@ class PerformanceRegressionTests(unittest.TestCase):
                         status, elapsed = _timed(lambda endpoint=endpoint: server.get_status(endpoint))
                         self.assertIn(status, GET_ENDPOINT_ALLOWED_STATUSES.get(endpoint, {200}))
                         self.assertLess(elapsed, budget)
+
+    def test_authenticated_panel_gets_never_launch_host_collectors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir()
+            _seed_collection_projections(store_path)
+            with (
+                patch("subprocess.run", side_effect=AssertionError("dashboard GET launched a host collector")),
+                patch("overseer.backup_ops._host_resolution_status", side_effect=AssertionError("dashboard GET launched DNS collection")),
+            ):
+                with LocalApiHarness(store_path) as server:
+                    statuses = {
+                        endpoint: server.get_status(endpoint)
+                        for endpoint in HOST_COLLECTION_FREE_ENDPOINTS
+                    }
+
+        self.assertEqual(statuses, {endpoint: 200 for endpoint in HOST_COLLECTION_FREE_ENDPOINTS})
+
+    def test_storage_capture_post_only_queues_the_scheduled_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir()
+            from overseer.runtime import seed_default_collection_jobs
+
+            seed_default_collection_jobs(store_path)
+            with patch("subprocess.run", side_effect=AssertionError("storage POST launched a host collector")):
+                with LocalApiHarness(store_path) as server:
+                    response = server.post_json(
+                        "/Overseer/storage/growth-snapshots/capture",
+                        {"requested_by": "kira"},
+                    )
+
+        self.assertEqual(response["collection_job_id"], "collection.storage.capacity")
+        self.assertIn(response["status"], {"queued", "coalesced"})
+        self.assertFalse(response["deprecated_inline_capture"])
+        self.assertFalse((store_path.parent.parent / "state" / "storage-growth-history.json").exists())
 
     def test_safe_mutating_workflow_routes_stay_within_budgets(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -9,7 +9,11 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .backup_ops import backup_operations_status
+from .backup_ops import backup_operations_projection_status, backup_operations_status
+from .store import SQLiteStore
+
+STORAGE_CAPACITY_PROJECTION_ID = "dashboard.storage.capacity"
+STORAGE_CAPACITY_PROJECTION_RETENTION = 100
 
 
 def storage_evidence_status(project_root: str | Path | None = None) -> dict[str, object]:
@@ -50,6 +54,120 @@ def storage_evidence_status(project_root: str | Path | None = None) -> dict[str,
         "growth_trends": growth_history["trends"],
         "growth_retention": growth_history["retention"],
         "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def storage_evidence_projection_status(
+    store_path: str | Path,
+    project_root: str | Path | None = None,
+) -> dict[str, object]:
+    """Return scheduled storage and persisted backup evidence without host scans."""
+
+    root = Path(project_root or Path.cwd())
+    backup_ops = backup_operations_projection_status(root)
+    try:
+        with SQLiteStore(store_path) as store:
+            projection = store.load_dashboard_projection(STORAGE_CAPACITY_PROJECTION_ID)
+    except (KeyError, OSError, ValueError):
+        projection = {"snapshots": [], "retention": {"max_snapshots": STORAGE_CAPACITY_PROJECTION_RETENTION}}
+    snapshots = sorted(
+        list(projection.get("snapshots") or []),
+        key=lambda item: str(item.get("captured_at") or item.get("id")),
+        reverse=True,
+    )
+    latest = snapshots[0] if snapshots else None
+    mounts = list(latest.get("mounts") or []) if latest else []
+    capacity = dict(latest.get("root_capacity") or {}) if latest else {
+        "mount": "/",
+        "total_bytes": None,
+        "used_bytes": None,
+        "free_bytes": None,
+        "status": "awaiting_scheduled_snapshot",
+    }
+    return {
+        "root": str(root),
+        "mounts": mounts,
+        "mount_count": len(mounts),
+        "backup_markers": [],
+        "backup_marker_count": 0,
+        "restore_tests": backup_ops["restore_tests"],
+        "backup_jobs": backup_ops["jobs"],
+        "backup_requests": backup_ops["backup_requests"],
+        "restore_requests": backup_ops["restore_requests"],
+        "cleanup_requests": backup_ops["cleanup_requests"],
+        "backup_provider_targets": backup_ops["provider_targets"],
+        "backup_provider_classes": backup_ops["provider_classes"],
+        "backup_provider_readiness": backup_ops["provider_readiness"],
+        "backup_provider_standard": backup_ops["provider_standard"],
+        "backup_provider_local_profiles": backup_ops["provider_local_profiles"],
+        "smart_health": [{"device": "scheduled_storage_inspection", "available": None, "status": "not_collected_inline"}],
+        "cleanup_candidates": [],
+        "risk_alerts": [],
+        "risk_alert_count": 0,
+        "encryption_trust": [],
+        "encryption_trust_count": 0,
+        "removable_media_review": [],
+        "removable_media_review_count": 0,
+        "capacity_summary": capacity,
+        "growth_samples": snapshots,
+        "growth_sample_count": len(snapshots),
+        "growth_trends": _growth_trend_rows(snapshots),
+        "growth_retention": dict(projection.get("retention") or {"max_snapshots": STORAGE_CAPACITY_PROJECTION_RETENTION}),
+        "collection_mode": "durable_sqlite_projection",
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def capture_storage_capacity_projection_status(
+    store_path: str | Path,
+    *,
+    timeout_seconds: float = 3.0,
+    captured_at: str | None = None,
+) -> dict[str, object]:
+    """Capture one bounded capacity sample into the canonical SQLite store."""
+
+    now = captured_at or _now()
+    mounts = [_growth_mount_sample(mount) for mount in _df_rows(timeout_seconds=min(1.5, max(0.1, timeout_seconds * 0.6)))[:64]]
+    snapshot = {
+        "id": f"storage-capacity.{_safe_id(now)}",
+        "captured_at": now,
+        "requested_by": "kira-scheduler",
+        "mounts": mounts,
+        "root_capacity": _capacity_summary(),
+        "notes": "scheduled capacity projection",
+        "next_step": "compare scheduled capacity history and investigate sustained growth before capacity becomes urgent",
+    }
+    with SQLiteStore(store_path) as store:
+        try:
+            existing = store.load_dashboard_projection(STORAGE_CAPACITY_PROJECTION_ID)
+        except KeyError:
+            existing = {"snapshots": []}
+        snapshots = [
+            item
+            for item in list(existing.get("snapshots") or [])
+            if item.get("id") != snapshot["id"]
+        ]
+        snapshots.append(snapshot)
+        snapshots = sorted(
+            snapshots,
+            key=lambda item: str(item.get("captured_at") or item.get("id")),
+            reverse=True,
+        )[:STORAGE_CAPACITY_PROJECTION_RETENTION]
+        store.save_dashboard_projection(
+            STORAGE_CAPACITY_PROJECTION_ID,
+            {
+                "captured_at": now,
+                "snapshots": snapshots,
+                "retention": {"max_snapshots": STORAGE_CAPACITY_PROJECTION_RETENTION},
+            },
+        )
+    return {
+        "outcome": "succeeded",
+        "evidence_ids": (str(snapshot["id"]),),
+        "snapshot": snapshot,
+        "mutation_performed": True,
         "host_mutation_performed": False,
     }
 
@@ -113,9 +231,9 @@ def capture_storage_growth_snapshot_status(
     return {"snapshot": row, "mutation_performed": True, "host_mutation_performed": False}
 
 
-def _df_rows() -> list[dict[str, object]]:
+def _df_rows(timeout_seconds: float = 1.5) -> list[dict[str, object]]:
     try:
-        completed = subprocess.run(("df", "-P", "-T"), check=False, capture_output=True, text=True, timeout=1.5)
+        completed = subprocess.run(("df", "-P", "-T"), check=False, capture_output=True, text=True, timeout=timeout_seconds)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
     rows = []

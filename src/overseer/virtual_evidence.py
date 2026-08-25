@@ -14,11 +14,15 @@ from .store import SQLiteStore
 from .virtual_ops import virtual_operations_status
 
 
-def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
+def virtual_evidence_status(
+    store_path: str | Path,
+    *,
+    collect_live: bool = True,
+) -> dict[str, object]:
     store_path = Path(store_path)
     project_root = store_path.parent.parent if store_path.parent.name == "state" else store_path.parent
     virtual_ops = virtual_operations_status(project_root)
-    image_scans = image_scan_status(project_root)
+    image_scans = image_scan_status(project_root, collect_live=collect_live)
     store = SQLiteStore(store_path)
     try:
         resources = [resource for resource in store.list_resources() if resource.type == ResourceType.VIRTUAL_ASSET]
@@ -28,7 +32,11 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
     rows = [_virtual_row(resource, claims) for resource in resources]
     port_rows = _port_pool_rows(resources, claims)
     runtime_records = list(virtual_ops["runtime_records"])
-    runtime_inventory = _runtime_inventory_rows(project_root, runtime_records)
+    runtime_inventory = (
+        _runtime_inventory_rows(project_root, runtime_records)
+        if collect_live
+        else _projected_runtime_inventory_rows(resources, runtime_records)
+    )
     return {
         "store": str(Path(store_path)),
         "runtime_assets": len(rows),
@@ -40,7 +48,7 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
         "snapshot_requests": virtual_ops["snapshot_requests"],
         "restore_requests": virtual_ops["restore_requests"],
         "execution_records": virtual_ops["execution_records"],
-        "runtime_adapters": _runtime_adapter_rows(),
+        "runtime_adapters": _runtime_adapter_rows(collect_live=collect_live),
         "runtime_inventory": runtime_inventory,
         "capacity_summary": _capacity_summary(resources, claims, runtime_records, runtime_inventory, port_rows),
         "image_provenance": _image_provenance_rows(runtime_inventory),
@@ -52,9 +60,16 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
         "runtime_readiness": _runtime_readiness_rows(runtime_inventory),
         "port_pool": port_rows,
         "cleanup": _cleanup_rows(claims),
+        "collection_mode": "live_diagnostic" if collect_live else "durable_projection",
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
+
+
+def virtual_evidence_projection_status(store_path: str | Path) -> dict[str, object]:
+    """Compose virtual dashboard evidence without probing host runtimes."""
+
+    return virtual_evidence_status(store_path, collect_live=False)
 
 
 def _virtual_row(resource: Resource, claims: tuple[Claim, ...]) -> dict[str, Any]:
@@ -110,17 +125,71 @@ def _cleanup_rows(claims: tuple[Claim, ...]) -> list[dict[str, object]]:
     ]
 
 
-def _runtime_adapter_rows() -> list[dict[str, object]]:
+def _runtime_adapter_rows(*, collect_live: bool = True) -> list[dict[str, object]]:
     adapters = ("docker", "podman", "virsh", "qemu-img", "qemu-system-x86_64", "qemu-system-aarch64", "emulator", "renode")
     return [
         {
             "adapter": adapter,
-            "available": shutil.which(adapter) is not None,
-            "status": "available_for_readonly_inventory" if shutil.which(adapter) else "missing",
+            "available": shutil.which(adapter) is not None if collect_live else None,
+            "status": (
+                "available_for_readonly_inventory" if shutil.which(adapter) else "missing"
+            ) if collect_live else "availability_not_collected_inline",
             "mutation_boundary": "start, stop, snapshot, restore, and destroy require approval-gated live adapter execution",
         }
         for adapter in adapters
     ]
+
+
+def _projected_runtime_inventory_rows(
+    resources: list[Resource],
+    runtime_records: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    rows = [_projected_resource_inventory_row(resource) for resource in resources]
+    rows.extend(_projected_registered_runtime_row(record) for record in runtime_records)
+    return rows
+
+
+def _projected_resource_inventory_row(resource: Resource) -> dict[str, object]:
+    identifiers = resource.identifiers
+    return {
+        "provider": str(identifiers.get("adapter") or identifiers.get("provider") or "overseer_resource"),
+        "resource_id": resource.id,
+        "kind": str(identifiers.get("kind") or "virtual_asset"),
+        "state": resource.state.value,
+        "image": _short_value(identifiers.get("image")),
+        "virtual_size": "",
+        "actual_size": "",
+        "snapshots": "",
+        "ports": ",".join(str(port) for port in sorted(resource.ports())),
+        "owner": resource.owner_domain.value,
+        "cpu": "",
+        "memory": "",
+        "network": str(identifiers.get("bind_scope") or ""),
+        "evidence": str(identifiers.get("snapshot_id") or resource.last_verified_at or ""),
+        "next_step": "request Dax claim before changing virtual runtime state",
+    }
+
+
+def _projected_registered_runtime_row(record: dict[str, object]) -> dict[str, object]:
+    provider = str(record.get("adapter") or "manual")
+    resource_id = str(record.get("resource_id") or "runtime")
+    return {
+        "provider": provider,
+        "resource_id": f"{provider}.{_safe_id(resource_id)}",
+        "kind": str(record.get("kind") or "runtime"),
+        "state": str(record.get("state") or "observed"),
+        "image": _redact_path(str(record.get("snapshot_hint") or "")),
+        "virtual_size": "",
+        "actual_size": "",
+        "snapshots": "",
+        "ports": ",".join(str(port) for port in record.get("ports") or []),
+        "owner": _owner_from_notes(str(record.get("notes") or "")),
+        "cpu": "",
+        "memory": "",
+        "network": "",
+        "evidence": str(record.get("updated_at") or ""),
+        "next_step": "request Dax claim before changing registered runtime state",
+    }
 
 
 def _runtime_inventory_rows(project_root: Path, runtime_records: list[dict[str, object]]) -> list[dict[str, object]]:

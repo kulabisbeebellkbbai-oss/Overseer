@@ -82,6 +82,7 @@ from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, U
 
 CURRENT_SCHEMA_VERSION = 12
 MAX_COLLECTION_PAYLOAD_LENGTH = 65536
+MAX_DASHBOARD_PROJECTION_PAYLOAD_LENGTH = 512 * 1024
 _COLLECTION_INDEX_SPECS = {
     "idx_collection_jobs_enabled_priority": {
         "table": "collection_jobs",
@@ -335,7 +336,16 @@ class SQLiteStore:
     otherwise changed.
     """
 
-    def __init__(self, path: str | Path, *, verified_fd: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        verified_fd: int | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        if isinstance(timeout_seconds, bool) or float(timeout_seconds) <= 0:
+            raise ValueError("SQLite timeout must be positive")
+        self._sqlite_timeout_seconds = float(timeout_seconds)
         self.path = Path(path)
         if verified_fd is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,9 +357,16 @@ class SQLiteStore:
         self._sidecar_identities: dict[str, tuple[int, int]] = {}
         self._compromised_sidecars: set[str] = set()
         if verified_fd is None:
-            self._connection = sqlite3.connect(self.path, timeout=30.0)
+            self._connection = sqlite3.connect(
+                self.path,
+                timeout=self._sqlite_timeout_seconds,
+            )
         else:
-            self._connection = sqlite3.connect(f"file:/proc/self/fd/{verified_fd}?mode=rw", uri=True, timeout=30.0)
+            self._connection = sqlite3.connect(
+                f"file:/proc/self/fd/{verified_fd}?mode=rw",
+                uri=True,
+                timeout=self._sqlite_timeout_seconds,
+            )
         try:
             self._harden_database_files()
         except Exception:
@@ -488,7 +505,8 @@ class SQLiteStore:
         return stashed
 
     def _configure_connection(self) -> None:
-        self._connection.execute("PRAGMA busy_timeout = 30000")
+        busy_timeout_ms = max(1, int(self._sqlite_timeout_seconds * 1000))
+        self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         try:
             # Overseer has a long-lived coordinator and API plus short-lived
             # CLI writers. WAL keeps readers from blocking the coordinator's
@@ -678,7 +696,8 @@ class SQLiteStore:
                 "'audit_event_normalization_state', 'package_inspection_records', "
                 "'package_reconciliation_evidence', 'collection_jobs', "
                 "'collection_job_states', 'collection_requests', 'collection_runs', "
-                "'triage_incidents', 'repair_runbooks', 'repair_attempts')"
+                "'triage_incidents', 'repair_runbooks', 'repair_attempts', "
+                "'dashboard_projections')"
             ).fetchall()
         }
         if tables != {
@@ -699,6 +718,7 @@ class SQLiteStore:
             "triage_incidents",
             "repair_runbooks",
             "repair_attempts",
+            "dashboard_projections",
         }:
             return False
         if not all(
@@ -1245,6 +1265,10 @@ class SQLiteStore:
                 owner_domain TEXT NOT NULL,
                 status TEXT NOT NULL,
                 payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dashboard_projections (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL CHECK(length(payload) <= 524288)
             );
             CREATE TABLE IF NOT EXISTS storage_adapter_registrations (id TEXT PRIMARY KEY, status TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS storage_execution_requests (id TEXT PRIMARY KEY, adapter_id TEXT NOT NULL, project_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(adapter_id, project_id, idempotency_key));
@@ -2640,6 +2664,41 @@ class SQLiteStore:
             (evidence.id, evidence.resource_id, _dump(evidence)),
         )
         self._commit()
+
+    def save_dashboard_projection(
+        self,
+        projection_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        self.save_dashboard_projections({projection_id: payload})
+
+    def save_dashboard_projections(
+        self,
+        projections: dict[str, dict[str, object]],
+    ) -> None:
+        if not isinstance(projections, dict) or not projections:
+            raise ValueError("dashboard projections must be a non-empty object")
+        encoded: list[tuple[str, str]] = []
+        for projection_id, payload in projections.items():
+            if not isinstance(projection_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", projection_id):
+                raise ValueError("dashboard projection id is invalid")
+            if not isinstance(payload, dict):
+                raise ValueError("dashboard projection payload must be an object")
+            document = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            if len(document.encode("utf-8")) > MAX_DASHBOARD_PROJECTION_PAYLOAD_LENGTH:
+                raise ValueError("dashboard projection payload exceeds the bounded limit")
+            encoded.append((projection_id, document))
+        with self.agent_transaction():
+            self._connection.executemany(
+                "INSERT OR REPLACE INTO dashboard_projections (id, payload) VALUES (?, ?)",
+                encoded,
+            )
+
+    def load_dashboard_projection(self, projection_id: str) -> dict[str, object]:
+        payload = json.loads(self._get_payload("dashboard_projections", projection_id))
+        if not isinstance(payload, dict):
+            raise ValueError("dashboard projection payload is invalid")
+        return payload
 
     def load_health_evidence(self, evidence_id: str) -> HealthEvidence:
         return _load_dataclass(HealthEvidence, self._get_payload("health_evidence", evidence_id))

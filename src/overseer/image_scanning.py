@@ -10,12 +10,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
-def image_scan_status(project_root: str | Path) -> dict[str, object]:
+def image_scan_status(
+    project_root: str | Path,
+    *,
+    collect_live: bool = True,
+) -> dict[str, object]:
     root = Path(project_root)
     data = _read_registry(root)
     return {
         "root": str(root),
-        "scanner_adapters": _scanner_adapter_rows(),
+        "scanner_adapters": _scanner_adapter_rows() if collect_live else _projected_scanner_adapter_rows(),
         "scan_requests": data["scan_requests"],
         "scan_request_count": len(data["scan_requests"]),
         "scan_results": data["scan_results"],
@@ -23,6 +27,19 @@ def image_scan_status(project_root: str | Path) -> dict[str, object]:
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
+
+
+def _projected_scanner_adapter_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "scanner": "trivy",
+            "available": None,
+            "path": "",
+            "status": "availability_not_collected_inline",
+            "mutation_boundary": "read-only image scan execution requires approved image scan request",
+            "next_step": "review scheduled scan results or stage an approved scanner operation",
+        }
+    ]
 
 
 def stage_image_scan_request_status(

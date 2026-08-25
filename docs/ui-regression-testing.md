@@ -186,6 +186,15 @@ bounded `400` with `no host snapshots are available` when that fixture
 prerequisite is absent. The disposable harness must satisfy these prerequisites
 so fixture omissions do not produce a browser `partial` load.
 
+Also assert that repeated authenticated GETs for operations gap coverage,
+service evidence, package status, firmware status, firmware preflight,
+software evidence, storage and backup evidence, virtual evidence, and Git
+status launch no subprocess and no backup-provider DNS readiness check. Their
+richer live diagnostics belong to scheduled collectors or explicit CLI
+commands, never the browser refresh path. The storage compatibility POST must
+only queue or coalesce `collection.storage.capacity`; it must not run `df` or
+rewrite a JSON sidecar during the request.
+
 In the harness, click one per-job `Run now` control and one filtered `Run now`
 control. Confirm that each request is a queue-only
 `POST /Overseer/collections/jobs/{job_id}/run` with the bounded

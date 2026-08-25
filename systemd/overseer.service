@@ -4,6 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
+WorkingDirectory=@OVERSEER_INSTALL@
 EnvironmentFile=%h/.config/overseer/runtime.env
 ExecStartPre=/usr/bin/test -d ${OVERSEER_INSTALL}/src
 ExecStart=/usr/bin/env -- ${OVERSEER_PYTHON} -m overseer.cli run --store ${OVERSEER_STORE}

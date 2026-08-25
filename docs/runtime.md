@@ -39,6 +39,9 @@ semantics.
 - Configured health probes are read-only adapters owned by independent `health_probe` jobs. Legacy collector flags are deprecated family selectors and are not used by the service unit.
 - Runtime health evidence, runs, requests, incidents, and repair attempts are retained within explicit store limits.
 - Host inspection snapshots are read-only command and file observations owned by a scheduled `host_inspection` job.
+- Git status, storage capacity, and firmware/preflight evidence are owned by independent scheduled `git_inspection`, `storage_inspection`, and `firmware_inspection` jobs; dashboard refreshes read only their durable SQLite projections.
+- Firmware collection runs behind a killable process deadline; EFI traversal is independently timeout-bound and entry-capped, and the two maintenance projections commit atomically or not at all.
+- Legacy operations, service, package, firmware, firmware-preflight, software, storage, backup, virtual, and Git dashboard GETs do not launch host commands or DNS checks. Deliberate CLI diagnostics remain the explicit live-inspection boundary.
 - Each host inspection automatically lets Odo advance security findings to the next safe gate: stage remediation plans, prepare IDS/firewall review packages, queue exact Sisko approval requests, or execute only plans that have no approval gate.
 - Station audits are owned by scheduled `station_audit` jobs. The audit lets each crew domain perform safe discovery or staging, route unknown or unplanned resources to Odo, and continue unrelated work while exact approval-gated items wait.
 - Knowledge capture is owned by scheduled `knowledge_capture` jobs and writes crew-message and audit-event notes through Ezri's Documents API only within its existing integration boundary.

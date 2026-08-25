@@ -65,7 +65,8 @@ from overseer.remote_testing import (
 from overseer.security_evidence import security_evidence_status
 from overseer.service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 from overseer.software_evidence import software_evidence_status
-from overseer.storage_evidence import capture_storage_growth_snapshot_status, storage_encryption_trust_status, storage_evidence_status
+from overseer.storage_evidence import capture_storage_capacity_projection_status, capture_storage_growth_snapshot_status, storage_encryption_trust_status, storage_evidence_status
+from overseer.runtime import seed_default_collection_jobs
 from overseer.store import SQLiteStore
 from overseer.usage_evidence import usage_evidence_status
 from overseer.usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
@@ -575,6 +576,8 @@ class OperationsGapCoverageTests(unittest.TestCase):
             capture = capture_storage_growth_snapshot_status(root, "growth.test", requested_by="kira", notes="test growth capture")
             history = storage_evidence_status(root)
             store_path = root / "state" / "overseer.sqlite3"
+            seed_default_collection_jobs(store_path)
+            capture_storage_capacity_projection_status(store_path)
             with LocalApiHarness(store_path) as server:
                 api_capture = server.post_json(
                     "/Overseer/storage/growth-snapshots/capture",
@@ -606,7 +609,9 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(history["growth_sample_count"], 1)
         self.assertEqual(history["growth_samples"][0]["id"], "growth.test")
         self.assertIn("daily_growth_bytes", history["growth_trends"][0])
-        self.assertEqual(api_capture["snapshot"]["id"], "growth.api")
+        self.assertIn(api_capture["status"], {"queued", "coalesced"})
+        self.assertFalse(api_capture["inline_execution"])
+        self.assertEqual(api_capture["collection_job_id"], "collection.storage.capacity")
         self.assertGreaterEqual(api_evidence["growth_sample_count"], 1)
         self.assertTrue(payload["smart_health"])
         self.assertFalse(payload["host_mutation_performed"])

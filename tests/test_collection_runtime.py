@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -415,6 +418,384 @@ def test_external_freshness_marks_old_last_trigger_failed(tmp_path: Path) -> Non
     execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
     assert execution.outcome is CollectionOutcome.FAILED
     assert execution.failure_category == "stale"
+
+
+def test_git_status_is_an_independent_scheduled_projection(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    calls: list[tuple[str, Path, float]] = []
+
+    def collector(store_path: str, repo_path: Path, *, timeout_seconds: float):
+        calls.append((store_path, repo_path, timeout_seconds))
+        return {
+            "outcome": "succeeded",
+            "evidence_ids": ("git.status.fixture",),
+        }
+
+    registry = runtime_collection_adapter_registry(git_projection_collector=collector)
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.git.overseer")
+    execution = registry.resolve(job, "git-inspection").collect(job, str(path))
+
+    assert job.kind is CollectionJobKind.GIT_INSPECTION
+    assert job.enabled is True
+    assert execution.outcome is CollectionOutcome.SUCCEEDED
+    assert calls == [(str(path), Path.cwd(), job.timeout_seconds)]
+
+
+def test_storage_capacity_is_an_independent_scheduled_projection(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    calls: list[tuple[str, float]] = []
+
+    def collector(store_path: str, *, timeout_seconds: float):
+        calls.append((store_path, timeout_seconds))
+        return {
+            "outcome": "succeeded",
+            "evidence_ids": ("evidence.storage.capacity",),
+        }
+
+    registry = runtime_collection_adapter_registry(storage_projection_collector=collector)
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.storage.capacity")
+    execution = registry.resolve(job, "storage-inspection").collect(job, str(path))
+
+    assert job.kind is CollectionJobKind.STORAGE_INSPECTION
+    assert job.enabled is True
+    assert execution.outcome is CollectionOutcome.SUCCEEDED
+    assert calls == [(str(path), job.timeout_seconds)]
+
+
+def test_firmware_is_an_independent_scheduled_projection(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    calls: list[tuple[str, float]] = []
+
+    def collector(store_path: str, *, timeout_seconds: float):
+        calls.append((store_path, timeout_seconds))
+        return {
+            "outcome": "succeeded",
+            "evidence_ids": ("firmware.inspection.fixture",),
+        }
+
+    registry = runtime_collection_adapter_registry(firmware_projection_collector=collector)
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.firmware.inspection")
+    execution = registry.resolve(job, "firmware-inspection").collect(job, str(path))
+
+    assert job.kind is CollectionJobKind.FIRMWARE_INSPECTION
+    assert job.enabled is True
+    assert execution.outcome is CollectionOutcome.SUCCEEDED
+    assert calls == [(str(path), job.timeout_seconds)]
+
+
+def test_scheduled_firmware_collection_updates_both_dashboard_projections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from overseer.maintenance_projections import (
+        capture_firmware_projections,
+        firmware_preflight_projection,
+        firmware_status_projection,
+    )
+    from overseer.packages import (
+        EfivarEntry,
+        FirmwareInspectionSnapshot,
+        FirmwarePreflightSnapshot,
+        FirmwareUpdate,
+    )
+
+    class FirmwareAdapter:
+        def __init__(self, timeout_seconds: float) -> None:
+            assert timeout_seconds == pytest.approx(11.25)
+
+        def inspect(self, captured_at: str) -> FirmwareInspectionSnapshot:
+            return FirmwareInspectionSnapshot(
+                id="firmware-inspection.fixture",
+                captured_at=captured_at,
+                command=("fwupdmgr", "get-upgrades", "--no-reboot-check"),
+                exit_code=0,
+                updates=(
+                    FirmwareUpdate(
+                        device="UEFI dbx",
+                        title="Secure Boot dbx update",
+                        release_id="release.fixture",
+                        urgency="high",
+                        reboot_required=True,
+                    ),
+                ),
+            )
+
+    class PreflightAdapter:
+        def __init__(self, **kwargs: object) -> None:
+            assert float(kwargs["timeout_seconds"]) > 0
+
+        def inspect(self, captured_at: str) -> FirmwarePreflightSnapshot:
+            return FirmwarePreflightSnapshot(
+                id="firmware-preflight.fixture",
+                captured_at=captured_at,
+                efivar_path="/sys/firmware/efi/efivars",
+                efivar_accessible=True,
+                efivars=(EfivarEntry("dump-fixture", 1024),),
+            )
+
+    monkeypatch.setattr(
+        "overseer.maintenance_projections.FwupdFirmwareInspectionAdapter",
+        FirmwareAdapter,
+    )
+    monkeypatch.setattr(
+        "overseer.maintenance_projections.FirmwarePreflightAdapter",
+        PreflightAdapter,
+    )
+    path = _store_path(tmp_path)
+    result = capture_firmware_projections(
+        path,
+        captured_at="2026-08-25T12:00:00Z",
+    )
+
+    firmware = firmware_status_projection(path)
+    preflight = firmware_preflight_projection(path)
+    assert result["outcome"] == "succeeded"
+    assert firmware["updates"] == 1
+    assert firmware["reboot_required"] == 1
+    assert firmware["items"][0]["status"] == "available"
+    assert firmware["items"][0]["blocker_type"] == ""
+    assert firmware["items"][0]["blocker_resolution"]
+    assert firmware["items"][0]["safe_preflight"] == [
+        "fwupdmgr get-upgrades --no-reboot-check"
+    ]
+    assert preflight["stale_dump_candidate_count"] == 1
+    assert firmware["collection_mode"] == "durable_sqlite_projection"
+    assert preflight["collection_mode"] == "durable_sqlite_projection"
+
+
+def test_firmware_collection_does_not_persist_after_its_absolute_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from overseer.maintenance_projections import (
+        FIRMWARE_STATUS_PROJECTION_ID,
+        capture_firmware_projections,
+    )
+    from overseer.packages import FirmwareInspectionSnapshot
+
+    class FirmwareAdapter:
+        def __init__(self, timeout_seconds: float) -> None:
+            self.timeout_seconds = timeout_seconds
+
+        def inspect(self, captured_at: str) -> FirmwareInspectionSnapshot:
+            return FirmwareInspectionSnapshot(
+                id="firmware-inspection.deadline",
+                captured_at=captured_at,
+                command=("fwupdmgr", "get-upgrades", "--no-reboot-check"),
+                exit_code=0,
+                updates=(),
+            )
+
+    monkeypatch.setattr(
+        "overseer.maintenance_projections.FwupdFirmwareInspectionAdapter",
+        FirmwareAdapter,
+    )
+    ticks = iter((100.0, 116.0))
+    path = _store_path(tmp_path)
+    result = capture_firmware_projections(
+        path,
+        timeout_seconds=15.0,
+        captured_at="2026-08-25T12:00:00Z",
+        monotonic=lambda: next(ticks),
+    )
+
+    assert result["outcome"] == "failed"
+    assert result["failure_category"] == "timeout"
+    with SQLiteStore(path) as store:
+        with pytest.raises(KeyError):
+            store.load_dashboard_projection(FIRMWARE_STATUS_PROJECTION_ID)
+
+
+def test_firmware_collection_database_lock_is_bounded_and_writes_no_partial_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from overseer.maintenance_projections import (
+        FIRMWARE_PREFLIGHT_PROJECTION_ID,
+        FIRMWARE_STATUS_PROJECTION_ID,
+        capture_firmware_projections,
+    )
+    from overseer.packages import FirmwareInspectionSnapshot, FirmwarePreflightSnapshot
+
+    class FirmwareAdapter:
+        def __init__(self, timeout_seconds: float) -> None:
+            self.timeout_seconds = timeout_seconds
+
+        def inspect(self, captured_at: str) -> FirmwareInspectionSnapshot:
+            return FirmwareInspectionSnapshot(
+                id="firmware-inspection.locked",
+                captured_at=captured_at,
+                command=("fwupdmgr", "get-upgrades", "--no-reboot-check"),
+                exit_code=0,
+                updates=(),
+            )
+
+    class PreflightAdapter:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        def inspect(self, captured_at: str) -> FirmwarePreflightSnapshot:
+            return FirmwarePreflightSnapshot(
+                id="firmware-preflight.locked",
+                captured_at=captured_at,
+                efivar_path="/sys/firmware/efi/efivars",
+                efivar_accessible=True,
+                efivars=(),
+            )
+
+    monkeypatch.setattr(
+        "overseer.maintenance_projections.FwupdFirmwareInspectionAdapter",
+        FirmwareAdapter,
+    )
+    monkeypatch.setattr(
+        "overseer.maintenance_projections.FirmwarePreflightAdapter",
+        PreflightAdapter,
+    )
+    path = _store_path(tmp_path)
+    with SQLiteStore(path):
+        pass
+    lock = sqlite3.connect(path, timeout=0.0)
+    lock.execute("BEGIN IMMEDIATE")
+    started = time.monotonic()
+    try:
+        result = capture_firmware_projections(
+            path,
+            timeout_seconds=0.3,
+            captured_at="2026-08-25T12:00:00Z",
+        )
+    finally:
+        elapsed = time.monotonic() - started
+        lock.rollback()
+        lock.close()
+
+    assert result["outcome"] == "failed"
+    assert result["failure_category"] == "timeout"
+    assert elapsed < 1.0
+    with SQLiteStore(path) as store:
+        with pytest.raises(KeyError):
+            store.load_dashboard_projection(FIRMWARE_STATUS_PROJECTION_ID)
+        with pytest.raises(KeyError):
+            store.load_dashboard_projection(FIRMWARE_PREFLIGHT_PROJECTION_ID)
+
+
+def test_firmware_collection_process_boundary_reports_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from overseer.maintenance_projections import capture_firmware_projections_subprocess
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("overseer.maintenance_projections.subprocess.run", timeout)
+    result = capture_firmware_projections_subprocess(
+        _store_path(tmp_path),
+        timeout_seconds=0.2,
+    )
+
+    assert result == {
+        "outcome": "failed",
+        "failure_category": "timeout",
+        "evidence_ids": (),
+    }
+
+
+def test_firmware_preflight_timeout_reaches_scheduler_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from overseer.maintenance_projections import capture_firmware_projections
+    from overseer.packages import FirmwareInspectionSnapshot, FirmwarePreflightSnapshot
+
+    class FirmwareAdapter:
+        def __init__(self, timeout_seconds: float) -> None:
+            self.timeout_seconds = timeout_seconds
+
+        def inspect(self, captured_at: str) -> FirmwareInspectionSnapshot:
+            return FirmwareInspectionSnapshot(
+                id="firmware-inspection.timeout-classification",
+                captured_at=captured_at,
+                command=("fwupdmgr", "get-upgrades", "--no-reboot-check"),
+                exit_code=0,
+                updates=(),
+            )
+
+    class PreflightAdapter:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        def inspect(self, captured_at: str) -> FirmwarePreflightSnapshot:
+            return FirmwarePreflightSnapshot(
+                id="firmware-preflight.timeout-classification",
+                captured_at=captured_at,
+                efivar_path="/sys/firmware/efi/efivars",
+                efivar_accessible=False,
+                efivars=(),
+                error="efivarfs inspection timed out",
+            )
+
+    monkeypatch.setattr(
+        "overseer.maintenance_projections.FwupdFirmwareInspectionAdapter",
+        FirmwareAdapter,
+    )
+    monkeypatch.setattr(
+        "overseer.maintenance_projections.FirmwarePreflightAdapter",
+        PreflightAdapter,
+    )
+    result = capture_firmware_projections(
+        _store_path(tmp_path),
+        captured_at="2026-08-25T12:00:00Z",
+    )
+
+    assert result["outcome"] == "failed"
+    assert result["failure_category"] == "timeout"
+
+
+def test_scheduled_storage_collection_updates_dashboard_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "project"
+    store_path = root / "state" / "overseer.sqlite3"
+    store_path.parent.mkdir(parents=True)
+    seed_default_collection_jobs(store_path)
+    monkeypatch.setattr(
+        "overseer.storage_evidence._df_rows",
+        lambda *args, **kwargs: [
+            {
+                "source": "disk",
+                "type": "ext4",
+                "size": "1000",
+                "used": "400",
+                "available": "600",
+                "use_percent": "40%",
+                "mount": "/",
+                "status": "ok",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "overseer.storage_evidence._capacity_summary",
+        lambda: {"mount": "/", "total_bytes": 1000, "used_bytes": 400, "free_bytes": 600, "status": "ok"},
+    )
+    registry = runtime_collection_adapter_registry()
+    with SQLiteStore(store_path) as store:
+        job = store.load_collection_job("collection.storage.capacity")
+    execution = registry.resolve(job, "storage-inspection").collect(job, str(store_path))
+
+    from overseer.storage_evidence import storage_evidence_projection_status
+
+    projected = storage_evidence_projection_status(store_path, root)
+    assert execution.outcome is CollectionOutcome.SUCCEEDED
+    assert projected["growth_sample_count"] == 1
+    assert projected["mounts"][0]["use_percent"] == "40%"
+    assert projected["capacity_summary"]["free_bytes"] == 600
 
 
 def test_legacy_runtime_family_selector_seeds_only_selected_families_plus_freshness(tmp_path: Path) -> None:

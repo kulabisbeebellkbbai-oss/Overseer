@@ -154,6 +154,33 @@ def test_schema_v12_is_normalized_and_repairs_claimed_current_missing_tables(tmp
         ) == CURRENT_SCHEMA_VERSION == 12
 
 
+def test_dashboard_projection_round_trip_is_bounded(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path / "state.sqlite3") as store:
+        store.save_dashboard_projection(
+            "dashboard.test",
+            {"captured_at": NOW, "items": [{"status": "ok"}]},
+        )
+        assert store.load_dashboard_projection("dashboard.test") == {
+            "captured_at": NOW,
+            "items": [{"status": "ok"}],
+        }
+        with pytest.raises(ValueError, match="bounded limit"):
+            store.save_dashboard_projection("dashboard.too-large", {"value": "x" * (512 * 1024)})
+
+
+def test_dashboard_projection_batch_validates_before_atomic_write(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path / "state.sqlite3") as store:
+        with pytest.raises(ValueError, match="bounded limit"):
+            store.save_dashboard_projections(
+                {
+                    "dashboard.valid": {"status": "ok"},
+                    "dashboard.too-large": {"value": "x" * (512 * 1024)},
+                }
+            )
+        with pytest.raises(KeyError):
+            store.load_dashboard_projection("dashboard.valid")
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

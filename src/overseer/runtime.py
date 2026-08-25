@@ -37,6 +37,9 @@ DEFAULT_COLLECTION_INTERVALS = {
     CollectionJobKind.STATION_AUDIT: 600,
     CollectionJobKind.PACKAGE_INSPECTION: 1800,
     CollectionJobKind.FRESHNESS_PROJECTION: 60,
+    CollectionJobKind.GIT_INSPECTION: 300,
+    CollectionJobKind.STORAGE_INSPECTION: 600,
+    CollectionJobKind.FIRMWARE_INSPECTION: 21600,
 }
 DEFAULT_COLLECTION_TIMEOUTS = {
     CollectionJobKind.HOST_INSPECTION: 1,
@@ -48,6 +51,9 @@ DEFAULT_COLLECTION_TIMEOUTS = {
     CollectionJobKind.STATION_AUDIT: 5,
     CollectionJobKind.PACKAGE_INSPECTION: 5,
     CollectionJobKind.FRESHNESS_PROJECTION: 5,
+    CollectionJobKind.GIT_INSPECTION: 5,
+    CollectionJobKind.STORAGE_INSPECTION: 3,
+    CollectionJobKind.FIRMWARE_INSPECTION: 15,
 }
 RUNTIME_ADAPTER_IDS = {
     CollectionJobKind.PHYSICAL_DISCOVERY: "physical-discovery",
@@ -57,6 +63,9 @@ RUNTIME_ADAPTER_IDS = {
     CollectionJobKind.KNOWLEDGE_CAPTURE: "knowledge-capture",
     CollectionJobKind.STATION_AUDIT: "station-audit",
     CollectionJobKind.FRESHNESS_PROJECTION: "freshness-projection",
+    CollectionJobKind.GIT_INSPECTION: "git-inspection",
+    CollectionJobKind.STORAGE_INSPECTION: "storage-inspection",
+    CollectionJobKind.FIRMWARE_INSPECTION: "firmware-inspection",
     CollectionJobKind.HOST_INSPECTION: "host-inspection",
     CollectionJobKind.PACKAGE_INSPECTION: "package-inspection",
 }
@@ -84,7 +93,20 @@ EXTERNAL_FRESHNESS_UNITS = {
     ),
 }
 COLLECTION_FAMILIES = frozenset(
-    {"health", "host", "discovery", "crew_dispatch", "usage_continuation", "knowledge_capture", "station_audit", "package", "freshness"}
+    {
+        "health",
+        "host",
+        "discovery",
+        "crew_dispatch",
+        "usage_continuation",
+        "knowledge_capture",
+        "station_audit",
+        "package",
+        "firmware",
+        "freshness",
+        "git",
+        "storage",
+    }
 )
 UNSAFE_AUTONOMOUS_COLLECTION_FAMILIES = frozenset(
     {"crew_dispatch", "usage_continuation", "knowledge_capture", "station_audit"}
@@ -190,6 +212,9 @@ def runtime_collection_adapter_registry(
     *,
     systemd_runner: Callable[[tuple[str, ...], float], object] | None = None,
     now: Callable[[], datetime] | None = None,
+    git_projection_collector: Callable[..., object] | None = None,
+    storage_projection_collector: Callable[..., object] | None = None,
+    firmware_projection_collector: Callable[..., object] | None = None,
 ) -> CollectionAdapterRegistry:
     """Build the exact bounded callback bindings used by seeded jobs."""
     # Importing the CLI lazily avoids the CLI/runtime module cycle at import time.
@@ -203,6 +228,19 @@ def runtime_collection_adapter_registry(
         discover_virtual_listeners_status,
         knowledge_capture_status,
     )
+    from .git import capture_git_status_projection
+    from .maintenance_projections import capture_firmware_projections_subprocess
+    from .storage_evidence import capture_storage_capacity_projection_status
+
+    def collect_storage_projection(job: CollectionJob, path: str, timeout: float) -> dict[str, object]:
+        if storage_projection_collector is not None:
+            return storage_projection_collector(path, timeout_seconds=timeout)  # type: ignore[return-value]
+        return capture_storage_capacity_projection_status(path, timeout_seconds=timeout)
+
+    def collect_firmware_projection(job: CollectionJob, path: str, timeout: float) -> dict[str, object]:
+        if firmware_projection_collector is not None:
+            return firmware_projection_collector(path, timeout_seconds=timeout)  # type: ignore[return-value]
+        return capture_firmware_projections_subprocess(path, timeout_seconds=timeout)
 
     registry = default_collection_adapter_registry()
     callbacks = {
@@ -219,6 +257,13 @@ def runtime_collection_adapter_registry(
         (CollectionJobKind.STATION_AUDIT, "station-audit"): lambda job, path, timeout: audit_station_status(path, limit=1, timeout_seconds=timeout),
         (CollectionJobKind.FRESHNESS_PROJECTION, "freshness-projection"): lambda job, path, timeout: _freshness_projection_status(job, path, timeout, systemd_runner or _systemd_runner, now),
         (CollectionJobKind.HOST_INSPECTION, "host-security"): lambda job, path, timeout: assess_host_security_status(path, timeout_seconds=timeout),
+        (CollectionJobKind.GIT_INSPECTION, "git-inspection"): lambda job, path, timeout: (git_projection_collector or capture_git_status_projection)(
+            path,
+            Path.cwd(),
+            timeout_seconds=timeout,
+        ),
+        (CollectionJobKind.STORAGE_INSPECTION, "storage-inspection"): collect_storage_projection,
+        (CollectionJobKind.FIRMWARE_INSPECTION, "firmware-inspection"): collect_firmware_projection,
     }
     for (kind, adapter_id), callback in callbacks.items():
         registry.register(kind, adapter_id, StorePathCallbackAdapter(callback, kind=kind))
@@ -275,6 +320,9 @@ def _default_jobs(
         ("collection.package.inspection", CollectionJobKind.PACKAGE_INSPECTION, OwnerDomain.OBRIEN, "package.inspection"),
         ("collection.freshness.psychlo-usage", CollectionJobKind.FRESHNESS_PROJECTION, OwnerDomain.QUARK, "overseer-psychlo-usage.service"),
         ("collection.freshness.quark-scheduler", CollectionJobKind.FRESHNESS_PROJECTION, OwnerDomain.QUARK, "overseer-quark-scheduler.service"),
+        ("collection.git.overseer", CollectionJobKind.GIT_INSPECTION, OwnerDomain.EZRI, "git.overseer"),
+        ("collection.storage.capacity", CollectionJobKind.STORAGE_INSPECTION, OwnerDomain.KIRA, "storage.capacity"),
+        ("collection.firmware.inspection", CollectionJobKind.FIRMWARE_INSPECTION, OwnerDomain.OBRIEN, "firmware.local"),
     )
     family_by_kind = {
         CollectionJobKind.HOST_INSPECTION: "host",
@@ -286,6 +334,9 @@ def _default_jobs(
         CollectionJobKind.STATION_AUDIT: "station_audit",
         CollectionJobKind.PACKAGE_INSPECTION: "package",
         CollectionJobKind.FRESHNESS_PROJECTION: "freshness",
+        CollectionJobKind.GIT_INSPECTION: "git",
+        CollectionJobKind.STORAGE_INSPECTION: "storage",
+        CollectionJobKind.FIRMWARE_INSPECTION: "firmware",
     }
     jobs.extend(
         CollectionJob(

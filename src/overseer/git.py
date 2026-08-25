@@ -2,17 +2,135 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
+from .store import SQLiteStore
 
-def git_status_status(repo_path: str | Path | None = None, account_root: str | Path | None = None) -> dict[str, object]:
+GIT_STATUS_PROJECTION_ID = "dashboard.git.status"
+
+
+def git_status_status(
+    repo_path: str | Path | None = None,
+    account_root: str | Path | None = None,
+    *,
+    include_account: bool = True,
+    command_timeout_seconds: float = 5.0,
+) -> dict[str, object]:
     root = Path(repo_path or Path.cwd()).resolve()
     account_base = Path(account_root).resolve() if account_root is not None else root.parent
-    current = _repo_status(root)
-    account = git_account_status(account_base, current["repo_path"])
+    current = _repo_status(root, timeout_seconds=command_timeout_seconds)
+    account = git_account_status(account_base, current["repo_path"]) if include_account else {
+        "root": str(account_base),
+        "repositories": [],
+        "repository_count": 0,
+        "dirty_count": 0,
+        "conflicted_count": 0,
+        "with_remote_count": 0,
+        "source": "scheduled_current_repository_only",
+    }
     return {**current, "account": account}
+
+
+def capture_git_status_projection(
+    store_path: str | Path,
+    repo_path: str | Path | None = None,
+    *,
+    timeout_seconds: float = 5.0,
+) -> dict[str, object]:
+    """Collect one bounded Git snapshot for later dashboard reads."""
+
+    root = Path(repo_path or Path.cwd()).resolve()
+    per_command_timeout = max(0.1, min(0.75, float(timeout_seconds) / 10.0))
+    try:
+        payload = git_status_status(
+            root,
+            account_root=root.parent,
+            include_account=False,
+            command_timeout_seconds=per_command_timeout,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return {
+            "outcome": "failed",
+            "failure_category": "unavailable",
+            "evidence_ids": (),
+            "error": type(error).__name__,
+        }
+    captured_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    projection_id = f"git.status.{digest[:32]}"
+    document = {
+        "projection_id": projection_id,
+        "captured_at": captured_at,
+        "payload": payload,
+    }
+    try:
+        with SQLiteStore(store_path) as store:
+            store.save_dashboard_projection(GIT_STATUS_PROJECTION_ID, document)
+    except (OSError, ValueError):
+        return {
+            "outcome": "failed",
+            "failure_category": "contract_mismatch",
+            "evidence_ids": (),
+        }
+    return {
+        "outcome": "succeeded",
+        "evidence_ids": (projection_id,),
+        "projection_id": projection_id,
+        "captured_at": captured_at,
+    }
+
+
+def git_status_projection_status(
+    store_path: str | Path,
+    repo_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Read the latest scheduled Git snapshot without invoking Git."""
+
+    root = Path(repo_path or Path.cwd()).resolve()
+    try:
+        with SQLiteStore(store_path) as store:
+            document = store.load_dashboard_projection(GIT_STATUS_PROJECTION_ID)
+        payload = document["payload"]
+        if not isinstance(payload, dict):
+            raise ValueError("projection payload is invalid")
+    except (KeyError, OSError, ValueError):
+        return {
+            "repo_path": str(root),
+            "branch": "unknown",
+            "head": "",
+            "short_head": "",
+            "upstream": None,
+            "ahead": None,
+            "behind": None,
+            "dirty": None,
+            "changed": None,
+            "staged": None,
+            "unstaged": None,
+            "untracked": None,
+            "conflicted": None,
+            "remote": {},
+            "links": {},
+            "status_lines": [],
+            "files": [],
+            "account": {"repositories": [], "repository_count": 0},
+            "projection_available": False,
+            "collection_mode": "durable_sqlite_projection",
+            "next_step": "wait for the scheduled Git inspection or request its queued collection job",
+        }
+    return {
+        **payload,
+        "projection_available": True,
+        "projection_id": str(document.get("projection_id") or ""),
+        "captured_at": str(document.get("captured_at") or ""),
+        "collection_mode": "durable_sqlite_projection",
+    }
 
 
 def git_account_status(account_root: str | Path, current_repo_path: str | Path | None = None) -> dict[str, object]:
@@ -80,20 +198,20 @@ def _repo_account_summary(root: Path) -> dict[str, object]:
     }
 
 
-def _repo_status(root: Path) -> dict[str, object]:
-    top_level = _git(root, "rev-parse", "--show-toplevel").stdout.strip()
+def _repo_status(root: Path, *, timeout_seconds: float = 5.0) -> dict[str, object]:
+    top_level = _git(root, "rev-parse", "--show-toplevel", timeout=timeout_seconds).stdout.strip()
     if top_level:
         root = Path(top_level)
-    branch = _git(root, "branch", "--show-current").stdout.strip()
-    head = _git(root, "rev-parse", "HEAD").stdout.strip()
-    short_head = _git(root, "rev-parse", "--short", "HEAD").stdout.strip()
-    upstream_result = _git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False)
+    branch = _git(root, "branch", "--show-current", timeout=timeout_seconds).stdout.strip()
+    head = _git(root, "rev-parse", "HEAD", timeout=timeout_seconds).stdout.strip()
+    short_head = _git(root, "rev-parse", "--short", "HEAD", timeout=timeout_seconds).stdout.strip()
+    upstream_result = _git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False, timeout=timeout_seconds)
     upstream = upstream_result.stdout.strip() if upstream_result.returncode == 0 else ""
-    porcelain = _git(root, "status", "--porcelain=v1", "--branch").stdout.splitlines()
-    remote_url = _git(root, "remote", "get-url", "origin", check=False).stdout.strip()
+    porcelain = _git(root, "status", "--porcelain=v1", "--branch", timeout=timeout_seconds).stdout.splitlines()
+    remote_url = _git(root, "remote", "get-url", "origin", check=False, timeout=timeout_seconds).stdout.strip()
     remote = _remote_status(remote_url, branch, head)
     counts = _porcelain_counts(porcelain)
-    ahead, behind = _ahead_behind(root, upstream) if upstream else (None, None)
+    ahead, behind = _ahead_behind(root, upstream, timeout_seconds=timeout_seconds) if upstream else (None, None)
     links = _links(remote.get("web_url", ""), branch, head)
     status_lines = _safe_status_lines(porcelain)
     return {
@@ -208,8 +326,8 @@ def _links(web_url: str, branch: str, head: str) -> dict[str, str | None]:
     }
 
 
-def _ahead_behind(root: Path, upstream: str) -> tuple[int, int]:
-    result = _git(root, "rev-list", "--left-right", "--count", f"HEAD...{upstream}", check=False)
+def _ahead_behind(root: Path, upstream: str, *, timeout_seconds: float = 5.0) -> tuple[int, int]:
+    result = _git(root, "rev-list", "--left-right", "--count", f"HEAD...{upstream}", check=False, timeout=timeout_seconds)
     if result.returncode != 0:
         return (0, 0)
     ahead_text, behind_text = result.stdout.strip().split()

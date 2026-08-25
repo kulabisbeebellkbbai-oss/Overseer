@@ -252,6 +252,16 @@ existing `/Overseer` prefix and authentication contract.
 Collection status reads and queue requests are bounded and do not contact a
 probe adapter during the HTTP request. See `docs/v1.1-operations.md` for
 runtime installation, migration, failure/repair, and rollback gates.
+
+The legacy authenticated dashboard surfaces at
+`/operations/gap-coverage`, `/health/service-evidence`,
+`/maintenance/package-status`, `/maintenance/firmware-status`,
+`/maintenance/firmware-preflight`, `/maintenance/software-evidence`, `/storage/evidence`,
+`/storage/backup-operations`, `/virtual/evidence`, and `/git/status` are also
+projection-only in v1.1. They compose persisted scheduler, health, resource,
+package, workflow, Git, and capacity evidence. They do not launch host commands,
+DNS readiness checks, journals, container/VM inventory, package inspection,
+storage inspection, or Git during the HTTP request.
 `POST /health/journal-access-requests` stages a Julian read-only system-journal access operation record without reading privileged logs.
 `POST /health/journal-access-requests/execute` executes only a staged journal access record that has been transitioned to `in_progress`. It runs bounded `journalctl` reads without `sudo`, writes redacted evidence under ignored `local-secrets/journal-captures`, and returns a persisted `blocked` result when approval or journal access is missing.
 `POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.
@@ -316,7 +326,7 @@ runtime installation, migration, failure/repair, and rollback gates.
 `POST /virtual/restore-requests/execute` executes only an approved Dax restore request against the same provider set, preserving rollback evidence where supported and blocking non-disposable or unsafe targets.
 `POST /virtual/destroy-requests/execute` executes only an approved Dax destroy request against disposable `local_fixture`, `qemu_img`, `qemu_process`, `libvirt`, `docker`, `podman`, `renode`, approved disposable `android_emulator`, or `gateway_proxy` provider targets. It preserves local fixture and file-backed target evidence before removal and blocks non-disposable or unsafe targets.
 `GET /storage/evidence` and `GET /storage/backup-operations` include Kira backup provider targets, local provider profiles, provider classes, and readiness rows. `//MediaStore/Overseer` is the first planned local NAS remote backup target. MediaStore readiness reports credential state, credential file mode, SMB/CIFS helper availability, name-resolution status, mount status, and blockers without exposing secrets. Raw usernames, passwords, cookies, tokens, and mounted file contents are never returned. Cloud object storage, full clone, and hosted failover rows are future work until services are available for testing. These rows do not mount, connect to, copy to, or mutate any remote storage.
-`GET /storage/evidence` also includes filesystem growth samples and trend rows from ignored local state. `POST /storage/growth-snapshots/capture` captures current `df` evidence into ignored `state/storage-growth-history.json`; it does not mount disks, change filesystems, or connect to remote backup targets.
+`GET /storage/evidence` also includes filesystem capacity samples and trend rows from the scheduler-owned SQLite projection. `POST /storage/growth-snapshots/capture` is a compatibility route that only queues or coalesces `collection.storage.capacity`; it never runs `df` inline and does not write the legacy JSON history sidecar. The scheduled collector does not mount disks, change filesystems, or connect to remote backup targets.
 `GET /storage/evidence` includes metadata-only storage risk alerts for local databases, WAL/SHM sidecars, ignored exports, and local secret exports. It reports relative path, kind, size, status, and next step without reading file contents.
 `GET /storage/evidence` includes read-only storage encryption trust and removable-media review rows from sysfs block metadata. It does not mount, unmount, format, partition, read device contents, or trust removable media automatically.
 `POST /storage/backup-execution-requests` stages a Kira backup execution request for an approved project-relative source path. It does not copy files until approval and execution.

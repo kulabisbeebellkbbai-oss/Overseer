@@ -25,6 +25,9 @@ class CollectionJobKind(StrEnum):
     STATION_AUDIT = "station_audit"
     PACKAGE_INSPECTION = "package_inspection"
     FRESHNESS_PROJECTION = "freshness_projection"
+    GIT_INSPECTION = "git_inspection"
+    STORAGE_INSPECTION = "storage_inspection"
+    FIRMWARE_INSPECTION = "firmware_inspection"
 
 
 class CollectionOutcome(StrEnum):

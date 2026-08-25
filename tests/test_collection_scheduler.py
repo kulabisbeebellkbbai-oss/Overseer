@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
@@ -27,7 +28,7 @@ from overseer.collection_adapters import (
 )
 from overseer.health import HealthEvidence, HealthStatus, HealthTarget, ProbeType
 from overseer.host import HostCommandObservation, HostInspectionSnapshot
-from overseer.packages import PackageInspectionSnapshot, PackageUpdate
+from overseer.packages import FirmwarePreflightAdapter, PackageInspectionSnapshot, PackageUpdate
 
 NOW = "2026-08-24T12:00:00+00:00"
 
@@ -185,6 +186,45 @@ def test_timeout_opens_incident_and_applies_backoff(tmp_path: Path) -> None:
     finally:
         release.set()
         scheduler.shutdown()
+
+
+def test_bounded_firmware_preflight_timeout_releases_the_worker_slot(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = replace(_job("firmware-preflight", key="firmware"), priority=10)
+    second = replace(_job("next-job", key="next"), priority=1)
+    _seed(path, (first, second))
+    calls: list[str] = []
+
+    class Adapter:
+        def collect(self, job: CollectionJob, _store_path: str) -> CollectionExecution:
+            calls.append(job.id)
+            if job.id == first.id:
+                def runner(command, timeout_seconds):
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+                snapshot = FirmwarePreflightAdapter(
+                    timeout_seconds=0.05,
+                    command_runner=runner,
+                ).inspect(NOW)
+                assert not snapshot.succeeded()
+                return CollectionExecution(
+                    CollectionOutcome.FAILED,
+                    "bounded firmware preflight timeout",
+                    failure_category="timeout",
+                )
+            return CollectionExecution(CollectionOutcome.SUCCEEDED, "next job completed")
+
+    scheduler = _scheduler(path, Adapter(), max_workers=1)
+    try:
+        first_cycle = scheduler.run_ready_once()
+        second_cycle = scheduler.run_ready_once()
+    finally:
+        scheduler.shutdown()
+
+    assert first_cycle.failed == 1
+    assert first_cycle.timed_out == 0
+    assert second_cycle.succeeded == 1
+    assert calls == [first.id, second.id]
 
 
 def test_registry_rejects_missing_and_mismatched_bindings() -> None:

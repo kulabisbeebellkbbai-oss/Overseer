@@ -158,6 +158,7 @@ from overseer import (
     policy_profile_from_mapping,
     SourceReviewDisposition,
 )
+from overseer.git import capture_git_status_projection, git_status_projection_status
 from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
 from overseer.host import run_read_only_command
@@ -1395,6 +1396,24 @@ LENOVO 80VR
         )
         self.assertFalse(status["host_mutation_performed"])
 
+    def test_firmware_adapter_passes_the_configured_timeout_to_the_runner(self):
+        calls = []
+
+        def runner(command, timeout_seconds):
+            calls.append((tuple(command), timeout_seconds))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        snapshot = FwupdFirmwareInspectionAdapter(
+            command_runner=runner,
+            timeout_seconds=7.5,
+        ).inspect("2026-07-29T01:45:00+00:00")
+
+        self.assertEqual(
+            calls,
+            [(('fwupdmgr', 'get-upgrades', '--no-reboot-check'), 7.5)],
+        )
+        self.assertTrue(snapshot.succeeded())
+
     def test_inspect_firmware_preflight_reports_efivar_candidates_without_mutation(self):
         class Adapter:
             def inspect(self, captured_at=None):
@@ -1428,6 +1447,40 @@ LENOVO 80VR
         self.assertEqual(status["status"], "failed")
         self.assertFalse(status["efivar_accessible"])
         self.assertIn("not present", status["error"])
+
+    def test_firmware_preflight_adapter_returns_bounded_timeout_evidence(self):
+        calls = []
+
+        def runner(command, timeout_seconds):
+            calls.append((tuple(command), timeout_seconds))
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+        snapshot = FirmwarePreflightAdapter(
+            "/sys/firmware/efi/efivars",
+            timeout_seconds=0.25,
+            command_runner=runner,
+        ).inspect("2026-07-29T03:31:00+00:00")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], 0.25)
+        self.assertFalse(snapshot.succeeded())
+        self.assertIn("timed out", snapshot.error)
+
+    def test_firmware_preflight_subprocess_caps_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Boot0000-fixture").write_bytes(b"a")
+            (root / "dump-fixture").write_bytes(b"bb")
+            snapshot = FirmwarePreflightAdapter(
+                root,
+                timeout_seconds=1.0,
+                max_entries=1,
+            ).inspect("2026-07-29T03:31:00+00:00")
+
+        self.assertTrue(snapshot.efivar_accessible)
+        self.assertEqual(len(snapshot.efivars), 1)
+        self.assertIn("entry limit", snapshot.error)
+        self.assertFalse(snapshot.succeeded())
 
     def test_plan_package_updates_stages_approval_gated_plans(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3863,6 +3916,29 @@ class OverseerApiTests(unittest.TestCase):
         self.assertEqual(status["account"]["repositories"][0]["relative_path"], "repo")
         self.assertTrue(status["account"]["repositories"][0]["is_current"])
 
+    def test_git_dashboard_projection_reads_cached_status_without_invoking_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            store_path = root / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir()
+            subprocess.run(("git", "init", "-b", "main"), cwd=repo_path, check=True, capture_output=True, text=True)
+            subprocess.run(("git", "config", "user.email", "test@example.invalid"), cwd=repo_path, check=True)
+            subprocess.run(("git", "config", "user.name", "Overseer Test"), cwd=repo_path, check=True)
+            (repo_path / "README.md").write_text("# Test\n", encoding="utf-8")
+            subprocess.run(("git", "add", "README.md"), cwd=repo_path, check=True)
+            subprocess.run(("git", "commit", "-m", "Initialize test repo"), cwd=repo_path, check=True, capture_output=True, text=True)
+
+            captured = capture_git_status_projection(store_path, repo_path)
+            with patch("subprocess.run", side_effect=AssertionError("projection read invoked git")):
+                projected = git_status_projection_status(store_path, repo_path)
+
+        self.assertEqual(captured["outcome"], "succeeded")
+        self.assertTrue(projected["projection_available"])
+        self.assertEqual(projected["branch"], "main")
+        self.assertEqual(projected["collection_mode"], "durable_sqlite_projection")
+
     def test_api_exposes_knowledge_capture_routes_behind_overseer_auth(self):
         with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
             env_file = Path(directory) / "obsidian.env"
@@ -3910,7 +3986,7 @@ class OverseerApiTests(unittest.TestCase):
                 "status_lines": [],
             }
 
-            with patch.object(overseer_api, "git_status_status", lambda repo_path=None: payload):
+            with patch.object(overseer_api, "git_status_projection_status", lambda store_path, repo_path=None: payload):
                 with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
                     direct = server.get("/git/status")
                     client = OverseerApiClient(server.url, auth_token="client-secret")
@@ -4975,8 +5051,8 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["items"][0]["kind"], AdminChangeKind.USER_SERVICE_RESTART.value)
 
     def test_client_reads_package_status(self):
-        original = overseer_api.inspect_packages_status
-        overseer_api.inspect_packages_status = lambda: {
+        original = overseer_api.package_status_projection
+        overseer_api.package_status_projection = lambda store_path: {
             "status": "ok",
             "upgradable": 1,
             "items": [{"name": "openssl"}],
@@ -4989,7 +5065,7 @@ class OverseerApiClientTests(unittest.TestCase):
                     client = OverseerApiClient(server.url, auth_token="client-secret")
                     status = client.package_status()
         finally:
-            overseer_api.inspect_packages_status = original
+            overseer_api.package_status_projection = original
 
         self.assertEqual(status["status"], "ok")
         self.assertEqual(status["upgradable"], 1)
@@ -5046,8 +5122,8 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertFalse(status["host_mutation_performed"])
 
     def test_api_reads_firmware_preflight_status(self):
-        original = overseer_api.inspect_firmware_preflight_status
-        overseer_api.inspect_firmware_preflight_status = lambda: {
+        original = overseer_api.firmware_preflight_projection
+        overseer_api.firmware_preflight_projection = lambda store_path: {
             "status": "ok",
             "efivar_accessible": True,
             "stale_dump_candidate_count": 1,
@@ -5066,7 +5142,7 @@ class OverseerApiClientTests(unittest.TestCase):
                     with urlopen(request, timeout=5) as response:
                         status = json.loads(response.read().decode("utf-8"))
         finally:
-            overseer_api.inspect_firmware_preflight_status = original
+            overseer_api.firmware_preflight_projection = original
 
         self.assertEqual(status["status"], "ok")
         self.assertEqual(status["stale_dump_candidate_count"], 1)

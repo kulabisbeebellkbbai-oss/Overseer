@@ -5,6 +5,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 UNIT_PATH = ROOT / "systemd" / "overseer.service"
 API_UNIT_PATH = ROOT / "systemd" / "overseer-api.service"
+QUARK_UNIT_PATH = ROOT / "systemd" / "overseer-quark-scheduler.service"
 OPERATIONS_PATH = ROOT / "docs" / "v1.1-operations.md"
 
 
@@ -114,6 +115,58 @@ def test_overseer_api_unit_passes_disposable_systemd_verify(tmp_path: Path) -> N
         .replace("@OVERSEER_PYTHON@", "/usr/bin/python3")
         .replace("@OVERSEER_STORE@", str(store_path))
         .replace("@OVERSEER_API_TOKEN_FILE@", str(token_path)),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["systemd-analyze", "verify", str(disposable_unit)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_quark_unit_uses_the_active_reviewed_overseer_release() -> None:
+    unit = QUARK_UNIT_PATH.read_text(encoding="utf-8")
+
+    assert "EnvironmentFile=%h/.config/overseer/runtime.env" in unit
+    assert "WorkingDirectory=@OVERSEER_INSTALL@" in unit
+    assert (
+        "ExecStart=/usr/bin/env -- ${OVERSEER_PYTHON} -m overseer.quark_scheduler_cli "
+        "--db @OVERSEER_QUARK_DB@ run-cycle"
+    ) in unit
+    assert "codex-usage-mcp-venv" not in unit
+    assert "Environment=PYTHONPATH=" not in unit
+
+
+def test_quark_unit_passes_disposable_systemd_verify(tmp_path: Path) -> None:
+    unit = QUARK_UNIT_PATH.read_text(encoding="utf-8")
+    install_path = tmp_path / "install"
+    (install_path / "src").mkdir(parents=True)
+    runtime_environment = tmp_path / "runtime.env"
+    runtime_environment.write_text(
+        "\n".join(
+            (
+                "OVERSEER_PYTHON=/usr/bin/python3",
+                f"OVERSEER_INSTALL={install_path}",
+                f"PYTHONPATH={install_path / 'src'}",
+                "PYTHONDONTWRITEBYTECODE=1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    quark_db = tmp_path / "quark.sqlite3"
+    disposable_unit = tmp_path / "overseer-quark-scheduler.service"
+    disposable_unit.write_text(
+        unit.replace(
+            "EnvironmentFile=%h/.config/overseer/runtime.env",
+            f"EnvironmentFile={runtime_environment}",
+        )
+        .replace("@OVERSEER_INSTALL@", str(install_path))
+        .replace("@OVERSEER_QUARK_DB@", str(quark_db)),
         encoding="utf-8",
     )
 

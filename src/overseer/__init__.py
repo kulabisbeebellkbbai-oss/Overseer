@@ -135,6 +135,19 @@ from .collection_policy import (
     next_failure_due,
     next_success_due,
 )
+from .collection_adapters import (
+    CollectionAdapter,
+    CollectionAdapterRegistry,
+    CollectionExecution,
+    HealthProbeCollectionAdapter,
+    HostInspectionCollectionAdapter,
+    PackageInspectionCollectionAdapter,
+    StorePathCallbackCollectionAdapter,
+    StorePathCallbackAdapter,
+    default_collection_adapter_registry,
+)
+from .collection_scheduler import CollectionScheduler, SchedulerCycle, scheduler_status
+from .repair import RepairCoordinator, RepairResult
 from .core import (
     ApprovalLevel,
     Claim,
@@ -331,6 +344,20 @@ __all__ = [
     "TriageIncidentStatus",
     "deterministic_jitter",
     "next_success_due",
+    "CollectionAdapter",
+    "CollectionAdapterRegistry",
+    "CollectionExecution",
+    "HealthProbeCollectionAdapter",
+    "HostInspectionCollectionAdapter",
+    "PackageInspectionCollectionAdapter",
+    "StorePathCallbackCollectionAdapter",
+    "StorePathCallbackAdapter",
+    "default_collection_adapter_registry",
+    "CollectionScheduler",
+    "SchedulerCycle",
+    "scheduler_status",
+    "RepairCoordinator",
+    "RepairResult",
     "next_failure_delay",
     "next_failure_due",
     "circuit_after_failure",

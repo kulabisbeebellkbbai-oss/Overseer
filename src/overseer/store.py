@@ -3668,7 +3668,13 @@ class SQLiteStore:
         )
 
     def claim_due_collection_jobs(
-        self, now: str, worker: str, lease_expires_at: str, *, limit: int = 2
+        self,
+        now: str,
+        worker: str,
+        lease_expires_at: str,
+        *,
+        limit: int = 2,
+        include_pending_requests: bool = False,
     ) -> tuple[CollectionJob, ...]:
         _collection_datetime(now, "current time")
         _collection_datetime(lease_expires_at, "lease expiry")
@@ -3692,11 +3698,21 @@ class SQLiteStore:
                       s.circuit_state <> 'open'
                       OR (s.cooldown_until IS NOT NULL AND julianday(s.cooldown_until) <= julianday(?))
                   )
-                  AND julianday(s.next_due_at) <= julianday(?)
+                  AND (
+                      julianday(s.next_due_at) <= julianday(?)
+                      OR (
+                          ? = 1 AND EXISTS (
+                              SELECT 1 FROM collection_requests AS r
+                              WHERE r.job_id = j.id AND r.status = 'pending'
+                                AND (r.earliest_execution_at IS NULL
+                                     OR julianday(r.earliest_execution_at) <= julianday(?))
+                          )
+                      )
+                  )
                 ORDER BY j.priority DESC, julianday(s.next_due_at) ASC, j.id ASC
                 LIMIT ?
                 """,
-                (now, now, now, limit),
+                (now, now, now, int(include_pending_requests), now, limit),
             ).fetchall()
             for row in rows:
                 job = _load_dataclass(CollectionJob, str(row["job_payload"]))
@@ -3801,6 +3817,96 @@ class SQLiteStore:
                             terminal_disposition=disposition,
                         )
                         self._update_collection_request_in_transaction(terminal)
+
+    def record_collection_timeout(
+        self,
+        run: CollectionRun,
+        lease_id: str,
+        lease_generation: int,
+    ) -> None:
+        """Record a scheduler-observed timeout without releasing its worker lease.
+
+        A Python future cannot be cancelled safely once its callable is running.
+        This narrow companion to ``complete_collection_run`` keeps the exact
+        lease occupied until the worker exits, while still applying the normal
+        failure, incident, and backoff policy exactly once.
+        """
+        if run.outcome is not CollectionOutcome.TIMED_OUT:
+            raise ValueError("timeout recording requires a timed-out collection run")
+        if not isinstance(lease_generation, int) or isinstance(lease_generation, bool):
+            raise ValueError("lease generation must be an integer")
+        with self.agent_transaction():
+            state = self.load_collection_job_state(run.job_id)
+            if state.active_lease_id != lease_id or state.lease_generation != lease_generation:
+                raise ValueError("stale collection lease")
+            existing = self._connection.execute(
+                "SELECT payload FROM collection_runs WHERE id=?", (run.id,)
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload"]) != _bounded_collection_dump(run):
+                    raise ValueError("immutable collection run collision")
+                return
+            job = self.load_collection_job(run.job_id)
+            self._insert_collection_run_in_transaction(run)
+            failures = state.consecutive_failures + 1
+            circuit_state = circuit_after_failure(job, failures)
+            next_due_at = next_failure_due(job, run.completed_at, failures)
+            cooldown_until = next_due_at if circuit_state is CircuitState.OPEN else None
+            self._open_collection_incident_in_transaction(job, run)
+            retained = replace(
+                state,
+                next_due_at=next_due_at,
+                last_completed_at=run.completed_at,
+                last_outcome=run.outcome,
+                consecutive_failures=failures,
+                circuit_state=circuit_state,
+                cooldown_until=cooldown_until,
+            )
+            self._save_collection_job_state_in_transaction(
+                retained, _bounded_collection_dump(retained)
+            )
+            if run.request_id is not None:
+                request = self._connection.execute(
+                    "SELECT payload FROM collection_requests WHERE id=?", (run.request_id,)
+                ).fetchone()
+                if request is not None:
+                    current_request = _load_dataclass(CollectionRequest, str(request["payload"]))
+                    if current_request.status == "pending":
+                        self._update_collection_request_in_transaction(
+                            replace(
+                                current_request,
+                                status="failed",
+                                terminal_disposition=CollectionOutcome.TIMED_OUT.value,
+                            )
+                        )
+
+    def release_collection_lease(
+        self, job_id: str, lease_id: str, lease_generation: int
+    ) -> bool:
+        """Release only the exact worker lease that has actually exited."""
+        if not isinstance(lease_generation, int) or isinstance(lease_generation, bool):
+            raise ValueError("lease generation must be an integer")
+        with self.agent_transaction():
+            state = self.load_collection_job_state(job_id)
+            if state.active_lease_id != lease_id or state.lease_generation != lease_generation:
+                return False
+            self._save_collection_job_state_in_transaction(
+                replace(
+                    state,
+                    active_lease_id=None,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                ),
+                _bounded_collection_dump(
+                    replace(
+                        state,
+                        active_lease_id=None,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                    )
+                ),
+            )
+            return True
 
     def request_collection_run(
         self,
@@ -3924,6 +4030,12 @@ class SQLiteStore:
             RepairRunbook, self._get_collection_payload("repair_runbooks", runbook_id)
         )
 
+    def list_repair_runbooks(self) -> tuple[RepairRunbook, ...]:
+        return tuple(
+            _load_dataclass(RepairRunbook, payload)
+            for payload in self._list_collection_payloads("repair_runbooks")
+        )
+
     def save_repair_attempt(self, attempt: RepairAttempt) -> None:
         if not isinstance(attempt, RepairAttempt):
             raise ValueError("repair attempt must be a RepairAttempt")
@@ -3992,6 +4104,39 @@ class SQLiteStore:
                         "DELETE FROM collection_runs WHERE id=?", (str(row["id"]),)
                     )
                     deleted += 1
+        return deleted
+
+    def prune_collection_runs_for_job(self, job_id: str, retain_per_job: int) -> int:
+        """Prune only one job's bounded collection evidence, never audit rows."""
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("job id must be a non-blank identifier")
+        if isinstance(retain_per_job, bool) or not isinstance(retain_per_job, int) or retain_per_job < 1:
+            raise ValueError("retention must be at least one")
+        deleted = 0
+        with self.agent_transaction():
+            protected: set[str] = set()
+            for payload in self._list_collection_payloads("triage_incidents"):
+                incident = _load_dataclass(TriageIncident, payload)
+                if incident.job_id == job_id and incident.status is TriageIncidentStatus.OPEN:
+                    protected.update(incident.evidence_ids)
+            protected.update(
+                attempt.verification_run_id
+                for attempt in self.list_repair_attempts()
+                if attempt.verification_run_id is not None
+            )
+            rows = self._connection.execute(
+                "SELECT id FROM collection_runs WHERE job_id=? "
+                "ORDER BY julianday(started_at) DESC, id DESC",
+                (job_id,),
+            ).fetchall()
+            for row in rows[retain_per_job:]:
+                if str(row["id"]) in protected:
+                    continue
+                self._connection.execute(
+                    "DELETE FROM collection_runs WHERE id=? AND job_id=?",
+                    (str(row["id"]), job_id),
+                )
+                deleted += 1
         return deleted
 
     def _save_collection_job_state_in_transaction(
@@ -4194,6 +4339,28 @@ class SQLiteStore:
             resolution="fresh verification recovered target",
         )
         self._upsert_collection_incident_in_transaction(incident)
+        if run.request_id is not None:
+            for payload in self._list_collection_payloads("repair_attempts"):
+                attempt = _load_dataclass(RepairAttempt, payload)
+                if (
+                    attempt.incident_id == current.id
+                    and run.request_id in attempt.result_evidence_ids
+                    and attempt.verification_run_id is None
+                ):
+                    verified = replace(
+                        attempt,
+                        outcome="verified",
+                        verification_run_id=run.id,
+                    )
+                    self._connection.execute(
+                        "UPDATE repair_attempts SET outcome=?, verification_run_id=?, payload=? WHERE id=?",
+                        (
+                            verified.outcome,
+                            verified.verification_run_id,
+                            _bounded_collection_dump(verified),
+                            verified.id,
+                        ),
+                    )
 
     def _upsert_collection_incident_in_transaction(self, incident: TriageIncident) -> None:
         payload = _bounded_collection_dump(incident)

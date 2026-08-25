@@ -157,13 +157,17 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class AptPackageInspectionAdapter:
-    def __init__(self, command_runner: PackageCommandRunner | None = None) -> None:
+    def __init__(self, command_runner: PackageCommandRunner | None = None, timeout_seconds: float = 30.0) -> None:
         self.command_runner = command_runner or self._run
+        self.timeout_seconds = timeout_seconds
 
     def inspect(self, captured_at: str | None = None) -> PackageInspectionSnapshot:
         observed_at = captured_at or datetime.now(UTC).isoformat()
         command = ("apt", "list", "--upgradable")
-        completed = self.command_runner(command)
+        try:
+            completed = self.command_runner(command, self.timeout_seconds)  # type: ignore[misc]
+        except TypeError:
+            completed = self.command_runner(command)
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
         return PackageInspectionSnapshot(
@@ -176,8 +180,13 @@ class AptPackageInspectionAdapter:
         )
 
     @staticmethod
-    def _run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(command, check=False, capture_output=True, text=True)
+    def _run(command: Sequence[str], timeout_seconds: float = 30.0) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout_seconds)
+        except FileNotFoundError as exc:
+            return subprocess.CompletedProcess(command, 127, "", str(exc))
+        except subprocess.TimeoutExpired as exc:
+            return subprocess.CompletedProcess(command, 124, exc.stdout or "", exc.stderr or "apt inspection timed out")
 
 
 class FwupdFirmwareInspectionAdapter:

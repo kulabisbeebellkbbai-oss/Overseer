@@ -135,8 +135,9 @@ def test_quark_unit_uses_the_active_reviewed_overseer_release() -> None:
     assert "WorkingDirectory=@OVERSEER_INSTALL@" in unit
     assert (
         "ExecStart=/usr/bin/env -- ${OVERSEER_PYTHON} -m overseer.quark_scheduler_cli "
-        "--db @OVERSEER_QUARK_DB@ run-cycle"
+        "--db %h/.local/share/overseer/codex-usage-mcp/state.sqlite3 run-cycle"
     ) in unit
+    assert "ReadWritePaths=%h/.local/share/overseer/codex-usage-mcp" in unit
     assert "codex-usage-mcp-venv" not in unit
     assert "Environment=PYTHONPATH=" not in unit
 
@@ -158,15 +159,13 @@ def test_quark_unit_passes_disposable_systemd_verify(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    quark_db = tmp_path / "quark.sqlite3"
     disposable_unit = tmp_path / "overseer-quark-scheduler.service"
     disposable_unit.write_text(
         unit.replace(
             "EnvironmentFile=%h/.config/overseer/runtime.env",
             f"EnvironmentFile={runtime_environment}",
         )
-        .replace("@OVERSEER_INSTALL@", str(install_path))
-        .replace("@OVERSEER_QUARK_DB@", str(quark_db)),
+        .replace("@OVERSEER_INSTALL@", str(install_path)),
         encoding="utf-8",
     )
 

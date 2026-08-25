@@ -95,6 +95,123 @@ def test_reseeding_updates_policy_without_erasing_active_lease(tmp_path: Path) -
     assert state.lease_generation == 4
 
 
+def test_default_collection_seeding_fails_closed_for_external_action_families(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+
+    result = seed_default_collection_jobs(path)
+
+    unsafe_ids = {
+        "collection.dispatch.crew",
+        "collection.usage.continuation",
+        "collection.knowledge.capture",
+        "collection.station.audit",
+    }
+    with SQLiteStore(path) as store:
+        jobs = {job.id: job for job in store.list_collection_jobs()}
+
+    assert unsafe_ids <= jobs.keys()
+    assert all(not jobs[job_id].enabled for job_id in unsafe_ids)
+    assert jobs["collection.health.health.api"].enabled is True
+    assert jobs["collection.freshness.psychlo-usage"].enabled is True
+    assert {item["job_id"] for item in result["disabled"]} >= unsafe_ids
+    assert all(
+        item["reason"] == "explicit durable authorization is required"
+        for item in result["disabled"]
+        if item["job_id"] in unsafe_ids
+    )
+
+
+def test_legacy_action_flags_do_not_authorize_unsafe_jobs(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+
+    class FakeScheduler:
+        def shutdown(self) -> None:
+            return None
+
+    with SQLiteStore(path) as store:
+        OverseerRuntime(
+            store,
+            dispatch_crew_messages=True,
+            dispatch_usage_continuations=True,
+            capture_knowledge_events=True,
+            audit_station=True,
+            scheduler=FakeScheduler(),
+        )
+        jobs = {job.id: job for job in store.list_collection_jobs()}
+
+    assert all(
+        jobs[job_id].enabled is False
+        for job_id in (
+            "collection.dispatch.crew",
+            "collection.usage.continuation",
+            "collection.knowledge.capture",
+            "collection.station.audit",
+        )
+    )
+
+
+def test_reseeding_preserves_operator_suspension_and_authorized_state(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+
+    with SQLiteStore(path) as store:
+        suspended_id = "collection.knowledge.capture"
+        authorized_id = "collection.station.audit"
+        store.set_collection_job_enabled(suspended_id, True)
+        store.set_collection_job_enabled(suspended_id, False)
+        store.set_collection_job_enabled(authorized_id, True)
+        state = store.load_collection_job_state(suspended_id)
+        store.save_collection_job_state(
+            state.__class__(
+                **{
+                    **state.__dict__,
+                    "active_lease_id": "lease.suspended",
+                    "lease_owner": "worker.suspended",
+                    "lease_expires_at": "2030-01-01T00:00:00+00:00",
+                    "lease_generation": 9,
+                }
+            )
+        )
+
+    with SQLiteStore(path) as store:
+        target = store.load_health_target("health.api")
+        store.save_health_target(
+            HealthTarget(
+                **{
+                    **target.__dict__,
+                    "interval_seconds": 300,
+                }
+            )
+        )
+    seed_default_collection_jobs(path)
+
+    with SQLiteStore(path) as store:
+        suspended = store.load_collection_job(suspended_id)
+        authorized = store.load_collection_job(authorized_id)
+        health = store.load_collection_job("collection.health.health.api")
+        state = store.load_collection_job_state(suspended_id)
+    assert suspended.enabled is False
+    assert authorized.enabled is True
+    assert health.interval_seconds == 300
+    assert state.active_lease_id == "lease.suspended"
+    assert state.lease_generation == 9
+
+
+def test_reseeding_disables_job_when_its_health_target_is_disabled(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+
+    with SQLiteStore(path) as store:
+        target = store.load_health_target("health.api")
+        store.save_health_target(HealthTarget(**{**target.__dict__, "enabled": False}))
+
+    seed_default_collection_jobs(path)
+
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.health.health.api")
+    assert job.enabled is False
+
+
 def test_runtime_tick_advances_scheduler_without_bulk_probe(tmp_path: Path) -> None:
     path = _seed_resource_and_target(tmp_path)
 

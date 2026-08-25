@@ -156,6 +156,7 @@ class CollectionScheduler:
                 lease_expires,
                 limit=1,
                 include_pending_requests=True,
+                job_id=job.id,
             )
             if not claimed or claimed[0].id != job.id:
                 return None

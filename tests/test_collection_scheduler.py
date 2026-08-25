@@ -112,6 +112,34 @@ def test_scheduler_never_exceeds_global_or_key_concurrency(tmp_path: Path) -> No
         scheduler.shutdown()
 
 
+def test_scheduler_claims_only_the_selected_candidate_under_key_pressure(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    active = replace(_job("active", key="shared"), priority=100)
+    second = replace(_job("second", key="shared"), priority=90)
+    other = replace(_job("other", key="other"), priority=1)
+    _seed(path, (active, second, other))
+    with SQLiteStore(path) as store:
+        assert store.claim_due_collection_jobs(
+            NOW, "other-runtime", "2026-08-24T12:05:00+00:00", limit=1, job_id=active.id
+        ) == (active,)
+
+    adapter = _BlockingAdapter()
+    scheduler = _scheduler(path, adapter, max_workers=1)
+    try:
+        cycle = scheduler.run_ready_once()
+        assert cycle.claimed == 1
+        assert cycle.started == 1
+        with SQLiteStore(path) as store:
+            assert store.load_collection_job_state(second.id).active_lease_id is None
+            assert store.load_collection_job_state(other.id).active_lease_id is None
+            runs = store.list_collection_runs()
+            assert [run.job_id for run in runs] == [other.id]
+    finally:
+        scheduler.shutdown()
+
+
 def test_restart_coalesces_missed_intervals(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     job = _job("old", interval=60)

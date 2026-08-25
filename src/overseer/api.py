@@ -7,6 +7,8 @@ import json
 import os
 import re
 import secrets
+import socket
+import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from json import JSONDecodeError
@@ -317,6 +319,60 @@ def codex_usage_health_status(db_path: str | Path | None = None) -> dict[str, An
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
 PROTECTED_GATEWAY_PREFIX = "/Overseer"
+API_JSON_MAX_BODY_BYTES = 64 * 1024
+API_MAX_REQUEST_THREADS = 8
+API_CONNECTION_READ_TIMEOUT_SECONDS = 5.0
+API_HEADER_READ_TIMEOUT_SECONDS = 5.0
+API_BODY_READ_TIMEOUT_SECONDS = 5.0
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threaded API server with bounded handlers and deterministic overload."""
+
+    daemon_threads = True
+
+    def __init__(self, server_address, handler_class, *, max_workers: int = API_MAX_REQUEST_THREADS):
+        if max_workers < 1:
+            raise ValueError("max_workers must be positive")
+        self.max_workers = max_workers
+        self._request_slots = threading.BoundedSemaphore(max_workers)
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request, client_address):
+        request.settimeout(API_CONNECTION_READ_TIMEOUT_SECONDS)
+        if not self._request_slots.acquire(blocking=False):
+            self._reject_overload(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+    @staticmethod
+    def _reject_overload(request) -> None:
+        body = b'{"error":"server_overloaded"}'
+        response = (
+            b"HTTP/1.0 503 Service Unavailable\r\n"
+            b"Connection: close\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Retry-After: 1\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"\r\n"
+            + body
+        )
+        try:
+            request.sendall(response)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
+            pass
+        finally:
+            request.close()
 
 
 def _strip_protected_gateway_prefix(path: str) -> str:
@@ -732,6 +788,10 @@ def make_api_handler(
 
     class OverseerApiHandler(BaseHTTPRequestHandler):
         server_version = "OverseerApi/0.1"
+
+        def setup(self) -> None:
+            super().setup()
+            self.connection.settimeout(API_HEADER_READ_TIMEOUT_SECONDS)
 
         @contextmanager
         def _psychlo_request(self):
@@ -2083,13 +2143,27 @@ def make_api_handler(
                 except (JSONDecodeError, UnicodeDecodeError, ValueError) as error:
                     self._write_json({"accepted": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
 
-        def _read_bounded_body(self) -> bytes:
-            text = self.headers.get("content-length", "")
-            if not text.isdigit() or int(text) < 1 or int(text) > MAX_BODY_BYTES:
+        def _read_request_body(self, maximum: int) -> bytes:
+            values = self.headers.get_all("content-length") or []
+            if len(values) != 1:
                 raise ValueError("invalid_content_length")
-            body = self.rfile.read(int(text))
-            if len(body) != int(text): raise ValueError("invalid_content_length")
+            text = values[0]
+            if not re.fullmatch(r"[0-9]+", text):
+                raise ValueError("invalid_content_length")
+            length = int(text)
+            if length < 1 or length > maximum:
+                raise ValueError("invalid_content_length")
+            self.connection.settimeout(API_BODY_READ_TIMEOUT_SECONDS)
+            try:
+                body = self.rfile.read(length)
+            except (TimeoutError, socket.timeout) as error:
+                raise ValueError("request_body_timeout") from error
+            if len(body) != length:
+                raise ValueError("invalid_content_length")
             return body
+
+        def _read_bounded_body(self) -> bytes:
+            return self._read_request_body(MAX_BODY_BYTES)
 
         def _singleton_headers(self) -> dict[str, str]:
             forbidden = ("authorization", "cookie", "origin", "transfer-encoding", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")
@@ -2113,10 +2187,7 @@ def make_api_handler(
             self._handle(lambda: execute_admin_change_status(store_path, plan_id))
 
         def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("content-length", "0"))
-            if length == 0:
-                return {}
-            data = self.rfile.read(length)
+            data = self._read_request_body(API_JSON_MAX_BODY_BYTES)
             parsed = json.loads(data.decode("utf-8"))
             if not isinstance(parsed, dict):
                 raise ValueError("request body must be a JSON object")
@@ -2278,7 +2349,7 @@ def run_api_server(
         # SQLite database.
         bridge_environment["OVERSEER_STORE_DATABASE"] = str(Path(store_path))
         psychlo_bridge = create_bridge_from_environment(bridge_environment)
-    server = ThreadingHTTPServer(
+    server = BoundedThreadingHTTPServer(
         (host, port),
         make_api_handler(
             store_path,

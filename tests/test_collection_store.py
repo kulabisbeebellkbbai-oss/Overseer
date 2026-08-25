@@ -374,6 +374,100 @@ def test_claim_due_jobs_is_atomic_and_respects_limit(tmp_path: Path) -> None:
         assert all(state.active_lease_id and state.lease_generation == 1 for state in states)
 
 
+def test_exact_claim_compare_and_set_does_not_claim_a_different_eligible_job(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = sample_job("collection.shared.first", priority=100, concurrency_key="shared")
+    second = sample_job("collection.shared.second", priority=90, concurrency_key="shared")
+    other = sample_job("collection.other", priority=1, concurrency_key="other")
+    with SQLiteStore(path) as store:
+        for job in (first, second, other):
+            store.save_collection_job(job, sample_state(job.id))
+        assert store.claim_due_collection_jobs(
+            NOW, "worker-a", LEASE_END, limit=1, job_id=first.id
+        ) == (first,)
+        assert store.claim_due_collection_jobs(
+            NOW, "worker-b", LEASE_END, limit=1, job_id=second.id
+        ) == ()
+        assert store.claim_due_collection_jobs(
+            NOW, "worker-b", LEASE_END, limit=1, job_id=other.id
+        ) == (other,)
+
+        assert store.load_collection_job_state(second.id).active_lease_id is None
+        assert store.load_collection_job_state(other.id).active_lease_id is not None
+
+
+def test_collection_key_lease_exclusion_is_durable_across_connections_and_expiry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = sample_job("collection.shared.first", priority=100, concurrency_key="shared")
+    second = sample_job(
+        "collection.shared.second", priority=90, concurrency_key="shared"
+    )
+    other = sample_job("collection.other", priority=1, concurrency_key="other")
+    with SQLiteStore(path) as seeded:
+        for job in (first, second, other):
+            seeded.save_collection_job(job, sample_state(job.id))
+
+    with SQLiteStore(path) as worker_a, SQLiteStore(path) as worker_b:
+        assert worker_a.claim_due_collection_jobs(
+            NOW, "worker-a", LEASE_END, limit=1, job_id=first.id
+        ) == (first,)
+        assert worker_b.claim_due_collection_jobs(
+            NOW, "worker-b", LEASE_END, limit=1, job_id=second.id
+        ) == ()
+        assert worker_b.claim_due_collection_jobs(
+            NOW, "worker-b", LEASE_END, limit=1, job_id=other.id
+        ) == (other,)
+
+        assert worker_b.claim_due_collection_jobs(
+            "2026-08-24T12:06:00+00:00",
+            "worker-b",
+            "2026-08-24T12:11:00+00:00",
+            limit=1,
+            job_id=second.id,
+        ) == (second,)
+
+
+def test_concurrent_store_connections_cannot_lease_the_same_concurrency_key(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = sample_job("collection.shared.first", priority=100, concurrency_key="shared")
+    second = sample_job(
+        "collection.shared.second", priority=90, concurrency_key="shared"
+    )
+    other = sample_job("collection.other", priority=1, concurrency_key="other")
+    with SQLiteStore(path) as seeded:
+        for job in (first, second, other):
+            seeded.save_collection_job(job, sample_state(job.id))
+
+    results: Queue[tuple[str, tuple[CollectionJob, ...]]] = Queue()
+
+    def claim(worker: str) -> None:
+        with SQLiteStore(path) as store:
+            results.put(
+                (
+                    worker,
+                    store.claim_due_collection_jobs(NOW, worker, LEASE_END, limit=1),
+                )
+            )
+
+    threads = [threading.Thread(target=claim, args=(worker,)) for worker in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    claimed = [job for _worker, jobs in (results.get() for _ in threads) for job in jobs]
+    assert {job.id for job in claimed} == {first.id, other.id}
+    assert len(claimed) == 2
+    with SQLiteStore(path) as store:
+        assert store.load_collection_job_state(second.id).active_lease_id is None
+
+
 def test_configuration_save_cannot_erase_concurrent_claim_lease(
     tmp_path: Path,
 ) -> None:

@@ -132,6 +132,7 @@ from overseer import (
     schedule_maintenance_window,
     schedule_limited_work,
     schedule_usage_limited_work,
+    seed_default_collection_jobs,
     seed_store_from_config,
     validate_config,
     approve_admin_change_plan,
@@ -12064,7 +12065,9 @@ class RuntimeTests(unittest.TestCase):
     def test_run_status_dispatches_ready_usage_continuations_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
+            seed_default_collection_jobs(store_path, families=("usage_continuation",))
             store = SQLiteStore(store_path)
+            store.set_collection_job_enabled("collection.usage.continuation", True)
             store.save_usage_limit(
                 UsageLimit(
                     id="limit.runtime.quota",

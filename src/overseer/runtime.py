@@ -86,6 +86,9 @@ EXTERNAL_FRESHNESS_UNITS = {
 COLLECTION_FAMILIES = frozenset(
     {"health", "host", "discovery", "crew_dispatch", "usage_continuation", "knowledge_capture", "station_audit", "package", "freshness"}
 )
+UNSAFE_AUTONOMOUS_COLLECTION_FAMILIES = frozenset(
+    {"crew_dispatch", "usage_continuation", "knowledge_capture", "station_audit"}
+)
 
 
 def _store_path(value: str | Any) -> str:
@@ -313,29 +316,46 @@ def seed_default_collection_jobs(
 
             seed_store_from_config(load_config(config_path), store)
         normalized_families = _normalize_collection_families(families)
+        seed_families = COLLECTION_FAMILIES if normalized_families is None else normalized_families
         registry = runtime_collection_adapter_registry()
         targets = store.list_health_targets()
         enabled_target_ids = {target.id for target in targets if target.enabled}
         seeded: list[str] = []
         skipped: list[dict[str, str]] = []
-        for existing in store.list_collection_jobs():
-            if (
-                (normalized_families is None or "health" in normalized_families)
-                and
-                existing.kind is CollectionJobKind.HEALTH_PROBE
-                and existing.target_id is not None
-                and existing.target_id not in enabled_target_ids
-                and existing.enabled
-            ):
-                store.save_collection_job(replace(existing, enabled=False))
+        existing_jobs = {job.id: job for job in store.list_collection_jobs()}
+        if "health" in seed_families:
+            for existing in existing_jobs.values():
+                if (
+                    existing.kind is CollectionJobKind.HEALTH_PROBE
+                    and existing.target_id is not None
+                    and existing.target_id not in enabled_target_ids
+                    and existing.enabled
+                ):
+                    store.save_collection_job(replace(existing, enabled=False))
+                    skipped.append(
+                        {
+                            "job_id": existing.id,
+                            "status": "disabled",
+                            "reason": "health target is disabled",
+                        }
+                    )
+        for job in _default_jobs(targets, seed_families):
+            existing = existing_jobs.get(job.id)
+            if existing is not None:
+                # Configuration refreshes must never rewrite the operator's
+                # durable enabled/suspended policy or scheduler state.
+                job = replace(job, enabled=existing.enabled)
+            elif job.kind.value in UNSAFE_AUTONOMOUS_COLLECTION_FAMILIES:
+                # Visibility is useful for a fresh install, but no external
+                # or mutating action is authorized by merely seeding it.
+                job = replace(job, enabled=False)
                 skipped.append(
                     {
-                        "job_id": existing.id,
+                        "job_id": job.id,
                         "status": "disabled",
-                        "reason": "health target is disabled",
+                        "reason": "explicit durable authorization is required",
                     }
                 )
-        for job in _default_jobs(targets, normalized_families):
             adapter_id = (
                 "health-probe"
                 if job.kind is CollectionJobKind.HEALTH_PROBE

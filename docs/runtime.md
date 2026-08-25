@@ -32,7 +32,7 @@ semantics.
 ## Boundaries
 
 - The source template is `systemd/overseer.service`; it is not installed or activated by this repository task.
-- The service reads fully resolved `OVERSEER_PYTHON`, `OVERSEER_INSTALL`, `OVERSEER_STORE`, and `PYTHONPATH` values from `%h/.config/overseer/runtime.env`; it does not derive one environment variable from another.
+- The service reads fully resolved `OVERSEER_PYTHON`, `OVERSEER_INSTALL`, `OVERSEER_STORE`, and `PYTHONPATH` values plus fixed `PYTHONDONTWRITEBYTECODE=1` from `%h/.config/overseer/runtime.env`; it does not derive one environment variable from another.
 - No host scheduler or socket listener is modified by the runtime unit.
 - Runtime state is read from an explicit SQLite store path.
 - The runtime writes a heartbeat and advances only due scheduler jobs on each cycle; the scheduler bounds workers, leases, timeouts, evidence, and status projections.

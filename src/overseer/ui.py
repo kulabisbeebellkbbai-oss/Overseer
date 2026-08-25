@@ -3858,6 +3858,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "View git account status", page: "Documents", owner: "Ezri", action: "open Documents", source, query: "View git account status"},
         {workflow: "View audit log", page: "Audit", owner: "Sisko", action: "open Audit", source, query: "View audit log"},
         {workflow: "Review approval history", page: "Audit", owner: "Sisko", action: "open Audit", source, query: "Review approval history"},
+        {workflow: "Review scheduler state", page: "Health", owner: "Julian", action: "open scheduler", source, query: "Review scheduler state"},
+        {workflow: "Queue a verification run", page: "Health", owner: "Julian", action: "open scheduler", source, query: "Queue a verification run"},
+        {workflow: "Triage and repair", page: "Health", owner: "Julian / owning domain", action: "open scheduler", source, query: "Triage and repair"},
         {workflow: "Adjust service schedule", page: "Admin", owner: "O'Brien", action: "record-maintenance-schedule", source, query: "Adjust service schedule"}
       ];
     }

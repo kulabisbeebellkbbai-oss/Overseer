@@ -3719,6 +3719,7 @@ class SQLiteStore:
         *,
         limit: int = 2,
         include_pending_requests: bool = False,
+        job_id: str | None = None,
     ) -> tuple[CollectionJob, ...]:
         _collection_datetime(now, "current time")
         _collection_datetime(lease_expires_at, "lease expiry")
@@ -3726,42 +3727,82 @@ class SQLiteStore:
             raise ValueError("lease owner must be a bounded non-blank identifier")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("lease limit must be a non-negative integer")
+        if job_id is not None and (
+            not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 240
+        ):
+            raise ValueError("collection job id must be a bounded non-blank identifier")
         if limit == 0:
             return ()
 
         claimed: list[CollectionJob] = []
         with self.agent_transaction():
-            rows = self._connection.execute(
-                """
-                SELECT j.payload AS job_payload, s.payload AS state_payload
-                FROM collection_jobs AS j
-                JOIN collection_job_states AS s ON s.job_id=j.id
-                WHERE j.enabled=1
-                  AND (s.lease_expires_at IS NULL OR julianday(s.lease_expires_at) <= julianday(?))
-                  AND (
-                      s.circuit_state <> 'open'
-                      OR (s.cooldown_until IS NOT NULL AND julianday(s.cooldown_until) <= julianday(?))
-                  )
-                  AND (
-                      julianday(s.next_due_at) <= julianday(?)
-                      OR (
-                          ? = 1 AND EXISTS (
-                              SELECT 1 FROM collection_requests AS r
-                              WHERE r.job_id = j.id AND r.status = 'pending'
-                                AND (r.earliest_execution_at IS NULL
-                                     OR julianday(r.earliest_execution_at) <= julianday(?))
+            # Select and claim one row per iteration.  The transaction is
+            # BEGIN IMMEDIATE, so each subsequent selection observes leases
+            # written by this call as well as leases written by other store
+            # connections.  This prevents a limit-sized batch from leasing
+            # two jobs that share a concurrency key.
+            while len(claimed) < limit:
+                row = self._connection.execute(
+                    """
+                    SELECT j.payload AS job_payload, s.payload AS state_payload
+                    FROM collection_jobs AS j
+                    JOIN collection_job_states AS s ON s.job_id=j.id
+                    WHERE j.enabled=1
+                      AND (? IS NULL OR j.id = ?)
+                      AND (
+                          s.active_lease_id IS NULL
+                          OR (
+                              s.lease_expires_at IS NOT NULL
+                              AND julianday(s.lease_expires_at) <= julianday(?)
                           )
                       )
-                  )
-                ORDER BY j.priority DESC, julianday(s.next_due_at) ASC, j.id ASC
-                LIMIT ?
-                """,
-                (now, now, now, int(include_pending_requests), now, limit),
-            ).fetchall()
-            for row in rows:
+                      AND (
+                          s.circuit_state <> 'open'
+                          OR (s.cooldown_until IS NOT NULL AND julianday(s.cooldown_until) <= julianday(?))
+                      )
+                      AND (
+                          julianday(s.next_due_at) <= julianday(?)
+                          OR (
+                              ? = 1 AND EXISTS (
+                                  SELECT 1 FROM collection_requests AS r
+                                  WHERE r.job_id = j.id AND r.status = 'pending'
+                                    AND (r.earliest_execution_at IS NULL
+                                         OR julianday(r.earliest_execution_at) <= julianday(?))
+                              )
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM collection_jobs AS occupied_job
+                          JOIN collection_job_states AS occupied_state
+                            ON occupied_state.job_id = occupied_job.id
+                          WHERE occupied_job.concurrency_key = j.concurrency_key
+                            AND occupied_state.job_id <> j.id
+                            AND occupied_state.active_lease_id IS NOT NULL
+                            AND (
+                                occupied_state.lease_expires_at IS NULL
+                                OR julianday(occupied_state.lease_expires_at) > julianday(?)
+                            )
+                      )
+                    ORDER BY j.priority DESC, julianday(s.next_due_at) ASC, j.id ASC
+                    LIMIT 1
+                    """,
+                    (
+                        job_id,
+                        job_id,
+                        now,
+                        now,
+                        now,
+                        int(include_pending_requests),
+                        now,
+                        now,
+                    ),
+                ).fetchone()
+                if row is None:
+                    break
                 job = _load_dataclass(CollectionJob, str(row["job_payload"]))
                 state = _load_dataclass(CollectionJobState, str(row["state_payload"]))
-                if state.lease_expires_at is not None:
+                if state.active_lease_id is not None and state.lease_expires_at is not None:
                     self._recover_expired_collection_lease_in_transaction(job, state, now)
                     state = self.load_collection_job_state(job.id)
                 generation = state.lease_generation + 1

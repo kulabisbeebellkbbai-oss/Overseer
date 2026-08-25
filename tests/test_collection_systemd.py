@@ -52,6 +52,7 @@ def test_overseer_runtime_unit_passes_disposable_systemd_verify(tmp_path: Path) 
                 f"OVERSEER_INSTALL={install_path}",
                 f"OVERSEER_STORE={store_path}",
                 f"PYTHONPATH={install_path / 'src'}",
+                "PYTHONDONTWRITEBYTECODE=1",
                 "",
             )
         ),
@@ -94,3 +95,14 @@ def test_v11_runbook_preserves_exact_state_without_secret_argv_or_globs() -> Non
     assert '"$OVERSEER_ACTIVATION_OUTPUT"/*' not in operations
     assert '"$OVERSEER_FORENSIC_ROOT"/*' not in operations
     assert 'store.before.sqlite3*' not in operations
+    assert 'status --porcelain=v1 --untracked-files=all --ignored=matching' in operations
+    assert '"PYTHONDONTWRITEBYTECODE=1"' in operations
+    assert 'test ! -s "$OVERSEER_EVIDENCE_DIR/source-status.txt"' in operations
+    assert 'test ! -s "$OVERSEER_ACTIVATION_OUTPUT/source-status.before.txt"' in operations
+    assert 'test ! -s "$OVERSEER_ACTIVATION_OUTPUT/source-status.pre-start.txt"' in operations
+    assert 'OVERSEER_APPROVED_TREE' in operations
+    assert 'OVERSEER_APPROVED_SOURCE_MANIFEST' in operations
+    assert 'OVERSEER_APPROVED_PYTHON_SHA256' in operations
+    assert 'OVERSEER_APPROVED_DEPENDENCIES_SHA256' in operations
+    assert 'OVERSEER_APPROVED_ENV_SHA256' in operations
+    assert 'OVERSEER_APPROVED_RENDERED_UNIT_SHA256' in operations

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+from http.client import HTTPConnection
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 import overseer.api as api_module
-from overseer.api import make_api_handler
+from overseer.api import BoundedThreadingHTTPServer, make_api_handler
 from overseer.collection_models import (
     CircuitState,
     CollectionJob,
@@ -28,12 +28,12 @@ class ApiHarness:
     def __init__(self, store_path: Path, token: str = "admin-secret") -> None:
         self.store_path = store_path
         self.token = token
-        self.server: ThreadingHTTPServer | None = None
+        self.server: BoundedThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.url = ""
 
     def __enter__(self) -> "ApiHarness":
-        self.server = ThreadingHTTPServer(
+        self.server = BoundedThreadingHTTPServer(
             ("127.0.0.1", 0), make_api_handler(str(self.store_path), self.token)
         )
         host, port = self.server.server_address
@@ -74,6 +74,24 @@ class ApiHarness:
 
     def post(self, path: str, payload: dict, *, authenticated: bool = True):
         return self.request("POST", path, payload, authenticated=authenticated)
+
+    def raw_post(
+        self,
+        path: str,
+        headers: list[tuple[str, str]],
+        body: bytes = b"",
+    ) -> tuple[int, dict, dict[str, str]]:
+        host, port = self.server.server_address
+        connection = HTTPConnection(host, port, timeout=2)
+        try:
+            connection.putrequest("POST", path)
+            for name, value in headers:
+                connection.putheader(name, value)
+            connection.endheaders(body)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read()), dict(response.headers)
+        finally:
+            connection.close()
 
 
 def seed_job(
@@ -162,6 +180,134 @@ def test_control_routes_require_admin_token_and_reject_extra_fields(tmp_path: Pa
         )
     assert status == 400
     assert "exact collection control fields" in body["error"]
+
+
+@pytest.mark.parametrize("prefix", ["", "/Overseer"])
+@pytest.mark.parametrize(
+    "content_length",
+    [None, "not-a-number", "-1", "0", str(api_module.API_JSON_MAX_BODY_BYTES + 1)],
+)
+def test_collection_control_rejects_invalid_content_length_before_body_read(
+    tmp_path: Path, prefix: str, content_length: str | None
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path)
+    headers = [
+        ("Authorization", "Bearer admin-secret"),
+        ("Content-Type", "application/json"),
+    ]
+    if content_length is not None:
+        headers.append(("Content-Length", content_length))
+    with ApiHarness(store_path) as api:
+        status, body, _ = api.raw_post(
+            f"{prefix}/collections/jobs/collection.health.api/run",
+            headers,
+            body=b"{}",
+        )
+    assert status == 400
+    assert body == {"error": "invalid_content_length"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/collections/jobs/collection.health.api/run",
+        "/Overseer/collections/jobs/collection.health.api/run",
+        "/claims/request",
+        "/Overseer/claims/request",
+    ],
+)
+def test_json_routes_reject_duplicate_content_length_before_body_read(
+    tmp_path: Path, path: str
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path)
+    with ApiHarness(store_path) as api:
+        status, body, _ = api.raw_post(
+            path,
+            [
+                ("Authorization", "Bearer admin-secret"),
+                ("Content-Type", "application/json"),
+                ("Content-Length", "2"),
+                ("Content-Length", "2"),
+            ],
+            body=b"{}",
+        )
+    assert status == 400
+    assert body == {"error": "invalid_content_length"}
+
+
+@pytest.mark.parametrize("path", ["/claims/request", "/Overseer/claims/request"])
+@pytest.mark.parametrize("content_length", [None, "not-a-number", "-1", str(api_module.API_JSON_MAX_BODY_BYTES + 1)])
+def test_general_json_route_rejects_invalid_content_length_before_body_read(
+    tmp_path: Path, path: str, content_length: str | None
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    headers = [
+        ("Authorization", "Bearer admin-secret"),
+        ("Content-Type", "application/json"),
+    ]
+    if content_length is not None:
+        headers.append(("Content-Length", content_length))
+    with ApiHarness(store_path) as api:
+        status, body, _ = api.raw_post(path, headers, body=b"{}")
+    assert status == 400
+    assert body == {"error": "invalid_content_length"}
+
+
+def test_bounded_server_returns_deterministic_overload_without_waiting_for_handlers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path)
+    started = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    started_count = 0
+
+    def blocked_projection(*args, **kwargs):
+        nonlocal started_count
+        with state_lock:
+            started_count += 1
+            if started_count == 2:
+                started.set()
+        assert release.wait(timeout=2)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(api_module, "_collection_scheduler_projection", blocked_projection)
+    server = BoundedThreadingHTTPServer(
+        ("127.0.0.1", 0), make_api_handler(str(store_path), "admin-secret"), max_workers=2
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+
+    def get_status() -> int:
+        connection = HTTPConnection(host, port, timeout=2)
+        try:
+            connection.request(
+                "GET",
+                "/collections/status",
+                headers={"Authorization": "Bearer admin-secret"},
+            )
+            response = connection.getresponse()
+            response.read()
+            return response.status
+        finally:
+            connection.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_two = [pool.submit(get_status), pool.submit(get_status)]
+            assert started.wait(timeout=2)
+            assert get_status() == 503
+            release.set()
+            assert [future.result(timeout=2) for future in first_two] == [200, 200]
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_suspend_preserves_active_lease_and_generation(tmp_path: Path) -> None:

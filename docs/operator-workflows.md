@@ -1034,12 +1034,15 @@ available through the current user journal.
 6. Use this before and after maintenance, remediation, or gateway changes so
    Julian can compare retained trend snapshots.
 
-### Run Health Probes
+### Queue A Health Collection
 
 1. Open Health.
-2. Click Run Probes.
-3. Review Health Targets for status, recovery requirement, and error.
-4. Send recovery work to the owning crew member.
+2. Open the scheduler and select the exact health collection job.
+3. Click Run now and confirm the request is `queued` or `coalesced`; the UI
+   must not execute the probe inline.
+4. Review the later run, incident, and Health Target projections for status,
+   recovery requirement, and bounded evidence.
+5. Send triage or approval-gated recovery work to the owning crew member.
 
 ### Register A Health Target
 

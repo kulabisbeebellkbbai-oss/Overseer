@@ -11,9 +11,10 @@ class _FakeBridge:
 
 
 class _FakeServer:
-    def __init__(self, address, handler):
+    def __init__(self, address, handler, **kwargs):
         self.address = address
         self.handler = handler
+        self.kwargs = kwargs
         self.closed = False
 
     def serve_forever(self) -> None:
@@ -36,7 +37,7 @@ def test_run_api_server_binds_psychlo_authority_to_explicit_api_store(monkeypatc
     monkeypatch.delenv("OVERSEER_STORE_DATABASE", raising=False)
     monkeypatch.delenv("OVERSEER_STORE_PATH", raising=False)
     monkeypatch.setattr(api, "create_bridge_from_environment", create_bridge)
-    monkeypatch.setattr(api, "ThreadingHTTPServer", _FakeServer)
+    monkeypatch.setattr(api, "BoundedThreadingHTTPServer", _FakeServer)
 
     api.run_api_server(str(api_store))
 
@@ -57,7 +58,7 @@ def test_run_api_server_rejects_conflicting_environment_authority_store(monkeypa
     monkeypatch.setenv("OVERSEER_PSYCHLO_PEER_SECRET_FILE", str(tmp_path / "secret"))
     monkeypatch.setenv("OVERSEER_STORE_DATABASE", str(configured_store))
     monkeypatch.setattr(api, "create_bridge_from_environment", create_bridge)
-    monkeypatch.setattr(api, "ThreadingHTTPServer", _FakeServer)
+    monkeypatch.setattr(api, "BoundedThreadingHTTPServer", _FakeServer)
 
     api.run_api_server(str(api_store))
 

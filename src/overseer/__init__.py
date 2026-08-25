@@ -147,6 +147,7 @@ from .collection_adapters import (
     default_collection_adapter_registry,
 )
 from .collection_scheduler import CollectionScheduler, SchedulerCycle, scheduler_status
+from .runtime import seed_default_collection_jobs, runtime_collection_adapter_registry
 from .repair import RepairCoordinator, RepairResult
 from .core import (
     ApprovalLevel,
@@ -356,6 +357,8 @@ __all__ = [
     "CollectionScheduler",
     "SchedulerCycle",
     "scheduler_status",
+    "seed_default_collection_jobs",
+    "runtime_collection_adapter_registry",
     "RepairCoordinator",
     "RepairResult",
     "next_failure_delay",

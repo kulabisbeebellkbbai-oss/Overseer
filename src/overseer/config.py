@@ -145,6 +145,10 @@ def _health_target_from_mapping(data: dict[str, Any]) -> HealthTarget:
         latency_warn_ms=int(data["latency_warn_ms"]) if "latency_warn_ms" in data else None,
         enabled=bool(data.get("enabled", True)),
         suspension_reason=str(data.get("suspension_reason", "")),
+        interval_seconds=data.get("interval_seconds", 120),
+        jitter_seconds=data.get("jitter_seconds", 0),
+        timeout_seconds=data.get("timeout_seconds", 30),
+        repair_policy=data.get("repair_policy", "triage_only"),
     )
 
 

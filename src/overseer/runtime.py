@@ -4,15 +4,228 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from .adapters import HealthProbeAdapter
+from .collection_adapters import (
+    CollectionAdapterRegistry,
+    CollectionExecution,
+    StorePathCallbackAdapter,
+    default_collection_adapter_registry,
+)
+from .collection_models import CollectionJob, CollectionJobKind, CollectionOutcome
+from .collection_scheduler import CollectionScheduler
+from .core import OwnerDomain
+from .health import HealthTarget
 from .host import HostInspectionAdapter, assess_host_security
 from .live_health import RoutedHealthProbeAdapter
 from .runtime_state import RuntimeHeartbeat
 from .store import SQLiteStore
+
+DEFAULT_RUNTIME_MAX_IDLE_SECONDS = 30.0
+DEFAULT_COLLECTION_INTERVALS = {
+    CollectionJobKind.HOST_INSPECTION: 300,
+    CollectionJobKind.PHYSICAL_DISCOVERY: 900,
+    CollectionJobKind.VIRTUAL_DISCOVERY: 300,
+    CollectionJobKind.CREW_DISPATCH: 120,
+    CollectionJobKind.USAGE_CONTINUATION: 120,
+    CollectionJobKind.KNOWLEDGE_CAPTURE: 300,
+    CollectionJobKind.STATION_AUDIT: 600,
+    CollectionJobKind.PACKAGE_INSPECTION: 1800,
+    CollectionJobKind.FRESHNESS_PROJECTION: 60,
+}
+DEFAULT_COLLECTION_TIMEOUTS = {
+    CollectionJobKind.HOST_INSPECTION: 1,
+    CollectionJobKind.PHYSICAL_DISCOVERY: 5,
+    CollectionJobKind.VIRTUAL_DISCOVERY: 5,
+    CollectionJobKind.CREW_DISPATCH: 5,
+    CollectionJobKind.USAGE_CONTINUATION: 5,
+    CollectionJobKind.KNOWLEDGE_CAPTURE: 5,
+    CollectionJobKind.STATION_AUDIT: 5,
+    CollectionJobKind.PACKAGE_INSPECTION: 5,
+    CollectionJobKind.FRESHNESS_PROJECTION: 5,
+}
+RUNTIME_ADAPTER_IDS = {
+    CollectionJobKind.PHYSICAL_DISCOVERY: "physical-discovery",
+    CollectionJobKind.VIRTUAL_DISCOVERY: "virtual-discovery",
+    CollectionJobKind.CREW_DISPATCH: "crew-dispatch",
+    CollectionJobKind.USAGE_CONTINUATION: "usage-continuation",
+    CollectionJobKind.KNOWLEDGE_CAPTURE: "knowledge-capture",
+    CollectionJobKind.STATION_AUDIT: "station-audit",
+    CollectionJobKind.FRESHNESS_PROJECTION: "freshness-projection",
+    CollectionJobKind.HOST_INSPECTION: "host-inspection",
+    CollectionJobKind.PACKAGE_INSPECTION: "package-inspection",
+}
+RUNTIME_JOB_ADAPTER_IDS = {
+    "collection.host.inspection": "host-inspection",
+    "collection.host.security": "host-security",
+    "collection.discovery.physical": "physical-discovery",
+    "collection.discovery.storage": "storage-discovery",
+}
+
+
+def _store_path(value: str | Any) -> str:
+    path = Path(value)
+    if path.is_dir():
+        return str(path / "state.sqlite3")
+    return str(path)
+
+
+def _freshness_projection_status(store_path: str, unit: str) -> dict[str, object]:
+    """Observe only persisted local evidence; external timer work stays external."""
+    with SQLiteStore(store_path) as store:
+        heartbeat = store.load_runtime_heartbeat("overseer") if _has_heartbeat(store, "overseer") else None
+        evidence_id = f"freshness.{unit}"
+        return {
+            "outcome": CollectionOutcome.SUCCEEDED.value,
+            "evidence_ids": (evidence_id,),
+            "observed": heartbeat.last_tick_at if heartbeat else None,
+        }
+
+
+def _has_heartbeat(store: SQLiteStore, service_name: str) -> bool:
+    try:
+        store.load_runtime_heartbeat(service_name)
+    except KeyError:
+        return False
+    return True
+
+
+def runtime_collection_adapter_registry() -> CollectionAdapterRegistry:
+    """Build the exact bounded callback bindings used by seeded jobs."""
+    # Importing the CLI lazily avoids the CLI/runtime module cycle at import time.
+    from .cli import (
+        assess_host_security_status,
+        audit_station_status,
+        dispatch_crew_messages_status,
+        dispatch_usage_continuations_status,
+        discover_physical_status,
+        discover_storage_status,
+        discover_virtual_listeners_status,
+        knowledge_capture_status,
+    )
+
+    registry = default_collection_adapter_registry()
+    callbacks = {
+        (CollectionJobKind.PHYSICAL_DISCOVERY, "physical-discovery"): lambda path: discover_physical_status(
+            ("/dev/serial/by-id", "/dev/serial/by-path"), path
+        ),
+        (CollectionJobKind.PHYSICAL_DISCOVERY, "storage-discovery"): lambda path: discover_storage_status(
+            store_path=path
+        ),
+        (CollectionJobKind.VIRTUAL_DISCOVERY, "virtual-discovery"): lambda path: discover_virtual_listeners_status(path),
+        (CollectionJobKind.CREW_DISPATCH, "crew-dispatch"): lambda path: dispatch_crew_messages_status(path, dispatched_by="sisko"),
+        (CollectionJobKind.USAGE_CONTINUATION, "usage-continuation"): lambda path: dispatch_usage_continuations_status(path, dispatched_by="quark"),
+        (CollectionJobKind.KNOWLEDGE_CAPTURE, "knowledge-capture"): lambda path: knowledge_capture_status(path),
+        (CollectionJobKind.STATION_AUDIT, "station-audit"): lambda path: audit_station_status(path),
+        (CollectionJobKind.FRESHNESS_PROJECTION, "freshness-projection"): lambda job, path: _freshness_projection_status(path, str(job.resource_id)),
+        (CollectionJobKind.HOST_INSPECTION, "host-security"): lambda path: assess_host_security_status(path),
+    }
+    for (kind, adapter_id), callback in callbacks.items():
+        registry.register(kind, adapter_id, StorePathCallbackAdapter(callback, kind=kind))
+    return registry
+
+
+def _default_jobs(targets: tuple[HealthTarget, ...]) -> tuple[CollectionJob, ...]:
+    jobs = [
+        CollectionJob(
+            id=f"collection.health.{target.id}",
+            kind=CollectionJobKind.HEALTH_PROBE,
+            owner_domain=target.owner_domain,
+            resource_id=target.resource_id,
+            target_id=target.id,
+            interval_seconds=target.interval_seconds,
+            jitter_seconds=target.jitter_seconds,
+            timeout_seconds=target.timeout_seconds,
+            repair_policy=target.repair_policy,
+        )
+        for target in targets
+        if target.enabled
+    ]
+    fixed = (
+        ("collection.host.inspection", CollectionJobKind.HOST_INSPECTION, OwnerDomain.ODO, "host.local"),
+        ("collection.host.security", CollectionJobKind.HOST_INSPECTION, OwnerDomain.ODO, "host-security"),
+        ("collection.discovery.physical", CollectionJobKind.PHYSICAL_DISCOVERY, OwnerDomain.KIRA, "physical.discovery"),
+        ("collection.discovery.storage", CollectionJobKind.PHYSICAL_DISCOVERY, OwnerDomain.KIRA, "storage.discovery"),
+        ("collection.discovery.virtual", CollectionJobKind.VIRTUAL_DISCOVERY, OwnerDomain.DAX, "virtual.discovery"),
+        ("collection.dispatch.crew", CollectionJobKind.CREW_DISPATCH, OwnerDomain.SISKO, "crew.dispatch"),
+        ("collection.usage.continuation", CollectionJobKind.USAGE_CONTINUATION, OwnerDomain.QUARK, "usage.continuation"),
+        ("collection.knowledge.capture", CollectionJobKind.KNOWLEDGE_CAPTURE, OwnerDomain.EZRI, "knowledge.capture"),
+        ("collection.station.audit", CollectionJobKind.STATION_AUDIT, OwnerDomain.JULIAN, "station.audit"),
+        ("collection.package.inspection", CollectionJobKind.PACKAGE_INSPECTION, OwnerDomain.OBRIEN, "package.inspection"),
+        ("collection.freshness.psychlo-usage", CollectionJobKind.FRESHNESS_PROJECTION, OwnerDomain.QUARK, "overseer-psychlo-usage.service"),
+        ("collection.freshness.quark-scheduler", CollectionJobKind.FRESHNESS_PROJECTION, OwnerDomain.QUARK, "overseer-quark-scheduler.service"),
+    )
+    jobs.extend(
+        CollectionJob(
+            id=job_id,
+            kind=kind,
+            owner_domain=owner,
+            resource_id=resource_id,
+            interval_seconds=DEFAULT_COLLECTION_INTERVALS[kind],
+            timeout_seconds=DEFAULT_COLLECTION_TIMEOUTS[kind],
+        )
+        for job_id, kind, owner, resource_id in fixed
+    )
+    return tuple(jobs)
+
+
+def seed_default_collection_jobs(
+    store_path: str | Any,
+    config_path: str | Any | None = None,
+) -> dict[str, object]:
+    """Idempotently seed stable definitions while preserving scheduler state."""
+    path = _store_path(store_path)
+    with SQLiteStore(path) as store:
+        if config_path is not None:
+            from .config import load_config, seed_store_from_config
+
+            seed_store_from_config(load_config(config_path), store)
+        registry = runtime_collection_adapter_registry()
+        targets = store.list_health_targets()
+        enabled_target_ids = {target.id for target in targets if target.enabled}
+        seeded: list[str] = []
+        skipped: list[dict[str, str]] = []
+        for existing in store.list_collection_jobs():
+            if (
+                existing.kind is CollectionJobKind.HEALTH_PROBE
+                and existing.target_id is not None
+                and existing.target_id not in enabled_target_ids
+                and existing.enabled
+            ):
+                store.save_collection_job(replace(existing, enabled=False))
+                skipped.append(
+                    {
+                        "job_id": existing.id,
+                        "status": "disabled",
+                        "reason": "health target is disabled",
+                    }
+                )
+        for job in _default_jobs(targets):
+            adapter_id = (
+                "health-probe"
+                if job.kind is CollectionJobKind.HEALTH_PROBE
+                else RUNTIME_JOB_ADAPTER_IDS.get(job.id, RUNTIME_ADAPTER_IDS.get(job.kind))
+            )
+            try:
+                registry.resolve(job, adapter_id)
+            except ValueError as error:
+                skipped.append({"job_id": job.id, "status": "disabled", "reason": str(error)})
+                continue
+            store.save_collection_job(job)
+            seeded.append(job.id)
+        return {
+            "store": str(store.path),
+            "status": "seeded",
+            "jobs": sorted(seeded),
+            "job_count": len(seeded),
+            "disabled": skipped,
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
 
 
 @dataclass(frozen=True)
@@ -65,6 +278,8 @@ class OverseerRuntime:
         station_auditor: Callable[[str, str | None], dict[str, Any]] | None = None,
         station_audit_interval_ticks: int = 120,
         psychlo_bridge: Any | None = None,
+        scheduler: Any | None = None,
+        maximum_idle_seconds: float = DEFAULT_RUNTIME_MAX_IDLE_SECONDS,
     ) -> None:
         self.store = store
         self.service_name = service_name
@@ -84,28 +299,24 @@ class OverseerRuntime:
         self.station_auditor = station_auditor
         self.station_audit_interval_ticks = max(1, station_audit_interval_ticks)
         self.psychlo_bridge = psychlo_bridge
+        seed_default_collection_jobs(store.path)
+        self._owns_scheduler = scheduler is None
+        self.scheduler = scheduler or CollectionScheduler(
+            str(store.path),
+            adapter_registry=runtime_collection_adapter_registry(),
+            adapter_ids={**RUNTIME_ADAPTER_IDS, **RUNTIME_JOB_ADAPTER_IDS},
+        )
+        if maximum_idle_seconds <= 0:
+            raise ValueError("maximum idle seconds must be positive")
+        self.maximum_idle_seconds = min(float(maximum_idle_seconds), DEFAULT_RUNTIME_MAX_IDLE_SECONDS)
         self.started_at = _utc_now()
         self.tick_count = 0
+        self.last_scheduler_cycle: Any | None = None
 
     def tick(self) -> RuntimeTick:
         self.tick_count += 1
         self._save_heartbeat()
-        if self.psychlo_bridge is not None:
-            self.psychlo_bridge.tick()
-        health_probes = self._probe_health_targets()
-        (
-            host_inspections,
-            host_high_findings,
-            host_warning_findings,
-            remediation_plans_staged,
-            ids_reviews_prepared,
-            sisko_requests,
-            auto_executions,
-        ) = self._inspect_host()
-        crew_dispatched, crew_blocked = self._dispatch_crew_messages()
-        usage_dispatched, usage_skipped = self._dispatch_usage_continuations()
-        knowledge_captured, knowledge_failed = self._capture_knowledge_events()
-        station_audits, station_actions, station_odo_referrals, station_sisko_requests = self._audit_station()
+        self.last_scheduler_cycle = self.scheduler.run_ready_once()
         self._save_heartbeat()
         return RuntimeTick(
             resources=len(self.store.list_resources()),
@@ -115,33 +326,46 @@ class OverseerRuntime:
             health_evidence=len(self.store.list_health_evidence()),
             physical_identities=len(self.store.list_physical_identities()),
             runtime_heartbeats=len(self.store.list_runtime_heartbeats()),
-            health_probes=health_probes,
-            host_inspections=host_inspections,
-            host_security_high_findings=host_high_findings,
-            host_security_warning_findings=host_warning_findings,
-            host_security_remediation_plans_staged=remediation_plans_staged,
-            host_security_ids_reviews_prepared=ids_reviews_prepared,
-            host_security_sisko_requests=sisko_requests,
-            host_security_auto_executions=auto_executions,
-            crew_messages_dispatched=crew_dispatched,
-            crew_messages_blocked=crew_blocked,
-            usage_continuations_dispatched=usage_dispatched,
-            usage_continuations_skipped=usage_skipped,
-            knowledge_events_captured=knowledge_captured,
-            knowledge_events_failed=knowledge_failed,
-            station_audits=station_audits,
-            station_audit_actions=station_actions,
-            station_audit_odo_referrals=station_odo_referrals,
-            station_audit_sisko_requests=station_sisko_requests,
+            health_probes=0,
+            host_inspections=0,
+            host_security_high_findings=0,
+            host_security_warning_findings=0,
+            host_security_remediation_plans_staged=0,
+            host_security_ids_reviews_prepared=0,
+            host_security_sisko_requests=0,
+            host_security_auto_executions=0,
+            crew_messages_dispatched=0,
+            crew_messages_blocked=0,
+            usage_continuations_dispatched=0,
+            usage_continuations_skipped=0,
+            knowledge_events_captured=0,
+            knowledge_events_failed=0,
+            station_audits=0,
+            station_audit_actions=0,
+            station_audit_odo_referrals=0,
+            station_audit_sisko_requests=0,
         )
 
     def run(self, interval_seconds: float = 30.0, once: bool = False) -> RuntimeTick:
+        if interval_seconds <= 0:
+            raise ValueError("runtime interval must be positive")
         last_tick = self.tick()
         if once:
+            self.close()
             return last_tick
         while True:
-            time.sleep(interval_seconds)
+            idle = min(float(interval_seconds), self.maximum_idle_seconds)
+            due_at = getattr(self.last_scheduler_cycle, "next_due_at", None)
+            if due_at is not None:
+                due_in = max(0.0, (datetime.fromisoformat(due_at) - datetime.now(UTC)).total_seconds())
+                idle = min(idle, due_in) if due_in else min(idle, 0.25)
+            time.sleep(max(0.0, idle))
             last_tick = self.tick()
+
+    def close(self) -> None:
+        shutdown = getattr(self.scheduler, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
 
     def _probe_health_targets(self) -> int:
         if not self.probe_health_targets:

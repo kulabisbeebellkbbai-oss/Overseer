@@ -1,4 +1,18 @@
 {
+  "collection_jobs": {
+    "seed_on_startup": true,
+    "default_interval_seconds": 120,
+    "maximum_idle_seconds": 30,
+    "global_max_workers": 2,
+    "external_timer_owners": [
+      "overseer-psychlo-usage.timer",
+      "overseer-quark-scheduler.timer"
+    ],
+    "freshness_observations": [
+      "overseer-psychlo-usage.service",
+      "overseer-quark-scheduler.service"
+    ]
+  },
   "checks": [
     {
       "area": "local secret boundary",

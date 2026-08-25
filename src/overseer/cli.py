@@ -68,6 +68,9 @@ from .codex_dispatch_system_activation import (
     validate_codex_dispatch_activation_plan,
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
+from .collection_adapters import bounded_text
+from .collection_models import CollectionJobKind, TriageIncidentStatus
+from .collection_scheduler import scheduler_status
 from .claim_continuation import (
     activate_claim_group_status,
     claim_group_status,
@@ -177,7 +180,7 @@ from .remote_testing import (
     revoke_remote_testing_token_status,
 )
 from .registry import ResourceRegistry
-from .runtime import OverseerRuntime
+from .runtime import OverseerRuntime, seed_default_collection_jobs
 from .runtime_state import (
     DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
     DEFAULT_RUNTIME_FRESHNESS_POLICY,
@@ -1160,6 +1163,10 @@ def record_health_target_status(
     latency_warn_ms: int | None = None,
     enabled: bool = True,
     suspension_reason: str = "",
+    interval_seconds: int = 120,
+    jitter_seconds: int = 0,
+    timeout_seconds: int = 30,
+    repair_policy: str = "triage_only",
 ) -> dict[str, object]:
     suspension_reason = "" if enabled else (suspension_reason or "monitoring suspended by operator")
     health_target = HealthTarget(
@@ -1174,6 +1181,10 @@ def record_health_target_status(
         latency_warn_ms=latency_warn_ms,
         enabled=enabled,
         suspension_reason=suspension_reason,
+        interval_seconds=interval_seconds,
+        jitter_seconds=jitter_seconds,
+        timeout_seconds=timeout_seconds,
+        repair_policy=repair_policy,
     )
     store = SQLiteStore(store_path)
     try:
@@ -1195,6 +1206,10 @@ def record_health_target_status(
             "latency_warn_ms": health_target.latency_warn_ms,
             "enabled": health_target.enabled,
             "suspension_reason": health_target.suspension_reason,
+            "interval_seconds": health_target.interval_seconds,
+            "jitter_seconds": health_target.jitter_seconds,
+            "timeout_seconds": health_target.timeout_seconds,
+            "repair_policy": health_target.repair_policy.value,
             "mutation_performed": True,
             "host_mutation_performed": False,
         }
@@ -2628,6 +2643,7 @@ def run_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
+        seed_default_collection_jobs(store.path)
         psychlo_bridge = None
         if os.environ.get("OVERSEER_PSYCHLO_PEER_SECRET_FILE"):
             bridge_environment = dict(os.environ)
@@ -2677,9 +2693,210 @@ def run_status(
             "station_audit_actions": tick.station_audit_actions,
             "station_audit_odo_referrals": tick.station_audit_odo_referrals,
             "station_audit_sisko_requests": tick.station_audit_sisko_requests,
+            "scheduler": collection_scheduler_status(store.path),
         }
     finally:
         store.close()
+
+
+def _collection_age_seconds(timestamp: str | None, now: datetime | None = None) -> int | None:
+    if timestamp is None:
+        return None
+    current = now or datetime.now(UTC)
+    observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=UTC)
+    return max(0, int((current - observed.astimezone(UTC)).total_seconds()))
+
+
+def collection_jobs_status(store_path: str | Path) -> dict[str, object]:
+    now = datetime.now(UTC)
+    with SQLiteStore(store_path) as store:
+        jobs = sorted(store.list_collection_jobs(), key=lambda job: job.id)
+        states = {state.job_id: state for state in store.list_collection_job_states()}
+        requests = {
+            request.job_id: request
+            for request in store.list_collection_requests()
+            if request.status == "pending"
+        }
+        incidents_by_job: dict[str, list[object]] = {}
+        for incident in store.list_triage_incidents():
+            incidents_by_job.setdefault(incident.job_id, []).append(incident)
+        rows: list[dict[str, object]] = []
+        for job in jobs:
+            state = states.get(job.id)
+            request = requests.get(job.id)
+            rows.append(
+                {
+                    "id": job.id,
+                    "kind": job.kind.value,
+                    "owner_domain": job.owner_domain.value,
+                    "resource_id": job.resource_id,
+                    "target_id": job.target_id,
+                    "enabled": job.enabled,
+                    "interval_seconds": job.interval_seconds,
+                    "jitter_seconds": job.jitter_seconds,
+                    "timeout_seconds": job.timeout_seconds,
+                    "repair_policy": job.repair_policy.value,
+                    "priority": job.priority,
+                    "concurrency_key": job.concurrency_key,
+                    "next_due_at": state.next_due_at if state else None,
+                    "due_age_seconds": _collection_age_seconds(state.next_due_at, now) if state else None,
+                    "last_started_at": state.last_started_at if state else None,
+                    "last_completed_at": state.last_completed_at if state else None,
+                    "data_age_seconds": _collection_age_seconds(
+                        state.last_completed_at if state else None, now
+                    ),
+                    "last_outcome": state.last_outcome.value if state and state.last_outcome else None,
+                    "consecutive_failures": state.consecutive_failures if state else 0,
+                    "circuit_state": state.circuit_state.value if state else None,
+                    "cooldown_until": state.cooldown_until if state else None,
+                    "active_lease": (
+                        {
+                            "id": state.active_lease_id,
+                            "owner": state.lease_owner,
+                            "expires_at": state.lease_expires_at,
+                            "generation": state.lease_generation,
+                        }
+                        if state and state.active_lease_id
+                        else None
+                    ),
+                    "pending_request": (
+                        {
+                            "id": request.id,
+                            "requested_at": request.requested_at,
+                            "requester": request.requester,
+                            "earliest_execution_at": request.earliest_execution_at,
+                            "reason": bounded_text(request.reason),
+                        }
+                        if request
+                        else None
+                    ),
+                    "incidents": [
+                        {
+                            "id": incident.id,
+                            "status": incident.status.value,
+                            "severity": incident.severity.value,
+                            "generation": incident.generation,
+                        }
+                        for incident in sorted(incidents_by_job.get(job.id, ()), key=lambda item: item.id)
+                    ],
+                }
+            )
+    return {"status": "ok", "jobs": rows, "job_count": len(rows)}
+
+
+def collection_scheduler_status(store_path: str | Path) -> dict[str, object]:
+    with SQLiteStore(store_path) as store:
+        requests = store.list_collection_requests()
+        incidents = store.list_triage_incidents()
+        jobs = store.list_collection_jobs()
+        states = store.list_collection_job_states()
+    status = scheduler_status(store_path)
+    status.update(
+        {
+            "status": "ok",
+            "pending_request_count": sum(1 for item in requests if item.status == "pending"),
+            "request_count": len(requests),
+            "open_incident_count": sum(1 for item in incidents if item.status is TriageIncidentStatus.OPEN),
+            "resolved_incident_count": sum(1 for item in incidents if item.status is TriageIncidentStatus.RESOLVED),
+            "enabled_job_count": sum(1 for item in jobs if item.enabled),
+            "leased_job_ids": sorted(item.job_id for item in states if item.active_lease_id),
+            "durable_status": True,
+        }
+    )
+    return status
+
+
+def collection_runs_status(
+    store_path: str | Path,
+    job_id: str | None = None,
+    limit: int = 50,
+) -> dict[str, object]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        raise ValueError("collection run limit must be between 1 and 1000")
+    with SQLiteStore(store_path) as store:
+        runs = [run for run in store.list_collection_runs() if job_id is None or run.job_id == job_id]
+    runs.sort(key=lambda run: (run.started_at, run.id), reverse=True)
+    rows = [
+        {
+            "id": run.id,
+            "job_id": run.job_id,
+            "trigger": run.trigger,
+            "started_at": run.started_at,
+            "completed_at": run.completed_at,
+            "outcome": run.outcome.value,
+            "summary": run.summary,
+            "evidence_ids": list(run.evidence_ids),
+            "error_category": run.error_category,
+            "retry_disposition": run.retry_disposition,
+            "request_id": run.request_id,
+        }
+        for run in runs[:limit]
+    ]
+    return {"status": "ok", "runs": rows, "run_count": len(rows), "limit": limit, "job_id": job_id}
+
+
+def collection_incidents_status(
+    store_path: str | Path,
+    status: str | None = None,
+) -> dict[str, object]:
+    if status is not None:
+        status = TriageIncidentStatus(status).value
+    with SQLiteStore(store_path) as store:
+        incidents = [
+            incident
+            for incident in store.list_triage_incidents()
+            if status is None or incident.status.value == status
+        ]
+    incidents.sort(key=lambda incident: (incident.latest_failure_at, incident.id), reverse=True)
+    rows = [
+        {
+            "id": incident.id,
+            "job_id": incident.job_id,
+            "resource_id": incident.resource_id,
+            "first_failure_at": incident.first_failure_at,
+            "latest_failure_at": incident.latest_failure_at,
+            "severity": incident.severity.value,
+            "owner_domain": incident.owner_domain.value,
+            "evidence_ids": list(incident.evidence_ids),
+            "status": incident.status.value,
+            "repair_state": incident.repair_state,
+            "resolution": incident.resolution,
+            "generation": incident.generation,
+        }
+        for incident in incidents
+    ]
+    return {"status": "ok", "incidents": rows, "incident_count": len(rows), "filter": status}
+
+
+def request_collection_run_status(
+    store_path: str | Path,
+    job_id: str,
+    requested_by: str,
+    reason: str,
+) -> dict[str, object]:
+    with SQLiteStore(store_path) as store:
+        before = {
+            request.id
+            for request in store.list_collection_requests()
+            if request.job_id == job_id and request.status == "pending"
+        }
+        request = store.request_collection_run(job_id, requested_by, reason)
+    return {
+        "status": "coalesced" if request.id in before else "queued",
+        "request": {
+            "id": request.id,
+            "job_id": request.job_id,
+            "requested_by": request.requester,
+            "requested_at": request.requested_at,
+            "reason": bounded_text(request.reason),
+            "status": request.status,
+        },
+        "inline_execution": False,
+        "mutation_performed": True,
+        "host_mutation_performed": False,
+    }
 
 
 def service_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
@@ -10505,6 +10722,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_health_target_parser.add_argument("--expected-status", type=int)
     record_health_target_parser.add_argument("--expected-content-type")
     record_health_target_parser.add_argument("--latency-warn-ms", type=int)
+    record_health_target_parser.add_argument("--interval-seconds", type=int, default=120)
+    record_health_target_parser.add_argument("--jitter-seconds", type=int, default=0)
+    record_health_target_parser.add_argument("--timeout-seconds", type=int, default=30)
+    record_health_target_parser.add_argument("--repair-policy", choices=("triage_only", "preapproved_low_risk"), default="triage_only")
     enablement_group = record_health_target_parser.add_mutually_exclusive_group()
     enablement_group.add_argument("--enabled", dest="enabled", action="store_true", default=True)
     enablement_group.add_argument("--disabled", dest="enabled", action="store_false")
@@ -10745,18 +10966,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     security_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     health_efficiency_parser = subparsers.add_parser("health-efficiency", help="summarize service health efficiency")
     health_efficiency_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    collection_jobs_parser = subparsers.add_parser(
+        "collection-jobs", help="read durable collection job definitions and scheduler state as JSON"
+    )
+    collection_jobs_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    collection_scheduler_parser = subparsers.add_parser(
+        "collection-scheduler-status", help="read durable collection scheduler status as JSON"
+    )
+    collection_scheduler_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    collection_runs_parser = subparsers.add_parser(
+        "collection-runs", help="read bounded durable collection runs as JSON"
+    )
+    collection_runs_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    collection_runs_parser.add_argument("--job-id")
+    collection_runs_parser.add_argument("--limit", type=int, default=50)
+    collection_incidents_parser = subparsers.add_parser(
+        "collection-incidents", help="read durable collection incidents as JSON"
+    )
+    collection_incidents_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    collection_incidents_parser.add_argument("--status", choices=[item.value for item in TriageIncidentStatus])
+    request_collection_parser = subparsers.add_parser(
+        "request-collection-run", help="queue one collection run without executing it inline"
+    )
+    request_collection_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    request_collection_parser.add_argument("--job-id", required=True)
+    request_collection_parser.add_argument("--requested-by", required=True)
+    request_collection_parser.add_argument("--reason", required=True)
+    seed_collection_parser = subparsers.add_parser(
+        "seed-collection-jobs", help="idempotently seed scheduler-owned collection jobs"
+    )
+    seed_collection_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    seed_collection_parser.add_argument("--config", help="optional config to seed before job definitions")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
     run_parser.add_argument("--interval-seconds", type=float, default=30.0)
-    run_parser.add_argument("--probe-health-targets", action="store_true", help="probe configured health targets on each tick")
+    run_parser.add_argument("--probe-health-targets", action="store_true", help="deprecated: idempotently seed health jobs; scheduling is scheduler-owned")
     run_parser.add_argument("--health-probe-timeout-seconds", type=float, default=5.0)
     run_parser.add_argument("--health-evidence-retention-per-target", type=int, default=5)
-    run_parser.add_argument("--inspect-host", action="store_true", help="capture a read-only host inspection snapshot on each tick")
-    run_parser.add_argument("--dispatch-crew-messages", action="store_true", help="dispatch open crew messages on each tick while preserving exact approval gates")
-    run_parser.add_argument("--dispatch-usage-continuations", action="store_true", help="dispatch ready usage-limited continuation handoffs on each tick without resuming threads")
-    run_parser.add_argument("--capture-knowledge-events", action="store_true", help="capture crew messages and audit events into Ezri's Documents vault")
-    run_parser.add_argument("--audit-station", action="store_true", help="run periodic safe crew-domain audits and route unknowns to Odo")
+    run_parser.add_argument("--inspect-host", action="store_true", help="deprecated: idempotently seed host jobs; scheduling is scheduler-owned")
+    run_parser.add_argument("--dispatch-crew-messages", action="store_true", help="deprecated: idempotently seed crew-dispatch jobs; scheduling is scheduler-owned")
+    run_parser.add_argument("--dispatch-usage-continuations", action="store_true", help="deprecated: idempotently seed usage jobs; scheduling is scheduler-owned")
+    run_parser.add_argument("--capture-knowledge-events", action="store_true", help="deprecated: idempotently seed knowledge jobs; scheduling is scheduler-owned")
+    run_parser.add_argument("--audit-station", action="store_true", help="deprecated: idempotently seed station-audit jobs; scheduling is scheduler-owned")
     run_parser.add_argument("--station-audit-interval-ticks", type=int, default=120, help="runtime ticks between station audits")
     station_audit_parser = subparsers.add_parser("audit-station", help="run one safe crew-domain station audit and route unknowns to Odo")
     station_audit_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -11696,6 +11948,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.latency_warn_ms,
                     args.enabled,
                     args.suspension_reason,
+                    args.interval_seconds,
+                    args.jitter_seconds,
+                    args.timeout_seconds,
+                    args.repair_policy,
                 ),
                 sort_keys=True,
             )
@@ -12102,6 +12358,37 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "health-efficiency":
         print(json.dumps(health_efficiency_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "collection-jobs":
+        print(json.dumps(collection_jobs_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "collection-scheduler-status":
+        print(json.dumps(collection_scheduler_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "collection-runs":
+        print(json.dumps(collection_runs_status(args.store, args.job_id, args.limit), sort_keys=True))
+        return 0
+
+    if args.command == "collection-incidents":
+        print(json.dumps(collection_incidents_status(args.store, args.status), sort_keys=True))
+        return 0
+
+    if args.command == "request-collection-run":
+        print(
+            json.dumps(
+                request_collection_run_status(
+                    args.store, args.job_id, args.requested_by, args.reason
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "seed-collection-jobs":
+        print(json.dumps(seed_default_collection_jobs(args.store, args.config), sort_keys=True))
         return 0
 
     if args.command == "run":

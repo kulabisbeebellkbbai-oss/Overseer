@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .core import OwnerDomain
+from .collection_models import RepairPolicy
 
 
 class ProbeType(StrEnum):
@@ -42,6 +43,23 @@ class HealthTarget:
     latency_warn_ms: int | None = None
     enabled: bool = True
     suspension_reason: str = ""
+    interval_seconds: int = 120
+    jitter_seconds: int = 0
+    timeout_seconds: int = 30
+    repair_policy: RepairPolicy = RepairPolicy.TRIAGE_ONLY
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "probe_type", ProbeType(self.probe_type))
+        object.__setattr__(self, "owner_domain", OwnerDomain(self.owner_domain))
+        object.__setattr__(self, "repair_policy", RepairPolicy(self.repair_policy))
+        if isinstance(self.enabled, bool) is False:
+            raise ValueError("health target enabled must be a boolean")
+        if isinstance(self.interval_seconds, bool) or not isinstance(self.interval_seconds, int) or self.interval_seconds <= 0:
+            raise ValueError("interval must be a positive integer")
+        if isinstance(self.jitter_seconds, bool) or not isinstance(self.jitter_seconds, int) or self.jitter_seconds < 0:
+            raise ValueError("jitter must be a non-negative integer")
+        if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, int) or self.timeout_seconds <= 0:
+            raise ValueError("timeout must be a positive integer")
 
 
 @dataclass(frozen=True)

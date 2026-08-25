@@ -2756,6 +2756,10 @@ def _health_target_args(payload: dict[str, Any]) -> dict[str, Any]:
         "latency_warn_ms": int(payload["latency_warn_ms"]) if payload.get("latency_warn_ms") is not None else None,
         "enabled": bool(payload.get("enabled", True)),
         "suspension_reason": str(payload.get("suspension_reason") or ""),
+        "interval_seconds": payload.get("interval_seconds", 120),
+        "jitter_seconds": payload.get("jitter_seconds", 0),
+        "timeout_seconds": payload.get("timeout_seconds", 30),
+        "repair_policy": str(payload.get("repair_policy", "triage_only")),
     }
 
 

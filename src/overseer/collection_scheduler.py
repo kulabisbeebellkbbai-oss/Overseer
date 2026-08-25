@@ -71,6 +71,13 @@ def _run_id(job_id: str, lease_id: str, generation: int) -> str:
     return f"run.collection.{digest}"
 
 
+def _not_before_started(started_at: str, completed_at: str) -> str:
+    """Keep fast worker completion valid when the coordinator clock was sampled first."""
+    started = _parse_now(started_at)
+    completed = _parse_now(completed_at)
+    return max(started, completed).isoformat()
+
+
 class CollectionScheduler:
     def __init__(
         self,
@@ -107,7 +114,11 @@ class CollectionScheduler:
         return value
 
     def _adapter_id(self, job: CollectionJob) -> str | None:
-        return self.adapter_ids.get(job.kind) or self.adapter_ids.get(job.kind.value)
+        return (
+            self.adapter_ids.get(job.id)
+            or self.adapter_ids.get(job.kind)
+            or self.adapter_ids.get(job.kind.value)
+        )
 
     def _active_keys(self) -> set[str]:
         with self._lock:
@@ -207,12 +218,13 @@ class CollectionScheduler:
             if work.timed_out or self._active.get(work.lease_id) is not work:
                 return
             work.timed_out = True
+            completed_at = _not_before_started(work.started_at, now)
             run = CollectionRun(
                 id=_run_id(work.job.id, work.lease_id, work.lease_generation),
                 job_id=work.job.id,
                 trigger="scheduled",
                 started_at=work.started_at,
-                completed_at=now,
+                completed_at=completed_at,
                 outcome=CollectionOutcome.TIMED_OUT,
                 summary="collection deadline exceeded",
                 error_category="timeout",
@@ -250,12 +262,13 @@ class CollectionScheduler:
                 "collection adapter failed internally",
                 failure_category="internal_error",
             )
+        completed_at = _not_before_started(work.started_at, now)
         run = CollectionRun(
             id=_run_id(work.job.id, work.lease_id, work.lease_generation),
             job_id=work.job.id,
             trigger="scheduled",
             started_at=work.started_at,
-            completed_at=now,
+            completed_at=completed_at,
             outcome=execution.outcome,
             # Adapter summaries are diagnostics, not a scheduler evidence
             # channel. Persist only the bounded outcome label.
@@ -277,7 +290,6 @@ class CollectionScheduler:
         if execution.outcome is CollectionOutcome.SUCCEEDED:
             return 1, 0, 0
         return 0, 1, 1 if execution.outcome is CollectionOutcome.TIMED_OUT else 0
-
     def _reap_done(self, now: str) -> tuple[int, int, int]:
         counts = [0, 0, 0]
         with self._lock:

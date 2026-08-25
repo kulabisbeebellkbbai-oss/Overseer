@@ -4037,7 +4037,15 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("data-action=\"register-health-target\"", html)
             self.assertIn("/health-targets", html)
             self.assertIn("data-action=\"discover-listeners\"", html)
-            self.assertIn("data-action=\"run-health-probes\"", html)
+            self.assertIn('collectionsStatus: "/collections/status"', html)
+            self.assertIn('collectionsJobs: "/collections/jobs"', html)
+            self.assertIn('collectionsRuns: "/collections/runs"', html)
+            self.assertIn('collectionsIncidents: "/collections/incidents"', html)
+            self.assertIn('postJson(`/collections/jobs/${jobId}/run`', html)
+            self.assertIn("data-collection-run-job", html)
+            self.assertIn('data-collection-run-filter="true"', html)
+            self.assertNotIn("data-action=\"run-health-probes\"", html)
+            self.assertNotIn('postJson("/health/probes/run"', html)
             self.assertEqual(error.exception.code, 401)
 
     def test_loopback_api_authorizes_gateway_target_with_admin_mediated_remote_token(self):

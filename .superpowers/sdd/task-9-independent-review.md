@@ -1,4 +1,4 @@
-# Task 9 Independent Review — not approved
+# Task 9 Independent Review — approved after correction
 
 ## Scope and review boundary
 
@@ -7,7 +7,7 @@ Reviewed `92be49a` and `7c07406` against parent `4ff624a` in the isolated
 install, reload, enable, start, stop, restart, or otherwise modify a live unit,
 store, gateway, timer, or external project.
 
-## Findings
+## Prior findings — resolved by the correction
 
 ### Important — the source unit cannot start with the documented portable environment
 
@@ -78,11 +78,59 @@ store, gateway, timer, or external project.
   compatibility and external-project non-mutation boundaries, and states the
   low-risk versus approval-required repair boundary.
 
+## Correction re-review: `856497c` and `0a74029`
+
+### Findings
+
+No Blocking, Critical, or Important findings remain in the corrected Task 9
+scope.
+
+- **Resolved unit portability finding:** `systemd/overseer.service:8-9` now
+  uses literal `/usr/bin/test` for the installation check and literal
+  `/usr/bin/env --` as `ExecStart` argv zero. Fully resolved `PYTHONPATH` is
+  supplied by the 0600 environment file rather than recursively derived in
+  `Environment=`. Real `systemd-analyze verify systemd/overseer.service`
+  completed with exit status zero; the disposable verifier contract also runs
+  `systemd-analyze` without installing a unit.
+- **Resolved reproducibility finding:**
+  `docs/v1.1-operations.md:141-335` provides an exact placeholder-bound,
+  WAL-consistent disposable canary. It uses SQLite's read-only online backup,
+  refuses canary overwrite, seeds/migrates only the disposable store, disables
+  every unsafe collector before `run --once`, and records bounded scheduler,
+  queue/coalescing, status, and checksum evidence.
+- **Activation and rollback contract:**
+  `docs/v1.1-operations.md:338-711` keeps all mutating commands explicitly
+  approval-bound. It captures prior unit/environment manifests at
+  `$OVERSEER_ROLLBACK_ROOT/prior-config.sha256`, stores the canonical backup
+  manifest at `$OVERSEER_ROLLBACK_ROOT/pre-v1.1.sqlite3.sha256`, captures raw
+  stopped database-sidecar evidence in `$OVERSEER_ROLLBACK_ROOT/prior-store.sha256`,
+  and verifies forensic manifests under `$OVERSEER_FORENSIC_ROOT`. Rollback
+  independently restores runtime enablement, runtime activity, and API
+  activity, failing closed for unsupported prior states.
+- **Secret and compatibility boundary:** prefix verification reads the token
+  internally from its path and uses `urllib.request`; no bearer token is placed
+  in shell argv or emitted into the documented output. The runbook continues
+  to prohibit live changes before approval and preserves Psychlo/Quark external
+  timer ownership, gateway-prefix/API compatibility, and external-project
+  non-mutation boundaries.
+
+### Re-review evidence
+
+- `systemd-analyze verify systemd/overseer.service`: passed (exit status zero).
+- `PYTHONPATH=src pytest -q tests/test_collection_systemd.py
+  tests/test_collection_runtime.py tests/test_collection_api.py
+  tests/test_performance_regression.py`: `41 passed`.
+- `git diff --check 79983c7..0a74029`: passed. The correction touches only the
+  source unit, its tests, README/runtime/runbook documentation, and Task 9
+  evidence; it does not modify a live unit/store/service or any external
+  project.
+
 ## Decision and residual activation risks
 
-Task 9 is **not approved** until both Important findings are corrected and
-independently re-reviewed. After correction, activation still requires the
-separate human-approved, exact change plan and live canary evidence; this
-review is source-only and does not establish the correctness of any particular
-interpreter, checkout, environment file, store, API process, existing timer,
-or rollback artifact on the host.
+Task 9 is **APPROVED** as corrected source and documentation. This approval is
+not authorization to activate it. A separately approved, exact live change
+plan and successful disposable-store canary remain required before any unit
+installation, daemon reload, migration, enablement, start, restart, or rollback
+operation. This source review does not establish live interpreter, store,
+API-process, existing-timer, filesystem-permission, or rollback-artifact
+readiness on the host.

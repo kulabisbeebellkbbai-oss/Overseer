@@ -5,8 +5,8 @@ After=default.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/overseer/runtime.env
-Environment=PYTHONPATH=${OVERSEER_INSTALL}/src
-ExecStart=${OVERSEER_PYTHON} -m overseer.cli run --store ${OVERSEER_STORE}
+ExecStartPre=/usr/bin/test -d ${OVERSEER_INSTALL}/src
+ExecStart=/usr/bin/env -- ${OVERSEER_PYTHON} -m overseer.cli run --store ${OVERSEER_STORE}
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15

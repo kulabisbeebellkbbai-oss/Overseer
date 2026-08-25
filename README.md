@@ -150,9 +150,10 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 
 Overseer v1.1 runs collectors on independent durable schedules. The dashboard
 and API read scheduler projections; run-now controls only queue/coalesce a
-request. The source unit uses `OVERSEER_PYTHON`, `OVERSEER_INSTALL`, and
-`OVERSEER_STORE` from a 0600 environment file and is not installed or activated
-by this repository task. See [v1.1 operations](docs/v1.1-operations.md) for
+request. The source unit loads fully resolved `OVERSEER_PYTHON`,
+`OVERSEER_INSTALL`, `OVERSEER_STORE`, and `PYTHONPATH` values from a 0600
+environment file and is not installed or activated by this repository task.
+See [v1.1 operations](docs/v1.1-operations.md) for
 defaults, failure/repair states, migration, canary, rollback, and the exact
 activation gate.
 

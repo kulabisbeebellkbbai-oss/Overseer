@@ -16,4 +16,4 @@
 | 7. Add API scheduler projections and queue-only mutations | Complete | Approved, no findings |
 | 8. Update the responsive dashboard projection | Complete | Approved, no remaining findings |
 | 9. Add service templates and operator documentation | Complete | Corrected in `856497c`; independently approved in `3d12f44` |
-| 10. Complete verification and security review | Complete | Final Daybreak review approved at `08bafba`; release reports ready |
+| 10. Complete verification and security review | Complete | Final Daybreak review approved source/package commit `2485a11`, tree `78adfc70`, and wheel SHA-256 `61644937...2887`; live activation remains separate |

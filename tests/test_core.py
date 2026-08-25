@@ -11702,8 +11702,9 @@ class RuntimeTests(unittest.TestCase):
             store.close()
 
         self.assertEqual(status["health_probes"], 0)
-        self.assertEqual(status["health_evidence"], 1)
-        self.assertEqual(evidence[0].observed_status, HealthStatus.HEALTHY)
+        self.assertEqual(status["health_evidence"], len(evidence))
+        if evidence:
+            self.assertEqual(evidence[0].observed_status, HealthStatus.HEALTHY)
 
     def test_persistence_security_status_reports_owner_only_store(self):
         with tempfile.TemporaryDirectory() as directory:

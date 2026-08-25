@@ -221,6 +221,25 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
         ):
             self.assertIn(label, OPERATOR_CONSOLE_HTML)
 
+    def test_scheduler_endpoint_registrations_match_protected_prefix_contract(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        expected = {
+            "runtime": "/runtime-status",
+            "listenerReviewQueue": "/host/security/listener-review-queue",
+            "sourceReviewQueue": "/host/security/source-review-queue",
+            "collectionsStatus": "/collections/status",
+            "collectionsJobs": "/collections/jobs",
+            "collectionsRuns": "/collections/runs",
+            "collectionsIncidents": "/collections/incidents",
+        }
+        for key, path in expected.items():
+            with self.subTest(key=key):
+                self.assertIn(f'{key}: "{path}"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('const apiBase = protectedGatewayPath ? "/Overseer" : ""', OPERATOR_CONSOLE_HTML)
+        self.assertIn('const target = `${apiBase}${path}`', OPERATOR_CONSOLE_HTML)
+        self.assertIn("mapEndpointEntries(endpointEntries, 4)", OPERATOR_CONSOLE_HTML)
+
     def test_scheduler_helpers_and_refresh_coalescing_execute_in_node(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
 
@@ -240,17 +259,29 @@ const payload = collectionRunPayload("collection.health.api");
 if (payload.requested_by !== "operator" || payload.reason !== "operator requested dashboard run") process.exit(8);
 if (!requestIsPending({pending_request:{id:"request.collection.1"}}, new Set())) process.exit(9);
 if (!requestIsPending({id:"collection.health.api", pending_request:null}, new Set(["collection.health.api"]))) process.exit(10);
+if (earliestExecutionLabel({earliest_execution_at:null, circuit:{state:"open", cooldown_until:"2026-08-24T12:10:00Z"}}) !== "cooldown until 2026-08-24T12:10:00Z") process.exit(11);
+if (earliestExecutionLabel({earliest_execution_at:null, circuit:{state:"open"}}) !== "blocked by open circuit") process.exit(12);
 const focus = captureFocusTarget({id:"scheduler-run-filter", dataset:{collectionRunJob:"collection.health.api"}});
-const focused = {focus(){ this.didFocus = true; }};
-const fakeDocument = {getElementById(id) { return id === focus.id ? focused : null; }, querySelector() { return null; }};
-if (restoreFocusTarget(focus, fakeDocument) !== focused || !focused.didFocus) process.exit(11);
+const fakeDocument = {activeElement:null, getElementById(id) { return id === focus.id ? focused : null; }, querySelector() { return null; }};
+const focused = {focus(){ this.didFocus = true; fakeDocument.activeElement = this; }};
+if (restoreFocusTarget(focus, fakeDocument) !== focused || !focused.didFocus || fakeDocument.activeElement !== focused) process.exit(13);
+const disabled = {disabled:true};
+const actionStatus = {hidden:false, tabIndex:-1, focus(){ this.didFocus = true; disabledDocument.activeElement = this; }};
+const disabledDocument = {activeElement:null, getElementById(id) { return id === focus.id ? disabled : id === "action-status" ? actionStatus : null; }, querySelectorAll() { return []; }};
+if (restoreFocusTarget(focus, disabledDocument) !== actionStatus || !actionStatus.didFocus || disabledDocument.activeElement !== actionStatus) process.exit(14);
+const filteredFocus = captureFocusTarget({dataset:{collectionRunFilter:"true"}});
+const filteredButton = {disabled:true, dataset:{collectionRunFilter:"true"}};
+const filteredStatus = {hidden:false, tabIndex:-1, focus(){ this.didFocus = true; filteredDocument.activeElement = this; }};
+const filteredDocument = {activeElement:null, getElementById(id) { return id === "action-status" ? filteredStatus : null; }, querySelectorAll(selector) { return selector === "[data-collection-run-filter]" ? [filteredButton] : []; }};
+if (filteredFocus.collectionRunFilter !== "true") process.exit(15);
+if (restoreFocusTarget(filteredFocus, filteredDocument) !== filteredStatus || !filteredStatus.didFocus || filteredDocument.activeElement !== filteredStatus) process.exit(16);
 let refreshPromise = null;
 let refreshCalls = 0;
 function performRefresh() { refreshCalls += 1; return Promise.resolve("ready"); }
 const first = refresh();
 const second = refresh();
-if (first !== second) process.exit(12);
-Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(13); });
+if (first !== second) process.exit(17);
+Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(18); });
 '''
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -262,6 +293,28 @@ Promise.all([first, second]).then(() => { if (refreshCalls !== 1) process.exit(1
         self.assertIn("restoreFocusTarget(focusTarget)", OPERATOR_CONSOLE_HTML)
         self.assertIn('<button type="button" class="action-btn" data-action="cancel-admin-change">Cancel</button>', OPERATOR_CONSOLE_HTML)
         self.assertIn('<button type="button" class="action-btn" data-disabled-action="cancel-agent"', OPERATOR_CONSOLE_HTML)
+
+    def test_scheduler_filter_and_narrow_forced_desktop_contract(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn('selectedCollectionRunJob: ""', OPERATOR_CONSOLE_HTML)
+        self.assertIn('state.selectedCollectionRunJob = event.target.value', OPERATOR_CONSOLE_HTML)
+        self.assertIn('const selectedJobId = jobs.some((job) => job.id === state.selectedCollectionRunJob)', OPERATOR_CONSOLE_HTML)
+        self.assertIn('job.id === selectedJobId ? " selected" : ""', OPERATOR_CONSOLE_HTML)
+        self.assertNotIn('body[data-layout-effective="desktop"] { overflow-x: hidden; }', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.grid > *, .toolbar > *, .actions > *, .scheduler-panel { min-width: 0; }', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.scheduler-panel .pill {', OPERATOR_CONSOLE_HTML)
+        self.assertIn('max-width: 100%;', OPERATOR_CONSOLE_HTML)
+        self.assertIn('white-space: normal;', OPERATOR_CONSOLE_HTML)
+        self.assertIn('overflow-wrap: anywhere;', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.scheduler-panel .table-scroll { min-width: 0; }', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.scheduler-panel .action-btn, .scheduler-panel select { min-height: 44px; min-width: 44px; }', OPERATOR_CONSOLE_HTML)
+        self.assertIn('@media (max-width: 390px)', OPERATOR_CONSOLE_HTML)
+        self.assertIn('body[data-layout-effective="desktop"] .shell { grid-template-columns: 96px minmax(224px, 1fr); }', OPERATOR_CONSOLE_HTML)
+        self.assertIn('id="action-status" class="panel action-status" role="status" aria-live="polite" tabindex="-1" hidden', OPERATOR_CONSOLE_HTML)
+        self.assertIn('collectionRunFilter: element.dataset?.collectionRunFilter || ""', OPERATOR_CONSOLE_HTML)
+        self.assertIn('id="action-status" class="panel action-status" role="status" aria-live="polite" tabindex="-1" hidden', OPERATOR_CONSOLE_HTML)
+        self.assertIn('collectionRunFilter: element.dataset?.collectionRunFilter || ""', OPERATOR_CONSOLE_HTML)
 
     def test_sisko_page_has_roadex_final_human_decision_card(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML

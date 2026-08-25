@@ -231,6 +231,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       grid-template-columns: repeat(12, minmax(0, 1fr));
       gap: 12px;
     }
+    .grid > *, .toolbar > *, .actions > *, .scheduler-panel { min-width: 0; }
     .panel {
       position: relative;
       background:
@@ -351,6 +352,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       width: 100%;
       max-width: 100%;
       overflow-x: auto;
+    }
+    .scheduler-panel .table-scroll { min-width: 0; }
+    .scheduler-panel .pill {
+      max-width: 100%;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
     th, td {
       border-bottom: 1px solid rgba(185, 166, 255, 0.18);
@@ -705,7 +712,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     body[data-layout-effective="desktop"] .span-6 { grid-column: span 6; }
     body[data-layout-effective="desktop"] .span-8 { grid-column: span 8; }
     #driver .action-btn { min-height: 44px; }
-    .scheduler-panel .action-btn, .scheduler-panel select { min-height: 44px; }
+    .scheduler-panel .action-btn, .scheduler-panel select { min-height: 44px; min-width: 44px; }
     .nav button[data-view="driver"],
     #driver input, #driver select { min-height: 44px; }
     body[data-layout-effective="desktop"] aside { width: min(294px, 28vw); }
@@ -762,7 +769,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         </form>
       </div>
       <div id="error" class="panel error" hidden></div>
-      <div id="action-status" class="panel action-status" hidden></div>
+      <div id="action-status" class="panel action-status" role="status" aria-live="polite" tabindex="-1" hidden></div>
       <section id="overview" class="section active"></section>
       <section id="driver" class="section"></section>
       <section id="admin" class="section"></section>
@@ -861,7 +868,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       lastAction: null,
       lastUpdatedAt: null,
       lastUiRefreshAt: null,
-      pendingCollectionRuns: new Set()
+      pendingCollectionRuns: new Set(),
+      selectedCollectionRunJob: ""
     };
     state.driverSelection = {};
     const AUTO_REFRESH_MS = 30000;
@@ -895,6 +903,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const cooldown = typeof circuit === "object" ? circuit?.cooldown_until : null;
       return `${state || "unknown"}${cooldown ? ` · cooldown ${cooldown}` : ""}`;
     }
+    function earliestExecutionLabel(result) {
+      if (result?.earliest_execution_at) return result.earliest_execution_at;
+      const circuit = result?.circuit || {};
+      if (circuit.cooldown_until) return `cooldown until ${circuit.cooldown_until}`;
+      if (circuit.state === "open") return "blocked by open circuit";
+      return "scheduler decides";
+    }
     function collectionRunPayload(jobId) {
       return {requested_by: "operator", reason: "operator requested dashboard run"};
     }
@@ -906,6 +921,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return {
         id: element.id || "",
         collectionRunJob: element.dataset?.collectionRunJob || "",
+        collectionRunFilter: element.dataset?.collectionRunFilter || "",
         view: element.dataset?.view || ""
       };
     }
@@ -916,9 +932,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         const candidates = targetDocument.querySelectorAll?.("[data-collection-run-job]") || [];
         target = Array.from(candidates).find((item) => item.dataset?.collectionRunJob === focusTarget.collectionRunJob) || null;
       }
+      if (!target && focusTarget.collectionRunFilter) {
+        const candidates = targetDocument.querySelectorAll?.("[data-collection-run-filter]") || [];
+        target = Array.from(candidates).find((item) => item.dataset?.collectionRunFilter === focusTarget.collectionRunFilter) || null;
+      }
       if (!target && focusTarget.view) {
         const candidates = targetDocument.querySelectorAll?.("[data-view]") || [];
         target = Array.from(candidates).find((item) => item.dataset?.view === focusTarget.view) || null;
+      }
+      if (target?.disabled === true || target?.hidden === true) {
+        const actionStatus = targetDocument.getElementById("action-status");
+        target = actionStatus && actionStatus.hidden !== true
+          ? actionStatus
+          : targetDocument.getElementById("scheduler-run-filter") || null;
       }
       if (target) {
         target.focus({preventScroll: true});
@@ -1012,6 +1038,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       await runAction(button.dataset.action, button);
     });
     document.addEventListener("change", (event) => {
+      if (event.target.closest("#scheduler-run-filter")) {
+        state.selectedCollectionRunJob = event.target.value || "";
+        return;
+      }
       if (!event.target.closest("#driver")) return;
       state.driverSelection[event.target.id] = event.target.value;
       renderDriver();
@@ -2306,7 +2336,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (state.lastAction.action === "queue-collection-run") {
         const circuit = result.circuit || {};
         status.className = `panel action-status ${result.status === "coalesced" ? "warn" : "pending"}`;
-        status.innerHTML = `<div class="toolbar"><h3>Run now queued</h3><span class="pill ${result.status === "coalesced" ? "warn" : "pending"}">${safe(result.status || "queued")}</span></div><div class="list"><div class="row"><span>Request ID</span><strong>${safe(result.request_id || result.request?.id || "unknown")}</strong></div><div class="row"><span>Earliest execution</span><strong>${safe(result.earliest_execution_at || "scheduler decides")}</strong></div><div class="row"><span>Circuit / cooldown</span><strong>${safe(circuitBadge(circuit))}</strong></div></div><p class="muted">Queue-only request; no collection ran in the browser.</p>`;
+        status.innerHTML = `<div class="toolbar"><h3>Run now queued</h3><span class="pill ${result.status === "coalesced" ? "warn" : "pending"}">${safe(result.status || "queued")}</span></div><div class="list"><div class="row"><span>Request ID</span><strong>${safe(result.request_id || result.request?.id || "unknown")}</strong></div><div class="row"><span>Earliest execution</span><strong>${safe(earliestExecutionLabel(result))}</strong></div><div class="row"><span>Circuit / cooldown</span><strong>${safe(circuitBadge(circuit))}</strong></div></div><p class="muted">Queue-only request; no collection ran in the browser.</p>`;
         return;
       }
       const detail = result.count ?? result.targets ?? result.resources ?? result.plans ?? result.status ?? "complete";
@@ -2349,7 +2379,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const overdueJobs = jobs.filter((job) => job.enabled !== false && Number(job.due_age_seconds) > 0).length;
       const heartbeat = runtime.service || {};
       const schedulerTone = heartbeat.freshness?.status === "ok" ? "good" : heartbeat.last_tick_at ? "warn" : "inactive";
-      const jobOptions = jobs.map((job) => `<option value="${safe(job.id)}">${safe(job.id)}</option>`).join("");
+      const selectedJobId = jobs.some((job) => job.id === state.selectedCollectionRunJob) ? state.selectedCollectionRunJob : "";
+      if (state.selectedCollectionRunJob && !selectedJobId) state.selectedCollectionRunJob = "";
+      const selectedJob = jobs.find((job) => job.id === selectedJobId);
+      const filteredRunPending = requestIsPending(selectedJob, state.pendingCollectionRuns);
+      const jobOptions = jobs.map((job) => `<option value="${safe(job.id)}"${job.id === selectedJobId ? " selected" : ""}>${safe(job.id)}</option>`).join("");
       const rows = jobs.map((job) => {
         const pending = requestIsPending(job, state.pendingCollectionRuns);
         if (!pending) state.pendingCollectionRuns.delete(job.id);
@@ -2364,7 +2398,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         disposition: incident.resolution || incident.repair_state || "pending"
       }));
       return `<div class="panel span-12 scheduler-panel" aria-labelledby="scheduler-title">
-        <div class="toolbar"><div><h3 id="scheduler-title">Autonomous Operations Scheduler</h3><p class="muted">Bounded projections and queue-only operator requests.</p></div><div class="actions"><label for="scheduler-run-filter">Filtered Run Now</label><select id="scheduler-run-filter" aria-label="Scheduler job for filtered Run Now"><option value="">Choose a job</option>${jobOptions}</select><button type="button" class="action-btn" data-collection-run-filter="true">Run now</button></div></div>
+        <div class="toolbar"><div><h3 id="scheduler-title">Autonomous Operations Scheduler</h3><p class="muted">Bounded projections and queue-only operator requests.</p></div><div class="actions"><label for="scheduler-run-filter">Filtered Run Now</label><select id="scheduler-run-filter" aria-label="Scheduler job for filtered Run Now"><option value="">Choose a job</option>${jobOptions}</select><button type="button" class="action-btn" data-collection-run-filter="true"${!selectedJobId || filteredRunPending ? " disabled" : ""}>Run now</button></div></div>
         <div class="grid">
           ${metric("Scheduler heartbeat", heartbeat.last_tick_at ? collectionAgeLabel(heartbeat.last_tick_at, null) : "unknown", heartbeat.freshness?.status || "no heartbeat evidence", "span-4", schedulerTone)}
           ${metric("Active jobs", status.active_count, "leased workers", "span-4", status.active_count ? "pending" : "good")}

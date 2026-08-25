@@ -175,6 +175,17 @@ freshness/data-age fields, a retry/backoff disposition, and an incident with
 repair disposition. Verify that the console requests `/Overseer/collections/...`
 and never calls `POST /Overseer/health/probes/run`.
 
+The legacy evidence projections remain part of the authenticated dashboard GET
+contract and retain these exact registrations: `/Overseer/runtime-status`,
+`/Overseer/host/security/listener-review-queue`, and
+`/Overseer/host/security/source-review-queue`. Seed the runtime heartbeat under
+the `overseer` record expected by `runtime-status` (a differently named record
+such as `runtime.overseer.browser` is not equivalent). Seed at least one host
+inspection snapshot before checking the Odo queues; both queue routes return a
+bounded `400` with `no host snapshots are available` when that fixture
+prerequisite is absent. The disposable harness must satisfy these prerequisites
+so fixture omissions do not produce a browser `partial` load.
+
 In the harness, click one per-job `Run now` control and one filtered `Run now`
 control. Confirm that each request is a queue-only
 `POST /Overseer/collections/jobs/{job_id}/run` with the bounded
@@ -185,10 +196,11 @@ disabled. Confirm the 30-second refresh and focus/visibility/manual refresh
 triggers issue GET projections only and coalesce through one refresh promise.
 
 At `390x844`, `820x1180`, and `1440x1000`, verify automatic mode, every forced
-mode, no horizontal overflow, visible focus restoration after a scheduler
-rerender, readable tables, 44px controls, reduced-motion behavior, and the
-top-right auto/desktop/tablet/mobile control with saved/effective mode
-announcement. Explicitly test the automatic boundaries at 700/701/1024/1025px
+mode, no horizontal overflow (including forced desktop at 390px), visible focus
+restoration after a scheduler rerender, preserved selected filtered-job state,
+readable tables, 44px controls including scheduler Run Now targets,
+reduced-motion behavior, and the top-right auto/desktop/tablet/mobile control
+with saved/effective mode announcement. Explicitly test the automatic boundaries at 700/701/1024/1025px
 and reload persistence. Cancel controls must remain `type="button"` and must
 not submit their surrounding forms. Browser MCP acceptance is controller-owned;
 this runbook does not claim that acceptance from static or Node-backed tests.
@@ -202,12 +214,11 @@ this runbook does not claim that acceptance from static or Node-backed tests.
 - Gateway-prefixed fetches from a gateway page are expected. Compare the
   expected endpoint list to the observed path base before treating a `partial`
   result as a functional failure.
-- If the only `partial` findings are Odo queue endpoints with request/auth
-  observed but no browser response before timeout, verify those exact endpoints
-  directly through `/Overseer/...` and inspect latest-snapshot loading before
-  treating the result as an auth or route failure. Slow queue generation is not
-  the same class as the original 401 bug, but it still blocks a full browser
-  smoke pass.
+- A `partial` result on `/Overseer/runtime-status` or either Odo queue route
+  must first be classified by response body: a missing `overseer` heartbeat or
+  missing host snapshot is a disposable-fixture defect; a `404`/`400` with a
+  complete fixture is an application route regression. Keep route names and
+  protected-prefix joining unchanged while repairing the fixture.
 
 ## Handoff
 

@@ -74,20 +74,20 @@ passed
 
 ## Controller Playwright acceptance checklist
 
-Pending controller execution; not run or claimed here.
+Completed by the controller after the implementation corrections below.
 
-- [ ] Use the configured Playwright MCP against a disposable prefix-aware
+- [x] Use the configured Playwright MCP against a disposable prefix-aware
   harness at `/Overseer/ui`, not a live service or gateway deployment.
-- [ ] Verify authenticated `/Overseer/collections/status`, `/jobs`, `/runs`,
+- [x] Verify authenticated `/Overseer/collections/status`, `/jobs`, `/runs`,
   and `/incidents` GETs, no console errors, no unauthorized panel requests,
   and no `POST /Overseer/health/probes/run`.
-- [ ] Verify per-job and filtered Run Now enqueue behavior, bounded payload,
+- [x] Verify per-job and filtered Run Now enqueue behavior, bounded payload,
   queued/coalesced response, request ID, earliest execution, circuit/cooldown,
   pending disablement, and focus restoration.
-- [ ] Verify 390x844, 820x1180, and 1440x1000; automatic mode; every forced
+- [x] Verify 390x844, 820x1180, and 1440x1000; automatic mode; every forced
   mode; 700/701/1024/1025 boundaries; reload persistence; no horizontal
   overflow; readable tables; reduced motion; and 44px targets.
-- [ ] Verify the top-right auto/desktop/tablet/mobile control exposes saved and
+- [x] Verify the top-right auto/desktop/tablet/mobile control exposes saved and
   effective modes to assistive technology, and Cancel remains non-submit.
 
 ## Files
@@ -151,8 +151,8 @@ $ git diff --check
 passed
 ```
 
-The report commit follows `524e744`. Controller Playwright acceptance remains
-pending and is not claimed here; it must rerun against the repaired disposable
+The report commit follows `524e744`. At that checkpoint, controller Playwright
+acceptance was still pending; it later reran against the repaired disposable
 fixture at `/Overseer/ui`, including per-job and filtered focus restoration,
 selected-filter persistence, forced-desktop 390px overflow/content bounds,
 and the exact protected-prefix GET matrix.
@@ -179,8 +179,8 @@ timestamps, request IDs, and cooldown values are exercised by Node fixtures;
 table overflow remains confined to `.table-scroll`.
 
 The follow-up source/test/docs commit is `524e744`. The report commit follows
-after this verification. Controller Playwright acceptance remains controller-owned and
-must confirm zero document overflow at 390px in auto/mobile and forced desktop,
+after this verification. The later controller-owned Playwright pass confirms
+zero document overflow at 390px in auto/mobile and forced desktop,
 with readable metric content bounds and `#action-status` focus.
 
 ## Follow-up filtered-selection and overview containment correction
@@ -201,9 +201,8 @@ crew content under forced desktop at 390px without page-level overflow hiding;
 local `.table-scroll` overflow remains unchanged.
 
 The source/test/docs correction commit and final report commit are recorded
-below after verification. Controller Playwright acceptance remains
-controller-owned and must confirm the real 390px document bounds in every
-forced mode.
+below after verification. The later controller-owned Playwright pass confirms
+the real 390px document bounds in every forced mode.
 
 Correction verification for `2d1bc5d` (`Sync filtered scheduler controls`):
 
@@ -218,5 +217,46 @@ $ git diff --check
 passed
 ```
 
-The final report commit follows `2d1bc5d`; controller Playwright acceptance is
-still pending and is not claimed here.
+The final delegated report commit is `16cc8da`; controller Playwright
+acceptance was completed afterward and is recorded below.
+
+## Final controller Playwright evidence
+
+The configured Playwright MCP exercised a disposable local API handler serving
+`/Overseer/ui`. The harness used a test-only bearer token, an isolated SQLite
+store, a valid `overseer` heartbeat, a bounded host-inspection fixture, and
+bounded scheduler records. It did not use or restart the live Overseer service,
+gateway, original checkout, or another project.
+
+- Locked load made no API requests. Authenticated load reached
+  `body[data-load-state="ready"]` with zero panel failures, zero console errors,
+  and no unauthorized responses.
+- `/Overseer/collections/status`, `/jobs`, `/runs`, and `/incidents` each
+  returned `200`. No request targeted `/Overseer/health/probes/run`.
+- Per-job and filtered controls each sent only queue-only
+  `POST /Overseer/collections/jobs/{job_id}/run` with
+  `{"requested_by":"operator","reason":"operator requested dashboard run"}`.
+  Each returned `202`; the UI rendered request ID, queued status, earliest
+  execution/cooldown, and circuit state. The selected job and both trigger
+  forms became disabled while pending, and focus landed on the live
+  `#action-status` region after rerender.
+- Rapid manual refresh clicks plus a focus event coalesced into one GET-only
+  refresh cycle. It issued one scheduler-status projection, all four collection
+  projections, no POST, and no deprecated direct-probe request; observed fetch
+  concurrency never exceeded the configured bound of four.
+- Automatic and forced auto/desktop/tablet/mobile modes passed at 390x844,
+  820x1180, and 1440x1000. The 700/701/1024/1025 boundaries mapped to
+  mobile/tablet/tablet/desktop. Every checked state had zero document overflow,
+  scheduler tables kept overflow local, and scheduler controls measured at
+  least 44px in both target dimensions.
+- A forced mobile preference persisted across reload with its saved/effective
+  announcement. The top-right control stayed 8px from the top/right, measured
+  44px high, and showed a 3px focus-visible outline.
+- Emulated reduced motion produced zero-second transitions/animations and auto
+  scroll behavior. Both Cancel controls resolved to `type="button"`; a cloned
+  surrounding-form smoke recorded no submit event.
+- Viewport screenshots were captured through Playwright as
+  `overseer-task8-390x844.png`, `overseer-task8-820x1180.png`, and
+  `overseer-task8-1440x1000.png`.
+
+Task 8 is browser-accepted and ready for independent review.

@@ -186,6 +186,7 @@ from .runtime_state import (
     DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
     DEFAULT_RUNTIME_FRESHNESS_POLICY,
     FreshnessAssessment,
+    FreshnessPolicy,
     FreshnessStatus,
     assess_freshness,
 )
@@ -3062,6 +3063,33 @@ def service_status(store_path: str | Path, service_name: str = "overseer") -> di
         store.close()
 
 
+_SCHEDULED_FRESHNESS_GRACE_SECONDS = 30
+
+
+def _host_inspection_freshness_policy(store: SQLiteStore) -> FreshnessPolicy:
+    policy = DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY
+    try:
+        job = store.load_collection_job("collection.host.inspection")
+    except KeyError:
+        return policy
+    if not job.enabled:
+        return policy
+    warning_after_seconds = max(
+        policy.warning_after_seconds,
+        job.interval_seconds
+        + job.jitter_seconds
+        + job.timeout_seconds
+        + _SCHEDULED_FRESHNESS_GRACE_SECONDS,
+    )
+    return FreshnessPolicy(
+        warning_after_seconds=warning_after_seconds,
+        high_after_seconds=max(
+            policy.high_after_seconds,
+            warning_after_seconds + job.interval_seconds,
+        ),
+    )
+
+
 def runtime_status(store_path: str | Path, service_name: str = "overseer", now: str | None = None) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -3076,7 +3104,7 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer", now: 
         host_freshness = assess_freshness(
             latest_snapshot.captured_at if latest_snapshot else None,
             now=now,
-            policy=DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
+            policy=_host_inspection_freshness_policy(store),
         )
         freshness_alerts = (
             freshness_alert_event("runtime.heartbeat", OwnerDomain.JULIAN, heartbeat_freshness),

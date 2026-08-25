@@ -258,7 +258,7 @@ def test_app_server_wire_omits_jsonrpc_header_and_supports_notifications():
         process,
         1,
         "initialize",
-        {"clientInfo": {"name": "overseer", "title": "Overseer", "version": "1.1.4"}},
+        {"clientInfo": {"name": "overseer", "title": "Overseer", "version": "1.1.5"}},
     )
     CodexAppServerClient._send(process, None, "initialized", {})
 
@@ -266,7 +266,7 @@ def test_app_server_wire_omits_jsonrpc_header_and_supports_notifications():
         {
             "id": 1,
             "method": "initialize",
-            "params": {"clientInfo": {"name": "overseer", "title": "Overseer", "version": "1.1.4"}},
+            "params": {"clientInfo": {"name": "overseer", "title": "Overseer", "version": "1.1.5"}},
         },
         {"method": "initialized", "params": {}},
     ]

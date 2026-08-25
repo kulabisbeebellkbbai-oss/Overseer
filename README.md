@@ -2,7 +2,7 @@
 
 Overseer is a local resource manager for coordinating shared machine services, physical assets, virtual assets, usage-limited services, maintenance, updates, security actions, and provider-neutral agent sessions.
 
-The current source release is Overseer `1.1.4`.
+The current source release is Overseer `1.1.5`.
 
 Its purpose is to prevent conflicting work by tracking ownership, checkout state, locks, limits, health, and safe timing for resources such as the Protected Gateway, USB and serial devices, emulators, VMs, gateways, proxies, MCP services, hosted pages, update pipelines, storage arrays, and power-sensitive assets.
 

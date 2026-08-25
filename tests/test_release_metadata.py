@@ -14,7 +14,7 @@ def test_v11_release_metadata_is_consistent() -> None:
     ).read_text(encoding="utf-8")
     codex_usage_source = Path(codex_usage.__file__).read_text(encoding="utf-8")
 
-    assert project["project"]["version"] == "1.1.4"
-    assert "Version: 1.1.4\n" in package_metadata
+    assert project["project"]["version"] == "1.1.5"
+    assert "Version: 1.1.5\n" in package_metadata
     assert '"version": "0.1.0"' not in codex_usage_source
-    assert codex_usage_source.count('"version": "1.1.4"') == 3
+    assert codex_usage_source.count('"version": "1.1.5"') == 3

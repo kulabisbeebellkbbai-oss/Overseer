@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overseer-local"
-version = "1.1.4"
+version = "1.1.5"
 description = "Local resource manager for service health, asset checkout, maintenance, security, and usage-limit coordination."
 readme = "README.md"
 requires-python = ">=3.11"

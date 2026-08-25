@@ -7944,6 +7944,63 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(audit_events[0].subject_id, "runtime.heartbeat")
         self.assertEqual(audit_events[0].risk_level, RiskLevel.MEDIUM)
 
+    def test_runtime_status_uses_enabled_host_collection_cadence_for_freshness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T16:00:00+00:00",
+                    last_tick_at="2026-07-18T16:05:40+00:00",
+                    tick_count=12,
+                )
+            )
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout="host-b" if tuple(command) == ("hostname",) else "ok",
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:01:30+00:00")
+            store.save_host_snapshot(snapshot)
+            store.close()
+            seed_default_collection_jobs(store_path)
+
+            status = runtime_status(store_path, now="2026-07-18T16:05:44+00:00")
+
+        self.assertEqual(status["host_inspection"]["freshness"]["age_seconds"], 254)
+        self.assertEqual(status["host_inspection"]["freshness"]["warning_after_seconds"], 335)
+        self.assertEqual(status["host_inspection"]["freshness"]["high_after_seconds"], 635)
+        self.assertEqual(status["host_inspection"]["freshness"]["status"], FreshnessStatus.OK.value)
+        self.assertEqual(status["freshness_alerts"], [])
+
+    def test_host_freshness_policy_honors_custom_cadence_and_disabled_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            seed_default_collection_jobs(store_path)
+            with SQLiteStore(store_path) as store:
+                job = store.load_collection_job("collection.host.inspection")
+                store.save_collection_job(
+                    replace(
+                        job,
+                        interval_seconds=400,
+                        jitter_seconds=20,
+                        timeout_seconds=10,
+                    )
+                )
+                custom = overseer_cli._host_inspection_freshness_policy(store)
+                store.save_collection_job(replace(job, enabled=False))
+                disabled = overseer_cli._host_inspection_freshness_policy(store)
+
+        self.assertEqual(custom.warning_after_seconds, 460)
+        self.assertEqual(custom.high_after_seconds, 860)
+        self.assertEqual(disabled.warning_after_seconds, 120)
+        self.assertEqual(disabled.high_after_seconds, 600)
+
 
 class AdminChangePlanTests(unittest.TestCase):
     def test_package_install_plan_requires_human_approval_and_rollback(self):

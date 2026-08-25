@@ -416,3 +416,76 @@ def test_late_completion_after_bounded_shutdown_releases_exact_timeout_lease(tmp
         assert len(runs) == 1
         assert runs[0].error_category == "timeout"
         assert len(store.list_triage_incidents()) == 1
+
+
+def test_timed_out_key_blocks_due_replacement_until_worker_exit(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    job_a = _job("replacement-a", key="shared-key", timeout=1)
+    job_b = _job("replacement-b", key="shared-key", timeout=1)
+    _seed(path, (job_a, job_b))
+    with SQLiteStore(path) as store:
+        store.save_collection_job_state(
+            replace(store.load_collection_job_state(job_b.id), next_due_at="2026-08-30T12:00:00+00:00")
+        )
+
+    a_entered = threading.Event()
+    a_release = threading.Event()
+    a_exited = threading.Event()
+    b_started = threading.Event()
+    starts: list[str] = []
+    starts_lock = threading.Lock()
+
+    class SameKeyAdapter:
+        def collect(self, job: CollectionJob, _store_path: str) -> CollectionExecution:
+            with starts_lock:
+                starts.append(job.id)
+            if job.id == job_a.id:
+                a_entered.set()
+                a_release.wait(2)
+                a_exited.set()
+            else:
+                b_started.set()
+            return CollectionExecution(CollectionOutcome.SUCCEEDED, f"completed {job.id}")
+
+    scheduler = _scheduler(path, SameKeyAdapter())
+    try:
+        first = scheduler.run_ready_once()
+        assert first.timed_out == 1
+        assert a_entered.is_set()
+        with SQLiteStore(path) as store:
+            state_a = store.load_collection_job_state(job_a.id)
+            state_b = store.load_collection_job_state(job_b.id)
+            assert state_a.active_lease_id is not None
+            retained_lease = state_a.active_lease_id
+            assert state_b.active_lease_id is None
+
+        with SQLiteStore(path) as store:
+            store.save_collection_job_state(
+                replace(store.load_collection_job_state(job_b.id), next_due_at=NOW)
+            )
+        before_release = scheduler.run_ready_once()
+        assert before_release.claimed == 0
+        assert before_release.started == 0
+        with starts_lock:
+            assert starts == [job_a.id]
+        with SQLiteStore(path) as store:
+            assert store.load_collection_job_state(job_a.id).active_lease_id == retained_lease
+            assert store.load_collection_job_state(job_b.id).active_lease_id is None
+
+        a_release.set()
+        assert a_exited.wait(2)
+        assert scheduler._completion_event.wait(2)
+        with SQLiteStore(path) as store:
+            assert store.load_collection_job_state(job_a.id).active_lease_id is None
+
+        after_release = scheduler.run_ready_once()
+        assert after_release.started == 1
+        assert b_started.is_set()
+        with starts_lock:
+            assert starts == [job_a.id, job_b.id]
+        with SQLiteStore(path) as store:
+            assert store.load_collection_job_state(job_b.id).active_lease_id is None
+            assert len(store.list_collection_runs()) == 2
+    finally:
+        a_release.set()
+        scheduler.shutdown()

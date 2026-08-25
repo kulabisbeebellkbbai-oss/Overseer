@@ -120,6 +120,17 @@ _COLLECTION_INDEX_SPECS = {
         "columns": (("job_id", 0), ("generation", 0)),
         "sql": "CREATE UNIQUE INDEX idx_triage_open_generation ON triage_incidents (job_id, generation) WHERE status = 'open'",
     },
+    "idx_host_snapshots_captured_at": {
+        "table": "host_snapshots",
+        "unique": 0,
+        "partial": 0,
+        "columns": (),
+        "expression": True,
+        "sql": (
+            "CREATE INDEX idx_host_snapshots_captured_at ON host_snapshots "
+            "(julianday(json_extract(payload, '$.captured_at')) DESC, id DESC)"
+        ),
+    },
 }
 _AUDIT_EVENT_INSERT_TRIGGER = "audit_events_validate_normalized_insert"
 _AUDIT_EVENT_UPDATE_TRIGGER = "audit_events_validate_normalized_update"
@@ -703,6 +714,10 @@ class SQLiteStore:
             return False
         if int(index_row[2]) != int(spec["unique"]) or int(index_row[4]) != int(spec["partial"]):
             return False
+        if spec.get("expression"):
+            return self._normalize_schema_sql(str(row["sql"])) == self._normalize_schema_sql(
+                str(spec["sql"])
+            )
         columns = self._connection.execute(
             "SELECT name, seqno FROM pragma_index_info(?) ORDER BY seqno",
             (index_name,),

@@ -6781,10 +6781,16 @@ class HostInspectionTests(unittest.TestCase):
 
             latest = store.load_latest_host_snapshot()
             latest_page = store.list_host_snapshots(limit=1)
+            query_plan = store._connection.execute(
+                "EXPLAIN QUERY PLAN SELECT payload FROM host_snapshots "
+                "ORDER BY julianday(json_extract(payload, '$.captured_at')) DESC, id DESC LIMIT 1"
+            ).fetchall()
+            query_plan_details = " ".join(str(row["detail"]) for row in query_plan)
             store.close()
 
         self.assertEqual(latest.id, newer.id)
         self.assertEqual(tuple(item.id for item in latest_page), (newer.id,))
+        self.assertIn("idx_host_snapshots_captured_at", query_plan_details)
 
     def test_host_security_assessment_flags_non_loopback_listeners(self):
         snapshot = HostInspectionAdapter(

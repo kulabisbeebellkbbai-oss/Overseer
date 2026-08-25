@@ -6,7 +6,7 @@ Implemented Task 5 in the isolated worktree:
 
 `/home/god/Documents/Codex Workspace/Overseer/.worktrees/overseer-v1-1-autonomous-operations`
 
-Code commit: `7e8353d` (`Add bounded autonomous collection scheduler`)
+Code commit: `ca73052` (`Harden Task 5 evidence and repair concurrency`)
 Base commit: `78768c0` (`Record collection lease race verification`)
 
 No live collection, service restart, gateway/network mutation, external project
@@ -53,15 +53,16 @@ Exact Task 5 suites:
 
 ```text
 PYTHONPATH=src pytest -q tests/test_collection_scheduler.py tests/test_collection_repair.py
-14 passed in 1.88s
+22 passed in 3.24s
 ```
 
 Task 3/4 policy and persistence regression suites, together with Task 5:
 
 ```text
 PYTHONPATH=src pytest -q tests/test_collection_scheduler.py tests/test_collection_repair.py \
-  tests/test_collection_store.py tests/test_collection_policy.py
-73 passed in 3.53s
+  tests/test_collection_store.py tests/test_collection_policy.py \
+  tests/test_package_reconciliation.py
+93 passed in 17.71s
 ```
 
 Compilation and formatting checks:
@@ -75,8 +76,78 @@ The clean post-code-commit full suite was:
 
 ```text
 PYTHONPATH=src pytest -q
-2116 passed, 31 skipped in 409.62s (0:06:49)
+2124 passed, 31 skipped in 412.08s (0:06:52)
 ```
+
+## Independent review corrections
+
+The independent Task 5 review returned `CHANGES_REQUIRED`. Each finding was
+converted to a failing test before the correction:
+
+- The four adversarial evidence tests initially found health target/error
+  content, host observations, package stderr, and callback summaries in
+  scheduler-visible persistence.
+- The two-entry scheduler test initially exposed that `_lock` was declared but
+  did not guard claim/submission or `_active` mutations.
+- The late-completion test initially found no post-shutdown callback/reaper and
+  no completion signal to release the exact retained lease.
+- The stale-incident and concurrent-repair tests initially found caller-state
+  trust and independent store transactions.
+
+The corrected GREEN evidence is the 22-test Task 5 run above. The scheduler
+and repair correction commit is `ca73052`; the prior implementation/report
+checkpoints remain `7e8353d` and `e86aafd`, respectively. The report commit is
+the separate commit immediately following this code checkpoint.
+
+### Evidence boundary
+
+Scheduler health persistence now projects evidence to a bounded target surface
+with URL userinfo/query values removed and a fixed error category; it never
+copies probe body summaries or raw observed errors. Host persistence uses a
+scheduler-only projection: command identity and exit status remain, while
+stdout, stderr, hostnames, and OS-release values are removed or hashed. The
+manual host adapter and its historical records are unchanged. Package
+inspection retains update rows and the content-addressed state fingerprint but
+constructs the scheduler record with empty stderr, leaving manual/history paths
+unchanged. Callback results are reduced to a fixed outcome summary, an
+allowlisted failure category, and namespaced evidence identifiers. Scheduler
+run completion also writes only a fixed outcome summary and allowlisted error
+category. Adversarial marker/secret assertions inspect stored evidence objects,
+package/host records, and collection runs.
+
+### Concurrency and timeout safety
+
+The scheduler RLock now serializes entry reservation and every `_active`
+mutation. Capacity is reserved before executor submission, so concurrent
+`run_ready_once` callers cannot exceed the global two-worker bound or the one
+worker per concurrency key bound. The adapter wrapper stamps `started_at` and
+the defensive deadline at the actual worker boundary rather than at a queued
+future's creation.
+
+Timeout observation is one exact `(job_id, lease_id, lease_generation)` state
+transition. The timeout run/incident is persisted while the lock prevents its
+completion callback from releasing the lease early. A timed-out future remains
+active and cannot be replaced. Its done callback remains valid after `_closed`,
+releases only the matching lease generation on actual worker exit, and is
+idempotent with `_finish` and polling reaping. Bounded shutdown therefore
+returns coherently with a non-cooperative worker still leased; releasing the
+fake worker later clears that lease without a duplicate timeout or
+`expired_lease` run/incident.
+
+### Triage and repair safety
+
+`RepairCoordinator.advance` obtains the current clock before opening one
+`BEGIN IMMEDIATE` writer transaction, reloads the incident by exact ID, and
+rejects stale snapshots, resolved incidents, generation changes, or job/resource
+binding changes. The persisted runbook is selected and compared inside the same
+transaction, then failure category, policy, approval, cooldown, immutable
+attempt ID, verification request, and admin-plan idempotency are evaluated
+atomically. Concurrent callers deterministically coalesce to one attempt and
+one request/plan; the serialized duplicate observes the existing cooldown.
+`TRIAGE_ONLY` still never invokes a repair adapter. Retry creates only one
+verification request, prune is restricted to the bound job's non-audit runs,
+and service restart only stages an existing unapproved admin plan. Resolution
+continues to require a fresh successful verification collection.
 
 ## Implementation
 
@@ -182,5 +253,5 @@ lease, immutability, migration, and retention behavior intact.
 - No `.superpowers/sdd/progress.md` was modified.
 - No live service, gateway, network, firewall, IDS, USB device, external
   project, branch, original checkout, or other worktree was touched.
-- The code commit is `7e8353d`; this report is the separate Task 5 report
+- The code commit is `ca73052`; this report is the separate Task 5 report
   commit created immediately after the verified code checkpoint.

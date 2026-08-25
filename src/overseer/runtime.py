@@ -348,6 +348,7 @@ def _default_jobs(
             jitter_seconds=target.jitter_seconds,
             timeout_seconds=target.timeout_seconds,
             priority=2,
+            concurrency_key="health",
             repair_policy=target.repair_policy,
         )
         for target in targets

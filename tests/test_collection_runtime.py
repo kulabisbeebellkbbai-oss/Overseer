@@ -62,6 +62,10 @@ def test_health_targets_seed_independent_stable_jobs(tmp_path: Path) -> None:
     assert [job.id for job in jobs if job.kind == CollectionJobKind.HEALTH_PROBE] == [
         "collection.health.health.api"
     ]
+    health = next(job for job in jobs if job.kind == CollectionJobKind.HEALTH_PROBE)
+    host = next(job for job in jobs if job.id == "collection.host.inspection")
+    assert health.concurrency_key == "health"
+    assert host.concurrency_key == "collection"
 
 
 def test_reseeding_updates_policy_without_erasing_active_lease(tmp_path: Path) -> None:

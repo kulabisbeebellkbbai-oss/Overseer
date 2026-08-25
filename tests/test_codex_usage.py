@@ -126,6 +126,10 @@ def test_method_not_found_compatibility_is_narrow():
     assert CodexAppServerClient.is_removed_account_usage_error(TimeoutError("timed out")) is False
 
 
+def test_app_server_default_timeout_tolerates_observed_cold_start():
+    assert CodexAppServerClient().timeout == 30.0
+
+
 def test_read_usage_preserves_limits_only_for_removed_usage_rpc(monkeypatch):
     monkeypatch.setattr("overseer.codex_usage.subprocess.Popen", lambda *args, **kwargs: _FinishedProcess())
     result = _ScriptedAppServerClient(CodexAppServerMethodNotFound(-32601, "Method not found: account/usage/read")).read_usage()

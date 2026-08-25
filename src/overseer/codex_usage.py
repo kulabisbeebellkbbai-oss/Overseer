@@ -57,7 +57,7 @@ class CodexAppServerClient:
     def __init__(
         self,
         command: tuple[str, ...] = ("codex", "app-server", "--stdio"),
-        timeout: float = 15.0,
+        timeout: float = 30.0,
         structured_command: tuple[str, ...] = ("codex", "app-server", "proxy"),
     ):
         self.command = command

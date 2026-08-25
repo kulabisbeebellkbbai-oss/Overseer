@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from hashlib import sha256
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -38,10 +39,13 @@ def knowledge_capture_status(
     kinds: Sequence[str] = DEFAULT_KNOWLEDGE_KINDS,
     limit: int = DEFAULT_KNOWLEDGE_LIMIT,
     dry_run: bool = False,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     normalized_kinds = _normalize_kinds(kinds)
     if limit < 1:
         raise ValueError("limit must be positive")
+    if isinstance(timeout_seconds, bool) or timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
     store = SQLiteStore(store_path)
     try:
         candidates = knowledge_capture_candidates(store, normalized_kinds, limit)
@@ -51,7 +55,12 @@ def knowledge_capture_status(
     items: list[dict[str, Any]] = []
     captured = 0
     failed = 0
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    timed_out = False
     for candidate in candidates:
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
         item: dict[str, Any] = {
             "kind": candidate.kind,
             "source_id": candidate.source_id,
@@ -80,6 +89,10 @@ def knowledge_capture_status(
         "captured": captured,
         "failed": failed,
         "items": items,
+        "returned_count": len(items),
+        "remaining_count": max(0, len(candidates) - len(items)),
+        "truncated": len(items) < len(candidates) or len(candidates) >= limit,
+        "timed_out": timed_out,
         "mutation_performed": bool(captured),
         "host_mutation_performed": False,
     }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -65,6 +66,26 @@ RUNTIME_JOB_ADAPTER_IDS = {
     "collection.discovery.physical": "physical-discovery",
     "collection.discovery.storage": "storage-discovery",
 }
+SYSTEMD_FRESHNESS_PROPERTIES = (
+    "ActiveState",
+    "SubState",
+    "Result",
+    "LastTriggerUSecRealtime",
+    "NextElapseUSecRealtime",
+)
+EXTERNAL_FRESHNESS_UNITS = {
+    "overseer-psychlo-usage.service": (
+        "overseer-psychlo-usage.timer",
+        "overseer-psychlo-usage.service",
+    ),
+    "overseer-quark-scheduler.service": (
+        "overseer-quark-scheduler.timer",
+        "overseer-quark-scheduler.service",
+    ),
+}
+COLLECTION_FAMILIES = frozenset(
+    {"health", "host", "discovery", "crew_dispatch", "usage_continuation", "knowledge_capture", "station_audit", "package", "freshness"}
+)
 
 
 def _store_path(value: str | Any) -> str:
@@ -74,27 +95,99 @@ def _store_path(value: str | Any) -> str:
     return str(path)
 
 
-def _freshness_projection_status(store_path: str, unit: str) -> dict[str, object]:
-    """Observe only persisted local evidence; external timer work stays external."""
-    with SQLiteStore(store_path) as store:
-        heartbeat = store.load_runtime_heartbeat("overseer") if _has_heartbeat(store, "overseer") else None
-        evidence_id = f"freshness.{unit}"
-        return {
-            "outcome": CollectionOutcome.SUCCEEDED.value,
-            "evidence_ids": (evidence_id,),
-            "observed": heartbeat.last_tick_at if heartbeat else None,
-        }
+def _systemd_runner(command: tuple[str, ...], timeout_seconds: float) -> object:
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
 
 
-def _has_heartbeat(store: SQLiteStore, service_name: str) -> bool:
+def _systemd_properties(output: object) -> dict[str, str]:
+    text = str(getattr(output, "stdout", ""))[:4096]
+    properties: dict[str, str] = {}
+    for line in text.splitlines()[:32]:
+        key, separator, value = line.partition("=")
+        if separator and key in SYSTEMD_FRESHNESS_PROPERTIES and len(value) <= 256:
+            properties[key] = value.strip()
+    return properties
+
+
+def _systemd_timestamp(value: str) -> datetime | None:
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized.split()) >= 3 and normalized.split()[0].rstrip(".").isalpha():
+        normalized = " ".join(normalized.split()[1:])
+    if normalized.endswith(" UTC"):
+        normalized = normalized[:-4] + "+00:00"
     try:
-        store.load_runtime_heartbeat(service_name)
-    except KeyError:
-        return False
-    return True
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
-def runtime_collection_adapter_registry() -> CollectionAdapterRegistry:
+def _freshness_projection_status(
+    job: CollectionJob,
+    store_path: str,
+    timeout_seconds: float,
+    runner: Callable[[tuple[str, ...], float], object],
+    now: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Read exact user-systemd timer/service freshness without executing either unit."""
+    del store_path
+    unit = str(job.resource_id or "")
+    units = EXTERNAL_FRESHNESS_UNITS.get(unit)
+    if units is None:
+        return {"outcome": CollectionOutcome.BLOCKED.value, "failure_category": "contract_mismatch"}
+    observations: dict[str, dict[str, str]] = {}
+    command = (
+        "systemctl",
+        "--user",
+        "show",
+        "--no-pager",
+        "--no-legend",
+        "--property=" + ",".join(SYSTEMD_FRESHNESS_PROPERTIES),
+    )
+    for queried_unit in units:
+        try:
+            result = runner((*command, queried_unit), timeout_seconds)
+        except (TimeoutError, subprocess.TimeoutExpired):
+            return {"outcome": CollectionOutcome.BLOCKED.value, "failure_category": "timeout"}
+        if getattr(result, "returncode", 1) != 0:
+            return {"outcome": CollectionOutcome.BLOCKED.value, "failure_category": "unavailable"}
+        observations[queried_unit] = _systemd_properties(result)
+    timer, service = (observations[units[0]], observations[units[1]])
+    last_trigger = _systemd_timestamp(timer.get("LastTriggerUSecRealtime", ""))
+    next_trigger = _systemd_timestamp(timer.get("NextElapseUSecRealtime", ""))
+    current = (now or (lambda: datetime.now(UTC)))()
+    if isinstance(current, str):
+        current = datetime.fromisoformat(current.replace("Z", "+00:00"))
+    current = current.replace(tzinfo=UTC) if current.tzinfo is None else current.astimezone(UTC)
+    if not {
+        timer.get("ActiveState"),
+        timer.get("SubState"),
+        timer.get("Result"),
+        service.get("Result"),
+    } <= {"active", "waiting", "success"} or last_trigger is None or next_trigger is None:
+        return {"outcome": CollectionOutcome.FAILED.value, "failure_category": "unavailable"}
+    if (current - last_trigger).total_seconds() > max(job.interval_seconds + job.timeout_seconds, 1):
+        return {"outcome": CollectionOutcome.FAILED.value, "failure_category": "stale"}
+    evidence_id = f"freshness.{job.id.replace('collection.freshness.', '')}"
+    return {
+        "outcome": CollectionOutcome.SUCCEEDED.value,
+        "evidence_ids": (evidence_id,),
+    }
+
+
+def runtime_collection_adapter_registry(
+    *,
+    systemd_runner: Callable[[tuple[str, ...], float], object] | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> CollectionAdapterRegistry:
     """Build the exact bounded callback bindings used by seeded jobs."""
     # Importing the CLI lazily avoids the CLI/runtime module cycle at import time.
     from .cli import (
@@ -110,26 +203,46 @@ def runtime_collection_adapter_registry() -> CollectionAdapterRegistry:
 
     registry = default_collection_adapter_registry()
     callbacks = {
-        (CollectionJobKind.PHYSICAL_DISCOVERY, "physical-discovery"): lambda path: discover_physical_status(
-            ("/dev/serial/by-id", "/dev/serial/by-path"), path
+        (CollectionJobKind.PHYSICAL_DISCOVERY, "physical-discovery"): lambda job, path, timeout: discover_physical_status(
+            ("/dev/serial/by-id", "/dev/serial/by-path"), path, limit=25, timeout_seconds=timeout
         ),
-        (CollectionJobKind.PHYSICAL_DISCOVERY, "storage-discovery"): lambda path: discover_storage_status(
-            store_path=path
+        (CollectionJobKind.PHYSICAL_DISCOVERY, "storage-discovery"): lambda job, path, timeout: discover_storage_status(
+            store_path=path, limit=25, timeout_seconds=timeout
         ),
-        (CollectionJobKind.VIRTUAL_DISCOVERY, "virtual-discovery"): lambda path: discover_virtual_listeners_status(path),
-        (CollectionJobKind.CREW_DISPATCH, "crew-dispatch"): lambda path: dispatch_crew_messages_status(path, dispatched_by="sisko"),
-        (CollectionJobKind.USAGE_CONTINUATION, "usage-continuation"): lambda path: dispatch_usage_continuations_status(path, dispatched_by="quark"),
-        (CollectionJobKind.KNOWLEDGE_CAPTURE, "knowledge-capture"): lambda path: knowledge_capture_status(path),
-        (CollectionJobKind.STATION_AUDIT, "station-audit"): lambda path: audit_station_status(path),
-        (CollectionJobKind.FRESHNESS_PROJECTION, "freshness-projection"): lambda job, path: _freshness_projection_status(path, str(job.resource_id)),
-        (CollectionJobKind.HOST_INSPECTION, "host-security"): lambda path: assess_host_security_status(path),
+        (CollectionJobKind.VIRTUAL_DISCOVERY, "virtual-discovery"): lambda job, path, timeout: discover_virtual_listeners_status(path, limit=25, timeout_seconds=timeout),
+        (CollectionJobKind.CREW_DISPATCH, "crew-dispatch"): lambda job, path, timeout: dispatch_crew_messages_status(path, dispatched_by="sisko", limit=1, timeout_seconds=timeout),
+        (CollectionJobKind.USAGE_CONTINUATION, "usage-continuation"): lambda job, path, timeout: dispatch_usage_continuations_status(path, dispatched_by="quark", limit=1, timeout_seconds=timeout),
+        (CollectionJobKind.KNOWLEDGE_CAPTURE, "knowledge-capture"): lambda job, path, timeout: knowledge_capture_status(path, limit=1, timeout_seconds=timeout),
+        (CollectionJobKind.STATION_AUDIT, "station-audit"): lambda job, path, timeout: audit_station_status(path, limit=1, timeout_seconds=timeout),
+        (CollectionJobKind.FRESHNESS_PROJECTION, "freshness-projection"): lambda job, path, timeout: _freshness_projection_status(job, path, timeout, systemd_runner or _systemd_runner, now),
+        (CollectionJobKind.HOST_INSPECTION, "host-security"): lambda job, path, timeout: assess_host_security_status(path, timeout_seconds=timeout),
     }
     for (kind, adapter_id), callback in callbacks.items():
         registry.register(kind, adapter_id, StorePathCallbackAdapter(callback, kind=kind))
     return registry
 
 
-def _default_jobs(targets: tuple[HealthTarget, ...]) -> tuple[CollectionJob, ...]:
+def _normalize_collection_families(families: object) -> frozenset[str] | None:
+    if families is None:
+        return None
+    if isinstance(families, (str, bytes)):
+        families = (families,)
+    try:
+        normalized = frozenset(str(item).strip().lower() for item in families)
+    except TypeError as error:
+        raise ValueError("collection families must be a sequence") from error
+    aliases = {"crew": "crew_dispatch", "usage": "usage_continuation", "knowledge": "knowledge_capture", "station": "station_audit"}
+    normalized = frozenset(aliases.get(item, item) for item in normalized)
+    unknown = normalized - COLLECTION_FAMILIES
+    if unknown:
+        raise ValueError(f"unknown collection family: {sorted(unknown)[0]}")
+    return normalized | {"freshness"}
+
+
+def _default_jobs(
+    targets: tuple[HealthTarget, ...],
+    families: frozenset[str] | None = None,
+) -> tuple[CollectionJob, ...]:
     jobs = [
         CollectionJob(
             id=f"collection.health.{target.id}",
@@ -140,10 +253,11 @@ def _default_jobs(targets: tuple[HealthTarget, ...]) -> tuple[CollectionJob, ...
             interval_seconds=target.interval_seconds,
             jitter_seconds=target.jitter_seconds,
             timeout_seconds=target.timeout_seconds,
+            priority=2,
             repair_policy=target.repair_policy,
         )
         for target in targets
-        if target.enabled
+        if target.enabled and (families is None or "health" in families)
     ]
     fixed = (
         ("collection.host.inspection", CollectionJobKind.HOST_INSPECTION, OwnerDomain.ODO, "host.local"),
@@ -159,6 +273,17 @@ def _default_jobs(targets: tuple[HealthTarget, ...]) -> tuple[CollectionJob, ...
         ("collection.freshness.psychlo-usage", CollectionJobKind.FRESHNESS_PROJECTION, OwnerDomain.QUARK, "overseer-psychlo-usage.service"),
         ("collection.freshness.quark-scheduler", CollectionJobKind.FRESHNESS_PROJECTION, OwnerDomain.QUARK, "overseer-quark-scheduler.service"),
     )
+    family_by_kind = {
+        CollectionJobKind.HOST_INSPECTION: "host",
+        CollectionJobKind.PHYSICAL_DISCOVERY: "discovery",
+        CollectionJobKind.VIRTUAL_DISCOVERY: "discovery",
+        CollectionJobKind.CREW_DISPATCH: "crew_dispatch",
+        CollectionJobKind.USAGE_CONTINUATION: "usage_continuation",
+        CollectionJobKind.KNOWLEDGE_CAPTURE: "knowledge_capture",
+        CollectionJobKind.STATION_AUDIT: "station_audit",
+        CollectionJobKind.PACKAGE_INSPECTION: "package",
+        CollectionJobKind.FRESHNESS_PROJECTION: "freshness",
+    }
     jobs.extend(
         CollectionJob(
             id=job_id,
@@ -167,8 +292,10 @@ def _default_jobs(targets: tuple[HealthTarget, ...]) -> tuple[CollectionJob, ...
             resource_id=resource_id,
             interval_seconds=DEFAULT_COLLECTION_INTERVALS[kind],
             timeout_seconds=DEFAULT_COLLECTION_TIMEOUTS[kind],
+            priority=1 if kind is not CollectionJobKind.FRESHNESS_PROJECTION else 0,
         )
         for job_id, kind, owner, resource_id in fixed
+        if families is None or family_by_kind[kind] in families
     )
     return tuple(jobs)
 
@@ -176,6 +303,7 @@ def _default_jobs(targets: tuple[HealthTarget, ...]) -> tuple[CollectionJob, ...
 def seed_default_collection_jobs(
     store_path: str | Any,
     config_path: str | Any | None = None,
+    families: object = None,
 ) -> dict[str, object]:
     """Idempotently seed stable definitions while preserving scheduler state."""
     path = _store_path(store_path)
@@ -184,6 +312,7 @@ def seed_default_collection_jobs(
             from .config import load_config, seed_store_from_config
 
             seed_store_from_config(load_config(config_path), store)
+        normalized_families = _normalize_collection_families(families)
         registry = runtime_collection_adapter_registry()
         targets = store.list_health_targets()
         enabled_target_ids = {target.id for target in targets if target.enabled}
@@ -191,6 +320,8 @@ def seed_default_collection_jobs(
         skipped: list[dict[str, str]] = []
         for existing in store.list_collection_jobs():
             if (
+                (normalized_families is None or "health" in normalized_families)
+                and
                 existing.kind is CollectionJobKind.HEALTH_PROBE
                 and existing.target_id is not None
                 and existing.target_id not in enabled_target_ids
@@ -204,7 +335,7 @@ def seed_default_collection_jobs(
                         "reason": "health target is disabled",
                     }
                 )
-        for job in _default_jobs(targets):
+        for job in _default_jobs(targets, normalized_families):
             adapter_id = (
                 "health-probe"
                 if job.kind is CollectionJobKind.HEALTH_PROBE
@@ -225,6 +356,7 @@ def seed_default_collection_jobs(
             "disabled": skipped,
             "mutation_performed": True,
             "host_mutation_performed": False,
+            "families": sorted(normalized_families) if normalized_families is not None else None,
         }
 
 
@@ -299,7 +431,19 @@ class OverseerRuntime:
         self.station_auditor = station_auditor
         self.station_audit_interval_ticks = max(1, station_audit_interval_ticks)
         self.psychlo_bridge = psychlo_bridge
-        seed_default_collection_jobs(store.path)
+        legacy_families = {
+            family
+            for enabled, family in (
+                (probe_health_targets, "health"),
+                (inspect_host, "host"),
+                (dispatch_crew_messages, "crew_dispatch"),
+                (dispatch_usage_continuations, "usage_continuation"),
+                (capture_knowledge_events, "knowledge_capture"),
+                (audit_station, "station_audit"),
+            )
+            if enabled
+        }
+        seed_default_collection_jobs(store.path, families=legacy_families or None)
         self._owns_scheduler = scheduler is None
         self.scheduler = scheduler or CollectionScheduler(
             str(store.path),

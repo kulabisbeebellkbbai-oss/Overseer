@@ -12084,7 +12084,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(status["usage_continuations_dispatched"], 0)
             self.assertEqual(status["usage_continuations_skipped"], 0)
-            self.assertEqual(plan["dispatches"], 0)
+            self.assertEqual(plan["dispatches"], 1)
 
     def test_runtime_prunes_health_evidence_per_target(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:

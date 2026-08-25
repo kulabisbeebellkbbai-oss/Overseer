@@ -6,11 +6,11 @@ from pathlib import Path
 import pytest
 
 from overseer.cli import main
-from overseer.collection_models import CollectionJobKind, CollectionOutcome
+from overseer.collection_models import CollectionJob, CollectionJobKind, CollectionOutcome, TriageIncident
 from overseer.config import config_from_mapping
 from overseer.core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 from overseer.health import HealthTarget, ProbeType
-from overseer.runtime import OverseerRuntime, seed_default_collection_jobs
+from overseer.runtime import OverseerRuntime, runtime_collection_adapter_registry, seed_default_collection_jobs
 from overseer.store import SQLiteStore
 
 
@@ -206,3 +206,208 @@ def test_collection_cli_reads_are_json_and_request_is_queue_only(tmp_path: Path,
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "ok"
     assert payload["durable_status"] is True
+
+
+def test_external_freshness_queries_exact_user_systemd_units_without_starting_them(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    calls: list[tuple[tuple[str, ...], float]] = []
+
+    def runner(command: tuple[str, ...], timeout_seconds: float):
+        calls.append((command, timeout_seconds))
+        unit = command[-1]
+        if unit.endswith(".timer"):
+            return type("Result", (), {
+                "returncode": 0,
+                "stdout": "ActiveState=active\nSubState=waiting\nResult=success\nLastTriggerUSecRealtime=2026-08-24 12:00:00 UTC\nNextElapseUSecRealtime=2026-08-24 12:05:00 UTC\n",
+                "stderr": "secret=must-not-persist",
+            })()
+        return type("Result", (), {
+            "returncode": 0,
+            "stdout": "ActiveState=inactive\nSubState=dead\nResult=success\n",
+            "stderr": "",
+        })()
+
+    registry = runtime_collection_adapter_registry(systemd_runner=runner, now=lambda: "2026-08-24T12:01:00+00:00")
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.freshness.psychlo-usage")
+    execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
+
+    assert execution.outcome is CollectionOutcome.SUCCEEDED
+    assert all(command[0][0:3] == ("systemctl", "--user", "show") for command in calls)
+    assert {command[-1] for command, _ in calls} == {
+        "overseer-psychlo-usage.timer",
+        "overseer-psychlo-usage.service",
+    }
+    assert all("start" not in command and "enable" not in command for command, _ in calls)
+    assert all(timeout == 5 for _, timeout in calls)
+    assert "secret" not in repr(execution)
+
+
+def test_external_freshness_unavailable_and_timeout_are_bounded(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    calls: list[tuple[tuple[str, ...], float]] = []
+
+    def unavailable(command: tuple[str, ...], timeout_seconds: float):
+        calls.append((command, timeout_seconds))
+        return type("Result", (), {"returncode": 1, "stdout": "", "stderr": "private failure"})()
+
+    registry = runtime_collection_adapter_registry(systemd_runner=unavailable)
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.freshness.quark-scheduler")
+    execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
+    assert execution.outcome is CollectionOutcome.BLOCKED
+    assert execution.failure_category == "unavailable"
+    assert len(calls) == 1
+
+    def timed_out(command: tuple[str, ...], timeout_seconds: float):
+        calls.append((command, timeout_seconds))
+        raise TimeoutError("private timeout")
+
+    registry = runtime_collection_adapter_registry(systemd_runner=timed_out)
+    execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
+    assert execution.outcome is CollectionOutcome.BLOCKED
+    assert execution.failure_category == "timeout"
+    assert calls[-1][1] == job.timeout_seconds
+
+
+def test_external_freshness_marks_old_last_trigger_failed(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+
+    def stale_runner(command: tuple[str, ...], timeout_seconds: float):
+        if command[-1].endswith(".timer"):
+            return type("Result", (), {
+                "returncode": 0,
+                "stdout": "ActiveState=active\nSubState=waiting\nResult=success\nLastTriggerUSecRealtime=2026-08-24 10:00:00 UTC\nNextElapseUSecRealtime=2026-08-24 10:05:00 UTC\n",
+                "stderr": "",
+            })()
+        return type("Result", (), {
+            "returncode": 0,
+            "stdout": "ActiveState=inactive\nSubState=dead\nResult=success\n",
+            "stderr": "",
+        })()
+
+    registry = runtime_collection_adapter_registry(
+        systemd_runner=stale_runner,
+        now=lambda: "2026-08-24T12:00:00+00:00",
+    )
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.freshness.quark-scheduler")
+    execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
+    assert execution.outcome is CollectionOutcome.FAILED
+    assert execution.failure_category == "stale"
+
+
+def test_legacy_runtime_family_selector_seeds_only_selected_families_plus_freshness(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path, families=("crew_dispatch",))
+    with SQLiteStore(path) as store:
+        ids = {job.id for job in store.list_collection_jobs()}
+    assert "collection.dispatch.crew" in ids
+    assert "collection.freshness.psychlo-usage" in ids
+    assert "collection.discovery.physical" not in ids
+    assert "collection.knowledge.capture" not in ids
+
+
+def test_scheduler_callback_passes_exact_timeout_and_one_message_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    observed: dict[str, object] = {}
+
+    def fake_dispatch(store_path, **kwargs):
+        observed.update(kwargs)
+        return {"processed": 1}
+
+    monkeypatch.setattr("overseer.cli.dispatch_crew_messages_status", fake_dispatch)
+    registry = runtime_collection_adapter_registry()
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.dispatch.crew")
+    registry.resolve(job, "crew-dispatch").collect(job, str(path))
+    assert observed["limit"] == 1
+    assert observed["timeout_seconds"] == job.timeout_seconds
+
+
+def test_collection_projections_are_bounded_and_never_return_request_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    with SQLiteStore(path) as store:
+        for index in range(4):
+            store.request_collection_run(
+                "collection.health.health.api",
+                "operator",
+                f"SECRET-REQUEST-REASON-{index}",
+            )
+
+    assert main(["collection-jobs", "--store", str(path), "--limit", "1"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["returned_count"] == 1
+    from overseer.cli import collection_jobs_status, request_collection_run_status
+
+    projection = collection_jobs_status(path, limit=1)
+    assert projection["total_count"] >= projection["returned_count"] == 1
+    assert projection["truncated"] is True
+    assert "SECRET-REQUEST-REASON" not in json.dumps(projection)
+    request_projection = request_collection_run_status(path, "collection.health.health.api", "operator", "SECRET-REQUEST-REASON")
+    assert "SECRET-REQUEST-REASON" not in json.dumps(request_projection)
+
+
+def test_scheduler_projections_bound_jobs_incidents_requests_and_leases(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    with SQLiteStore(path) as store:
+        for index in range(120):
+            job_id = f"collection.fixture.{index:03d}"
+            store.save_collection_job(
+                CollectionJob(
+                    id=job_id,
+                    kind=CollectionJobKind.HOST_INSPECTION,
+                    owner_domain=OwnerDomain.ODO,
+                    resource_id=f"fixture.resource.{index:03d}",
+                )
+            )
+            store.request_collection_run(job_id, "operator", f"SECRET-FIXTURE-REASON-{index}")
+        for generation in range(3):
+            store.save_collection_incident(
+                TriageIncident(
+                    id=f"incident.fixture.{generation}",
+                    job_id="collection.fixture.000",
+                    resource_id="fixture.resource.000",
+                    first_failure_at="2026-08-24T12:00:00+00:00",
+                    latest_failure_at="2026-08-24T12:00:00+00:00",
+                    severity=RiskLevel.MEDIUM,
+                    owner_domain=OwnerDomain.ODO,
+                    evidence_ids=(f"evidence.fixture.{generation}",),
+                    generation=generation + 1,
+                )
+            )
+        state = store.load_collection_job_state("collection.fixture.000")
+        store.save_collection_job_state(
+            state.__class__(
+                **{
+                    **state.__dict__,
+                    "active_lease_id": "lease.fixture.000",
+                    "lease_owner": "worker.fixture",
+                    "lease_expires_at": "2030-01-01T00:00:00+00:00",
+                }
+            )
+        )
+
+    from overseer.cli import collection_jobs_status, collection_scheduler_status
+
+    jobs = collection_jobs_status(path, limit=10, incident_limit=1)
+    scheduler = collection_scheduler_status(path, limit=1)
+    assert jobs["total_count"] > jobs["returned_count"] == 10
+    assert jobs["truncated"] is True
+    fixture = next(row for row in jobs["jobs"] if row["id"] == "collection.fixture.000")
+    assert fixture["incident_total_count"] == 3
+    assert fixture["incident_returned_count"] == 1
+    assert fixture["incident_truncated"] is True
+    assert jobs["request_truncated"] is True
+    assert scheduler["leased_returned_count"] == 1
+    assert scheduler["leased_truncated"] is False
+    assert "SECRET-FIXTURE-REASON" not in json.dumps(jobs)
+    assert "SECRET-FIXTURE-REASON" not in json.dumps(scheduler)

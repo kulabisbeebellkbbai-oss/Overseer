@@ -44,7 +44,7 @@ def bounded_evidence_ids(values: object) -> tuple[str, ...]:
     result: list[str] = []
     for value in values:
         item = bounded_text(value, limit=MAX_IDENTIFIER_LENGTH)
-        if item and not re.fullmatch(r"(?:evidence|health|host|package|run|request)\.[A-Za-z0-9_.:-]+", item):
+        if item and not re.fullmatch(r"(?:evidence|freshness|health|host|package|run|request)\.[A-Za-z0-9_.:-]+", item):
             item = _scheduler_digest(item, "evidence")
         if item and item not in result:
             result.append(item)
@@ -136,7 +136,7 @@ def _callback_evidence_ids(values: object) -> tuple[str, ...]:
             continue
         # Callback evidence is an identifier channel, never a payload channel.
         # Keep the established namespaced identifiers and hash everything else.
-        if not re.fullmatch(r"(?:evidence|health|host|package|run|request)\.[A-Za-z0-9_.:-]+", item):
+        if not re.fullmatch(r"(?:evidence|freshness|health|host|package|run|request)\.[A-Za-z0-9_.:-]+", item):
             item = _scheduler_digest(item, "evidence")
         if item not in result:
             result.append(item)
@@ -152,7 +152,7 @@ def _callback_execution(
 ) -> CollectionExecution:
     safe_category = bounded_text(failure_category, limit=MAX_IDENTIFIER_LENGTH)
     if safe_category not in {
-        "", "timeout", "unavailable", "contract_mismatch", "authentication",
+        "", "timeout", "stale", "unavailable", "contract_mismatch", "authentication",
         "resource_conflict", "policy_blocked", "adapter_error", "internal_error",
     }:
         safe_category = "adapter_error"

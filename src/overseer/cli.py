@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -180,7 +181,7 @@ from .remote_testing import (
     revoke_remote_testing_token_status,
 )
 from .registry import ResourceRegistry
-from .runtime import OverseerRuntime, seed_default_collection_jobs
+from .runtime import COLLECTION_FAMILIES, OverseerRuntime, seed_default_collection_jobs
 from .runtime_state import (
     DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
     DEFAULT_RUNTIME_FRESHNESS_POLICY,
@@ -1230,33 +1231,60 @@ def _health_evidence_item_status(evidence: HealthEvidence) -> dict[str, object]:
     }
 
 
-def discover_physical_status(roots: Sequence[str], store_path: str | Path | None = None) -> dict[str, object]:
+def discover_physical_status(
+    roots: Sequence[str],
+    store_path: str | Path | None = None,
+    *,
+    limit: int | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, object]:
+    limit = _callback_limit(limit)
+    timeout_seconds = _callback_timeout(timeout_seconds)
     identities = PathPhysicalDiscoveryAdapter(tuple(roots)).discover()
-    return discovered_physical_identities_status(identities, store_path)
+    return discovered_physical_identities_status(identities, store_path, limit=limit, timeout_seconds=timeout_seconds)
 
 
 def discover_storage_status(
     sysfs_block_root: str | Path = "/sys/class/block",
     store_path: str | Path | None = None,
+    *,
+    limit: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
+    limit = _callback_limit(limit)
+    timeout_seconds = _callback_timeout(timeout_seconds)
     identities = StoragePhysicalDiscoveryAdapter(sysfs_block_root).discover()
-    return discovered_physical_identities_status(identities, store_path)
+    return discovered_physical_identities_status(identities, store_path, limit=limit, timeout_seconds=timeout_seconds)
 
 
 def discovered_physical_identities_status(
     identities: Sequence[PhysicalIdentity],
     store_path: str | Path | None = None,
+    *,
+    limit: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
+    limit = _callback_limit(limit)
+    timeout_seconds = _callback_timeout(timeout_seconds)
+    selected = tuple(identities if limit is None else identities[:limit])
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
     if store_path is not None:
         store = SQLiteStore(store_path)
         try:
-            for identity in identities:
+            for identity in selected:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 store.save_physical_identity(identity)
         finally:
             store.close()
+    returned = len(selected)
     status = {
-        "count": len(identities),
-        "assets": [physical_identity_status(identity) for identity in identities],
+        "count": returned,
+        "assets": [physical_identity_status(identity) for identity in selected],
+        "total_count": len(identities),
+        "returned_count": returned,
+        "remaining_count": max(0, len(identities) - returned),
+        "truncated": len(identities) > returned,
     }
     if store_path is not None:
         status["store"] = str(Path(store_path))
@@ -1366,16 +1394,29 @@ def discover_virtual_listeners_status(
     store_path: str | Path,
     adapter: ListenerVirtualDiscoveryAdapter | None = None,
     snapshot: HostInspectionSnapshot | None = None,
+    *,
+    limit: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
+    limit = _callback_limit(limit)
+    timeout_seconds = _callback_timeout(timeout_seconds)
     resources = (adapter or ListenerVirtualDiscoveryAdapter()).discover(snapshot)
+    selected = tuple(resources if limit is None else resources[:limit])
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
     store = SQLiteStore(store_path)
     try:
-        for resource in resources:
+        for resource in selected:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             store.save_resource(resource)
         return {
             "store": str(store.path),
-            "count": len(resources),
-            "assets": [virtual_resource_status(resource, ()) for resource in resources],
+            "count": len(selected),
+            "assets": [virtual_resource_status(resource, ()) for resource in selected],
+            "total_count": len(resources),
+            "returned_count": len(selected),
+            "remaining_count": max(0, len(resources) - len(selected)),
+            "truncated": len(resources) > len(selected),
         }
     finally:
         store.close()
@@ -2643,7 +2684,6 @@ def run_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        seed_default_collection_jobs(store.path)
         psychlo_bridge = None
         if os.environ.get("OVERSEER_PSYCHLO_PEER_SECRET_FILE"):
             bridge_environment = dict(os.environ)
@@ -2709,15 +2749,69 @@ def _collection_age_seconds(timestamp: str | None, now: datetime | None = None) 
     return max(0, int((current - observed.astimezone(UTC)).total_seconds()))
 
 
-def collection_jobs_status(store_path: str | Path) -> dict[str, object]:
+DEFAULT_COLLECTION_STATUS_LIMIT = 100
+MAX_COLLECTION_STATUS_LIMIT = 500
+DEFAULT_COLLECTION_INCIDENT_LIMIT = 10
+MAX_COLLECTION_INCIDENT_LIMIT = 50
+
+
+def _collection_status_limit(value: int, label: str = "collection status limit") -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_COLLECTION_STATUS_LIMIT:
+        raise ValueError(f"{label} must be between 1 and {MAX_COLLECTION_STATUS_LIMIT}")
+    return value
+
+
+def _collection_incident_limit(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_COLLECTION_INCIDENT_LIMIT:
+        raise ValueError(f"collection incident limit must be between 1 and {MAX_COLLECTION_INCIDENT_LIMIT}")
+    return value
+
+
+def _collection_page(total: int, returned: int, limit: int) -> dict[str, object]:
+    return {
+        "total_count": total,
+        "returned_count": returned,
+        "truncated": total > returned,
+        "limit": limit,
+    }
+
+
+def _callback_limit(value: int | None, *, maximum: int = 100) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ValueError(f"callback limit must be between 1 and {maximum}")
+    return value
+
+
+def _callback_timeout(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError("callback timeout must be positive")
+    return float(value)
+
+
+def collection_jobs_status(
+    store_path: str | Path,
+    limit: int = DEFAULT_COLLECTION_STATUS_LIMIT,
+    incident_limit: int = DEFAULT_COLLECTION_INCIDENT_LIMIT,
+) -> dict[str, object]:
+    limit = _collection_status_limit(limit)
+    incident_limit = _collection_incident_limit(incident_limit)
     now = datetime.now(UTC)
     with SQLiteStore(store_path) as store:
-        jobs = sorted(store.list_collection_jobs(), key=lambda job: job.id)
+        all_jobs = sorted(store.list_collection_jobs(), key=lambda job: job.id)
+        jobs = all_jobs[:limit]
         states = {state.job_id: state for state in store.list_collection_job_states()}
-        requests = {
-            request.job_id: request
+        all_requests = [
+            request
             for request in store.list_collection_requests()
             if request.status == "pending"
+        ]
+        requests = {
+            request.job_id: request
+            for request in sorted(all_requests, key=lambda item: (item.requested_at, item.id))[:limit]
         }
         incidents_by_job: dict[str, list[object]] = {}
         for incident in store.list_triage_incidents():
@@ -2726,6 +2820,8 @@ def collection_jobs_status(store_path: str | Path) -> dict[str, object]:
         for job in jobs:
             state = states.get(job.id)
             request = requests.get(job.id)
+            job_incidents = sorted(incidents_by_job.get(job.id, ()), key=lambda item: item.id)
+            incident_rows = job_incidents[:incident_limit]
             rows.append(
                 {
                     "id": job.id,
@@ -2767,7 +2863,6 @@ def collection_jobs_status(store_path: str | Path) -> dict[str, object]:
                             "requested_at": request.requested_at,
                             "requester": request.requester,
                             "earliest_execution_at": request.earliest_execution_at,
-                            "reason": bounded_text(request.reason),
                         }
                         if request
                         else None
@@ -2779,20 +2874,40 @@ def collection_jobs_status(store_path: str | Path) -> dict[str, object]:
                             "severity": incident.severity.value,
                             "generation": incident.generation,
                         }
-                        for incident in sorted(incidents_by_job.get(job.id, ()), key=lambda item: item.id)
+                        for incident in incident_rows
                     ],
+                    "incident_total_count": len(job_incidents),
+                    "incident_returned_count": len(incident_rows),
+                    "incident_truncated": len(job_incidents) > len(incident_rows),
                 }
             )
-    return {"status": "ok", "jobs": rows, "job_count": len(rows)}
+    return {
+        "status": "ok",
+        "jobs": rows,
+        "job_count": len(rows),
+        **_collection_page(len(all_jobs), len(rows), limit),
+        "request_total_count": len(all_requests),
+        "request_returned_count": len(requests),
+        "request_truncated": len(all_requests) > len(requests),
+    }
 
 
-def collection_scheduler_status(store_path: str | Path) -> dict[str, object]:
+def collection_scheduler_status(
+    store_path: str | Path,
+    limit: int = DEFAULT_COLLECTION_STATUS_LIMIT,
+) -> dict[str, object]:
+    limit = _collection_status_limit(limit)
     with SQLiteStore(store_path) as store:
         requests = store.list_collection_requests()
         incidents = store.list_triage_incidents()
         jobs = store.list_collection_jobs()
         states = store.list_collection_job_states()
     status = scheduler_status(store_path)
+    leased_job_ids = sorted(item.job_id for item in states if item.active_lease_id)
+    pending_requests = sorted(
+        (item for item in requests if item.status == "pending"),
+        key=lambda item: (item.requested_at, item.id),
+    )
     status.update(
         {
             "status": "ok",
@@ -2801,8 +2916,25 @@ def collection_scheduler_status(store_path: str | Path) -> dict[str, object]:
             "open_incident_count": sum(1 for item in incidents if item.status is TriageIncidentStatus.OPEN),
             "resolved_incident_count": sum(1 for item in incidents if item.status is TriageIncidentStatus.RESOLVED),
             "enabled_job_count": sum(1 for item in jobs if item.enabled),
-            "leased_job_ids": sorted(item.job_id for item in states if item.active_lease_id),
+            "leased_job_ids": leased_job_ids[:limit],
+            "leased_total_count": len(leased_job_ids),
+            "leased_returned_count": min(len(leased_job_ids), limit),
+            "leased_truncated": len(leased_job_ids) > limit,
+            "pending_requests": [
+                {
+                    "id": item.id,
+                    "job_id": item.job_id,
+                    "requester": item.requester,
+                    "requested_at": item.requested_at,
+                    "status": item.status,
+                }
+                for item in pending_requests[:limit]
+            ],
+            "request_total_count": len(pending_requests),
+            "request_returned_count": min(len(pending_requests), limit),
+            "request_truncated": len(pending_requests) > limit,
             "durable_status": True,
+            "limit": limit,
         }
     )
     return status
@@ -2834,13 +2966,21 @@ def collection_runs_status(
         }
         for run in runs[:limit]
     ]
-    return {"status": "ok", "runs": rows, "run_count": len(rows), "limit": limit, "job_id": job_id}
+    return {
+        "status": "ok",
+        "runs": rows,
+        "run_count": len(rows),
+        "job_id": job_id,
+        **_collection_page(len(runs), len(rows), limit),
+    }
 
 
 def collection_incidents_status(
     store_path: str | Path,
     status: str | None = None,
+    limit: int = DEFAULT_COLLECTION_STATUS_LIMIT,
 ) -> dict[str, object]:
+    limit = _collection_status_limit(limit)
     if status is not None:
         status = TriageIncidentStatus(status).value
     with SQLiteStore(store_path) as store:
@@ -2865,9 +3005,15 @@ def collection_incidents_status(
             "resolution": incident.resolution,
             "generation": incident.generation,
         }
-        for incident in incidents
+        for incident in incidents[:limit]
     ]
-    return {"status": "ok", "incidents": rows, "incident_count": len(rows), "filter": status}
+    return {
+        "status": "ok",
+        "incidents": rows,
+        "incident_count": len(rows),
+        "filter": status,
+        **_collection_page(len(incidents), len(rows), limit),
+    }
 
 
 def request_collection_run_status(
@@ -2890,7 +3036,6 @@ def request_collection_run_status(
             "job_id": request.job_id,
             "requested_by": request.requester,
             "requested_at": request.requested_at,
-            "reason": bounded_text(request.reason),
             "status": request.status,
         },
         "inline_execution": False,
@@ -3216,7 +3361,13 @@ def discovered_service_resource_status(resource: Resource) -> dict[str, object]:
     }
 
 
-def assess_host_security_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
+def assess_host_security_status(
+    store_path: str | Path,
+    snapshot_id: str | None = None,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, object]:
+    _callback_timeout(timeout_seconds)
     store = SQLiteStore(store_path)
     try:
         if snapshot_id is not None:
@@ -7707,7 +7858,12 @@ def dispatch_crew_messages_status(
     message_id: str | None = None,
     dispatched_by: str = "sisko",
     dispatched_at: str | None = None,
+    *,
+    limit: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
+    limit = _callback_limit(limit)
+    timeout_seconds = _callback_timeout(timeout_seconds)
     lock_path = Path(f"{store_path}.crew-dispatch.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with _CREW_DISPATCH_LOCK, lock_path.open("a", encoding="utf-8") as lock_stream:
@@ -7719,6 +7875,8 @@ def dispatch_crew_messages_status(
                 message_id=message_id,
                 dispatched_by=dispatched_by,
                 dispatched_at=dispatched_at,
+                limit=limit,
+                timeout_seconds=timeout_seconds,
             )
         finally:
             fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
@@ -7730,6 +7888,9 @@ def _dispatch_crew_messages_status_unlocked(
     message_id: str | None = None,
     dispatched_by: str = "sisko",
     dispatched_at: str | None = None,
+    *,
+    limit: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
     if owner_domain is not None:
         OwnerDomain(owner_domain)
@@ -7758,8 +7919,17 @@ def _dispatch_crew_messages_status_unlocked(
     finally:
         store.close()
 
+    total_messages = len(messages)
+    selected_messages = sorted(messages, key=lambda item: item.created_at or item.id)
+    if limit is not None:
+        selected_messages = selected_messages[:limit]
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
     results = []
-    for message in sorted(messages, key=lambda item: item.created_at or item.id):
+    timed_out = False
+    for message in selected_messages:
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
         try:
             result = _dispatch_crew_message(store_path, message, dispatched_by, now)
             final_status = CrewMessageStatus.ACKNOWLEDGED
@@ -7804,6 +7974,11 @@ def _dispatch_crew_messages_status_unlocked(
         "dispatched_by": dispatched_by,
         "dispatched_at": now,
         "processed": len(results),
+        "total_count": total_messages,
+        "returned_count": len(results),
+        "remaining_count": max(0, total_messages - len(results)),
+        "truncated": total_messages > len(results),
+        "timed_out": timed_out,
         "acknowledged": sum(1 for result in results if result["message_status"] == CrewMessageStatus.ACKNOWLEDGED.value),
         "blocked": sum(1 for result in results if result.get("status") == "blocked"),
         "approved": sum(1 for result in results if result["review_status"] == CrewReviewStatus.APPROVED.value),
@@ -8300,19 +8475,34 @@ def audit_station_status(
     store_path: str | Path,
     snapshot_id: str | None = None,
     audited_at: str | None = None,
+    *,
+    limit: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
+    limit = _callback_limit(limit, maximum=7)
+    timeout_seconds = _callback_timeout(timeout_seconds)
     now = audited_at or datetime.now(UTC).replace(microsecond=0).isoformat()
-    snapshot = _load_optional_host_snapshot(store_path, snapshot_id)
+    snapshot = _load_optional_host_snapshot(store_path, snapshot_id, timeout_seconds=timeout_seconds)
     actions: list[dict[str, object]] = []
     referrals: list[dict[str, object]] = []
 
-    actions.append({"owner_domain": OwnerDomain.KIRA.value, "action": "discover_physical", **discover_physical_status(("/dev/serial/by-id", "/dev/serial/by-path"), store_path)})
-    actions.append({"owner_domain": OwnerDomain.KIRA.value, "action": "discover_storage", **discover_storage_status(store_path=store_path)})
-    actions.append({"owner_domain": OwnerDomain.DAX.value, "action": "discover_virtual_listeners", **discover_virtual_listeners_status(store_path, snapshot=snapshot)})
-    actions.append({"owner_domain": OwnerDomain.JULIAN.value, "action": "discover_user_services", **discover_user_services_status(store_path, snapshot=snapshot)})
-    actions.append({"owner_domain": OwnerDomain.OBRIEN.value, "action": "plan_package_updates", **plan_package_updates_status(store_path, captured_at=now)})
-    actions.append({"owner_domain": OwnerDomain.QUARK.value, "action": "discover_codex_threads", **discover_codex_project_threads_status(store_path)})
-    actions.append({"owner_domain": OwnerDomain.EZRI.value, "action": "capture_knowledge_events", **knowledge_capture_status(store_path, limit=DEFAULT_KNOWLEDGE_LIMIT)})
+    action_specs = (
+        (OwnerDomain.KIRA.value, "discover_physical", lambda: discover_physical_status(("/dev/serial/by-id", "/dev/serial/by-path"), store_path)),
+        (OwnerDomain.KIRA.value, "discover_storage", lambda: discover_storage_status(store_path=store_path)),
+        (OwnerDomain.DAX.value, "discover_virtual_listeners", lambda: discover_virtual_listeners_status(store_path, snapshot=snapshot)),
+        (OwnerDomain.JULIAN.value, "discover_user_services", lambda: discover_user_services_status(store_path, snapshot=snapshot)),
+        (OwnerDomain.OBRIEN.value, "plan_package_updates", lambda: plan_package_updates_status(store_path, captured_at=now)),
+        (OwnerDomain.QUARK.value, "discover_codex_threads", lambda: discover_codex_project_threads_status(store_path)),
+        (OwnerDomain.EZRI.value, "capture_knowledge_events", lambda: knowledge_capture_status(store_path, limit=DEFAULT_KNOWLEDGE_LIMIT)),
+    )
+    selected_specs = action_specs if limit is None else action_specs[:limit]
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    timed_out = False
+    for owner, action_name, action in selected_specs:
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        actions.append({"owner_domain": owner, "action": action_name, **action()})
 
     referrals.extend(_refer_physical_unknowns_to_odo(store_path, actions, now))
     referrals.extend(_refer_virtual_unknowns_to_odo(store_path, actions, now))
@@ -8323,6 +8513,11 @@ def audit_station_status(
         "audited_at": now,
         "snapshot_id": snapshot.id if snapshot else None,
         "actions": len(actions),
+        "total_count": len(action_specs),
+        "returned_count": len(actions),
+        "remaining_count": max(0, len(action_specs) - len(actions)),
+        "truncated": len(action_specs) > len(actions),
+        "timed_out": timed_out,
         "odo_referrals": len(referrals),
         "sisko_requests": sisko_requests,
         "items": actions,
@@ -8332,9 +8527,17 @@ def audit_station_status(
     }
 
 
-def _load_optional_host_snapshot(store_path: str | Path, snapshot_id: str | None) -> HostInspectionSnapshot | None:
+def _load_optional_host_snapshot(
+    store_path: str | Path,
+    snapshot_id: str | None,
+    *,
+    timeout_seconds: float | None = None,
+) -> HostInspectionSnapshot | None:
     if snapshot_id is None:
-        return HostInspectionAdapter(collect_firewall_commands=False).inspect()
+        return HostInspectionAdapter(
+            timeout_seconds=timeout_seconds or 5,
+            collect_firewall_commands=False,
+        ).inspect()
     store = SQLiteStore(store_path)
     try:
         return store.load_host_snapshot(snapshot_id)
@@ -9272,10 +9475,16 @@ def dispatch_usage_continuations_status(
     agent_manager: AgentManager | None = None,
     agent_registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
     local_agent_registry_path: str | Path | None = None,
+    *,
+    limit: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
+    limit = _callback_limit(limit)
+    timeout_seconds = _callback_timeout(timeout_seconds)
     store = SQLiteStore(store_path)
     try:
         now = dispatched_at or datetime.now(UTC).isoformat()
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
         adapter = thread_adapter
         if (resume_codex_projects or resume_agent_sessions) and adapter is None:
             adapter = CodexProjectThreadAdapter(codex_projects_registry)
@@ -9285,7 +9494,16 @@ def dispatch_usage_continuations_status(
         dispatches: list[UsageContinuationDispatch] = []
         skipped: list[dict[str, object]] = []
         resume_results: list[dict[str, object]] = []
-        for request in store.list_usage_continuation_requests():
+        requests = store.list_usage_continuation_requests()
+        processed_requests = 0
+        timed_out = False
+        for request in requests:
+            if limit is not None and processed_requests >= limit:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                break
+            processed_requests += 1
             if request.id in dispatched_request_ids:
                 skipped.append(
                     {
@@ -9298,7 +9516,7 @@ def dispatch_usage_continuations_status(
                 )
                 continue
             try:
-                limit = store.load_usage_limit(request.limit_id)
+                usage_limit = store.load_usage_limit(request.limit_id)
             except KeyError:
                 skipped.append(
                     {
@@ -9310,7 +9528,7 @@ def dispatch_usage_continuations_status(
                     }
                 )
                 continue
-            schedule = schedule_usage_limited_work(limit, request.to_limited_work_request())
+            schedule = schedule_usage_limited_work(usage_limit, request.to_limited_work_request())
             if schedule.status != ScheduledWorkStatus.READY:
                 skipped.append(scheduled_work_status(schedule))
                 continue
@@ -9421,6 +9639,11 @@ def dispatch_usage_continuations_status(
             "store": str(store.path),
             "dispatched": len(dispatches),
             "skipped": len(skipped),
+            "total_count": len(requests),
+            "returned_count": processed_requests,
+            "remaining_count": max(0, len(requests) - processed_requests),
+            "truncated": len(requests) > processed_requests,
+            "timed_out": timed_out,
             "dispatches": [usage_continuation_dispatch_status(dispatch) for dispatch in dispatches],
             "skipped_items": skipped,
             "resume_codex_projects": resume_codex_projects,
@@ -10970,10 +11193,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "collection-jobs", help="read durable collection job definitions and scheduler state as JSON"
     )
     collection_jobs_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    collection_jobs_parser.add_argument("--limit", type=int, default=DEFAULT_COLLECTION_STATUS_LIMIT)
     collection_scheduler_parser = subparsers.add_parser(
         "collection-scheduler-status", help="read durable collection scheduler status as JSON"
     )
     collection_scheduler_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    collection_scheduler_parser.add_argument("--limit", type=int, default=DEFAULT_COLLECTION_STATUS_LIMIT)
     collection_runs_parser = subparsers.add_parser(
         "collection-runs", help="read bounded durable collection runs as JSON"
     )
@@ -10985,6 +11210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     collection_incidents_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     collection_incidents_parser.add_argument("--status", choices=[item.value for item in TriageIncidentStatus])
+    collection_incidents_parser.add_argument("--limit", type=int, default=DEFAULT_COLLECTION_STATUS_LIMIT)
     request_collection_parser = subparsers.add_parser(
         "request-collection-run", help="queue one collection run without executing it inline"
     )
@@ -10997,6 +11223,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     seed_collection_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     seed_collection_parser.add_argument("--config", help="optional config to seed before job definitions")
+    seed_collection_parser.add_argument(
+        "--family",
+        action="append",
+        choices=sorted(COLLECTION_FAMILIES),
+        help="deprecated-selector-compatible family; repeat to select multiple families",
+    )
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
@@ -12361,11 +12593,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "collection-jobs":
-        print(json.dumps(collection_jobs_status(args.store), sort_keys=True))
+        print(json.dumps(collection_jobs_status(args.store, args.limit), sort_keys=True))
         return 0
 
     if args.command == "collection-scheduler-status":
-        print(json.dumps(collection_scheduler_status(args.store), sort_keys=True))
+        print(json.dumps(collection_scheduler_status(args.store, args.limit), sort_keys=True))
         return 0
 
     if args.command == "collection-runs":
@@ -12373,7 +12605,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "collection-incidents":
-        print(json.dumps(collection_incidents_status(args.store, args.status), sort_keys=True))
+        print(json.dumps(collection_incidents_status(args.store, args.status, args.limit), sort_keys=True))
         return 0
 
     if args.command == "request-collection-run":
@@ -12388,7 +12620,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "seed-collection-jobs":
-        print(json.dumps(seed_default_collection_jobs(args.store, args.config), sort_keys=True))
+        print(json.dumps(seed_default_collection_jobs(args.store, args.config, args.family), sort_keys=True))
         return 0
 
     if args.command == "run":

@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from concurrent.futures import ThreadPoolExecutor
 
 from overseer import (
     CollectionOutcome,
@@ -177,3 +178,46 @@ def test_prune_bounded_evidence_does_not_prune_other_job(tmp_path: Path) -> None
     with SQLiteStore(path) as store:
         assert {run.job_id for run in store.list_collection_runs()} == {first.id, other.id}
         assert len([run for run in store.list_collection_runs() if run.job_id == other.id]) == 3
+
+
+def test_repair_rejects_stale_or_resolved_incident_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    _job(path, policy=RepairPolicy.PREAPPROVED_LOW_RISK)
+    incident = _incident(path)
+    runbook = _runbook(action="retry_read_only")
+    with SQLiteStore(path) as store:
+        store.save_repair_runbook(runbook)
+        store.save_collection_incident(replace(incident, generation=2))
+    with pytest.raises(ValueError, match="stale triage incident"):
+        RepairCoordinator(path).advance(incident, runbook)
+    current = replace(incident, generation=2, status=TriageIncidentStatus.RESOLVED, repair_state="verified", resolution="fresh verification")
+    with SQLiteStore(path) as store:
+        store.save_collection_incident(current)
+    with pytest.raises(ValueError, match="not open"):
+        RepairCoordinator(path).advance(current, runbook)
+
+
+def test_concurrent_repair_advances_coalesce_one_attempt_and_request(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    _job(path, policy=RepairPolicy.PREAPPROVED_LOW_RISK)
+    incident = _incident(path)
+    runbook = _runbook(action="retry_read_only")
+    with SQLiteStore(path) as store:
+        store.save_repair_runbook(runbook)
+    entry = __import__("threading").Barrier(2)
+
+    def clock() -> str:
+        entry.wait()
+        return NOW
+
+    def advance() -> object:
+        return RepairCoordinator(path, clock=clock).advance(incident, runbook)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _value: advance(), (1, 2)))
+    # The serialized second caller observes the same cooldown window and
+    # returns the existing attempt deterministically; no duplicate is created.
+    assert {result.disposition for result in results} == {"verification_queued", "cooldown"}
+    with SQLiteStore(path) as store:
+        assert len(store.list_repair_attempts()) == 1
+        assert len(store.list_collection_requests()) == 1

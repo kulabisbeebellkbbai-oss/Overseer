@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,15 @@ from overseer import (
     SQLiteStore,
     scheduler_status,
 )
+from overseer.collection_adapters import (
+    HealthProbeCollectionAdapter,
+    HostInspectionCollectionAdapter,
+    PackageInspectionCollectionAdapter,
+    StorePathCallbackAdapter,
+)
+from overseer.health import HealthEvidence, HealthStatus, HealthTarget, ProbeType
+from overseer.host import HostCommandObservation, HostInspectionSnapshot
+from overseer.packages import PackageInspectionSnapshot, PackageUpdate
 
 NOW = "2026-08-24T12:00:00+00:00"
 
@@ -44,9 +54,16 @@ def _seed(path: Path, jobs: tuple[CollectionJob, ...]) -> None:
 
 
 class _BlockingAdapter:
-    def __init__(self, *, delay: float = 0.01, block: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        delay: float = 0.01,
+        block: threading.Event | None = None,
+        started: threading.Event | None = None,
+    ) -> None:
         self.delay = delay
         self.block = block
+        self.started = started
         self.active = 0
         self.peak_active = 0
         self.by_key: dict[str, int] = {}
@@ -57,6 +74,8 @@ class _BlockingAdapter:
         with self.lock:
             self.active += 1
             self.peak_active = max(self.peak_active, self.active)
+            if self.started is not None and self.active >= 2:
+                self.started.set()
             self.by_key[job.concurrency_key] = self.by_key.get(job.concurrency_key, 0) + 1
             self.peak_by_key[job.concurrency_key] = max(
                 self.peak_by_key.get(job.concurrency_key, 0), self.by_key[job.concurrency_key]
@@ -216,3 +235,184 @@ def test_pending_request_makes_future_job_run_once_and_terminalizes_request(tmp_
             assert saved.status == "completed"
     finally:
         scheduler.shutdown()
+
+
+def test_health_collection_persists_no_body_or_secret_markers(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    job = _job("health-secret")
+    _seed(path, (job,))
+    target = HealthTarget(
+        id=job.target_id or "target",
+        resource_id=job.resource_id or "resource",
+        name="health",
+        probe_type=ProbeType.HTTP,
+        target="https://example.test/health?token=HEALTH_BODY_MARKER",
+    )
+    with SQLiteStore(path) as store:
+        store.save_health_target(target)
+
+    class Probe:
+        def probe(self, received: HealthTarget) -> HealthEvidence:
+            assert received.target == target.target
+            return HealthEvidence(
+                id="health.evidence.secret",
+                resource_id=received.resource_id,
+                target=received.target,
+                probe_type=received.probe_type,
+                observed_status=HealthStatus.FAILED,
+                owner_domain=received.owner_domain,
+                observed_error="HEALTH_BODY_MARKER password=HEALTH_SECRET",
+            )
+
+    HealthProbeCollectionAdapter(lambda _timeout: Probe()).collect(job, str(path))
+    with SQLiteStore(path) as store:
+        evidence = store.load_health_evidence("health.evidence.secret")
+        stored = repr(evidence)
+        assert "HEALTH_BODY_MARKER" not in stored
+        assert "HEALTH_SECRET" not in stored
+        assert "example.test/health" in evidence.target
+
+
+def test_host_collection_persists_projection_without_full_observations(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    job = replace(_job("host-secret", key="host"), kind=CollectionJobKind.HOST_INSPECTION)
+    _seed(path, (job,))
+    marker = "HOST_BODY_MARKER"
+    snapshot = HostInspectionSnapshot(
+        id=f"host.{marker}",
+        captured_at=NOW,
+        hostname=f"host-{marker}",
+        os_release={"NAME": marker, "TOKEN": "HOST_SECRET"},
+        observations=(
+            HostCommandObservation(
+                name="ss",
+                command=("ss", "-ltnp"),
+                exit_code=0,
+                stdout=f"{marker} stdout password=HOST_SECRET",
+                stderr=f"{marker} stderr",
+            ),
+        ),
+    )
+    adapter = HostInspectionCollectionAdapter(lambda _timeout: SimpleNamespace(inspect=lambda: snapshot))
+    adapter.collect(job, str(path))
+    with SQLiteStore(path) as store:
+        saved = store.list_host_snapshots()[0]
+        stored = repr(saved)
+        assert marker not in stored
+        assert "HOST_SECRET" not in stored
+        assert saved.observation("ss").command == ("ss", "-ltnp")
+        assert saved.observation("ss").exit_code == 0
+        assert saved.observation("ss").stdout == ""
+        assert saved.observation("ss").stderr == ""
+
+
+def test_package_collection_preserves_updates_but_strips_raw_stderr(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    job = replace(_job("package-secret", key="package"), kind=CollectionJobKind.PACKAGE_INSPECTION)
+    _seed(path, (job,))
+    snapshot = PackageInspectionSnapshot(
+        id="package.secret",
+        captured_at=NOW,
+        command=("apt", "list", "--upgradable"),
+        exit_code=100,
+        updates=(PackageUpdate("openssl", "security", "2", "amd64"),),
+        stderr="PACKAGE_BODY_MARKER token=PACKAGE_SECRET",
+    )
+    adapter = PackageInspectionCollectionAdapter(lambda _timeout: SimpleNamespace(inspect=lambda: snapshot))
+    adapter.collect(job, str(path))
+    with SQLiteStore(path) as store:
+        record = store.list_package_inspection_records()[0]
+        assert record.updates == snapshot.updates
+        assert record.state_fingerprint
+        assert "PACKAGE_BODY_MARKER" not in repr(record)
+        assert "PACKAGE_SECRET" not in repr(record)
+        assert record.stderr == ""
+
+
+def test_callback_body_marker_is_not_written_to_collection_run(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    job = _job("callback-secret")
+    _seed(path, (job,))
+
+    def callback(_job: CollectionJob, _store_path: str, _timeout: float) -> CollectionExecution:
+        return CollectionExecution(
+            CollectionOutcome.SUCCEEDED,
+            "CALLBACK_BODY_MARKER arbitrary external payload",
+            ("evidence.safe",),
+        )
+
+    scheduler = _scheduler(path, StorePathCallbackAdapter(callback))
+    try:
+        scheduler.run_ready_once()
+        with SQLiteStore(path) as store:
+            run = store.list_collection_runs()[0]
+            assert "CALLBACK_BODY_MARKER" not in repr(run)
+            assert run.evidence_ids == ("evidence.safe",)
+    finally:
+        scheduler.shutdown()
+
+
+def test_concurrent_scheduler_entries_reserve_capacity_once(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    jobs = tuple(_job(f"entry-{index}", key=f"key-{index}") for index in range(4))
+    _seed(path, jobs)
+    adapter_started = threading.Event()
+    adapter = _BlockingAdapter(block=threading.Event(), started=adapter_started)
+    scheduler = _scheduler(path, adapter)
+    entry = threading.Barrier(2)
+    results: list[object] = []
+
+    def invoke() -> None:
+        entry.wait()
+        results.append(scheduler.run_ready_once())
+
+    callers = [threading.Thread(target=invoke), threading.Thread(target=invoke)]
+    for caller in callers:
+        caller.start()
+    assert adapter_started.wait(2)
+    assert adapter.peak_active == 2
+    with SQLiteStore(path) as store:
+        assert len([state for state in store.list_collection_job_states() if state.active_lease_id]) == 2
+    adapter.block.set()  # type: ignore[union-attr]
+    for caller in callers:
+        caller.join(2)
+    assert all(not caller.is_alive() for caller in callers)
+    assert len(results) == 2
+    scheduler.shutdown()
+
+
+def test_late_completion_after_bounded_shutdown_releases_exact_timeout_lease(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    job = _job("late", timeout=1)
+    _seed(path, (job,))
+    release = threading.Event()
+    exited = threading.Event()
+
+    class NonCooperative:
+        def collect(self, _job: CollectionJob, _store_path: str) -> CollectionExecution:
+            release.wait(2)
+            exited.set()
+            return CollectionExecution(CollectionOutcome.SUCCEEDED, "late completion")
+
+    scheduler = _scheduler(path, NonCooperative())
+    scheduler.shutdown_timeout_seconds = 0.05
+    scheduler.run_ready_once()
+    with SQLiteStore(path) as store:
+        before = store.load_collection_job_state(job.id)
+        assert before.active_lease_id is not None
+        lease_id = before.active_lease_id
+        generation = before.lease_generation
+    scheduler.shutdown()
+    with SQLiteStore(path) as store:
+        assert store.load_collection_job_state(job.id).active_lease_id == lease_id
+    release.set()
+    assert exited.wait(2)
+    assert scheduler._completion_event.wait(2)
+    with SQLiteStore(path) as store:
+        after = store.load_collection_job_state(job.id)
+        assert after.active_lease_id is None
+        assert after.lease_generation == generation
+        runs = store.list_collection_runs()
+        assert len(runs) == 1
+        assert runs[0].error_category == "timeout"
+        assert len(store.list_triage_incidents()) == 1

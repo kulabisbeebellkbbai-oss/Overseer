@@ -14,7 +14,6 @@ from typing import Callable
 from .collection_adapters import (
     CollectionAdapterRegistry,
     CollectionExecution,
-    bounded_text,
     default_collection_adapter_registry,
 )
 from .collection_models import (
@@ -45,13 +44,15 @@ class SchedulerCycle:
 @dataclass
 class _ActiveWork:
     job: CollectionJob
-    future: Future[CollectionExecution]
+    future: Future[CollectionExecution] | None
     lease_id: str
     lease_generation: int
     started_at: str
     deadline: float
     request_id: str | None = None
     timed_out: bool = False
+    completion_handled: bool = False
+    started: bool = False
 
 
 def _utc_now() -> str:
@@ -98,6 +99,7 @@ class CollectionScheduler:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._closed = False
+        self._completion_event = threading.Event()
 
     def _now(self, now: str | None) -> str:
         value = now if now is not None else self.clock()
@@ -108,7 +110,8 @@ class CollectionScheduler:
         return self.adapter_ids.get(job.kind) or self.adapter_ids.get(job.kind.value)
 
     def _active_keys(self) -> set[str]:
-        return {work.job.concurrency_key for work in self._active.values()}
+        with self._lock:
+            return {work.job.concurrency_key for work in self._active.values()}
 
     def _due_candidates(self, now: str, excluded_keys: set[str]) -> list[CollectionJob]:
         with SQLiteStore(self.store_path) as store:
@@ -152,46 +155,92 @@ class CollectionScheduler:
 
     def _submit(self, job: CollectionJob, lease_id: str, generation: int, now: str, request_id: str | None) -> _ActiveWork:
         adapter = self.registry.resolve(job, self._adapter_id(job))
-        future = self._executor.submit(adapter.collect, job, self.store_path)
         work = _ActiveWork(
             job=job,
-            future=future,
+            future=None,
             lease_id=lease_id,
             lease_generation=generation,
             started_at=now,
-            deadline=time.monotonic() + job.timeout_seconds,
+            deadline=float("inf"),
             request_id=request_id,
         )
+        # Reserve the in-memory slot before submission. The wrapper starts the
+        # deadline at the actual callable boundary, excluding queue time.
         self._active[lease_id] = work
+        future = self._executor.submit(self._run_adapter, adapter, work)
+        work.future = future
+        future.add_done_callback(lambda _future, lease=lease_id: self._on_future_done(lease))
         return work
 
+    def _run_adapter(self, adapter: object, work: _ActiveWork) -> CollectionExecution:
+        with self._lock:
+            if self._active.get(work.lease_id) is work:
+                work.started = True
+                work.started_at = self._now(None)
+                work.deadline = time.monotonic() + work.job.timeout_seconds
+        return adapter.collect(work.job, self.store_path)  # type: ignore[attr-defined]
+
+    def _on_future_done(self, lease_id: str) -> None:
+        with self._lock:
+            work = self._active.get(lease_id)
+            if work is None:
+                return
+            if not work.timed_out:
+                self._completion_event.set()
+                return
+            if work.completion_handled:
+                return
+            work.completion_handled = True
+            job_id = work.job.id
+            generation = work.lease_generation
+        try:
+            with SQLiteStore(self.store_path) as store:
+                store.release_collection_lease(job_id, lease_id, generation)
+        finally:
+            with self._lock:
+                if self._active.get(lease_id) is work:
+                    self._active.pop(lease_id, None)
+                self._completion_event.set()
+
     def _timeout(self, work: _ActiveWork, now: str) -> None:
-        if work.timed_out:
-            return
-        run = CollectionRun(
-            id=_run_id(work.job.id, work.lease_id, work.lease_generation),
-            job_id=work.job.id,
-            trigger="scheduled",
-            started_at=work.started_at,
-            completed_at=now,
-            outcome=CollectionOutcome.TIMED_OUT,
-            summary="collection deadline exceeded",
-            error_category="timeout",
-            retry_disposition="backoff",
-            request_id=work.request_id,
-        )
-        with SQLiteStore(self.store_path) as store:
-            store.record_collection_timeout(run, work.lease_id, work.lease_generation)
-        work.timed_out = True
+        with self._lock:
+            if work.timed_out or self._active.get(work.lease_id) is not work:
+                return
+            work.timed_out = True
+            run = CollectionRun(
+                id=_run_id(work.job.id, work.lease_id, work.lease_generation),
+                job_id=work.job.id,
+                trigger="scheduled",
+                started_at=work.started_at,
+                completed_at=now,
+                outcome=CollectionOutcome.TIMED_OUT,
+                summary="collection deadline exceeded",
+                error_category="timeout",
+                retry_disposition="backoff",
+                request_id=work.request_id,
+            )
+            # Keep the coordinator lock through persistence so a completion
+            # callback cannot release the lease before the timeout run exists.
+            with SQLiteStore(self.store_path) as store:
+                store.record_collection_timeout(run, work.lease_id, work.lease_generation)
 
     def _finish(self, work: _ActiveWork, now: str) -> tuple[int, int, int]:
         """Return ``(succeeded, failed, timed_out)`` for one completed future."""
+        with self._lock:
+            if self._active.get(work.lease_id) is not work or work.completion_handled:
+                return 0, 0, 0
+            work.completion_handled = True
         if work.timed_out:
             with SQLiteStore(self.store_path) as store:
                 store.release_collection_lease(work.job.id, work.lease_id, work.lease_generation)
-            self._active.pop(work.lease_id, None)
+            with self._lock:
+                if self._active.get(work.lease_id) is work:
+                    self._active.pop(work.lease_id, None)
+                self._completion_event.set()
             return 0, 0, 0
         try:
+            if work.future is None:
+                raise RuntimeError("collection future was not installed")
             execution = work.future.result()
             if not isinstance(execution, CollectionExecution):
                 raise TypeError("collection adapter returned an invalid execution")
@@ -208,23 +257,33 @@ class CollectionScheduler:
             started_at=work.started_at,
             completed_at=now,
             outcome=execution.outcome,
-            summary=bounded_text(execution.summary),
+            # Adapter summaries are diagnostics, not a scheduler evidence
+            # channel. Persist only the bounded outcome label.
+            summary=f"collection {execution.outcome.value}",
             evidence_ids=execution.evidence_ids,
-            error_category=bounded_text(execution.failure_category, limit=160),
+            error_category=(execution.failure_category if execution.failure_category in {
+                "", "timeout", "unavailable", "contract_mismatch", "authentication",
+                "resource_conflict", "policy_blocked", "adapter_error", "internal_error",
+            } else "adapter_error"),
             retry_disposition="backoff" if execution.outcome is not CollectionOutcome.SUCCEEDED else "none",
             request_id=work.request_id,
         )
         with SQLiteStore(self.store_path) as store:
             store.complete_collection_run(run, work.lease_id, work.lease_generation)
-        self._active.pop(work.lease_id, None)
+        with self._lock:
+            if self._active.get(work.lease_id) is work:
+                self._active.pop(work.lease_id, None)
+            self._completion_event.set()
         if execution.outcome is CollectionOutcome.SUCCEEDED:
             return 1, 0, 0
         return 0, 1, 1 if execution.outcome is CollectionOutcome.TIMED_OUT else 0
 
     def _reap_done(self, now: str) -> tuple[int, int, int]:
         counts = [0, 0, 0]
-        for work in tuple(self._active.values()):
-            if work.future.done():
+        with self._lock:
+            works = tuple(self._active.values())
+        for work in works:
+            if work.future is not None and work.future.done():
                 if work.timed_out:
                     result = self._finish(work, now)
                 elif time.monotonic() >= work.deadline:
@@ -237,63 +296,65 @@ class CollectionScheduler:
         return tuple(counts)  # type: ignore[return-value]
 
     def run_ready_once(self, now: str | None = None) -> SchedulerCycle:
-        if self._closed:
-            raise RuntimeError("collection scheduler is shut down")
         current = self._now(now)
-        succeeded, failed, timed_out = self._reap_done(current)
-        claimed = started = blocked = 0
-        new_work: list[_ActiveWork] = []
-        excluded = self._active_keys()
-        while len(self._active) < self.max_workers:
-            candidates = self._due_candidates(current, excluded | {work.job.concurrency_key for work in new_work})
-            if not candidates:
-                break
-            candidate = candidates[0]
-            try:
-                self.registry.resolve(candidate, self._adapter_id(candidate))
-            except ValueError:
-                blocked += 1
-                excluded.add(candidate.concurrency_key)
-                continue
-            result = self._claim_one(candidate, current)
-            if result is None:
-                excluded.add(candidate.concurrency_key)
-                continue
-            job, lease_id, generation = result
-            with SQLiteStore(self.store_path) as store:
-                request_id = next(
-                    (
-                        request.id
-                        for request in store.list_collection_requests()
-                        if request.job_id == job.id
-                        and request.status == "pending"
-                        and (request.earliest_execution_at is None or _parse_now(request.earliest_execution_at) <= _parse_now(current))
-                    ),
-                    None,
-                )
-            claimed += 1
-            work = self._submit(job, lease_id, generation, current, request_id)
-            new_work.append(work)
-            excluded.add(job.concurrency_key)
-            started += 1
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("collection scheduler is shut down")
+            succeeded, failed, timed_out = self._reap_done(current)
+            claimed = started = blocked = 0
+            new_work: list[_ActiveWork] = []
+            excluded = self._active_keys()
+            while len(self._active) < self.max_workers:
+                candidates = self._due_candidates(current, excluded | {work.job.concurrency_key for work in new_work})
+                if not candidates:
+                    break
+                candidate = candidates[0]
+                try:
+                    self.registry.resolve(candidate, self._adapter_id(candidate))
+                except ValueError:
+                    blocked += 1
+                    excluded.add(candidate.concurrency_key)
+                    continue
+                result = self._claim_one(candidate, current)
+                if result is None:
+                    excluded.add(candidate.concurrency_key)
+                    continue
+                job, lease_id, generation = result
+                with SQLiteStore(self.store_path) as store:
+                    request_id = next(
+                        (
+                            request.id
+                            for request in store.list_collection_requests()
+                            if request.job_id == job.id
+                            and request.status == "pending"
+                            and (request.earliest_execution_at is None or _parse_now(request.earliest_execution_at) <= _parse_now(current))
+                        ),
+                        None,
+                    )
+                claimed += 1
+                work = self._submit(job, lease_id, generation, current, request_id)
+                new_work.append(work)
+                excluded.add(job.concurrency_key)
+                started += 1
 
         pending = set(work.lease_id for work in new_work)
         while pending:
             progress = False
             for lease_id in tuple(pending):
-                work = self._active.get(lease_id)
+                with self._lock:
+                    work = self._active.get(lease_id)
                 if work is None:
                     pending.remove(lease_id)
                     progress = True
                     continue
-                if not work.timed_out and not work.future.done() and time.monotonic() >= work.deadline:
+                if not work.timed_out and work.started and work.future is not None and not work.future.done() and time.monotonic() >= work.deadline:
                     self._timeout(work, current)
                     failed += 1
                     timed_out += 1
                     pending.remove(lease_id)
                     progress = True
                     continue
-                if work.future.done():
+                if work.future is not None and work.future.done():
                     done = self._finish(work, current)
                     succeeded += done[0]
                     failed += done[1]
@@ -301,7 +362,8 @@ class CollectionScheduler:
                     pending.remove(lease_id)
                     progress = True
             if pending and not progress:
-                time.sleep(0.005)
+                self._completion_event.wait(0.005)
+                self._completion_event.clear()
 
         with SQLiteStore(self.store_path) as store:
             next_due = [state.next_due_at for state in store.list_collection_job_states() if state.active_lease_id is None]
@@ -324,16 +386,28 @@ class CollectionScheduler:
                 break
 
     def shutdown(self) -> None:
-        if self._closed:
-            return
+        with self._lock:
+            if self._closed:
+                return
         self._stop.set()
         deadline = time.monotonic() + self.shutdown_timeout_seconds
-        while self._active and time.monotonic() < deadline:
-            self._reap_done(self._now(None))
-            if self._active:
-                time.sleep(0.005)
-        self._executor.shutdown(wait=not self._active, cancel_futures=False)
-        self._closed = True
+        while time.monotonic() < deadline:
+            with self._lock:
+                active = tuple(self._active.values())
+            if not active:
+                break
+            current = self._now(None)
+            for work in active:
+                if work.started and not work.timed_out and time.monotonic() >= work.deadline:
+                    self._timeout(work, current)
+            self._reap_done(current)
+            self._completion_event.wait(min(0.005, max(0.0, deadline - time.monotonic())))
+            self._completion_event.clear()
+        with self._lock:
+            has_active = bool(self._active)
+        self._executor.shutdown(wait=not has_active, cancel_futures=False)
+        with self._lock:
+            self._closed = True
 
     def __enter__(self) -> CollectionScheduler:
         return self

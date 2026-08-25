@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from .collection_models import (
     MAX_EVIDENCE_IDS,
@@ -17,7 +19,7 @@ from .collection_models import (
     CollectionOutcome,
 )
 from .health import HealthStatus
-from .host import HostInspectionAdapter
+from .host import HostCommandObservation, HostInspectionAdapter, HostInspectionSnapshot
 from .live_health import RoutedHealthProbeAdapter
 from .packages import AptPackageInspectionAdapter, package_inspection_record
 from .store import SQLiteStore
@@ -42,6 +44,8 @@ def bounded_evidence_ids(values: object) -> tuple[str, ...]:
     result: list[str] = []
     for value in values:
         item = bounded_text(value, limit=MAX_IDENTIFIER_LENGTH)
+        if item and not re.fullmatch(r"(?:evidence|health|host|package|run|request)\.[A-Za-z0-9_.:-]+", item):
+            item = _scheduler_digest(item, "evidence")
         if item and item not in result:
             result.append(item)
         if len(result) >= MAX_EVIDENCE_IDS:
@@ -49,6 +53,115 @@ def bounded_evidence_ids(values: object) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _scheduler_digest(value: object, prefix: str) -> str:
+    digest = hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"{prefix}.{digest}"
+
+
+def _safe_target_surface(value: object) -> str:
+    """Keep target identity useful while discarding query values and bodies."""
+    text = bounded_text(value, limit=320)
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return _scheduler_digest(text, "target")
+    if parsed.scheme and parsed.netloc:
+        try:
+            hostname = parsed.hostname or ""
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            safe_netloc = hostname
+            if parsed.port is not None:
+                safe_netloc += f":{parsed.port}"
+        except ValueError:
+            return _scheduler_digest(text, "target")
+        return urlunsplit((parsed.scheme, safe_netloc, parsed.path, "", ""))
+    return _scheduler_digest(text, "target")
+
+
+def _scheduler_health_evidence(evidence: object) -> object:
+    """Project probe output to the fields safe for scheduler persistence."""
+    return replace(
+        evidence,
+        target=_safe_target_surface(evidence.target),
+        observed_error="health probe reported an error" if evidence.observed_error else "",
+    )
+
+
+_SAFE_HOST_COMMANDS = frozenset(
+    {
+        "hostname", "uname", "systemctl", "ss", "df", "firewall-cmd",
+        "--user", "list-units", "--type=service", "--state=running", "--no-pager",
+        "-tnp", "-ltnp", "-h", "--output=source,size,used,avail,pcent,target",
+        "--state", "--get-active-zones", "--zone=public", "--list-all",
+    }
+)
+
+
+def _safe_command_identity(command: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(part if part in _SAFE_HOST_COMMANDS else _scheduler_digest(part, "arg") for part in command)
+
+
+def _scheduler_host_snapshot(snapshot: HostInspectionSnapshot) -> HostInspectionSnapshot:
+    observations = tuple(
+        HostCommandObservation(
+            name=observation.name if observation.name in _SAFE_HOST_COMMANDS else _scheduler_digest(observation.name, "command"),
+            command=_safe_command_identity(observation.command),
+            exit_code=observation.exit_code,
+            stdout="",
+            stderr="",
+        )
+        for observation in snapshot.observations
+    )
+    return replace(
+        snapshot,
+        id=_scheduler_digest(snapshot.id, "host"),
+        hostname=_scheduler_digest(snapshot.hostname, "hostname"),
+        os_release={
+            key if key in {"NAME", "VERSION", "ID", "VERSION_ID", "PRETTY_NAME"} else _scheduler_digest(key, "os-key"):
+            _scheduler_digest(value, "os-value")
+            for key, value in snapshot.os_release.items()
+        },
+        observations=observations,
+    )
+
+
+def _callback_evidence_ids(values: object) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or values is None:
+        return ()
+    result: list[str] = []
+    for value in values:
+        item = bounded_text(value, limit=MAX_IDENTIFIER_LENGTH)
+        if not item:
+            continue
+        # Callback evidence is an identifier channel, never a payload channel.
+        # Keep the established namespaced identifiers and hash everything else.
+        if not re.fullmatch(r"(?:evidence|health|host|package|run|request)\.[A-Za-z0-9_.:-]+", item):
+            item = _scheduler_digest(item, "evidence")
+        if item not in result:
+            result.append(item)
+        if len(result) >= MAX_EVIDENCE_IDS:
+            break
+    return tuple(result)
+
+
+def _callback_execution(
+    outcome: CollectionOutcome,
+    evidence_ids: object = (),
+    failure_category: object = "",
+) -> CollectionExecution:
+    safe_category = bounded_text(failure_category, limit=MAX_IDENTIFIER_LENGTH)
+    if safe_category not in {
+        "", "timeout", "unavailable", "contract_mismatch", "authentication",
+        "resource_conflict", "policy_blocked", "adapter_error", "internal_error",
+    }:
+        safe_category = "adapter_error"
+    return CollectionExecution(
+        outcome,
+        f"store-path callback {CollectionOutcome(outcome).value}",
+        _callback_evidence_ids(evidence_ids),
+        safe_category,
+    )
 @dataclass(frozen=True)
 class CollectionExecution:
     outcome: CollectionOutcome
@@ -122,7 +235,9 @@ class HealthProbeCollectionAdapter:
             return CollectionExecution(CollectionOutcome.FAILED, "health target binding is missing", failure_category="contract_mismatch")
         with SQLiteStore(store_path) as store:
             target = store.load_health_target(job.target_id)
-            evidence = self.probe_adapter_factory(job.timeout_seconds).probe(target)
+            evidence = _scheduler_health_evidence(
+                self.probe_adapter_factory(job.timeout_seconds).probe(target)
+            )
             store.save_health_evidence(evidence)
         healthy = HealthStatus(evidence.observed_status) in {HealthStatus.HEALTHY, HealthStatus.RECOVERED}
         return CollectionExecution(
@@ -140,7 +255,7 @@ class HostInspectionCollectionAdapter:
         self.inspection_adapter_factory = inspection_adapter_factory or (lambda timeout: HostInspectionAdapter(timeout_seconds=timeout))
 
     def collect(self, job: CollectionJob, store_path: str) -> CollectionExecution:
-        snapshot = self.inspection_adapter_factory(job.timeout_seconds).inspect()
+        snapshot = _scheduler_host_snapshot(self.inspection_adapter_factory(job.timeout_seconds).inspect())
         with SQLiteStore(store_path) as store:
             store.save_host_snapshot(snapshot)
         return CollectionExecution(CollectionOutcome.SUCCEEDED, f"host inspection captured for {bounded_text(snapshot.hostname, limit=160)}", (snapshot.id,))
@@ -154,7 +269,7 @@ class PackageInspectionCollectionAdapter:
 
     def collect(self, job: CollectionJob, store_path: str) -> CollectionExecution:
         snapshot = self.inspection_adapter_factory(job.timeout_seconds).inspect()
-        record = package_inspection_record(snapshot)
+        record = package_inspection_record(replace(snapshot, stderr=""))
         with SQLiteStore(store_path) as store:
             store.save_package_inspection_record(record)
         succeeded = record.succeeded()
@@ -191,15 +306,14 @@ class StorePathCallbackCollectionAdapter:
             else:
                 result = self.callback(store_path)
         if isinstance(result, CollectionExecution):
-            return result
+            return _callback_execution(result.outcome, result.evidence_ids, result.failure_category)
         if isinstance(result, Mapping):
-            return CollectionExecution(
+            return _callback_execution(
                 result.get("outcome", CollectionOutcome.SUCCEEDED),
-                result.get("summary", "store-path callback completed"),
                 result.get("evidence_ids", ()),
                 result.get("failure_category", ""),
             )
-        return CollectionExecution(CollectionOutcome.SUCCEEDED, bounded_text(result) or "store-path callback completed")
+        return _callback_execution(CollectionOutcome.SUCCEEDED)
 
 
 # Short compatibility name used by existing store-path integration callers.

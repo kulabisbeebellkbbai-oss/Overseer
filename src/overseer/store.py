@@ -3973,6 +3973,12 @@ class SQLiteStore:
             for payload in self._list_collection_payloads("triage_incidents")
         )
 
+    def load_collection_incident(self, incident_id: str) -> TriageIncident:
+        return _load_dataclass(
+            TriageIncident,
+            self._get_collection_payload("triage_incidents", incident_id),
+        )
+
     def save_collection_incident(self, incident: TriageIncident) -> None:
         if not isinstance(incident, TriageIncident):
             raise ValueError("triage incident must be a TriageIncident")

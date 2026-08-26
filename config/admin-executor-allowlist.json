@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "overseer.admin-executor-allowlist.v1",
+  "allowed": [
+    {
+      "operation": "restart-system-unit",
+      "unit": "overseer-approval-smoke.service"
+    }
+  ]
+}

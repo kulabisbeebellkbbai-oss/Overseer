@@ -1,0 +1,40 @@
+[Unit]
+Description=Overseer system runtime
+After=local-fs.target
+
+[Service]
+Type=simple
+User=overseer
+Group=overseer
+WorkingDirectory=@OVERSEER_RELEASE@
+Environment=PYTHONPATH=@OVERSEER_RELEASE@/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=@OVERSEER_PYTHON@ -m overseer.cli run --store /var/lib/overseer/overseer.sqlite3
+Restart=on-failure
+RestartSec=5
+StateDirectory=overseer
+StateDirectoryMode=0700
+ReadOnlyPaths=@OVERSEER_RELEASE@
+ReadOnlyPaths=/etc/overseer
+ReadWritePaths=/var/lib/overseer
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

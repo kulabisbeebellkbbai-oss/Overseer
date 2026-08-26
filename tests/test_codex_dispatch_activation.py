@@ -1655,6 +1655,6 @@ def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_pa
     assert "external isolated CLI" in blocked["summary"]
     with system.external_activation_cli():
         result = cli.execute_admin_change_status(store, "admin.codex-dispatch.e2e", runner=runner)
-    assert result["status"] == "completed"
+    assert result["status"] == "completed", result
     with cli.SQLiteStore(store) as persisted:
         assert persisted.load_admin_change_plan("admin.codex-dispatch.e2e").approved is True

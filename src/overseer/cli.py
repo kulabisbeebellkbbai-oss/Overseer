@@ -25,6 +25,8 @@ from .admin import (
     AdminChangePlan,
     AdminCommandResult,
     AdminExecutionResult,
+    AdminExecutionClaim,
+    AdminExecutionClaimState,
     AdminExecutionStatus,
     AdminHistoryArchiveRecord,
     admin_change_authority_digest,
@@ -53,6 +55,7 @@ from .admin import (
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
+from .admin_authority import admin_authority_lock
 from .python_venv import plan_python_hashed_venv_provision, python_venv_spec_from_metadata
 from .psychlo_cycle_activation import (
     plan_psychlo_recurring_cycle_activation,
@@ -219,7 +222,6 @@ from .serialization import to_jsonable
 
 
 _CREW_DISPATCH_LOCK = threading.Lock()
-_ADMIN_EXECUTION_LOCK = threading.Lock()
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
 DEFAULT_AGENT_REGISTRY = Path(__file__).parents[2] / "config" / "agent-providers.json"
@@ -4797,106 +4799,139 @@ def execute_admin_change_status(
     runner=None,
     policy_profile_path: str | Path | None = None,
 ) -> dict[str, object]:
-    database_path = Path(store_path)
-    database_path.parent.mkdir(parents=True, exist_ok=True)
-    with _ADMIN_EXECUTION_LOCK, database_path.open("a+b") as lock_stream:
-        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
-        try:
-            return _execute_admin_change_status_unlocked(
-                store_path,
-                plan_id,
-                runner=runner,
-                policy_profile_path=policy_profile_path,
-            )
-        finally:
-            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    with admin_authority_lock(store_path):
+        return _execute_admin_change_with_claim_status(
+            store_path,
+            plan_id,
+            runner=runner,
+            policy_profile_path=policy_profile_path,
+        )
 
 
-def _execute_admin_change_status_unlocked(
+def _execute_admin_change_with_claim_status(
     store_path: str | Path,
     plan_id: str,
     runner=None,
     policy_profile_path: str | Path | None = None,
 ) -> dict[str, object]:
-    store = SQLiteStore(store_path)
-    try:
-        plan = store.load_admin_change_plan(plan_id)
-        plan_digest = admin_change_authority_digest(plan)
-        completed_execution = next(
-            (
-                result
-                for result in store.list_admin_executions()
-                if result.plan_id == plan.id and result.status == AdminExecutionStatus.COMPLETED
-            ),
-            None,
-        )
-        if completed_execution is not None:
-            if completed_execution.plan_digest is None:
-                raise ValueError("completed execution lacks an immutable plan binding")
-            if completed_execution.plan_digest != plan_digest:
-                raise ValueError("completed execution plan binding does not match the current plan")
-            return {
-                "store": str(store.path),
-                "policy_profile": None,
-                "policy_profile_source": "completed_execution_replay",
-                "policy_profile_path": None,
-                "replayed": True,
-                "mutation_performed": False,
-                **admin_execution_status(completed_execution),
-            }
-        profile, profile_path, profile_source = load_active_policy_profile(store_path, policy_profile_path)
-        enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
-        ids_review_packages = store.list_host_security_ids_review_packages_for_plan(plan.id)
-        policy_decision = evaluate_admin_change_policy(
-            plan,
-            admin_execution_capability_for(AdminChangeKind(plan.kind), enabled_adapter_kinds),
-            ids_review_packages,
-            approved_admin_policy_warning_check_ids(store, plan.id),
-            profile,
-        )
-        if not policy_decision.can_proceed():
-            blocking = tuple(
-                check
-                for check in policy_decision.checks
-                if check.status in {PolicyCheckStatus.BLOCK, PolicyCheckStatus.WARN}
+    with admin_authority_lock(store_path):
+        store = SQLiteStore(store_path)
+        try:
+            plan = store.load_admin_change_plan(plan_id)
+            plan_digest = admin_change_authority_digest(plan)
+            existing_claim = store.load_admin_execution_claim_for_plan(plan.id)
+            if existing_claim is not None:
+                if existing_claim.plan_digest != plan_digest:
+                    raise ValueError("admin execution claim plan binding does not match the current plan")
+                if existing_claim.state is AdminExecutionClaimState.CLAIMED:
+                    raise ValueError("admin execution was interrupted; reconciliation required before any retry")
+                if not existing_claim.result_id:
+                    raise ValueError("finalized admin execution claim has no result binding")
+                prior_result = store.load_admin_execution(existing_claim.result_id)
+                return {
+                    "store": str(store.path),
+                    "policy_profile": None,
+                    "policy_profile_source": "durable_execution_claim_replay",
+                    "policy_profile_path": None,
+                    "replayed": True,
+                    "mutation_performed": False,
+                    **admin_execution_status(prior_result),
+                }
+            completed_execution = next(
+                (
+                    result
+                    for result in store.list_admin_executions()
+                    if result.plan_id == plan.id and result.status == AdminExecutionStatus.COMPLETED
+                ),
+                None,
             )
-            result = AdminExecutionResult(
-                id=f"admin.exec.{plan.id}.blocked",
+            if completed_execution is not None:
+                if completed_execution.plan_digest is None:
+                    raise ValueError("completed execution lacks an immutable plan binding")
+                if completed_execution.plan_digest != plan_digest:
+                    raise ValueError("completed execution plan binding does not match the current plan")
+                return {
+                    "store": str(store.path),
+                    "policy_profile": None,
+                    "policy_profile_source": "completed_execution_replay",
+                    "policy_profile_path": None,
+                    "replayed": True,
+                    "mutation_performed": False,
+                    **admin_execution_status(completed_execution),
+                }
+            profile, profile_path, profile_source = load_active_policy_profile(store_path, policy_profile_path)
+            enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
+            ids_review_packages = store.list_host_security_ids_review_packages_for_plan(plan.id)
+            policy_decision = evaluate_admin_change_policy(
+                plan,
+                admin_execution_capability_for(AdminChangeKind(plan.kind), enabled_adapter_kinds),
+                ids_review_packages,
+                approved_admin_policy_warning_check_ids(store, plan.id),
+                profile,
+            )
+            if not policy_decision.can_proceed():
+                blocking = tuple(
+                    check
+                    for check in policy_decision.checks
+                    if check.status in {PolicyCheckStatus.BLOCK, PolicyCheckStatus.WARN}
+                )
+                result = AdminExecutionResult(
+                    id=f"admin.exec.{plan.id}.blocked",
+                    plan_id=plan.id,
+                    status=AdminExecutionStatus.BLOCKED,
+                    summary=f"admin policy {policy_decision.status.value}: {blocking[0].summary if blocking else 'policy gate blocked execution'}",
+                    command_results=(),
+                    plan_digest=plan_digest,
+                )
+                store.save_admin_execution(result)
+                store.save_audit_event(audit_event_from_admin_execution(plan, result))
+                return {
+                    "store": str(store.path),
+                    "policy_profile": profile.name,
+                    "policy_profile_source": profile_source,
+                    "policy_profile_path": str(profile_path),
+                    "policy": admin_policy_decision_status(policy_decision),
+                    "replayed": False,
+                    "mutation_performed": False,
+                    **admin_execution_status(result),
+                }
+            claim = AdminExecutionClaim(
+                id=f"admin.exec.claim.{plan.id}",
                 plan_id=plan.id,
-                status=AdminExecutionStatus.BLOCKED,
-                summary=f"admin policy {policy_decision.status.value}: {blocking[0].summary if blocking else 'policy gate blocked execution'}",
-                command_results=(),
                 plan_digest=plan_digest,
+                state=AdminExecutionClaimState.CLAIMED,
+                claimed_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
             )
-            store.save_admin_execution(result)
-            store.save_audit_event(audit_event_from_admin_execution(plan, result))
+            store.claim_admin_execution(claim)
+        finally:
+            store.close()
+
+    result = replace(
+        execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds),
+        plan_digest=plan_digest,
+    )
+    with admin_authority_lock(store_path):
+        store = SQLiteStore(store_path)
+        try:
+            current_claim = store.load_admin_execution_claim_for_plan(plan.id)
+            if current_claim != claim:
+                raise ValueError("admin execution claim changed before finalization")
+            store.finalize_admin_execution_claim(
+                claim,
+                result,
+                audit_event_from_admin_execution(plan, result),
+            )
             return {
                 "store": str(store.path),
                 "policy_profile": profile.name,
                 "policy_profile_source": profile_source,
                 "policy_profile_path": str(profile_path),
-                "policy": admin_policy_decision_status(policy_decision),
                 "replayed": False,
-                "mutation_performed": False,
+                "mutation_performed": result.status is not AdminExecutionStatus.BLOCKED,
                 **admin_execution_status(result),
             }
-        result = replace(
-            execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds),
-            plan_digest=plan_digest,
-        )
-        store.save_admin_execution(result)
-        store.save_audit_event(audit_event_from_admin_execution(plan, result))
-        return {
-            "store": str(store.path),
-            "policy_profile": profile.name,
-            "policy_profile_source": profile_source,
-            "policy_profile_path": str(profile_path),
-            "replayed": False,
-            "mutation_performed": True,
-            **admin_execution_status(result),
-        }
-    finally:
-        store.close()
+        finally:
+            store.close()
 
 
 def export_codex_dispatch_authority_data_status(store_path: str | Path, plan_id: str) -> dict[str, object]:

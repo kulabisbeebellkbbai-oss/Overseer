@@ -18,7 +18,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .admin import AdminChangePlan, AdminExecutionResult, AdminHistoryArchiveRecord
+from .admin import (
+    AdminChangePlan,
+    AdminExecutionClaim,
+    AdminExecutionClaimState,
+    AdminExecutionResult,
+    AdminHistoryArchiveRecord,
+)
+from .admin_authority import admin_authority_lock
 from .agent_contracts import (
     AgentCheckpoint,
     AgentRecoveryAttempt,
@@ -1239,6 +1246,12 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS admin_executions (
                 id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admin_execution_claims (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS admin_history_archives (
@@ -3026,7 +3039,13 @@ class SQLiteStore:
         return _load_dataclass(HostInspectionSnapshot, str(row["payload"]))
 
     def save_admin_change_plan(self, plan: AdminChangePlan) -> None:
-        with self.agent_transaction():
+        with admin_authority_lock(self.path), self.agent_transaction():
+            active_claim = self._connection.execute(
+                "SELECT payload FROM admin_execution_claims WHERE plan_id=? AND state=?",
+                (plan.id, AdminExecutionClaimState.CLAIMED.value),
+            ).fetchone()
+            if active_claim is not None:
+                raise ValueError("admin execution is claimed; authority mutation is prohibited")
             claimed = self._connection.execute(
                 "SELECT 1 FROM psychlo_legacy_abandonment_execution_claims WHERE plan_id=?",
                 (plan.id,),
@@ -3226,7 +3245,7 @@ class SQLiteStore:
             subject=f"Psychlo policy exception {request_id}",
         )
 
-        with self.agent_transaction():
+        with admin_authority_lock(self.path), self.agent_transaction():
             existing_plan = None
             existing_approval = None
             existing_binding = None
@@ -3290,7 +3309,7 @@ class SQLiteStore:
             raise ValueError("policy exception decided_at is invalid")
         plan_id = f"admin.psychlo.policy-exception.{request_id}"
         approval_id = f"approval.psychlo.policy-exception.{request_id}"
-        with self.agent_transaction():
+        with admin_authority_lock(self.path), self.agent_transaction():
             plan = self.load_admin_change_plan(plan_id)
             approval = self.load_approval(approval_id)
             if plan.kind.value != "psychlo_policy_exception" or plan.target != request_id or approval.subject_id != plan_id or approval.approval_level is not ApprovalLevel.HUMAN:
@@ -3397,7 +3416,7 @@ class SQLiteStore:
             raise ValueError("policy exception expiration time is invalid")
         plan_id = f"admin.psychlo.policy-exception.{request_id}"
         approval_id = f"approval.psychlo.policy-exception.{request_id}"
-        with self.agent_transaction():
+        with admin_authority_lock(self.path), self.agent_transaction():
             plan = self.load_admin_change_plan(plan_id)
             approval = self.load_approval(approval_id)
             decision = self.psychlo_policy_exception_decision(request_id)
@@ -4787,6 +4806,66 @@ class SQLiteStore:
             (result.id, result.plan_id, _dump(result)),
         )
         self._commit()
+
+    def claim_admin_execution(self, claim: AdminExecutionClaim) -> None:
+        with self.agent_transaction():
+            existing = self._connection.execute(
+                "SELECT payload FROM admin_execution_claims WHERE plan_id=?",
+                (claim.plan_id,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("admin execution claim already exists")
+            self._connection.execute(
+                "INSERT INTO admin_execution_claims (id, plan_id, state, payload) VALUES (?, ?, ?, ?)",
+                (claim.id, claim.plan_id, claim.state.value, _dump(claim)),
+            )
+
+    def load_admin_execution_claim_for_plan(self, plan_id: str) -> AdminExecutionClaim | None:
+        row = self._connection.execute(
+            "SELECT payload FROM admin_execution_claims WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _load_dataclass(AdminExecutionClaim, str(row["payload"]))
+
+    def list_admin_execution_claims(self) -> tuple[AdminExecutionClaim, ...]:
+        return tuple(
+            _load_dataclass(AdminExecutionClaim, payload)
+            for payload in self._list_payloads("admin_execution_claims")
+        )
+
+    def finalize_admin_execution_claim(
+        self,
+        claim: AdminExecutionClaim,
+        result: AdminExecutionResult,
+        event: AuditEvent,
+    ) -> AdminExecutionClaim:
+        if claim.state is not AdminExecutionClaimState.CLAIMED:
+            raise ValueError("only a claimed admin execution can be finalized")
+        if result.plan_id != claim.plan_id or result.plan_digest != claim.plan_digest:
+            raise ValueError("admin execution result does not match its durable claim")
+        state = AdminExecutionClaimState(result.status.value)
+        finalized = replace(
+            claim,
+            state=state,
+            result_id=result.id,
+            finalized_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+        )
+        with self.agent_transaction():
+            current = self.load_admin_execution_claim_for_plan(claim.plan_id)
+            if current != claim:
+                raise ValueError("admin execution claim changed before finalization")
+            self._connection.execute(
+                "INSERT OR REPLACE INTO admin_executions (id, plan_id, payload) VALUES (?, ?, ?)",
+                (result.id, result.plan_id, _dump(result)),
+            )
+            self._connection.execute(
+                "UPDATE admin_execution_claims SET state=?, payload=? WHERE id=?",
+                (finalized.state.value, _dump(finalized), finalized.id),
+            )
+            self.save_audit_event(event)
+        return finalized
 
     def load_admin_execution(self, result_id: str) -> AdminExecutionResult:
         return _load_dataclass(AdminExecutionResult, self._get_payload("admin_executions", result_id))

@@ -49,6 +49,13 @@ class AdminExecutionStatus(StrEnum):
     FAILED = "failed"
 
 
+class AdminExecutionClaimState(StrEnum):
+    CLAIMED = "claimed"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
 class AdminAdapterStatus(StrEnum):
     ENABLED = "enabled"
     DISABLED = "disabled"
@@ -83,6 +90,17 @@ class AdminExecutionResult:
     verification_results: tuple[AdminCommandResult, ...] = ()
     rollback_results: tuple[AdminCommandResult, ...] = ()
     plan_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class AdminExecutionClaim:
+    id: str
+    plan_id: str
+    plan_digest: str
+    state: AdminExecutionClaimState
+    claimed_at: str
+    result_id: str | None = None
+    finalized_at: str | None = None
 
 
 @dataclass(frozen=True)

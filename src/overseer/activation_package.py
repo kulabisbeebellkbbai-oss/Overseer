@@ -3993,7 +3993,7 @@ def _execute_approved_activation_locked(
         )
     staging = _contract_commands(contract, "stagingAndCanaryCommands")
     cutover = _contract_commands(contract, "cutoverCommands")
-    _contract_commands(contract, "rollbackCommands")
+    rollback = _contract_commands(contract, "rollbackCommands")
     _cleanup_commands(contract)
 
     _write_activation_state(_runner_state(package_digest=digest, status="running", phase="staging"))
@@ -4062,10 +4062,10 @@ def _execute_approved_activation_locked(
             _write_activation_state(
                 _runner_state(
                     package_digest=digest,
-                    status="rollback_running",
+                    status="rollback_command_running",
                     phase="rollback",
-                    command_index=index,
-                    command=command,
+                    command_index=0,
+                    command=rollback[0],
                     failure=command_failure,
                 )
             )

@@ -1818,3 +1818,73 @@ def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
     }
     with pytest.raises(ActivationPackageError, match="not safely resumable"):
         activation_package_module.execute_approved_activation(package)
+
+
+def test_cutover_failure_records_recoverable_first_rollback_command_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "e" * 64
+    package = tmp_path / "package"
+    rollback = ["/bin/true", "rollback-zero"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/false", "cutover"]],
+        "rollbackCommands": [rollback],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_approved_cutover",
+        lambda _package: {"verified": True},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: 1 if command[1] == "cutover" else 0,
+    )
+
+    def crash_before_first_rollback_command(*_args, **_kwargs):
+        raise KeyboardInterrupt("simulated process loss")
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_rollback_sequence",
+        crash_before_first_rollback_command,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="process loss"):
+        activation_package_module.execute_approved_activation(package)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["phase"] == "rollback"
+    assert state["status"] == "rollback_command_running"
+    assert state["commandIndex"] == 0
+    assert state["commandDigest"] == hashlib.sha256(
+        json.dumps(rollback, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()

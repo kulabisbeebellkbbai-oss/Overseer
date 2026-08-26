@@ -254,13 +254,24 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
         self.assertIn('const target = `${apiBase}${path}`', OPERATOR_CONSOLE_HTML)
         self.assertIn("mapEndpointEntries(endpointEntries, 4)", OPERATOR_CONSOLE_HTML)
 
+    def test_console_refreshes_only_the_active_view_projection_group(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn('const commonEndpointKeys = new Set(["dashboard"]);', OPERATOR_CONSOLE_HTML)
+        self.assertIn('overview: new Set([', OPERATOR_CONSOLE_HTML)
+        self.assertIn('security: new Set([', OPERATOR_CONSOLE_HTML)
+        self.assertIn('health: new Set([', OPERATOR_CONSOLE_HTML)
+        self.assertIn('const endpointKeys = endpointKeysForView(view);', OPERATOR_CONSOLE_HTML)
+        self.assertIn('.filter(([key]) => endpointKeys.has(key))', OPERATOR_CONSOLE_HTML)
+        self.assertNotIn('.filter(([key]) => !requiredEndpointKeys.has(key))', OPERATOR_CONSOLE_HTML)
+
     def test_scheduler_helpers_and_refresh_coalescing_execute_in_node(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
 
         helper_start = OPERATOR_CONSOLE_HTML.index("    const LAYOUT_MODES")
         helper_end = OPERATOR_CONSOLE_HTML.index("    let layoutMode", helper_start)
         refresh_start = OPERATOR_CONSOLE_HTML.index("    function refresh()")
-        refresh_end = OPERATOR_CONSOLE_HTML.index("    async function performRefresh()", refresh_start)
+        refresh_end = OPERATOR_CONSOLE_HTML.index("    async function performRefresh(", refresh_start)
         queue_start = OPERATOR_CONSOLE_HTML.index("    async function queueCollectionRun")
         queue_end = OPERATOR_CONSOLE_HTML.index("    function applyActionResult", queue_start)
         script = OPERATOR_CONSOLE_HTML[helper_start:helper_end] + OPERATOR_CONSOLE_HTML[refresh_start:refresh_end] + OPERATOR_CONSOLE_HTML[queue_start:queue_end] + r'''
@@ -292,6 +303,9 @@ const filteredDocument = {activeElement:null, getElementById(id) { return id ===
 if (filteredFocus.collectionRunFilter !== "true") process.exit(15);
 if (restoreFocusTarget(filteredFocus, filteredDocument) !== filteredStatus || !filteredStatus.didFocus || filteredDocument.activeElement !== filteredStatus) process.exit(16);
 let refreshPromise = null;
+let refreshActiveView = null;
+let refreshRequestedView = null;
+globalThis.state = {view:"overview", token:"test"};
 let refreshCalls = 0;
 function performRefresh() { refreshCalls += 1; return Promise.resolve("ready"); }
 const first = refresh();
@@ -492,7 +506,9 @@ if (requestId.length < 60) process.exit(4);
         from overseer.ui import OPERATOR_CONSOLE_HTML
 
         self.assertIn("const AUTO_REFRESH_MS = 30000", OPERATOR_CONSOLE_HTML)
-        self.assertIn("if (refreshPromise) return refreshPromise", OPERATOR_CONSOLE_HTML)
+        self.assertIn("if (refreshPromise) {", OPERATOR_CONSOLE_HTML)
+        self.assertIn("if (refreshActiveView !== requestedView) refreshRequestedView = requestedView", OPERATOR_CONSOLE_HTML)
+        self.assertIn("return refreshPromise", OPERATOR_CONSOLE_HTML)
         self.assertIn('window.addEventListener("focus"', OPERATOR_CONSOLE_HTML)
         self.assertIn('document.addEventListener("visibilitychange"', OPERATOR_CONSOLE_HTML)
         self.assertIn("if (!document.hidden && state.token) refresh()", OPERATOR_CONSOLE_HTML)

@@ -4063,9 +4063,10 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn('apiBase = protectedGatewayPath ? "/Overseer" : ""', html)
             self.assertIn("tokenStore = protectedGatewayPath ? sessionStorage : localStorage", html)
             self.assertIn('auth: "/auth-check"', html)
-            self.assertIn('requiredEndpointKeys = new Set(["auth"])', html)
+            self.assertIn('commonEndpointKeys = new Set(["dashboard"])', html)
+            self.assertIn('endpointEntriesForView(view)', html)
             self.assertIn("authPayload = await getJson(endpoints.auth)", html)
-            self.assertIn("filter(([key]) => !requiredEndpointKeys.has(key))", html)
+            self.assertIn("filter(([key]) => endpointKeys.has(key))", html)
             self.assertIn("mapEndpointEntries(endpointEntries, 4)", html)
             self.assertIn("Loaded with panel errors", html)
             self.assertIn("data-view-target", html)
@@ -7055,6 +7056,26 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(by_listener["10.50.0.100:9443"]["queue_status"], "needs_exposure_review")
         self.assertIn("read-only listener queue", queue["approval_boundary"])
 
+    def test_host_security_listener_review_queue_is_empty_before_first_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            queue = host_security_listener_review_queue_status(store_path)
+
+        self.assertIsNone(queue["snapshot_id"])
+        self.assertEqual(queue["listener_count"], 0)
+        self.assertEqual(queue["items"], [])
+
+    def test_host_security_source_review_queue_is_empty_before_first_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            queue = host_security_source_review_queue_status(store_path)
+
+        self.assertIsNone(queue["snapshot_id"])
+        self.assertEqual(queue["connection_count"], 0)
+        self.assertEqual(queue["items"], [])
+
     def test_plan_host_security_listener_queue_remediations_groups_unplanned_ports(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -7934,6 +7955,19 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual({event.event_type for event in audit_events}, {AuditEventType.ALERT})
         self.assertEqual({event.subject_id for event in audit_events}, {"runtime.heartbeat", "host.inspection"})
         self.assertEqual({event.risk_level for event in audit_events}, {RiskLevel.HIGH})
+
+    def test_runtime_status_reports_clean_uninitialized_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = runtime_status(store_path, now="2026-07-18T16:06:30+00:00")
+
+        self.assertFalse(status["service"]["available"])
+        self.assertEqual(status["service"]["service_name"], "overseer")
+        self.assertEqual(status["service"]["tick_count"], 0)
+        self.assertEqual(status["service"]["freshness"]["status"], FreshnessStatus.MISSING.value)
+        self.assertFalse(status["host_inspection"]["enabled"])
+        self.assertEqual(status["freshness_alerts"], [])
 
     def test_runtime_status_persists_warning_freshness_alert(self):
         with tempfile.TemporaryDirectory() as directory:

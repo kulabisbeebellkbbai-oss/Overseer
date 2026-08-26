@@ -869,7 +869,54 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       ,collectionsRuns: "/collections/runs"
       ,collectionsIncidents: "/collections/incidents"
     };
-    const requiredEndpointKeys = new Set(["auth"]);
+    const commonEndpointKeys = new Set(["dashboard"]);
+    const viewEndpointKeys = Object.freeze({
+      overview: new Set([
+        "incidentLifecycle", "operations", "operationWorkflows", "runtime", "crewMessages",
+        "roadexHumanDecisions", "psychloStatus", "collectionsStatus", "collectionsJobs",
+        "collectionsRuns", "collectionsIncidents"
+      ]),
+      driver: new Set([
+        "agentProviders", "agentInstances", "agentFailoverExecutions", "agentSessions",
+        "agentDispatches", "agentUsage"
+      ]),
+      admin: new Set([
+        "authorizations", "readiness", "adapters", "adminArchivePlan", "adminArchives",
+        "activePolicy", "complianceEvidence", "policyHelper", "packageStatus", "firmwareStatus",
+        "firmwarePreflight", "softwareEvidence", "advisories", "maintenanceSchedules", "operations"
+      ]),
+      assets: new Set(["physical", "storageEvidence", "backupOperations", "virtual", "operations"]),
+      claims: new Set([
+        "claims", "claimCleanup", "operations", "virtualEvidence", "virtualOperations", "imageScans"
+      ]),
+      security: new Set([
+        "security", "securityEvidence", "keyBroker", "identityEvidence", "identityRotationRequests",
+        "identityRotationReadiness", "listenerReviewQueue", "sourceReviewQueue", "operations",
+        "authorizations", "readiness"
+      ]),
+      health: new Set([
+        "health", "healthSummary", "serviceEvidence", "codexUsage", "skillerEffectiveness",
+        "skillerGuidanceAdherence", "observabilityTrends", "metricHistory", "performanceHistory",
+        "runtime", "operations"
+      ]),
+      usage: new Set(["usage", "usageEvidence", "remoteTesting", "operations"]),
+      ezri: new Set([
+        "documentsStatus", "documentationEvidence", "gitStatus", "documentsNotes",
+        "knowledgeCapturePlan", "operations", "skillerEffectiveness", "skillerGuidanceAdherence"
+      ]),
+      audit: new Set(["audit", "approvals"])
+    });
+    function endpointKeysForView(view) {
+      const keys = new Set(commonEndpointKeys);
+      for (const key of viewEndpointKeys[view] || viewEndpointKeys.overview) keys.add(key);
+      return keys;
+    }
+    function endpointEntriesForView(view) {
+      const endpointKeys = endpointKeysForView(view);
+      return Object.entries(endpoints)
+        .filter(([key]) => endpointKeys.has(key))
+        .map(([key, path]) => [key, endpointPath(key, path)]);
+    }
     const protectedGatewayPath = window.location.pathname === "/Overseer" || window.location.pathname.startsWith("/Overseer/");
     const apiBase = protectedGatewayPath ? "/Overseer" : "";
     const tokenStore = protectedGatewayPath ? sessionStorage : localStorage;
@@ -890,6 +937,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     const AUTO_REFRESH_MS = 30000;
     const DATA_AGE_UPDATE_MS = 1000;
     let refreshPromise = null;
+    let refreshActiveView = null;
+    let refreshRequestedView = null;
     let approvalRequestInFlight = false;
     const approvalTokenFields = new Set();
     const LAYOUT_MODES = ["auto", "desktop", "tablet", "mobile"];
@@ -1142,15 +1191,25 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       });
       document.getElementById("view-title").textContent = title(view);
       render();
+      if (state.token) refresh();
     }
     function refresh() {
-      if (refreshPromise) return refreshPromise;
-      refreshPromise = performRefresh().finally(() => {
+      const requestedView = state.view;
+      if (refreshPromise) {
+        if (refreshActiveView !== requestedView) refreshRequestedView = requestedView;
+        return refreshPromise;
+      }
+      refreshActiveView = requestedView;
+      refreshPromise = performRefresh(requestedView).finally(() => {
+        const queuedView = refreshRequestedView;
         refreshPromise = null;
+        refreshActiveView = null;
+        refreshRequestedView = null;
+        if (queuedView && queuedView !== requestedView && state.token) return refresh();
       });
       return refreshPromise;
     }
-    async function performRefresh() {
+    async function performRefresh(view = state.view) {
       const error = document.getElementById("error");
       document.body.dataset.loadState = "loading";
       document.body.dataset.loadFailures = "0";
@@ -1179,9 +1238,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       }
       state.data = {...state.data, auth: authPayload};
       state.loadErrors = [];
-      const endpointEntries = Object.entries(endpoints)
-        .filter(([key]) => !requiredEndpointKeys.has(key))
-        .map(([key, path]) => [key, endpointPath(key, path)]);
+      const endpointEntries = endpointEntriesForView(view);
       const results = await mapEndpointEntries(endpointEntries, 4);
       const nextData = {...state.data};
       const failures = [];

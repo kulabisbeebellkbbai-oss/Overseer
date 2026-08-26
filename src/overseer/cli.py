@@ -3105,11 +3105,14 @@ def _host_inspection_freshness_policy(store: SQLiteStore) -> FreshnessPolicy:
 def runtime_status(store_path: str | Path, service_name: str = "overseer", now: str | None = None) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        heartbeat = store.load_runtime_heartbeat(service_name)
+        try:
+            heartbeat = store.load_runtime_heartbeat(service_name)
+        except KeyError:
+            heartbeat = None
         latest_snapshot = store.load_latest_host_snapshot()
         host_security = host_security_status(latest_snapshot) if latest_snapshot else None
         heartbeat_freshness = assess_freshness(
-            heartbeat.last_tick_at,
+            heartbeat.last_tick_at if heartbeat else None,
             now=now,
             policy=DEFAULT_RUNTIME_FRESHNESS_POLICY,
         )
@@ -3118,7 +3121,7 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer", now: 
             now=now,
             policy=_host_inspection_freshness_policy(store),
         )
-        freshness_alerts = (
+        freshness_alerts = () if heartbeat is None and latest_snapshot is None else (
             freshness_alert_event("runtime.heartbeat", OwnerDomain.JULIAN, heartbeat_freshness),
             freshness_alert_event("host.inspection", OwnerDomain.ODO, host_freshness),
         )
@@ -3131,10 +3134,11 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer", now: 
         return {
             "store": str(store.path),
             "service": {
-                "service_name": heartbeat.service_name,
-                "started_at": heartbeat.started_at,
-                "last_tick_at": heartbeat.last_tick_at,
-                "tick_count": heartbeat.tick_count,
+                "available": heartbeat is not None,
+                "service_name": heartbeat.service_name if heartbeat else service_name,
+                "started_at": heartbeat.started_at if heartbeat else None,
+                "last_tick_at": heartbeat.last_tick_at if heartbeat else None,
+                "tick_count": heartbeat.tick_count if heartbeat else 0,
                 "freshness": freshness_status(heartbeat_freshness),
             },
             "host_inspection": {
@@ -3518,6 +3522,28 @@ def host_security_triage_groups(findings: Sequence[dict[str, object]]) -> list[d
 
 
 def host_security_listener_review_queue_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
+    if snapshot_id is None:
+        store = SQLiteStore(store_path)
+        try:
+            if store.load_latest_host_snapshot() is None:
+                return {
+                    "store": str(store.path),
+                    "snapshot_id": None,
+                    "captured_at": None,
+                    "finding_count": 0,
+                    "listener_count": 0,
+                    "needs_exposure_review": 0,
+                    "plan_staged": 0,
+                    "approved_for_execution": 0,
+                    "plan_canceled": 0,
+                    "items": [],
+                    "approval_boundary": (
+                        "read-only listener queue only; firewall, IDS, route, service-bind, or enforcement changes "
+                        "require separate approval-gated remediation"
+                    ),
+                }
+        finally:
+            store.close()
     triage = host_security_triage_status(store_path, snapshot_id)
     store = SQLiteStore(store_path)
     try:
@@ -4039,6 +4065,29 @@ def host_security_source_reviews_status(store_path: str | Path) -> dict[str, obj
 
 
 def host_security_source_review_queue_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
+    if snapshot_id is None:
+        store = SQLiteStore(store_path)
+        try:
+            if store.load_latest_host_snapshot() is None:
+                reviews = store.list_host_security_source_reviews()
+                return {
+                    "store": str(store.path),
+                    "snapshot_id": None,
+                    "captured_at": None,
+                    "connection_count": 0,
+                    "review_count": len(reviews),
+                    "needs_review": 0,
+                    "ready_for_block_plan": 0,
+                    "reviewed_no_action": 0,
+                    "not_blockable": 0,
+                    "items": [],
+                    "approval_boundary": (
+                        "read-only queue only; hostile classification, block plans, firewall, IDS, route, or "
+                        "service-bind changes require separate review and approval-gated remediation"
+                    ),
+                }
+        finally:
+            store.close()
     sources = host_security_sources_status(store_path, snapshot_id)
     reviews = host_security_source_reviews_status(store_path)
     latest_reviews = _latest_source_reviews_by_source(reviews["reviews"])

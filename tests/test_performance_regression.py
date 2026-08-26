@@ -56,9 +56,9 @@ GET_ENDPOINT_BUDGETS = {
 }
 
 GET_ENDPOINT_ALLOWED_STATUSES = {
-    "/Overseer/runtime-status": {200, 404},
-    "/Overseer/host/security/listener-review-queue": {200, 400},
-    "/Overseer/host/security/source-review-queue": {200, 400},
+    "/Overseer/runtime-status": {200},
+    "/Overseer/host/security/listener-review-queue": {200},
+    "/Overseer/host/security/source-review-queue": {200},
 }
 
 HOST_COLLECTION_FREE_ENDPOINTS = (

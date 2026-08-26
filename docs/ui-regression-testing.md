@@ -69,7 +69,19 @@ The protected gateway path is `/Overseer`. The regression suite must verify:
 - safe disposable workflows execute through gateway routes; high-risk workflows
   remain wired but are not executed without explicit fixtures.
 
-Empty-store application responses such as missing heartbeat or missing host snapshot may return `400` or `404`; those are not auth regressions. A protected-gateway UI auth regression is a missing console, missing `#token`, `401` after token submission, or a route that bypasses `/Overseer` unexpectedly.
+An empty store is a supported startup state. Runtime status and the two host
+security review queues must return bounded `200` projections with explicit
+missing or empty state; they must not turn first startup into a partial browser
+load. A protected-gateway UI auth regression is a missing console, missing
+`#token`, `401` after token submission, or a route that bypasses `/Overseer`
+unexpectedly.
+
+The console refreshes only the active view plus its common dashboard
+projection. Opening another view queues one coalesced refresh for that view;
+the periodic timer never reloads every hidden panel. Browser acceptance must
+confirm the initial Overview request set excludes Admin, Security, Health,
+Usage, Documents, and Audit-only routes, then confirm view navigation loads
+only that view's bounded projection group.
 
 ## Tank Remote Testing Queue
 
@@ -145,7 +157,7 @@ The full UI regression job should also verify every Ezri workflow row listed in
 section maps to several UI controls.
 
 The performance regression job should measure protected-gateway browser load,
-all-panel completion, command-view switching, and authenticated endpoint
+active-panel completion, command-view switching, and authenticated endpoint
 round-trips. It must fail on any `401`, any `5xx`, or any exceeded budget.
 
 Admin approval smoke needs an explicit disposable fixture contract before it can
@@ -179,12 +191,11 @@ The legacy evidence projections remain part of the authenticated dashboard GET
 contract and retain these exact registrations: `/Overseer/runtime-status`,
 `/Overseer/host/security/listener-review-queue`, and
 `/Overseer/host/security/source-review-queue`. Seed the runtime heartbeat under
-the `overseer` record expected by `runtime-status` (a differently named record
-such as `runtime.overseer.browser` is not equivalent). Seed at least one host
-inspection snapshot before checking the Odo queues; both queue routes return a
-bounded `400` with `no host snapshots are available` when that fixture
-prerequisite is absent. The disposable harness must satisfy these prerequisites
-so fixture omissions do not produce a browser `partial` load.
+the `overseer` record expected by `runtime-status` when testing fresh runtime
+data (a differently named record such as `runtime.overseer.browser` is not
+equivalent). Before the first heartbeat or host inspection, those routes return
+bounded `200` projections with missing runtime state or empty review queues so
+the UI can load cleanly while scheduled collection starts.
 
 Also assert that repeated authenticated GETs for operations gap coverage,
 service evidence, package status, firmware status, firmware preflight,

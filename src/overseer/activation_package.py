@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import getpass
 import grp
 import hashlib
@@ -21,6 +22,7 @@ import sqlite3
 import stat
 import subprocess
 import time
+from contextlib import contextmanager
 from urllib.parse import quote
 from pathlib import Path, PurePosixPath
 from typing import Mapping
@@ -1720,12 +1722,13 @@ def _stage_rollback_inputs(
             raw, metadata = _stable_read(source)
             if len(raw) != item.get("size") or _sha256(raw) != item.get("sha256"):
                 raise ActivationPackageError(f"rollback input drifted while staging: {label}")
-            mode = 0o500 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o400
+            staged_mode = 0o500 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o400
+            bundle_mode = 0o550 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o440
             staged_relative = f"{relative_root}/artifact"
-            _write_new(staging_root / staged_relative, raw, mode)
+            _write_new(staging_root / staged_relative, raw, staged_mode)
             item["bundle"] = {
                 "relativeRoot": relative_root,
-                "files": [{"relativePath": "artifact", "mode": f"{mode:04o}"}],
+                "files": [{"relativePath": "artifact", "mode": f"{bundle_mode:04o}"}],
             }
             continue
         if kind != "directory" or not isinstance(item.get("entries"), list):
@@ -1738,9 +1741,10 @@ def _stage_rollback_inputs(
             raw, metadata = _stable_read(source / relative)
             if len(raw) != entry.get("size") or _sha256(raw) != entry.get("sha256"):
                 raise ActivationPackageError(f"rollback input drifted while staging: {label}/{relative}")
-            mode = 0o500 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o400
-            _write_new(staging_root / relative_root / relative, raw, mode)
-            bundled_files.append({"relativePath": relative, "mode": f"{mode:04o}"})
+            staged_mode = 0o500 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o400
+            bundle_mode = 0o550 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o440
+            _write_new(staging_root / relative_root / relative, raw, staged_mode)
+            bundled_files.append({"relativePath": relative, "mode": f"{bundle_mode:04o}"})
         item["bundle"] = {
             "relativeRoot": relative_root,
             "files": bundled_files,
@@ -1768,7 +1772,7 @@ def _rollback_bundle_install_commands(
                 raise ActivationPackageError("rollback bundle file entry is invalid")
             relative = Path(_safe_relative(str(entry.get("relativePath", ""))))
             mode = str(entry.get("mode", ""))
-            if mode not in {"0400", "0500"}:
+            if mode not in {"0440", "0550"}:
                 raise ActivationPackageError("rollback bundle file mode is invalid")
             target = bundle_root / relative_root / relative
             directories.update(target.parents)
@@ -1778,7 +1782,7 @@ def _rollback_bundle_install_commands(
                     "-o",
                     "root",
                     "-g",
-                    "root",
+                    "god",
                     "-m",
                     mode,
                     str(staging_root / relative_root / relative),
@@ -1790,10 +1794,10 @@ def _rollback_bundle_install_commands(
         key=lambda path: (len(path.parts), str(path)),
     )
     directory_commands = [
-        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", str(path)]
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "god", "-m", "0750", str(path)]
         for path in selected
     ]
-    freeze_commands = [["/usr/bin/chmod", "0555", str(path)] for path in reversed(selected)]
+    freeze_commands = [["/usr/bin/chmod", "0550", str(path)] for path in reversed(selected)]
     return [*directory_commands, *file_commands, *freeze_commands]
 
 
@@ -1808,13 +1812,14 @@ def verify_rollback_bundle(
     root = Path(bundle_root)
     manifest_path = Path(rollback_manifest)
     root_uid, root_gid = _activation_root_identity()
+    bundle_gid = pwd.getpwnam("god").pw_gid
     root_metadata = root.lstat()
     if (
         root.is_symlink()
         or not stat.S_ISDIR(root_metadata.st_mode)
         or root_metadata.st_uid != root_uid
-        or root_metadata.st_gid != root_gid
-        or stat.S_IMODE(root_metadata.st_mode) != 0o555
+        or root_metadata.st_gid != bundle_gid
+        or stat.S_IMODE(root_metadata.st_mode) != 0o550
     ):
         raise ActivationPackageError("root rollback bundle directory is invalid")
     manifest_raw, manifest_metadata = _stable_read(manifest_path)
@@ -1872,7 +1877,7 @@ def verify_rollback_bundle(
                 observed["sha256"] != expected.get("sha256")
                 or observed["size"] != expected.get("size")
                 or observed["uid"] != root_uid
-                or observed["gid"] != root_gid
+                or observed["gid"] != bundle_gid
                 or observed["mode"] != bundled.get("mode")
                 or observed["links"] != 1
             ):
@@ -1887,8 +1892,8 @@ def verify_rollback_bundle(
         if stat.S_ISDIR(metadata.st_mode):
             if (
                 metadata.st_uid != root_uid
-                or metadata.st_gid != root_gid
-                or stat.S_IMODE(metadata.st_mode) != 0o555
+                or metadata.st_gid != bundle_gid
+                or stat.S_IMODE(metadata.st_mode) != 0o550
             ):
                 raise ActivationPackageError("root rollback bundle directory metadata drifted")
         elif stat.S_ISREG(metadata.st_mode):
@@ -2247,7 +2252,11 @@ def render_activation_contract(
         "/usr/bin/env",
         f"PYTHONHOME={release_root}/runtime",
         f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
         str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+        "-s",
+        "-P",
         "-m",
         "overseer.activation_package",
         "prepare-final-store",
@@ -2304,10 +2313,17 @@ def render_activation_contract(
         "/usr/bin/env",
         f"PYTHONHOME={release_root}/runtime",
         f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
         str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+        "-s",
+        "-P",
         "-m",
         "overseer.activation_package",
     ]
+    rollback_tag = manifest_digest[:16]
+    rollback_runtime_unit = f"overseer-v1-1-5-rollback-runtime-{rollback_tag}.service"
+    rollback_api_unit = f"overseer-v1-1-5-rollback-api-{rollback_tag}.service"
     canary_commands = [
         [
             "/usr/bin/install",
@@ -2361,7 +2377,7 @@ def render_activation_contract(
             "--target-token",
             "/home/god/.local/share/overseer/project/state/api-token",
             "--expected-target-uid",
-            str(god.pw_uid),
+            "0",
             "--expected-target-gid",
             str(god.pw_gid),
             "--expected-parent-device",
@@ -2384,12 +2400,7 @@ def render_activation_contract(
         ["/usr/bin/systemctl", "disable", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
         ["/usr/bin/systemctl", "daemon-reload"],
         [
-            "/usr/bin/env",
-            f"PYTHONHOME={release_root}/runtime",
-            f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
-            str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
-            "-m",
-            "overseer.activation_package",
+            *activation_python,
             "restore-legacy-store-access",
             "--source-store",
             str(source.resolve()),
@@ -2410,15 +2421,19 @@ def render_activation_contract(
         ],
         [
             *user_systemd_run,
-            "--unit=overseer-v1-1-5-rollback-runtime.service",
+            f"--unit={rollback_runtime_unit}",
             "--service-type=simple",
             "--property=Restart=on-failure",
             "--property=RestartSec=5s",
             f"--working-directory={rollback_bundle_root / 'v1.1.5-release'}",
             f"--setenv=PYTHONHOME={release_root}/runtime",
             f"--setenv=PYTHONPATH={rollback_bundle_root / 'v1.1.5-release' / 'src'}:{release_root}/site-packages",
+            "--setenv=PYTHONNOUSERSITE=1",
+            "--setenv=PYTHONSAFEPATH=1",
             "--",
             str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+            "-s",
+            "-P",
             "-m",
             "overseer.cli",
             "run",
@@ -2427,17 +2442,19 @@ def render_activation_contract(
         ],
         [
             *user_systemd_run,
-            "--unit=overseer-v1-1-5-rollback-api.service",
+            f"--unit={rollback_api_unit}",
             "--service-type=simple",
             "--property=Restart=on-failure",
             "--property=RestartSec=5s",
-            "--property=After=overseer-v1-1-5-rollback-runtime.service",
+            f"--property=After={rollback_runtime_unit}",
             "--property=LoadCredential=psychlo-overseer-peer-secret:/home/god/.config/psychlo/overseer-peer-secret",
             "--property=LoadCredential=roadex-project-human-thread-secret:/home/god/.config/overseer/project-human-thread-relay.secret",
             f"--working-directory={rollback_bundle_root / 'v1.1.5-release'}",
             f"--setenv=PYTHONHOME={release_root}/runtime",
             f"--setenv=PYTHONPATH={rollback_bundle_root / 'v1.1.5-release' / 'src'}:{release_root}/site-packages",
             "--setenv=PYTHONDONTWRITEBYTECODE=1",
+            "--setenv=PYTHONNOUSERSITE=1",
+            "--setenv=PYTHONSAFEPATH=1",
             "--setenv=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798",
             "--setenv=OVERSEER_PSYCHLO_BRIDGE_DATABASE=/home/god/.local/share/overseer/psychlo/bridge.sqlite3",
             "--setenv=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=/home/god/.config/overseer/psychlo-project-bindings.json",
@@ -2448,6 +2465,8 @@ def render_activation_contract(
             "--setenv=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780/api/internal/overseer/project-human-thread/questions",
             "--",
             str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+            "-s",
+            "-P",
             "-m",
             "overseer.cli",
             "serve-api",
@@ -2522,7 +2541,13 @@ def render_activation_contract(
             "mustPassBeforeLegacyStop": True,
             "mutatingExecutorAcceptanceRequiresInteractiveAdminApproval": True,
             "failureCleanupCommands": [
-                ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"]
+                [
+                    "/usr/bin/systemctl",
+                    "stop",
+                    "overseer-api-canary.service",
+                    "overseer-admin-executor.socket",
+                    "overseer-codex-user-bridge.socket",
+                ]
             ],
         },
         "acceptanceControls": {
@@ -2864,12 +2889,16 @@ def _verify_install_results(
         if not isinstance(raw_command, list) or not all(isinstance(value, str) for value in raw_command):
             raise ActivationPackageError("activation install command is invalid")
         command = list(raw_command)
-        if command[:2] == ["/usr/bin/chmod", "0555"] and len(command) == 3:
+        if (
+            len(command) == 3
+            and command[0] == "/usr/bin/chmod"
+            and command[1] in {"0550", "0555"}
+        ):
             target = Path(command[2])
             if target not in expected_directories:
                 raise ActivationPackageError("activation directory freeze target was not installed")
             uid, gid, _mode = expected_directories[target]
-            expected_directories[target] = (uid, gid, 0o555)
+            expected_directories[target] = (uid, gid, int(command[1], 8))
             continue
         if not command or command[0] != "/usr/bin/install":
             continue
@@ -3268,6 +3297,38 @@ def _activation_state_path() -> Path:
     return Path("/var/lib/overseer-executor/activation-state.json")
 
 
+def _activation_lock_path() -> Path:
+    return _activation_state_path().with_name("activation.lock")
+
+
+@contextmanager
+def _activation_execution_lock():
+    target = _activation_lock_path()
+    _ensure_directory(target.parent)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags, 0o600)
+    except OSError as error:
+        raise ActivationPackageError("activation execution lock could not be opened") from error
+    root_uid, root_gid = _activation_root_identity()
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ActivationPackageError("activation execution lock is unsafe")
+        os.fchown(descriptor, root_uid, root_gid)
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ActivationPackageError("another activation or rollback runner holds the execution lock") from error
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _load_activation_state() -> dict[str, object] | None:
     target = _activation_state_path()
     try:
@@ -3368,6 +3429,54 @@ def _execute_contract_command(command: list[str]) -> int:
     return int(result.returncode)
 
 
+def _command_outcome(command: list[str]) -> tuple[int, str | None]:
+    try:
+        return _execute_contract_command(command), None
+    except Exception as error:
+        return 127, type(error).__name__
+
+
+def _validated_command_outcome(
+    contract: Mapping[str, object],
+    command: list[str],
+) -> tuple[int, str | None]:
+    try:
+        _validate_contract_principal_binding(contract)
+    except Exception as error:
+        return 126, type(error).__name__
+    return _command_outcome(command)
+
+
+def _cleanup_commands(contract: Mapping[str, object]) -> list[list[str]]:
+    canary = contract.get("canary")
+    raw = canary.get("failureCleanupCommands") if isinstance(canary, Mapping) else None
+    if not isinstance(raw, list) or not raw:
+        raise ActivationPackageError("activation canary cleanup contract is empty or invalid")
+    result: list[list[str]] = []
+    for command in raw:
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(value, str) and value for value in command)
+            or not command[0].startswith("/")
+        ):
+            raise ActivationPackageError("activation canary cleanup command is invalid")
+        result.append(list(command))
+    return result
+
+
+def _cleanup_command_satisfied(command: list[str]) -> bool:
+    if len(command) < 4 or command[:2] != ["/usr/bin/systemctl", "stop"]:
+        return False
+    for unit in command[2:]:
+        returncode, start_error = _command_outcome(
+            ["/usr/bin/systemctl", "is-active", "--quiet", unit]
+        )
+        if start_error is not None or returncode == 0:
+            return False
+    return True
+
+
 def _runner_state(
     *,
     package_digest: str,
@@ -3390,7 +3499,144 @@ def _runner_state(
     }
 
 
-def execute_approved_activation(
+def _execute_cleanup_sequence(
+    contract: Mapping[str, object],
+    *,
+    package_digest: str,
+) -> None:
+    for index, command in enumerate(_cleanup_commands(contract)):
+        _write_activation_state(
+            _runner_state(
+                package_digest=package_digest,
+                status="cleanup_command_running",
+                phase="staging_cleanup",
+                command_index=index,
+                command=command,
+            )
+        )
+        returncode, start_error = _validated_command_outcome(contract, command)
+        if returncode != 0 and not (
+            start_error is None and _cleanup_command_satisfied(command)
+        ):
+            _write_activation_state(
+                _runner_state(
+                    package_digest=package_digest,
+                    status="cleanup_failed",
+                    phase="staging_cleanup",
+                    command_index=index,
+                    command=command,
+                    failure=start_error or f"exit-{returncode}",
+                )
+            )
+            raise ActivationPackageError("staging cleanup command failed")
+        _write_activation_state(
+            _runner_state(
+                package_digest=package_digest,
+                status="cleanup_command_complete",
+                phase="staging_cleanup",
+                command_index=index,
+                command=command,
+            )
+        )
+
+
+def _rollback_transient_unit_active(command: list[str]) -> bool:
+    try:
+        runner_index = command.index("/usr/bin/systemd-run")
+    except ValueError:
+        return False
+    unit_argument = next((value for value in command if value.startswith("--unit=")), None)
+    if unit_argument is None:
+        return False
+    probe = [
+        *command[:runner_index],
+        "/usr/bin/systemctl",
+        "--user",
+        "is-active",
+        "--quiet",
+        unit_argument.removeprefix("--unit="),
+    ]
+    returncode, _start_error = _command_outcome(probe)
+    return returncode == 0
+
+
+def _execute_rollback_sequence(
+    contract: Mapping[str, object],
+    *,
+    package_digest: str,
+    prior_state: Mapping[str, object] | None = None,
+    originating_failure: str | None = None,
+) -> None:
+    commands = _contract_commands(contract, "rollbackCommands")
+    for index, command in enumerate(commands):
+        try:
+            _validate_contract_principal_binding(contract)
+        except Exception as error:
+            _write_activation_state(
+                _runner_state(
+                    package_digest=package_digest,
+                    status="rollback_failed",
+                    phase="rollback",
+                    command_index=index,
+                    command=command,
+                    failure=type(error).__name__,
+                )
+            )
+            raise ActivationPackageError("rollback principal binding drifted") from error
+        replayed_interrupted_transient = (
+            prior_state is not None
+            and prior_state.get("phase") == "rollback"
+            and prior_state.get("status")
+            in {"rollback_command_running", "rollback_command_complete", "rollback_failed"}
+            and _rollback_transient_unit_active(command)
+        )
+        if not replayed_interrupted_transient:
+            _write_activation_state(
+                _runner_state(
+                    package_digest=package_digest,
+                    status="rollback_command_running",
+                    phase="rollback",
+                    command_index=index,
+                    command=command,
+                    failure=originating_failure,
+                )
+            )
+            returncode, start_error = _command_outcome(command)
+            if returncode != 0:
+                _write_activation_state(
+                    _runner_state(
+                        package_digest=package_digest,
+                        status="rollback_failed",
+                        phase="rollback",
+                        command_index=index,
+                        command=command,
+                        failure=start_error or f"exit-{returncode}",
+                    )
+                )
+                raise ActivationPackageError("sealed rollback command failed")
+        _write_activation_state(
+            _runner_state(
+                package_digest=package_digest,
+                status="rollback_command_complete",
+                phase="rollback",
+                command_index=index,
+                command=command,
+                failure=originating_failure,
+            )
+        )
+        if prior_state is not None and prior_state.get("commandIndex") == index:
+            prior_state = None
+    _write_activation_state(
+        _runner_state(
+            package_digest=package_digest,
+            status="rolled_back",
+            phase="rollback",
+            failure=originating_failure,
+        )
+    )
+
+
+def _execute_approved_activation_locked(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
     """Execute one sealed activation contract in order through a fail-closed state machine."""
@@ -3420,18 +3666,11 @@ def execute_approved_activation(
         )
     staging = _contract_commands(contract, "stagingAndCanaryCommands")
     cutover = _contract_commands(contract, "cutoverCommands")
-    rollback = _contract_commands(contract, "rollbackCommands")
-    canary = contract.get("canary")
-    cleanup_raw = canary.get("failureCleanupCommands") if isinstance(canary, Mapping) else None
-    cleanup = []
-    if isinstance(cleanup_raw, list):
-        for command in cleanup_raw:
-            if isinstance(command, list) and command and all(isinstance(value, str) for value in command):
-                cleanup.append(list(command))
+    _contract_commands(contract, "rollbackCommands")
+    _cleanup_commands(contract)
 
     _write_activation_state(_runner_state(package_digest=digest, status="running", phase="staging"))
     for index, command in enumerate(staging):
-        _validate_contract_principal_binding(contract)
         _write_activation_state(
             _runner_state(
                 package_digest=digest,
@@ -3441,10 +3680,10 @@ def execute_approved_activation(
                 command=command,
             )
         )
-        returncode = _execute_contract_command(command)
+        returncode, start_error = _validated_command_outcome(contract, command)
         if returncode != 0:
-            for cleanup_command in cleanup:
-                _execute_contract_command(cleanup_command)
+            command_failure = start_error or f"exit-{returncode}"
+            _execute_cleanup_sequence(contract, package_digest=digest)
             _write_activation_state(
                 _runner_state(
                     package_digest=digest,
@@ -3452,7 +3691,7 @@ def execute_approved_activation(
                     phase="staging",
                     command_index=index,
                     command=command,
-                    failure=f"exit-{returncode}",
+                    failure=command_failure,
                 )
             )
             raise ActivationPackageError("staged activation command failed before cutover")
@@ -3466,10 +3705,21 @@ def execute_approved_activation(
             )
         )
 
-    verify_approved_cutover(package)
+    try:
+        verify_approved_cutover(package)
+    except Exception as error:
+        _execute_cleanup_sequence(contract, package_digest=digest)
+        _write_activation_state(
+            _runner_state(
+                package_digest=digest,
+                status="failed_before_cutover",
+                phase="staging_cleanup",
+                failure=type(error).__name__,
+            )
+        )
+        raise ActivationPackageError("cutover gate failed after staging cleanup") from error
     _write_activation_state(_runner_state(package_digest=digest, status="running", phase="cutover"))
     for index, command in enumerate(cutover):
-        _validate_contract_principal_binding(contract)
         _write_activation_state(
             _runner_state(
                 package_digest=digest,
@@ -3479,8 +3729,9 @@ def execute_approved_activation(
                 command=command,
             )
         )
-        returncode = _execute_contract_command(command)
+        returncode, start_error = _validated_command_outcome(contract, command)
         if returncode != 0:
+            command_failure = start_error or f"cutover-exit-{returncode}"
             _write_activation_state(
                 _runner_state(
                     package_digest=digest,
@@ -3488,31 +3739,19 @@ def execute_approved_activation(
                     phase="rollback",
                     command_index=index,
                     command=command,
-                    failure=f"cutover-exit-{returncode}",
+                    failure=command_failure,
                 )
             )
-            for rollback_index, rollback_command in enumerate(rollback):
-                rollback_returncode = _execute_contract_command(rollback_command)
-                if rollback_returncode != 0:
-                    _write_activation_state(
-                        _runner_state(
-                            package_digest=digest,
-                            status="rollback_failed",
-                            phase="rollback",
-                            command_index=rollback_index,
-                            command=rollback_command,
-                            failure=f"exit-{rollback_returncode}",
-                        )
-                    )
-                    raise ActivationPackageError("cutover failed and sealed rollback did not complete")
-            _write_activation_state(
-                _runner_state(
+            try:
+                _execute_rollback_sequence(
+                    contract,
                     package_digest=digest,
-                    status="rolled_back",
-                    phase="rollback",
-                    failure=f"cutover-exit-{returncode}",
+                    originating_failure=command_failure,
                 )
-            )
+            except ActivationPackageError as error:
+                raise ActivationPackageError(
+                    "cutover failed and sealed rollback did not complete"
+                ) from error
             raise ActivationPackageError("cutover failed and the sealed rollback completed")
         _write_activation_state(
             _runner_state(
@@ -3527,7 +3766,7 @@ def execute_approved_activation(
     return {"status": "complete", "packageDigest": digest, "replayed": False}
 
 
-def execute_approved_rollback(
+def _execute_approved_rollback_locked(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
     """Recover an interrupted/failed cutover through only the sealed rollback commands."""
@@ -3549,39 +3788,45 @@ def execute_approved_rollback(
         raise ActivationPackageError("no matching activation runner state exists for rollback")
     if state.get("status") == "rolled_back":
         return {"status": "rolled_back", "packageDigest": digest, "replayed": True}
-    if state.get("phase") == "staging":
-        raise ActivationPackageError("activation stopped before cutover; rollback execution is not required")
-    if state.get("phase") not in {"cutover", "rollback"}:
-        raise ActivationPackageError("activation runner state is not eligible for sealed rollback")
-    rollback = _contract_commands(contract, "rollbackCommands")
-    for index, command in enumerate(rollback):
-        _validate_contract_principal_binding(contract)
+    if state.get("status") == "aborted_before_cutover":
+        return {
+            "status": "aborted_before_cutover",
+            "packageDigest": digest,
+            "replayed": True,
+        }
+    if state.get("phase") in {"staging", "staging_cleanup"}:
+        _execute_cleanup_sequence(contract, package_digest=digest)
         _write_activation_state(
             _runner_state(
                 package_digest=digest,
-                status="rollback_command_running",
-                phase="rollback",
-                command_index=index,
-                command=command,
+                status="aborted_before_cutover",
+                phase="staging_cleanup",
             )
         )
-        returncode = _execute_contract_command(command)
-        if returncode != 0:
-            _write_activation_state(
-                _runner_state(
-                    package_digest=digest,
-                    status="rollback_failed",
-                    phase="rollback",
-                    command_index=index,
-                    command=command,
-                    failure=f"exit-{returncode}",
-                )
-            )
-            raise ActivationPackageError("sealed rollback recovery command failed")
-    _write_activation_state(
-        _runner_state(package_digest=digest, status="rolled_back", phase="rollback")
+        return {"status": "aborted_before_cutover", "packageDigest": digest, "replayed": False}
+    if state.get("phase") not in {"cutover", "rollback"}:
+        raise ActivationPackageError("activation runner state is not eligible for sealed rollback")
+    _execute_rollback_sequence(
+        contract,
+        package_digest=digest,
+        prior_state=state,
+        originating_failure=str(state.get("failure")) if state.get("failure") else None,
     )
     return {"status": "rolled_back", "packageDigest": digest, "replayed": False}
+
+
+def execute_approved_activation(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    with _activation_execution_lock():
+        return _execute_approved_activation_locked(package_root)
+
+
+def execute_approved_rollback(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    with _activation_execution_lock():
+        return _execute_approved_rollback_locked(package_root)
 
 
 def _canary_attestation_path(package_digest: str) -> Path:

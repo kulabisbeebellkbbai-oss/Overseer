@@ -86,6 +86,8 @@ def test_api_and_runtime_use_the_dedicated_system_principal_and_immutable_releas
             "@OVERSEER_RELEASE@/site-packages"
         ) in unit
         assert "Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime" in unit
+        assert "Environment=PYTHONNOUSERSITE=1" in unit
+        assert "Environment=PYTHONSAFEPATH=1" in unit
         assert _one(unit, "StateDirectory") == "overseer"
         assert _one(unit, "StateDirectoryMode") == "0700"
         assert "/etc/overseer" in unit
@@ -118,6 +120,7 @@ def test_api_and_runtime_use_the_dedicated_system_principal_and_immutable_releas
 
         exec_start = _one(unit, "ExecStart")
         assert "@OVERSEER_PYTHON@" in exec_start
+        assert " -s -P -m " in exec_start
         assert "$" not in exec_start
         assert "%i" not in exec_start and "%I" not in exec_start
 
@@ -200,7 +203,7 @@ def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> 
 
     command = _one(executor, "ExecStart")
     assert re.search(
-        r"@OVERSEER_PYTHON@ -m overseer\.admin_executor serve-one(?: |$)",
+        r"@OVERSEER_PYTHON@ -s -P -m overseer\.admin_executor serve-one(?: |$)",
         command,
     )
     assert "--allowlist-file /etc/overseer/admin-executor-allowlist.json" in command

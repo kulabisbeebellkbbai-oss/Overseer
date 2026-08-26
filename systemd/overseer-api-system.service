@@ -11,6 +11,8 @@ WorkingDirectory=@OVERSEER_RELEASE@
 Environment=PYTHONPATH=@OVERSEER_RELEASE@/app/src:@OVERSEER_RELEASE@/site-packages
 Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONSAFEPATH=1
 Environment=OVERSEER_DEDICATED_PRINCIPAL=1
 Environment=OVERSEER_ADMIN_TICKET_PRIVATE_KEY=/etc/overseer/admin-ticket-private-key
 Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock
@@ -26,7 +28,7 @@ Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.
 LoadCredential=api-token:/etc/overseer/api-token
 LoadCredential=psychlo-peer-secret:/etc/overseer/psychlo-peer-secret
 LoadCredential=roadex-peer-secret:/etc/overseer/roadex-project-human-thread-secret
-ExecStart=@OVERSEER_PYTHON@ -m overseer.cli serve-api --store /var/lib/overseer/overseer.sqlite3 --host 127.0.0.1 --port 8766 --auth-token-file %d/api-token --admin-approval-verifier-file /etc/overseer/admin-approval-verifier.json --roadex-fixture-approval-verifier-file /etc/overseer/roadex-fixture-approval-verifier.json
+ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.cli serve-api --store /var/lib/overseer/overseer.sqlite3 --host 127.0.0.1 --port 8766 --auth-token-file %d/api-token --admin-approval-verifier-file /etc/overseer/admin-approval-verifier.json --roadex-fixture-approval-verifier-file /etc/overseer/roadex-fixture-approval-verifier.json
 Restart=on-failure
 RestartSec=5
 StateDirectory=overseer

@@ -145,12 +145,24 @@ def test_copied_release_runtime_executes_with_release_local_pythonhome(tmp_path:
         package_root=package,
     )
     staged_python = release / "runtime" / "bin" / "python3.13"
+    hostile_userbase = tmp_path / "hostile-userbase"
+    hostile_site = hostile_userbase / "lib" / "python3.13" / "site-packages"
+    hostile_site.mkdir(parents=True)
+    hostile_marker = tmp_path / "hostile-site-loaded"
+    (hostile_site / "sitecustomize.py").write_text(
+        "import os, pathlib\npathlib.Path(os.environ['HOSTILE_MARKER']).write_text('loaded')\n",
+        encoding="utf-8",
+    )
     result = subprocess.run(
-        [str(staged_python), "-c", "import json, sqlite3, ssl; print('runtime-ok')"],
+        [str(staged_python), "-s", "-P", "-c", "import json, sqlite3, ssl; print('runtime-ok')"],
         env={
             "PATH": "/usr/bin:/bin",
             "PYTHONHOME": str(release / "runtime"),
             "PYTHONPATH": f"{release / 'app' / 'src'}:{release / 'site-packages'}",
+            "PYTHONUSERBASE": str(hostile_userbase),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONSAFEPATH": "1",
+            "HOSTILE_MARKER": str(hostile_marker),
         },
         capture_output=True,
         text=True,
@@ -159,6 +171,7 @@ def test_copied_release_runtime_executes_with_release_local_pythonhome(tmp_path:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "runtime-ok"
+    assert not hostile_marker.exists()
 
 
 def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Path) -> None:
@@ -875,7 +888,11 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     assert token_copy[token_copy.index("-g") + 1] == "god"
     assert token_copy[token_copy.index("-m") + 1] == "0640"
     assert token_copy[-2] == "/etc/overseer/api-token"
-    assert "verify-compatibility-token" in commands[token_copy_index + 1]
+    token_verify = commands[token_copy_index + 1]
+    assert "verify-compatibility-token" in token_verify
+    assert token_verify[token_verify.index("--expected-target-uid") + 1] == "0"
+    assert token_verify[token_verify.index("--expected-target-gid") + 1] == str(os.getgid())
+    assert token_verify[token_verify.index("--expected-target-uid") + 1] != str(os.getuid())
     canary_health_index = next(
         index for index, command in enumerate(commands) if command[-1] == "http://127.0.0.1:18766/health"
     )
@@ -914,9 +931,20 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     assert "verify-rollback-bundle" in contract["rollbackCommands"][0]
     assert "v1.1.5-release" in contract["rollbackBundle"]["executionSourceLabel"]
     assert any(
-        any("overseer-v1-1-5-rollback-runtime.service" in value for value in command)
+        any("overseer-v1-1-5-rollback-runtime-" in value for value in command)
         for command in contract["rollbackCommands"]
     )
+    rollback_installs = [
+        command
+        for command in staging_commands
+        if command[0] == "/usr/bin/install"
+        and "-d" not in command
+        and command[-1].startswith("/opt/overseer/rollback/")
+    ]
+    assert rollback_installs
+    assert all(command[command.index("-o") + 1] == "root" for command in rollback_installs)
+    assert all(command[command.index("-g") + 1] == "god" for command in rollback_installs)
+    assert all(command[command.index("-m") + 1] in {"0440", "0550"} for command in rollback_installs)
     assert contract["rollbackCommands"][-1] == [
         "/usr/bin/curl",
         "--fail",
@@ -1253,8 +1281,8 @@ def test_root_rollback_bundle_is_exact_and_drift_detected(
         key=lambda path: len(path.parts),
         reverse=True,
     ):
-        directory.chmod(0o555)
-    bundle_root.chmod(0o555)
+        directory.chmod(0o550)
+    bundle_root.chmod(0o550)
     root_manifest = tmp_path / "root-rollback-manifest.json"
     root_manifest.write_bytes(package_manifest.read_bytes())
     root_manifest.chmod(0o644)
@@ -1386,6 +1414,152 @@ def test_activation_runner_enforces_order_state_and_replay(
     assert state["secretValuesRecorded"] is False
 
 
+def test_activation_runner_lock_rejects_concurrent_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "executor" / "activation-state.json"
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    with activation_package_module._activation_execution_lock():
+        with pytest.raises(ActivationPackageError, match="holds the execution lock"):
+            with activation_package_module._activation_execution_lock():
+                raise AssertionError("nested activation lock must not be acquired")
+
+
+def test_interrupted_staging_recovery_runs_and_records_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "c" * 64
+    package = tmp_path / "package"
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="command_running",
+            phase="staging",
+            command_index=0,
+            command=["/bin/true", "staging"],
+        )
+    )
+
+    result = activation_package_module.execute_approved_rollback(package)
+
+    assert result == {
+        "status": "aborted_before_cutover",
+        "packageDigest": digest,
+        "replayed": False,
+    }
+    assert calls == [("/bin/true", "cleanup")]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+
+
+def test_interrupted_rollback_verifies_active_transient_instead_of_restarting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "d" * 64
+    transient = [
+        "/usr/sbin/runuser",
+        "--user",
+        "god",
+        "--",
+        "/usr/bin/systemd-run",
+        "--user",
+        "--unit=overseer-rollback-d.service",
+        "--",
+        "/bin/true",
+    ]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "rollbackCommands": [["/bin/true", "verify"], transient],
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_rollback_transient_unit_active",
+        lambda command: command == transient,
+    )
+    prior_state = {
+        "phase": "rollback",
+        "status": "rollback_command_running",
+        "commandIndex": 1,
+        "commandDigest": hashlib.sha256(
+            json.dumps(transient, sort_keys=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest(),
+    }
+
+    activation_package_module._execute_rollback_sequence(
+        contract,
+        package_digest=digest,
+        prior_state=prior_state,
+    )
+
+    assert calls == [("/bin/true", "verify")]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "rolled_back"
+
+
 def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1432,7 +1606,9 @@ def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
 
     def execute(command: list[str]) -> int:
         calls.append(tuple(command))
-        return 1 if command[1] == "cutover" else 0
+        if command[1] == "cutover":
+            raise ActivationPackageError("simulated command-start failure")
+        return 0
 
     monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
 

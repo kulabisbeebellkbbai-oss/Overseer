@@ -19,6 +19,7 @@ import pwd
 import re
 import secrets
 import shlex
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -26,7 +27,7 @@ import time
 from contextlib import contextmanager
 from urllib.parse import quote
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Callable, Mapping
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -1559,6 +1560,83 @@ def _legacy_inode_activity(
     return tuple(sorted(result))
 
 
+@contextmanager
+def _kernel_read_lease_barrier(
+    descriptors: tuple[int, ...],
+) -> object:
+    """Hold Linux read leases so hidden writable references fail closed."""
+
+    required_constants = ("F_SETLEASE", "F_GETLEASE", "F_SETOWN")
+    if any(not hasattr(fcntl, name) for name in required_constants):
+        raise ActivationPackageError("kernel read lease support is unavailable")
+    unique_descriptors = tuple(dict.fromkeys(descriptors))
+    if not unique_descriptors:
+        raise ActivationPackageError("kernel read lease barrier has no artifacts")
+
+    break_requested = False
+
+    def mark_break_requested(_signum: int, _frame: object) -> None:
+        nonlocal break_requested
+        break_requested = True
+
+    try:
+        previous_handler = signal.getsignal(signal.SIGIO)
+        signal.signal(signal.SIGIO, mark_break_requested)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ActivationPackageError(
+            "kernel read lease break monitoring could not be installed"
+        ) from error
+
+    leased: list[int] = []
+
+    def require_intact() -> None:
+        if break_requested:
+            raise ActivationPackageError(
+                "kernel read lease barrier received a write-open request"
+            )
+        try:
+            intact = all(
+                fcntl.fcntl(descriptor, fcntl.F_GETLEASE) == fcntl.F_RDLCK
+                for descriptor in leased
+            )
+        except OSError as error:
+            raise ActivationPackageError(
+                "kernel read lease barrier could not be verified"
+            ) from error
+        if not intact:
+            raise ActivationPackageError("kernel read lease barrier was lost")
+
+    try:
+        try:
+            for descriptor in unique_descriptors:
+                fcntl.fcntl(descriptor, fcntl.F_SETOWN, os.getpid())
+                fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+                leased.append(descriptor)
+        except OSError as error:
+            raise ActivationPackageError(
+                "kernel read lease barrier rejected a writable reference or mapping"
+            ) from error
+        require_intact()
+        yield require_intact
+        require_intact()
+    finally:
+        release_error: OSError | None = None
+        for descriptor in reversed(leased):
+            try:
+                fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+            except OSError as error:
+                release_error = release_error or error
+        try:
+            signal.signal(signal.SIGIO, previous_handler)
+        except (OSError, RuntimeError, ValueError) as error:
+            if release_error is None:
+                release_error = OSError(str(error))
+        if release_error is not None:
+            raise ActivationPackageError(
+                "kernel read lease barrier could not be released cleanly"
+            ) from release_error
+
+
 def _artifact_identity(path: Path) -> tuple[int, ...] | None:
     try:
         metadata = path.lstat()
@@ -1885,10 +1963,41 @@ def prepare_final_store_migration(
                 raise ActivationPackageError("final migration WAL checkpoint did not quiesce")
             checkpoint = "truncate_complete"
         for path in bound_paths:
+            if not path.exists():
+                continue
+            metadata = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ActivationPackageError(
+                    "legacy store changed after the final WAL checkpoint"
+                )
+            if not any(
+                (opened.st_dev, opened.st_ino) == (metadata.st_dev, metadata.st_ino)
+                for opened in (os.fstat(descriptor) for descriptor in legacy_descriptors)
+            ):
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    os.close(descriptor)
+                    raise ActivationPackageError(
+                        "legacy store changed while opening after the final WAL checkpoint"
+                    )
+                os.fchown(descriptor, root_uid, root_gid)
+                os.fchmod(descriptor, 0o600)
+                legacy_descriptors.append(descriptor)
+        for path in bound_paths:
             if path.exists():
                 os.chmod(path, 0o400)
+        quiesced_inode_identities = tuple(
+            (metadata.st_dev, metadata.st_ino)
+            for metadata in (os.fstat(descriptor) for descriptor in legacy_descriptors)
+        )
         if _legacy_inode_activity(
-            legacy_inode_identities,
+            quiesced_inode_identities,
             include_open_files=True,
             exclude_current_process=True,
         ):
@@ -1896,47 +2005,57 @@ def prepare_final_store_migration(
                 "final migration SQLite artifacts acquired an open process or mapping before hashing"
             )
         locked_source = os.fstat(source_descriptor)
-        source_digest_before = _stream_hash_open_regular(
-            source_descriptor,
-            label="locked legacy authority store",
-        )
-
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(backup, flags, 0o600)
-        os.close(descriptor)
-        source_connection = sqlite3.connect(
-            f"file:/proc/self/fd/{source_descriptor}?mode=ro&immutable=1",
-            uri=True,
-            timeout=5,
-        )
-        target_connection = sqlite3.connect(backup, timeout=5)
-        try:
-            def progress(_status: int, remaining: int, _total: int) -> None:
-                if remaining and sleep_seconds:
-                    time.sleep(float(sleep_seconds))
-
-            source_connection.backup(
-                target_connection,
-                pages=pages_per_step,
-                progress=progress,
-                sleep=0,
+        with _kernel_read_lease_barrier(
+            tuple(legacy_descriptors)
+        ) as require_lease_intact:
+            source_digest_before = _stream_hash_open_regular(
+                source_descriptor,
+                label="locked legacy authority store",
+                guard=require_lease_intact,
             )
-            target_connection.commit()
-        finally:
-            target_connection.close()
-            source_connection.close()
-        os.chmod(backup, 0o600)
-        source_digest_after = _stream_hash_open_regular(
-            source_descriptor,
-            label="locked legacy authority store",
-        )
-        if source_digest_before != source_digest_after:
-            raise ActivationPackageError("final migration source content changed during backup")
+
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(backup, flags, 0o600)
+            os.close(descriptor)
+            require_lease_intact()
+            source_connection = sqlite3.connect(
+                f"file:/proc/self/fd/{source_descriptor}?mode=ro&immutable=1",
+                uri=True,
+                timeout=5,
+            )
+            target_connection = sqlite3.connect(backup, timeout=5)
+            try:
+                def progress(_status: int, remaining: int, _total: int) -> None:
+                    require_lease_intact()
+                    if remaining and sleep_seconds:
+                        time.sleep(float(sleep_seconds))
+
+                source_connection.backup(
+                    target_connection,
+                    pages=pages_per_step,
+                    progress=progress,
+                    sleep=0,
+                )
+                target_connection.commit()
+                require_lease_intact()
+            finally:
+                target_connection.close()
+                source_connection.close()
+            os.chmod(backup, 0o600)
+            source_digest_after = _stream_hash_open_regular(
+                source_descriptor,
+                label="locked legacy authority store",
+                guard=require_lease_intact,
+            )
+            if source_digest_before != source_digest_after:
+                raise ActivationPackageError(
+                    "final migration source content changed during backup"
+                )
         for descriptor in legacy_descriptors:
             os.close(descriptor)
         legacy_descriptors.clear()
-        if _legacy_inode_activity(legacy_inode_identities, include_open_files=True):
+        if _legacy_inode_activity(quiesced_inode_identities, include_open_files=True):
             raise ActivationPackageError(
                 "final migration SQLite artifacts acquired another open process or mapping"
             )
@@ -2006,7 +2125,8 @@ def prepare_final_store_migration(
             "rowCountsAfter": after_counts,
             "schemaBefore": schema_before,
             "schemaAfter": schema_after,
-            "quiescenceLock": "parent-and-store-write-access-revoked",
+            "quiescenceLock": "kernel-read-leases-and-write-access-revoked",
+            "kernelReadLeaseBarrier": "held-through-source-hashes-and-backup",
             "retainedParentLock": {
                 "uid": root_uid,
                 "gid": expected_source_gid,
@@ -2221,7 +2341,12 @@ def render_systemd_units(
     return result
 
 
-def _stream_hash_open_regular(descriptor: int, *, label: str) -> dict[str, object]:
+def _stream_hash_open_regular(
+    descriptor: int,
+    *,
+    label: str,
+    guard: Callable[[], None] | None = None,
+) -> dict[str, object]:
     """Hash one already-open regular file without reopening its pathname."""
 
     before = os.fstat(descriptor)
@@ -2230,11 +2355,15 @@ def _stream_hash_open_regular(descriptor: int, *, label: str) -> dict[str, objec
     digest = hashlib.sha256()
     size = 0
     while size < before.st_size:
+        if guard is not None:
+            guard()
         chunk = os.pread(descriptor, min(1024 * 1024, before.st_size - size), size)
         if not chunk:
             break
         digest.update(chunk)
         size += len(chunk)
+    if guard is not None:
+        guard()
     after = os.fstat(descriptor)
     identity = lambda item: (
         item.st_dev,

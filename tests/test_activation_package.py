@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import array
 import hashlib
 import io
 import json
@@ -1074,7 +1075,8 @@ def test_final_migration_requires_quiescence_and_preserves_source(
 
     assert report["status"] == "final_migration_complete"
     assert report["openProcessPreflight"] == "clear"
-    assert report["quiescenceLock"] == "parent-and-store-write-access-revoked"
+    assert report["quiescenceLock"] == "kernel-read-leases-and-write-access-revoked"
+    assert report["kernelReadLeaseBarrier"] == "held-through-source-hashes-and-backup"
     assert source.read_bytes() == source_before
     assert report["rowCountsBefore"]["retained_items"] == 3
     assert report["rowCountsAfter"]["retained_items"] == 3
@@ -1313,6 +1315,100 @@ def test_open_inode_scan_fails_closed_for_root_permission_errors(
 
     with pytest.raises(ActivationPackageError, match=expected_message):
         activation_package_module._processes_with_open_inode(1, 2)
+
+
+def test_final_migration_rejects_scm_rights_queued_writable_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    _wal_store(source)
+    approved = source.stat()
+    parent = source.parent.stat()
+    parent_mode = stat_mode(source.parent)
+    backup_parent = tmp_path / "executor-state"
+    destination_parent = tmp_path / "authority-state"
+    backup_parent.mkdir(mode=0o700)
+    destination_parent.mkdir(mode=0o700)
+    backup = backup_parent / "final-source.sqlite3"
+    destination = destination_parent / "final-migrated.sqlite3"
+    receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    queued_descriptor = os.open(source, os.O_RDWR)
+    try:
+        assert sender.sendmsg(
+            [b"queued-writer"],
+            [
+                (
+                    socket.SOL_SOCKET,
+                    socket.SCM_RIGHTS,
+                    array.array("i", [queued_descriptor]),
+                )
+            ],
+        ) == len(b"queued-writer")
+    finally:
+        os.close(queued_descriptor)
+
+    assert os.getpid() not in activation_package_module._processes_with_open_inode(
+        approved.st_dev,
+        approved.st_ino,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_parent_lock_mode", lambda: 0o700)
+    try:
+        with pytest.raises(ActivationPackageError, match="lease barrier rejected"):
+            prepare_final_store_migration(
+                source_store=source,
+                backup_store=backup,
+                destination_store=destination,
+                expected_source_device=approved.st_dev,
+                expected_source_inode=approved.st_ino,
+                expected_source_uid=os.geteuid(),
+                expected_source_gid=os.getegid(),
+                expected_parent_device=parent.st_dev,
+                expected_parent_inode=parent.st_ino,
+                expected_parent_mode=parent_mode,
+                destination_uid=os.geteuid(),
+                destination_gid=os.getegid(),
+                sleep_seconds=0,
+            )
+    finally:
+        receiver.close()
+        sender.close()
+
+    assert not backup.exists()
+    assert not destination.exists()
+    assert stat_mode(source) == 0o600
+    assert stat_mode(source.parent) == parent_mode
+
+
+def test_kernel_read_lease_barrier_rejects_a_new_writer(tmp_path: Path) -> None:
+    source = tmp_path / "lease-target"
+    source.write_bytes(b"lease target")
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        with pytest.raises(ActivationPackageError, match="write-open request"):
+            with activation_package_module._kernel_read_lease_barrier(
+                (descriptor,)
+            ) as require_lease_intact:
+                child = os.fork()
+                if child == 0:
+                    try:
+                        os.open(source, os.O_RDWR | os.O_NONBLOCK)
+                    except BlockingIOError:
+                        os._exit(0)
+                    except OSError:
+                        os._exit(2)
+                    os._exit(1)
+                _child, status = os.waitpid(child, 0)
+                assert os.waitstatus_to_exitcode(status) == 0
+                require_lease_intact()
+    finally:
+        os.close(descriptor)
 
 
 def test_final_migration_pre_hash_checkpoint_rescans_open_descriptors(

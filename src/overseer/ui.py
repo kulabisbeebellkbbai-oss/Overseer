@@ -890,6 +890,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     const AUTO_REFRESH_MS = 30000;
     const DATA_AGE_UPDATE_MS = 1000;
     let refreshPromise = null;
+    let approvalRequestInFlight = false;
+    const approvalTokenFields = new Set();
     const LAYOUT_MODES = ["auto", "desktop", "tablet", "mobile"];
     function viewportLayout(width) {
       if (width <= 700) return "mobile";
@@ -983,6 +985,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         ".section input[id], .section textarea[id], .section select[id]"
       ) || [];
       for (const field of fields) {
+        if (field.id === "admin-approval-token" && approvalRequestInFlight) {
+          approvalTokenFields.add(field);
+          continue;
+        }
         values[field.id] = field.type === "checkbox"
           ? {checked: field.checked, value: ""}
           : {checked: null, value: field.value};
@@ -993,12 +999,22 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       for (const [id, saved] of Object.entries(values || {})) {
         const field = targetDocument.getElementById(id);
         if (!field) continue;
+        if (id === "admin-approval-token" && approvalRequestInFlight) {
+          approvalTokenFields.add(field);
+          field.value = "";
+          continue;
+        }
         if (field.type === "checkbox") {
           field.checked = Boolean(saved.checked);
         } else {
           field.value = saved.value;
         }
       }
+    }
+    function clearApprovalTokenFields(targetDocument = document) {
+      const currentFields = targetDocument.querySelectorAll?.("#admin-approval-token") || [];
+      for (const field of currentFields) approvalTokenFields.add(field);
+      for (const field of approvalTokenFields) field.value = "";
     }
     function readLayoutMode() {
       try {
@@ -1271,6 +1287,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const approvalTokenInput = document.getElementById("admin-approval-token");
       const approvalToken = approvalTokenInput?.value.trim() || "";
       if (!approvalToken) throw new Error("Independent approval token is required");
+      approvalTokenFields.add(approvalTokenInput);
+      approvalRequestInFlight = true;
+      approvalTokenInput.value = "";
       const headers = {
         "content-type": "application/json",
         authorization: `Bearer ${approvalToken}`
@@ -1284,7 +1303,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         if (!response.ok) throw new Error(`${path}: ${response.status}`);
         return await response.json();
       } finally {
-        approvalTokenInput.value = "";
+        clearApprovalTokenFields(document);
+        approvalRequestInFlight = false;
+        approvalTokenFields.clear();
       }
     }
     async function runAction(action, source) {
@@ -2395,6 +2416,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       renderAudit();
       renderActionStatus();
       restoreFormValues(formValues, document);
+      if (approvalRequestInFlight) clearApprovalTokenFields(document);
       restoreFocusTarget(focusTarget);
     }
     function renderActionStatus() {

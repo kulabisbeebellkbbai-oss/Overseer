@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -359,3 +360,64 @@ def test_periodic_render_preserves_in_progress_admin_form_values() -> None:
     assert "function restoreFormValues(" in OPERATOR_CONSOLE_HTML
     assert "const formValues = captureFormValues(document);" in OPERATOR_CONSOLE_HTML
     assert "restoreFormValues(formValues, document);" in OPERATOR_CONSOLE_HTML
+
+
+def test_admin_approval_token_race_clears_replaced_fields_on_success_and_failure() -> None:
+    helper_start = OPERATOR_CONSOLE_HTML.index("    let approvalRequestInFlight = false;")
+    helper_end = OPERATOR_CONSOLE_HTML.index("    function readLayoutMode", helper_start)
+    helpers = OPERATOR_CONSOLE_HTML[helper_start:helper_end]
+    approval_start = OPERATOR_CONSOLE_HTML.index("    async function postApprovalJson")
+    approval_end = OPERATOR_CONSOLE_HTML.index("    async function runAction", approval_start)
+    approval_request = OPERATOR_CONSOLE_HTML[approval_start:approval_end]
+    script = helpers + approval_request + r'''
+const apiBase = "";
+let currentToken;
+let detachedTokens;
+let planField;
+let respond;
+let observedAuthorization;
+const document = {
+  getElementById(id) {
+    if (id === "admin-approval-token") return currentToken;
+    if (id === "admin-approval-plan-id") return planField;
+    return null;
+  },
+  querySelectorAll(selector) {
+    if (selector === "#admin-approval-token") return [currentToken, ...detachedTokens];
+    if (selector.includes(".section input")) return [planField, currentToken];
+    return [];
+  }
+};
+globalThis.fetch = async (_url, options) => {
+  observedAuthorization = options.headers.authorization;
+  const values = captureFormValues(document);
+  const submittedToken = currentToken;
+  currentToken = {id:"admin-approval-token", type:"password", value:""};
+  detachedTokens.push(submittedToken);
+  restoreFormValues(values, document);
+  if (currentToken.value !== "") process.exit(2);
+  if (planField.value !== "keep-this-field") process.exit(3);
+  return await new Promise((resolve) => { respond = resolve; });
+};
+async function exercise(response) {
+  currentToken = {id:"admin-approval-token", type:"password", value:"submitted-token"};
+  detachedTokens = [];
+  planField = {id:"admin-approval-plan-id", type:"text", value:"keep-this-field"};
+  const request = postApprovalJson("/admin/approve", {plan_id:"approval.race"});
+  await Promise.resolve();
+  if (observedAuthorization !== "Bearer submitted-token") process.exit(4);
+  if (currentToken.value !== "") process.exit(5);
+  respond(response);
+  let failed = false;
+  try { await request; } catch (_) { failed = true; }
+  if (response.ok === false && !failed) process.exit(6);
+  if (response.ok !== false && failed) process.exit(7);
+  if ([currentToken, ...detachedTokens].some((field) => field.value !== "")) process.exit(8);
+}
+(async () => {
+  await exercise({ok:false, status:403});
+  await exercise({ok:true, status:200, json:async () => ({approved:true})});
+})().catch(() => process.exit(9));
+'''
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

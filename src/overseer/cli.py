@@ -11797,7 +11797,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
     api_parser.add_argument("--port", type=int, default=8766)
-    api_parser.add_argument("--socket-fd", type=int)
     api_parser.add_argument("--socket-path")
     api_parser.add_argument("--socket-peer-uid", type=int)
     api_parser.add_argument("--socket-owner-uid", type=int)
@@ -13328,7 +13327,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             load_approval_verifier(args.roadex_fixture_approval_verifier_file)
             if args.roadex_fixture_approval_verifier_file
             else None,
-            socket_fd=args.socket_fd,
             socket_path=args.socket_path,
             socket_peer_uid=args.socket_peer_uid,
             socket_owner_uid=args.socket_owner_uid,

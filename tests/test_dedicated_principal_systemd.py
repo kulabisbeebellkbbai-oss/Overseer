@@ -12,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SYSTEMD = ROOT / "systemd"
 API_UNIT = SYSTEMD / "overseer-api-system.service"
 CANARY_UNIT = SYSTEMD / "overseer-api-canary.service"
-CANARY_SOCKET = SYSTEMD / "overseer-api-canary.socket"
 RUNTIME_UNIT = SYSTEMD / "overseer-runtime-system.service"
 SOCKET_UNIT = SYSTEMD / "overseer-admin-executor.socket"
 EXECUTOR_UNIT = SYSTEMD / "overseer-admin-executor@.service"
@@ -67,7 +66,6 @@ def _render_units(tmp_path: Path) -> list[Path]:
     for source in (
         API_UNIT,
         CANARY_UNIT,
-        CANARY_SOCKET,
         RUNTIME_UNIT,
         SOCKET_UNIT,
         EXECUTOR_UNIT,
@@ -161,39 +159,28 @@ def test_api_uses_independent_credentials_verifiers_and_loopback_peer_channels()
     assert "api-token:/etc/overseer/roadex-fixture-approval-verifier.json" not in api
 
 
-def test_disposable_api_canary_is_separate_bounded_and_socket_activated() -> None:
+def test_disposable_api_canary_is_separate_bounded_and_principal_owned() -> None:
     canary = _read(CANARY_UNIT)
     command = _one(canary, "ExecStart")
     assert _one(canary, "User") == "overseer"
     assert _one(canary, "Group") == "overseer"
     assert "--store /var/lib/overseer/overseer-canary.sqlite3" in command
-    assert "--socket-fd 3" in command
-    assert "--socket-path /run/overseer/api-canary.sock" in command
+    assert "--socket-fd" not in command
+    assert "--socket-path /run/overseer-canary/api.sock" in command
     assert "--socket-peer-uid 0" in command
-    assert "--socket-owner-uid 0 --socket-owner-gid 0" in command
+    assert "--socket-owner-uid 984 --socket-owner-gid 984" in command
     assert "--host" not in command and "--port" not in command
-    assert "Requires=overseer-api-canary.socket" in canary
+    assert "overseer-api-canary.socket" not in canary
     assert "OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-canary-bridge.sqlite3" in canary
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-canary-relay.sqlite3" in canary
     assert _one(canary, "RuntimeMaxSec") == "10min"
     assert _one(canary, "TimeoutStopSec") == "10s"
+    assert _one(canary, "RuntimeDirectory") == "overseer-canary"
+    assert _one(canary, "RuntimeDirectoryMode") == "0700"
     assert _one(canary, "RestrictAddressFamilies") == "AF_UNIX"
     assert "[Install]" not in canary
     for setting in COMMON_HARDENING:
         assert setting in canary
-
-
-def test_canary_socket_is_root_owned_private_disposable_and_not_enabled() -> None:
-    socket_unit = _read(CANARY_SOCKET)
-    assert _one(socket_unit, "ListenStream") == "/run/overseer/api-canary.sock"
-    assert _one(socket_unit, "SocketMode") == "0600"
-    assert _one(socket_unit, "SocketUser") == "root"
-    assert _one(socket_unit, "SocketGroup") == "root"
-    assert _one(socket_unit, "RemoveOnStop") == "yes"
-    assert _one(socket_unit, "Service") == "overseer-api-canary.service"
-    assert "[Install]" not in socket_unit
-
-
 def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> None:
     socket = _read(SOCKET_UNIT)
     assert "Accept=yes" in socket

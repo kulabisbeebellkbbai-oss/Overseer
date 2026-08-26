@@ -530,7 +530,6 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
         "overseer-admin-executor.socket",
         "overseer-admin-executor@.service",
         "overseer-api-canary.service",
-        "overseer-api-canary.socket",
         "overseer-api.service",
         "overseer-approval-smoke.service",
         "overseer-codex-user-bridge.service",
@@ -1097,6 +1096,78 @@ def test_final_migration_requires_quiescence_and_preserves_source(
     assert stat_mode(source) == 0o600
 
 
+def test_final_migration_rejects_source_replacement_during_parent_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    _wal_store(source)
+    approved = source.stat()
+    parent = source.parent.stat()
+    parent_mode = stat_mode(source.parent)
+    backup_parent = tmp_path / "executor-state"
+    destination_parent = tmp_path / "authority-state"
+    backup_parent.mkdir(mode=0o700)
+    destination_parent.mkdir(mode=0o700)
+    backup = backup_parent / "final-source.sqlite3"
+    destination = destination_parent / "final-migrated.sqlite3"
+    displaced = tmp_path / "approved-displaced.sqlite3"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_parent_lock_mode", lambda: 0o700)
+    real_fchown = os.fchown
+    replacement_performed = False
+
+    def replace_after_parent_ownership_change(
+        descriptor: int,
+        uid: int,
+        gid: int,
+    ) -> None:
+        nonlocal replacement_performed
+        real_fchown(descriptor, uid, gid)
+        opened = os.fstat(descriptor)
+        if not replacement_performed and (opened.st_dev, opened.st_ino) == (
+            parent.st_dev,
+            parent.st_ino,
+        ):
+            replacement_performed = True
+            source.rename(displaced)
+            _wal_store(source)
+            with sqlite3.connect(source) as connection:
+                connection.execute(
+                    "INSERT INTO retained_items(value) VALUES ('attacker-selected')"
+                )
+
+    monkeypatch.setattr(os, "fchown", replace_after_parent_ownership_change)
+
+    with pytest.raises(ActivationPackageError, match="identity drifted"):
+        prepare_final_store_migration(
+            source_store=source,
+            backup_store=backup,
+            destination_store=destination,
+            expected_source_device=approved.st_dev,
+            expected_source_inode=approved.st_ino,
+            expected_source_uid=os.geteuid(),
+            expected_source_gid=os.getegid(),
+            expected_parent_device=parent.st_dev,
+            expected_parent_inode=parent.st_ino,
+            expected_parent_mode=parent_mode,
+            destination_uid=os.geteuid(),
+            destination_gid=os.getegid(),
+            sleep_seconds=0,
+        )
+
+    assert replacement_performed is True
+    assert displaced.stat().st_ino == approved.st_ino
+    assert not backup.exists()
+    assert not destination.exists()
+    assert not backup.with_suffix(f"{backup.suffix}.report.json").exists()
+
+
 def _prepared_package(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
     checkout = _reviewed_checkout(tmp_path)
     dependencies = _dependencies(tmp_path)
@@ -1366,7 +1437,7 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         for index, command in enumerate(commands)
         if command[-3:] == [
             "--unix-socket",
-            "/run/overseer/api-canary.sock",
+            "/run/overseer-canary/api.sock",
             "http://localhost/health",
         ]
     )
@@ -1387,12 +1458,12 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     canary_start_index = next(
         index
         for index, command in enumerate(staging_commands)
-        if command[-2:] == ["start", "overseer-api-canary.socket"]
+        if command[-2:] == ["start", "overseer-api-canary.service"]
     )
     assert staging_verify_index < canary_start_index
     assert contract["canary"] == {
         "store": "/var/lib/overseer/overseer-canary.sqlite3",
-        "unixSocket": "/run/overseer/api-canary.sock",
+        "unixSocket": "/run/overseer-canary/api.sock",
         "serverPeerUid": 984,
         "allowedClientUid": 0,
         "mustPassBeforeLegacyStop": True,
@@ -1402,7 +1473,6 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
                 "/usr/bin/systemctl",
                 "stop",
                 "overseer-api-canary.service",
-                "overseer-api-canary.socket",
                 "overseer-admin-executor.socket",
                 "overseer-codex-user-bridge.socket",
             ]
@@ -1973,6 +2043,16 @@ def test_live_canary_rejects_prebound_socket_before_connecting_or_attesting(
         activation_package_module,
         "_activation_root_identity",
         lambda: (os.geteuid() + 1, os.getegid() + 1),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_UID",
+        os.geteuid() + 1,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_GID",
+        os.getegid() + 1,
     )
     try:
         with pytest.raises(ActivationPackageError, match="socket identity"):

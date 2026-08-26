@@ -221,18 +221,17 @@ def test_unix_api_listener_and_client_authenticate_kernel_peer_uids(
     store = tmp_path / "state.sqlite3"
     SQLiteStore(store).close()
     socket_path = tmp_path / "api.sock"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(socket_path))
-    socket_path.chmod(0o600)
-    listener.listen()
     server = BoundedThreadingUnixHTTPServer(
-        listener.fileno(),
         make_api_handler(str(store), "ordinary-token"),
         socket_path=str(socket_path),
         allowed_peer_uid=os.geteuid(),
         socket_owner_uid=os.geteuid(),
         socket_owner_gid=os.getegid(),
     )
+    socket_metadata = socket_path.lstat()
+    assert socket_metadata.st_uid == os.geteuid()
+    assert socket_metadata.st_gid == os.getegid()
+    assert socket_metadata.st_mode & 0o777 == 0o600
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -248,8 +247,8 @@ def test_unix_api_listener_and_client_authenticate_kernel_peer_uids(
     finally:
         server.shutdown()
         server.server_close()
-        listener.close()
         thread.join(timeout=5)
+    assert not socket_path.exists()
 
 
 def test_unix_client_sends_no_http_or_secret_to_wrong_uid_peer(
@@ -286,3 +285,27 @@ def test_unix_client_sends_no_http_or_secret_to_wrong_uid_peer(
         listener.close()
 
     assert received == [b""]
+
+
+def test_unix_server_rejects_and_preserves_a_prebound_listener(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "prebound.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    listener.listen()
+    original = socket_path.lstat()
+    try:
+        with pytest.raises(ValueError, match="listener identity"):
+            BoundedThreadingUnixHTTPServer(
+                make_api_handler(str(tmp_path / "unused.sqlite3"), "ordinary-token"),
+                socket_path=str(socket_path),
+                allowed_peer_uid=os.geteuid(),
+                socket_owner_uid=os.geteuid(),
+                socket_owner_gid=os.getegid(),
+            )
+        observed = socket_path.lstat()
+        assert (observed.st_dev, observed.st_ino) == (original.st_dev, original.st_ino)
+    finally:
+        listener.close()

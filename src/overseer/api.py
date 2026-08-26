@@ -710,13 +710,12 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class BoundedThreadingUnixHTTPServer(BoundedThreadingHTTPServer):
-    """Bounded HTTP server on one pre-opened, identity-checked Unix listener."""
+    """Bounded HTTP server on one principal-created, identity-checked listener."""
 
     address_family = socket.AF_UNIX
 
     def __init__(
         self,
-        listener_fd: int,
         handler_class,
         *,
         socket_path: str,
@@ -726,9 +725,7 @@ class BoundedThreadingUnixHTTPServer(BoundedThreadingHTTPServer):
         max_workers: int = API_MAX_REQUEST_THREADS,
     ) -> None:
         if (
-            type(listener_fd) is not int
-            or listener_fd < 0
-            or type(allowed_peer_uid) is not int
+            type(allowed_peer_uid) is not int
             or allowed_peer_uid < 0
             or type(socket_owner_uid) is not int
             or socket_owner_uid < 0
@@ -738,35 +735,56 @@ class BoundedThreadingUnixHTTPServer(BoundedThreadingHTTPServer):
             or max_workers < 1
         ):
             raise ValueError("Unix API listener configuration is invalid")
-        listener = socket.fromfd(listener_fd, socket.AF_UNIX, socket.SOCK_STREAM)
+        path = Path(socket_path)
+        listener: socket.socket | None = None
+        created_path = False
         try:
-            path = Path(socket_path)
-            path_metadata = path.lstat()
             parent_metadata = path.parent.lstat()
             if (
-                listener.family != socket.AF_UNIX
-                or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
+                path.exists()
+                or path.is_symlink()
+                or path.parent.is_symlink()
+                or not stat.S_ISDIR(parent_metadata.st_mode)
+                or parent_metadata.st_uid != socket_owner_uid
+                or parent_metadata.st_gid != socket_owner_gid
+                or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+            ):
+                raise ValueError("Unix API listener identity is invalid")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            previous_umask = os.umask(0o177)
+            try:
+                listener.bind(socket_path)
+                created_path = True
+            finally:
+                os.umask(previous_umask)
+            listener.listen(self.request_queue_size)
+            path_metadata = path.lstat()
+            if (
+                listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
                 or listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1
                 or listener.getsockname() != socket_path
-                or path.is_symlink()
                 or not stat.S_ISSOCK(path_metadata.st_mode)
                 or path_metadata.st_nlink != 1
                 or path_metadata.st_uid != socket_owner_uid
                 or path_metadata.st_gid != socket_owner_gid
                 or stat.S_IMODE(path_metadata.st_mode) != 0o600
-                or path.parent.is_symlink()
-                or not stat.S_ISDIR(parent_metadata.st_mode)
-                or parent_metadata.st_uid != socket_owner_uid
-                or stat.S_IMODE(parent_metadata.st_mode) & 0o022
             ):
                 raise ValueError("Unix API listener identity is invalid")
         except BaseException:
-            listener.close()
+            if listener is not None:
+                listener.close()
+            if created_path:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
             raise
         self.max_workers = max_workers
         self._request_slots = threading.BoundedSemaphore(max_workers)
         self.allowed_peer_uid = allowed_peer_uid
         self.socket = listener
+        self._socket_path = path
+        self._socket_identity = (path_metadata.st_dev, path_metadata.st_ino)
         BaseServer.__init__(self, socket_path, handler_class)
         self.server_name = "localhost"
         self.server_port = 0
@@ -785,6 +803,15 @@ class BoundedThreadingUnixHTTPServer(BoundedThreadingHTTPServer):
             if uid == self.allowed_peer_uid:
                 return request, client_address
             request.close()
+
+    def server_close(self) -> None:
+        super().server_close()
+        try:
+            metadata = self._socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if (metadata.st_dev, metadata.st_ino) == self._socket_identity:
+            self._socket_path.unlink()
 
 
 def _strip_protected_gateway_prefix(path: str) -> str:
@@ -2877,7 +2904,6 @@ def run_api_server(
     admin_approval_verifier: ApprovalVerifier | None = None,
     roadex_fixture_approval_verifier: ApprovalVerifier | None = None,
     user_bridge_client: Any | None = None,
-    socket_fd: int | None = None,
     socket_path: str | None = None,
     socket_peer_uid: int | None = None,
     socket_owner_uid: int | None = None,
@@ -2914,21 +2940,15 @@ def run_api_server(
         psychlo_bridge=psychlo_bridge,
         user_bridge_client=selected_user_bridge_client,
     )
-    unix_values = (
-        socket_path,
-        socket_peer_uid,
-        socket_owner_uid,
-        socket_owner_gid,
-    )
-    if socket_fd is None:
-        if any(value is not None for value in unix_values):
-            raise ValueError("Unix API listener arguments require socket_fd")
+    unix_identity = (socket_peer_uid, socket_owner_uid, socket_owner_gid)
+    if socket_path is None:
+        if any(value is not None for value in unix_identity):
+            raise ValueError("Unix API listener arguments require socket_path")
         server = BoundedThreadingHTTPServer((host, port), handler)
     else:
-        if any(value is None for value in unix_values):
+        if any(value is None for value in unix_identity):
             raise ValueError("Unix API listener arguments are incomplete")
         server = BoundedThreadingUnixHTTPServer(
-            socket_fd,
             handler,
             socket_path=str(socket_path),
             allowed_peer_uid=int(socket_peer_uid),

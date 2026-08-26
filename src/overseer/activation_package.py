@@ -50,7 +50,7 @@ APPROVED_OVERSEER_UID = 984
 APPROVED_OVERSEER_GID = 984
 APPROVED_PACKAGE_PARENT = Path("/home/god/.local/share/overseer/activation-packages")
 APPROVED_EXECUTION_PACKAGE = Path("/var/lib/overseer-executor/approved-package")
-CANARY_API_SOCKET = Path("/run/overseer/api-canary.sock")
+CANARY_API_SOCKET = Path("/run/overseer-canary/api.sock")
 APPROVED_SQLITE_VERSION = "3.53.4"
 APPROVED_SQLITE_SOURCE_ID = (
     "2026-07-24 19:02:57 "
@@ -144,7 +144,6 @@ _SYSTEMD_TEMPLATES = {
     "overseer-admin-executor.socket": "overseer-admin-executor.socket",
     "overseer-admin-executor@.service": "overseer-admin-executor@.service",
     "overseer-api-canary.service": "overseer-api-canary.service",
-    "overseer-api-canary.socket": "overseer-api-canary.socket",
     "overseer-api-system.service": "overseer-api.service",
     "overseer-approval-smoke.service": "overseer-approval-smoke.service",
     "overseer-codex-user-bridge.service": "overseer-codex-user-bridge.service",
@@ -1667,24 +1666,116 @@ def prepare_final_store_migration(
 
     root_uid, root_gid = _activation_root_identity()
     lock_acquired = False
+    parent_descriptor: int | None = None
+    source_descriptor: int | None = None
+    legacy_descriptors: list[int] = []
     try:
-        os.chown(parent, root_uid, root_gid)
-        os.chmod(parent, _activation_parent_lock_mode())
-        for path in _legacy_store_paths(source):
-            if path.exists() or path.is_symlink():
-                metadata = path.lstat()
-                if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                    raise ActivationPackageError("legacy store changed while acquiring the quiescence lock")
-                os.chown(path, root_uid, root_gid)
-                os.chmod(path, 0o600)
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_parent = os.fstat(parent_descriptor)
+        if (
+            opened_parent.st_dev != expected_parent_device
+            or opened_parent.st_ino != expected_parent_inode
+            or opened_parent.st_uid != expected_source_uid
+            or opened_parent.st_gid != expected_source_gid
+            or stat.S_IMODE(opened_parent.st_mode) != expected_parent_mode
+        ):
+            raise ActivationPackageError("final migration source parent changed while opening")
+        os.fchown(parent_descriptor, root_uid, root_gid)
+        os.fchmod(parent_descriptor, _activation_parent_lock_mode())
+        bound_parent = Path(f"/proc/self/fd/{parent_descriptor}")
+        bound_source = bound_parent / source.name
+        try:
+            post_lock_source = _validate_store_artifact(
+                bound_source,
+                label="post-lock final migration source SQLite store",
+                expected_uid=expected_source_uid,
+            )
+            lexical_parent = parent.lstat()
+            lexical_source = source.lstat()
+            if (
+                lexical_parent.st_dev != expected_parent_device
+                or lexical_parent.st_ino != expected_parent_inode
+                or post_lock_source.st_dev != expected_source_device
+                or post_lock_source.st_ino != expected_source_inode
+                or post_lock_source.st_gid != expected_source_gid
+                or lexical_source.st_dev != expected_source_device
+                or lexical_source.st_ino != expected_source_inode
+            ):
+                raise ActivationPackageError(
+                    "final migration source identity drifted while acquiring the parent lock"
+                )
+        except BaseException:
+            os.fchown(parent_descriptor, expected_source_uid, expected_source_gid)
+            os.fchmod(parent_descriptor, expected_parent_mode)
+            raise
         lock_acquired = True
         if _processes_with_open_inode(source_metadata.st_dev, source_metadata.st_ino):
             raise ActivationPackageError("final migration source still has an open process")
 
-        wal = sidecars[0]
+        bound_paths = tuple(bound_parent / path.name for path in _legacy_store_paths(source))
+        for original_path, path in zip(_legacy_store_paths(source), bound_paths, strict=True):
+            if path.exists() or path.is_symlink():
+                metadata = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ActivationPackageError("legacy store changed while acquiring the quiescence lock")
+                expected_identity = (
+                    (
+                        source_metadata.st_dev,
+                        source_metadata.st_ino,
+                        source_metadata.st_mode,
+                        source_metadata.st_uid,
+                        source_metadata.st_gid,
+                        source_metadata.st_nlink,
+                        source_metadata.st_size,
+                        source_metadata.st_mtime_ns,
+                        source_metadata.st_ctime_ns,
+                    )
+                    if original_path == source
+                    else sidecar_before[str(original_path)]
+                )
+                observed_identity = _artifact_identity(path)
+                if expected_identity is None or observed_identity != expected_identity:
+                    raise ActivationPackageError(
+                        "legacy store changed while acquiring the quiescence lock"
+                    )
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    os.close(descriptor)
+                    raise ActivationPackageError(
+                        "legacy store changed while opening under the quiescence lock"
+                    )
+                os.fchown(descriptor, root_uid, root_gid)
+                os.fchmod(descriptor, 0o600)
+                legacy_descriptors.append(descriptor)
+                if original_path == source:
+                    source_descriptor = descriptor
+            elif original_path == source or sidecar_before[str(original_path)] is not None:
+                raise ActivationPackageError(
+                    "legacy store changed while acquiring the quiescence lock"
+                )
+
+        if source_descriptor is None:
+            raise ActivationPackageError("locked legacy authority descriptor is unavailable")
+        wal = bound_paths[1]
         checkpoint = "not_required"
         if wal.exists() and wal.stat().st_size:
-            checkpoint_connection = sqlite3.connect(source, timeout=5)
+            checkpoint_connection = sqlite3.connect(
+                _sqlite_uri(bound_source, mode="rw"),
+                uri=True,
+                timeout=5,
+            )
             try:
                 row = checkpoint_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             finally:
@@ -1692,12 +1783,12 @@ def prepare_final_store_migration(
             if row is None or int(row[0]) != 0:
                 raise ActivationPackageError("final migration WAL checkpoint did not quiesce")
             checkpoint = "truncate_complete"
-        for path in _legacy_store_paths(source):
+        for path in bound_paths:
             if path.exists():
                 os.chmod(path, 0o400)
-        locked_source = source.lstat()
-        source_digest_before = _stream_hash_regular(
-            source,
+        locked_source = os.fstat(source_descriptor)
+        source_digest_before = _stream_hash_open_regular(
+            source_descriptor,
             label="locked legacy authority store",
         )
 
@@ -1705,7 +1796,11 @@ def prepare_final_store_migration(
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(backup, flags, 0o600)
         os.close(descriptor)
-        source_connection = sqlite3.connect(_sqlite_uri(source), uri=True, timeout=5)
+        source_connection = sqlite3.connect(
+            f"file:/proc/self/fd/{source_descriptor}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5,
+        )
         target_connection = sqlite3.connect(backup, timeout=5)
         try:
             def progress(_status: int, remaining: int, _total: int) -> None:
@@ -1723,15 +1818,21 @@ def prepare_final_store_migration(
             target_connection.close()
             source_connection.close()
         os.chmod(backup, 0o600)
-        source_digest_after = _stream_hash_regular(
-            source,
+        source_digest_after = _stream_hash_open_regular(
+            source_descriptor,
             label="locked legacy authority store",
         )
         if source_digest_before != source_digest_after:
             raise ActivationPackageError("final migration source content changed during backup")
+        for descriptor in legacy_descriptors:
+            os.close(descriptor)
+        legacy_descriptors.clear()
         if _processes_with_open_inode(source_metadata.st_dev, source_metadata.st_ino):
             raise ActivationPackageError("final migration source acquired another open process")
-        sidecar_after = {str(path): _artifact_identity(path) for path in sidecars}
+        sidecar_after = {
+            str(original): _artifact_identity(bound)
+            for original, bound in zip(sidecars, bound_paths[1:], strict=True)
+        }
 
         backup_integrity = _integrity_check(backup)
         before_counts, schema_before = _migration_evidence(backup)
@@ -1805,12 +1906,22 @@ def prepare_final_store_migration(
             "sidecarsAtStart": sidecar_before,
             "sidecarsAfterBackup": sidecar_after,
         }
+        final_parent = parent.lstat()
+        final_source = source.lstat()
+        if (
+            final_parent.st_dev != expected_parent_device
+            or final_parent.st_ino != expected_parent_inode
+            or final_source.st_dev != expected_source_device
+            or final_source.st_ino != expected_source_inode
+        ):
+            raise ActivationPackageError("final migration source pathname drifted while locked")
         report_path = backup.with_suffix(f"{backup.suffix}.report.json")
         _write_new(report_path, _canonical(report) + b"\n", 0o600)
-        os.chown(parent, root_uid, expected_source_gid)
-        os.chmod(parent, 0o555)
+        os.fchown(parent_descriptor, root_uid, expected_source_gid)
+        os.fchmod(parent_descriptor, 0o555)
         return report
     except BaseException:
+        restore_error: BaseException | None = None
         if lock_acquired:
             try:
                 restore_legacy_store_access(
@@ -1823,16 +1934,27 @@ def prepare_final_store_migration(
                     expected_parent_inode=expected_parent_inode,
                     expected_parent_mode=expected_parent_mode,
                 )
-            except BaseException as restore_error:
-                raise ActivationPackageError(
-                    "final migration failed and legacy store access restoration also failed"
-                ) from restore_error
-        for target in (destination, backup):
+            except BaseException as error:
+                restore_error = error
+        for target in (
+            destination,
+            backup,
+            backup.with_suffix(f"{backup.suffix}.report.json"),
+        ):
             try:
                 target.unlink()
             except FileNotFoundError:
                 pass
+        if restore_error is not None:
+            raise ActivationPackageError(
+                "final migration failed and legacy store access restoration also failed"
+            ) from restore_error
         raise
+    finally:
+        for descriptor in legacy_descriptors:
+            os.close(descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
 
 
 def stage_release_payload(
@@ -1986,6 +2108,46 @@ def render_systemd_units(
     allowlist_target = output.parent / "config" / "admin-executor-allowlist.json"
     _write_new(allowlist_target, _canonical(parsed_allowlist) + b"\n", 0o644)
     return result
+
+
+def _stream_hash_open_regular(descriptor: int, *, label: str) -> dict[str, object]:
+    """Hash one already-open regular file without reopening its pathname."""
+
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ActivationPackageError(f"{label} descriptor is not a single-link regular file")
+    digest = hashlib.sha256()
+    size = 0
+    while size < before.st_size:
+        chunk = os.pread(descriptor, min(1024 * 1024, before.st_size - size), size)
+        if not chunk:
+            break
+        digest.update(chunk)
+        size += len(chunk)
+    after = os.fstat(descriptor)
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    if identity(before) != identity(after):
+        raise ActivationPackageError(f"{label} descriptor changed while hashing")
+    if size != before.st_size:
+        raise ActivationPackageError(f"{label} descriptor was not read completely")
+    return {
+        "sha256": digest.hexdigest(),
+        "size": size,
+        "mode": f"{stat.S_IMODE(before.st_mode):04o}",
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+        "links": before.st_nlink,
+    }
 
 
 def _stream_hash_regular(path: Path, *, label: str) -> dict[str, object]:
@@ -2682,7 +2844,6 @@ def render_activation_contract(
         "overseer-admin-executor.socket": "/etc/systemd/system/overseer-admin-executor.socket",
         "overseer-admin-executor@.service": "/etc/systemd/system/overseer-admin-executor@.service",
         "overseer-api-canary.service": "/etc/systemd/system/overseer-api-canary.service",
-        "overseer-api-canary.socket": "/etc/systemd/system/overseer-api-canary.socket",
         "overseer-api.service": "/etc/systemd/system/overseer-api.service",
         "overseer-approval-smoke.service": "/etc/systemd/system/overseer-approval-smoke.service",
         "overseer-codex-user-bridge.service": "/etc/systemd/system/overseer-codex-user-bridge.service",
@@ -2810,23 +2971,23 @@ def render_activation_contract(
             "overseer-codex-user-bridge.socket",
             "overseer-admin-executor.socket",
         ],
-        ["/usr/bin/systemctl", "start", "overseer-api-canary.socket"],
+        ["/usr/bin/systemctl", "start", "overseer-api-canary.service"],
         [
             "/usr/bin/curl",
             "--fail",
             "--silent",
             "--show-error",
+            "--retry",
+            "10",
+            "--retry-delay",
+            "1",
+            "--retry-connrefused",
             "--unix-socket",
             str(CANARY_API_SOCKET),
             "http://localhost/health",
         ],
         [*activation_python, "run-approved-canary", "--package-root", str(execution_package)],
-        [
-            "/usr/bin/systemctl",
-            "stop",
-            "overseer-api-canary.service",
-            "overseer-api-canary.socket",
-        ],
+        ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"],
     ]
     cutover_commands = [
         [*activation_python, "verify-approved-cutover", "--package-root", str(execution_package)],
@@ -3033,7 +3194,6 @@ def render_activation_contract(
                     "/usr/bin/systemctl",
                     "stop",
                     "overseer-api-canary.service",
-                    "overseer-api-canary.socket",
                     "overseer-admin-executor.socket",
                     "overseer-codex-user-bridge.socket",
                 ]
@@ -3738,6 +3898,7 @@ def _validate_canary_socket(
         raise ActivationPackageError("canary API socket path is invalid")
     try:
         metadata = socket_path.lstat()
+        parent_metadata = socket_path.parent.lstat()
     except OSError as error:
         raise ActivationPackageError("canary API socket is unavailable") from error
     if (
@@ -3746,6 +3907,11 @@ def _validate_canary_socket(
         or metadata.st_gid != expected_owner_gid
         or stat.S_IMODE(metadata.st_mode) != 0o600
         or metadata.st_nlink != 1
+        or socket_path.parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != expected_owner_uid
+        or parent_metadata.st_gid != expected_owner_gid
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
     ):
         raise ActivationPackageError("canary API socket identity is invalid")
     return metadata
@@ -3775,8 +3941,8 @@ def run_canary_acceptance(
     canary_socket = Path(unix_socket_path)
     _validate_canary_socket(
         canary_socket,
-        expected_owner_uid=root_uid,
-        expected_owner_gid=root_gid,
+        expected_owner_uid=APPROVED_OVERSEER_UID,
+        expected_owner_gid=APPROVED_OVERSEER_GID,
     )
     credential_root = _installed_credential_root()
     admin_verifier = load_approval_verifier(

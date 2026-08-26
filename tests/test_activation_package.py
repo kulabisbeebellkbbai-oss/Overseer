@@ -1124,6 +1124,34 @@ def _finalized_package(tmp_path: Path) -> tuple[Path, str]:
     return package, str(finalized["packageDigest"])
 
 
+def _reseal_package_manifest_for_test(package: Path) -> str:
+    manifest_path = package / "public" / "package-manifest.json"
+    try:
+        manifest_path.unlink()
+    except FileNotFoundError:
+        pass
+    unsigned = {
+        "schemaVersion": activation_package_module.PACKAGE_MANIFEST_SCHEMA,
+        "liveExecutionApproved": False,
+        "files": activation_package_module._package_file_inventory(package),
+        "directories": activation_package_module._package_directory_inventory(package),
+    }
+    replacement_digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(
+            {**unsigned, "packageDigest": replacement_digest},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o644)
+    return replacement_digest
+
+
 def test_prepare_package_cli_stops_at_human_verifier_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1455,29 +1483,57 @@ def test_package_verification_rejects_self_consistent_unapproved_migration_repor
         encoding="utf-8",
     )
     report_path.chmod(0o600)
-    manifest_path = package / "public" / "package-manifest.json"
-    manifest_path.unlink()
-    unsigned = {
-        "schemaVersion": activation_package_module.PACKAGE_MANIFEST_SCHEMA,
-        "liveExecutionApproved": False,
-        "files": activation_package_module._package_file_inventory(package),
-        "directories": activation_package_module._package_directory_inventory(package),
-    }
-    replacement_digest = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("ascii")
-    ).hexdigest()
-    manifest_path.write_text(
-        json.dumps(
-            {**unsigned, "packageDigest": replacement_digest},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    manifest_path.chmod(0o644)
+    replacement_digest = _reseal_package_manifest_for_test(package)
 
     with pytest.raises(ActivationPackageError, match="approved semantics"):
+        verify_activation_package(package, replacement_digest)
+
+
+def test_package_finalization_rejects_missing_migration_database(tmp_path: Path) -> None:
+    package, manifest, source = _prepared_package(tmp_path)
+    rollback = tmp_path / "rollback"
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
+    render_activation_contract(
+        package,
+        manifest,
+        source_store=source,
+        overseer_uid=984,
+        overseer_gid=984,
+        rollback_inputs={"v1.1.5-release": rollback},
+    )
+    create_human_verifiers(
+        package,
+        admin_secret="admin-approval-secret-123456",
+        roadex_secret="roadex-approval-secret-12345",
+    )
+    (package / "private" / "migration" / "rehearsal-source.sqlite3").unlink()
+
+    with pytest.raises(ActivationPackageError, match="artifact evidence"):
+        finalize_activation_package(package)
+
+
+@pytest.mark.parametrize("operation", ("delete", "replace"))
+def test_package_verification_rejects_resealed_migration_artifact_substitution(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    package, _digest = _finalized_package(tmp_path)
+    migration = package / "private" / "migration"
+    if operation == "delete":
+        (migration / "rehearsal-source.sqlite3").unlink()
+    else:
+        migrated = migration / "rehearsal-migrated.sqlite3"
+        migrated.unlink()
+        with sqlite3.connect(migrated) as connection:
+            connection.execute(
+                "CREATE TABLE retained_items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO retained_items(value) VALUES ('replacement')")
+        migrated.chmod(0o600)
+    replacement_digest = _reseal_package_manifest_for_test(package)
+
+    with pytest.raises(ActivationPackageError, match="artifact evidence"):
         verify_activation_package(package, replacement_digest)
 
 

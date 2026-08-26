@@ -1238,6 +1238,51 @@ def _integrity_check(path: Path) -> str:
     return result
 
 
+def _migration_evidence_from_connection(
+    connection: sqlite3.Connection,
+    *,
+    counted_tables: tuple[str, ...] | None = None,
+) -> tuple[dict[str, int], dict[str, object]]:
+    names = [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+    ]
+    selected = list(counted_tables) if counted_tables is not None else [
+        name for name in MIGRATION_KEY_TABLES if name in names
+    ]
+    if counted_tables is not None and any(name not in names for name in selected):
+        raise ActivationPackageError("migration lost a counted table")
+    if counted_tables is None and not selected:
+        if len(names) > 32:
+            raise ActivationPackageError("migration store has no known key tables and exceeds fallback bounds")
+        selected = names
+    result: dict[str, int] = {}
+    for name in selected:
+        quoted = name.replace('"', '""')
+        result[name] = int(connection.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0])
+    schema_rows = [
+        {
+            "type": str(row[0]),
+            "name": str(row[1]),
+            "table": str(row[2]),
+            "sqlSha256": _sha256(str(row[3] or "").encode("utf-8")),
+        }
+        for row in connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        )
+    ]
+    schema = {
+        "objectCount": len(schema_rows),
+        "digest": _sha256(_canonical(schema_rows)),
+        "tableNames": names,
+        "countedTables": selected,
+    }
+    return result, schema
+
+
 def _migration_evidence(
     path: Path,
     *,
@@ -1245,44 +1290,10 @@ def _migration_evidence(
 ) -> tuple[dict[str, int], dict[str, object]]:
     connection = sqlite3.connect(_sqlite_uri(path), uri=True, timeout=5)
     try:
-        names = [
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            )
-        ]
-        selected = list(counted_tables) if counted_tables is not None else [
-            name for name in MIGRATION_KEY_TABLES if name in names
-        ]
-        if counted_tables is not None and any(name not in names for name in selected):
-            raise ActivationPackageError("migration lost a counted table")
-        if counted_tables is None and not selected:
-            if len(names) > 32:
-                raise ActivationPackageError("migration store has no known key tables and exceeds fallback bounds")
-            selected = names
-        result: dict[str, int] = {}
-        for name in selected:
-            quoted = name.replace('"', '""')
-            result[name] = int(connection.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0])
-        schema_rows = [
-            {
-                "type": str(row[0]),
-                "name": str(row[1]),
-                "table": str(row[2]),
-                "sqlSha256": _sha256(str(row[3] or "").encode("utf-8")),
-            }
-            for row in connection.execute(
-                "SELECT type, name, tbl_name, sql FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-            )
-        ]
-        schema = {
-            "objectCount": len(schema_rows),
-            "digest": _sha256(_canonical(schema_rows)),
-            "tableNames": names,
-            "countedTables": selected,
-        }
-        return result, schema
+        return _migration_evidence_from_connection(
+            connection,
+            counted_tables=counted_tables,
+        )
     finally:
         connection.close()
 
@@ -3019,6 +3030,82 @@ def render_activation_contract(
     return contract
 
 
+def _sealed_migration_artifact_evidence(
+    path: Path,
+    *,
+    expected_uid: int,
+    counted_tables: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    metadata = _validate_store_artifact(
+        path,
+        label="sealed migration artifact",
+        expected_uid=expected_uid,
+    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ActivationPackageError("sealed migration artifact could not be opened") from error
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if identity(opened) != identity(metadata):
+            raise ActivationPackageError("sealed migration artifact changed while opening")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        connection = sqlite3.connect(
+            f"file:/proc/self/fd/{descriptor}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5,
+        )
+        try:
+            integrity_row = connection.execute("PRAGMA integrity_check").fetchone()
+            integrity = str(integrity_row[0]) if integrity_row else "missing"
+            if integrity != "ok":
+                raise ActivationPackageError(
+                    "sealed migration artifact failed SQLite integrity_check"
+                )
+            row_counts, schema = _migration_evidence_from_connection(
+                connection,
+                counted_tables=counted_tables,
+            )
+        finally:
+            connection.close()
+        after = os.fstat(descriptor)
+        lexical_after = path.lstat()
+        if identity(after) != identity(metadata) or identity(lexical_after) != identity(metadata):
+            raise ActivationPackageError("sealed migration artifact changed during verification")
+        if size != metadata.st_size:
+            raise ActivationPackageError("sealed migration artifact was not read completely")
+    except sqlite3.Error as error:
+        raise ActivationPackageError("sealed migration artifact is not valid SQLite") from error
+    except OSError as error:
+        raise ActivationPackageError("sealed migration artifact changed or became unreadable") from error
+    finally:
+        os.close(descriptor)
+    return {
+        "sha256": digest.hexdigest(),
+        "size": size,
+        "integrityCheck": integrity,
+        "rowCounts": row_counts,
+        "schema": schema,
+    }
+
+
 def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
     report_path = package / "private" / "migration" / "migration-report.json"
     try:
@@ -3034,6 +3121,28 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
     completed = bounds.get("completedUnixNs") if isinstance(bounds, dict) else None
     before_counts = report.get("rowCountsBefore") if isinstance(report, dict) else None
     after_counts = report.get("rowCountsAfter") if isinstance(report, dict) else None
+    package_owner = package.lstat().st_uid
+    backup_path = package / "private" / "migration" / "rehearsal-source.sqlite3"
+    migrated_path = package / "private" / "migration" / "rehearsal-migrated.sqlite3"
+    try:
+        observed_backup = _sealed_migration_artifact_evidence(
+            backup_path,
+            expected_uid=package_owner,
+        )
+        backup_schema = observed_backup["schema"]
+        if not isinstance(backup_schema, dict) or not isinstance(
+            backup_schema.get("countedTables"),
+            list,
+        ):
+            raise ActivationPackageError("sealed backup schema evidence is invalid")
+        counted_tables = tuple(str(value) for value in backup_schema["countedTables"])
+        observed_migrated = _sealed_migration_artifact_evidence(
+            migrated_path,
+            expected_uid=package_owner,
+            counted_tables=counted_tables,
+        )
+    except ActivationPackageError as error:
+        raise ActivationPackageError("migration rehearsal artifact evidence is invalid") from error
     row_counts_valid = isinstance(before_counts, dict) and isinstance(after_counts, dict)
     if row_counts_valid:
         for table, count in before_counts.items():
@@ -3052,7 +3161,30 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
             ):
                 row_counts_valid = False
                 break
-    package_owner = package.lstat().st_uid
+    artifact_evidence_valid = (
+        isinstance(backup, dict)
+        and isinstance(migrated, dict)
+        and isinstance(backup.get("path"), str)
+        and isinstance(migrated.get("path"), str)
+        and Path(str(backup["path"])).name == backup_path.name
+        and Path(str(migrated["path"])).name == migrated_path.name
+        and backup.get("sha256") == observed_backup["sha256"]
+        and backup.get("size") == observed_backup["size"]
+        and backup.get("integrityCheck") == observed_backup["integrityCheck"]
+        and migrated.get("sha256") == observed_migrated["sha256"]
+        and migrated.get("size") == observed_migrated["size"]
+        and migrated.get("integrityCheck") == observed_migrated["integrityCheck"]
+        and before_counts == observed_backup["rowCounts"]
+        and after_counts == observed_migrated["rowCounts"]
+        and report.get("schemaBefore") == observed_backup["schema"]
+        and report.get("schemaAfter") == observed_migrated["schema"]
+        and isinstance(before_counts, dict)
+        and bool(before_counts)
+        and isinstance(after_counts, dict)
+        and bool(after_counts)
+    )
+    if not artifact_evidence_valid:
+        raise ActivationPackageError("migration rehearsal artifact evidence does not match sealed databases")
     if (
         metadata.st_uid != package_owner
         or stat.S_IMODE(metadata.st_mode) != 0o600
@@ -3062,10 +3194,6 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         or report.get("sourceMutationPerformed") is not False
         or not isinstance(source, dict)
         or source.get("journalMode") != "wal"
-        or not isinstance(backup, dict)
-        or backup.get("integrityCheck") != "ok"
-        or not isinstance(migrated, dict)
-        or migrated.get("integrityCheck") != "ok"
         or not row_counts_valid
         or not isinstance(bounds, dict)
         or type(bounds.get("pagesPerStep")) is not int

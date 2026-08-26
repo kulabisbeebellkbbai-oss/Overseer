@@ -112,6 +112,9 @@
 - [x] Test finalization refuses missing interactive verifier documents and any artifact drift.
 - [x] Test finalization and package approval reject a self-consistent report
   unless it proves the mandatory WAL/single-step/no-sleep rehearsal semantics.
+- [x] Recompute hashes, sizes, integrity, schema, and row evidence from the two
+  exact descriptor-bound rehearsal databases; reject deletion or substitution
+  even when the outer package manifest is consistently resealed.
 - [x] Implement command rendering, package self-verification, state-machine execution, interrupted-cutover rollback recovery, and status reporting.
 - [x] Run focused tests, `systemd-analyze verify`, and `git diff --check`.
 

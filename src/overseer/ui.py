@@ -977,6 +977,29 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       }
       return target;
     }
+    function captureFormValues(targetDocument = document) {
+      const values = {};
+      const fields = targetDocument.querySelectorAll?.(
+        ".section input[id], .section textarea[id], .section select[id]"
+      ) || [];
+      for (const field of fields) {
+        values[field.id] = field.type === "checkbox"
+          ? {checked: field.checked, value: ""}
+          : {checked: null, value: field.value};
+      }
+      return values;
+    }
+    function restoreFormValues(values, targetDocument = document) {
+      for (const [id, saved] of Object.entries(values || {})) {
+        const field = targetDocument.getElementById(id);
+        if (!field) continue;
+        if (field.type === "checkbox") {
+          field.checked = Boolean(saved.checked);
+        } else {
+          field.value = saved.value;
+        }
+      }
+    }
     function readLayoutMode() {
       try {
         const mode = localStorage.getItem("overseerLayoutMode");
@@ -2354,6 +2377,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function render() {
       const focusTarget = captureFocusTarget(document.activeElement);
+      const formValues = captureFormValues(document);
       const dashboard = state.data.dashboard || {};
       const overall = dashboard.overall_status || "loading";
       const overallEl = document.getElementById("overall");
@@ -2370,6 +2394,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       renderEzri();
       renderAudit();
       renderActionStatus();
+      restoreFormValues(formValues, document);
       restoreFocusTarget(focusTarget);
     }
     function renderActionStatus() {

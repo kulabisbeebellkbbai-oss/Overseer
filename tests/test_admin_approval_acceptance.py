@@ -352,3 +352,10 @@ def test_admin_ui_uses_an_ephemeral_independent_approval_credential() -> None:
     assert 'id="admin-approved-by"' not in OPERATOR_CONSOLE_HTML
     assert 'postApprovalJson("/admin/approve"' in OPERATOR_CONSOLE_HTML
     assert 'approvalTokenInput.value = ""' in OPERATOR_CONSOLE_HTML
+
+
+def test_periodic_render_preserves_in_progress_admin_form_values() -> None:
+    assert "function captureFormValues(" in OPERATOR_CONSOLE_HTML
+    assert "function restoreFormValues(" in OPERATOR_CONSOLE_HTML
+    assert "const formValues = captureFormValues(document);" in OPERATOR_CONSOLE_HTML
+    assert "restoreFormValues(formValues, document);" in OPERATOR_CONSOLE_HTML

@@ -1800,7 +1800,11 @@ def test_final_migration_pre_hash_checkpoint_rescans_open_descriptors(
     assert not destination.exists()
 
 
-def _prepared_package(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
+def _prepared_package(
+    tmp_path: Path,
+    *,
+    stale_expression_index: bool = False,
+) -> tuple[Path, dict[str, object], Path]:
     checkout = _reviewed_checkout(tmp_path)
     dependencies = _dependencies(tmp_path)
     python = _python(tmp_path)
@@ -1839,7 +1843,10 @@ def _prepared_package(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
         ticket_private_key=Ed25519PrivateKey.from_private_bytes(bytes(range(32))),
     )
     source = tmp_path / "overseer.sqlite3"
-    _wal_store(source)
+    if stale_expression_index:
+        _stale_expression_index_store(source, journal_mode="WAL")
+    else:
+        _wal_store(source)
     rehearse_store_migration(
         package,
         source_store=source,
@@ -2309,7 +2316,10 @@ def test_package_finalization_rejects_unapproved_migration_semantics(
     )
     report_path.chmod(0o600)
 
-    with pytest.raises(ActivationPackageError, match="approved semantics"):
+    with pytest.raises(
+        ActivationPackageError,
+        match="approved semantics|artifact evidence",
+    ):
         finalize_activation_package(package)
 
 
@@ -2328,6 +2338,48 @@ def test_package_verification_rejects_self_consistent_unapproved_migration_repor
     replacement_digest = _reseal_package_manifest_for_test(package)
 
     with pytest.raises(ActivationPackageError, match="approved semantics"):
+        verify_activation_package(package, replacement_digest)
+
+
+def test_package_verification_rejects_omitted_reindex_evidence(
+    tmp_path: Path,
+) -> None:
+    package, manifest, source = _prepared_package(
+        tmp_path,
+        stale_expression_index=True,
+    )
+    rollback = tmp_path / "rollback"
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
+    render_activation_contract(
+        package,
+        manifest,
+        source_store=source,
+        overseer_uid=984,
+        overseer_gid=984,
+        rollback_inputs={"v1.1.5-release": rollback},
+    )
+    create_human_verifiers(
+        package,
+        admin_secret="admin-approval-secret-123456",
+        roadex_secret="roadex-approval-secret-12345",
+    )
+    finalized = finalize_activation_package(package)
+    assert isinstance(finalized["packageDigest"], str)
+    report_path = package / "private" / "migration" / "migration-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["copyNormalization"]["reindexedExpressionIndexes"] == [
+        "idx_host_snapshots_captured_at"
+    ]
+    report["copyNormalization"]["reindexedExpressionIndexes"] = []
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    report_path.chmod(0o600)
+    replacement_digest = _reseal_package_manifest_for_test(package)
+
+    with pytest.raises(ActivationPackageError, match="artifact evidence"):
         verify_activation_package(package, replacement_digest)
 
 

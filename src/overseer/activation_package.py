@@ -1246,6 +1246,25 @@ def _integrity_check(path: Path) -> str:
     return result
 
 
+def _approved_expression_indexes_from_connection(
+    connection: sqlite3.Connection,
+) -> list[str]:
+    present: list[str] = []
+    for name, expected_sql in sorted(COPIED_EXPRESSION_INDEX_SQL.items()):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            continue
+        if str(row[0]) != expected_sql:
+            raise ActivationPackageError(
+                f"copied migration expression index schema is unapproved: {name}"
+            )
+        present.append(name)
+    return present
+
+
 def _normalize_copied_expression_indexes(path: Path) -> dict[str, object]:
     """Rebuild exact approved expression indexes only on a copied store."""
 
@@ -1268,17 +1287,7 @@ def _normalize_copied_expression_indexes(path: Path) -> dict[str, object]:
             raise ActivationPackageError(
                 "copied migration store did not leave WAL journal mode"
             )
-        for name, expected_sql in sorted(COPIED_EXPRESSION_INDEX_SQL.items()):
-            row = connection.execute(
-                "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
-                (name,),
-            ).fetchone()
-            if row is None:
-                continue
-            if str(row[0]) != expected_sql:
-                raise ActivationPackageError(
-                    f"copied migration expression index schema is unapproved: {name}"
-                )
+        for name in _approved_expression_indexes_from_connection(connection):
             quoted = name.replace('"', '""')
             connection.execute(f'REINDEX "{quoted}"')
             reindexed.append(name)
@@ -3728,6 +3737,9 @@ def _sealed_migration_artifact_evidence(
                 raise ActivationPackageError(
                     "sealed migration artifact failed SQLite integrity_check"
                 )
+            expression_indexes = _approved_expression_indexes_from_connection(
+                connection
+            )
             row_counts, schema = _migration_evidence_from_connection(
                 connection,
                 counted_tables=counted_tables,
@@ -3750,6 +3762,7 @@ def _sealed_migration_artifact_evidence(
         "sha256": digest.hexdigest(),
         "size": size,
         "integrityCheck": integrity,
+        "approvedExpressionIndexes": expression_indexes,
         "rowCounts": row_counts,
         "schema": schema,
     }
@@ -3837,6 +3850,7 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         and migrated.get("sha256") == observed_migrated["sha256"]
         and migrated.get("size") == observed_migrated["size"]
         and migrated.get("integrityCheck") == observed_migrated["integrityCheck"]
+        and reindexed == observed_backup["approvedExpressionIndexes"]
         and before_counts == observed_backup["rowCounts"]
         and after_counts == observed_migrated["rowCounts"]
         and report.get("schemaBefore") == observed_backup["schema"]

@@ -1496,15 +1496,21 @@ def _processes_with_mapped_inode(
         if process_id in excluded_pids:
             continue
         try:
-            lines = (process / "maps").read_text(encoding="ascii").splitlines()
-        except (FileNotFoundError, PermissionError, ProcessLookupError, UnicodeDecodeError):
+            lines = (process / "maps").read_bytes().splitlines()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as error:
+            if os.geteuid() == 0:
+                raise ActivationPackageError(
+                    "mapped-process preflight could not inspect a relevant live process"
+                ) from error
             continue
         for line in lines:
             fields = line.split(maxsplit=5)
-            if len(fields) < 5 or not fields[4].isdecimal() or int(fields[4]) != inode:
+            if len(fields) < 5 or not fields[4].isdigit() or int(fields[4]) != inode:
                 continue
             try:
-                major_text, minor_text = fields[3].split(":", 1)
+                major_text, minor_text = fields[3].split(b":", 1)
                 mapped_device = os.makedev(int(major_text, 16), int(minor_text, 16))
             except (ValueError, OSError):
                 continue
@@ -1518,7 +1524,9 @@ def _legacy_inode_activity(
     identities: tuple[tuple[int, int], ...],
     *,
     include_open_files: bool,
+    exclude_current_process: bool = False,
 ) -> tuple[int, ...]:
+    excluded_pids = frozenset({os.getpid()}) if exclude_current_process else frozenset()
     result: set[int] = set()
     for device, inode in identities:
         if include_open_files:
@@ -1526,12 +1534,14 @@ def _legacy_inode_activity(
                 _processes_with_open_inode(
                     device,
                     inode,
+                    excluded_pids=excluded_pids,
                 )
             )
         result.update(
             _processes_with_mapped_inode(
                 device,
                 inode,
+                excluded_pids=excluded_pids,
             )
         )
     return tuple(sorted(result))
@@ -1865,9 +1875,13 @@ def prepare_final_store_migration(
         for path in bound_paths:
             if path.exists():
                 os.chmod(path, 0o400)
-        if _legacy_inode_activity(legacy_inode_identities, include_open_files=False):
+        if _legacy_inode_activity(
+            legacy_inode_identities,
+            include_open_files=True,
+            exclude_current_process=True,
+        ):
             raise ActivationPackageError(
-                "final migration SQLite artifacts acquired a mapped process before hashing"
+                "final migration SQLite artifacts acquired an open process or mapping before hashing"
             )
         locked_source = os.fstat(source_descriptor)
         source_digest_before = _stream_hash_open_regular(

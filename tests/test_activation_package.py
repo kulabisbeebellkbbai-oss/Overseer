@@ -1183,6 +1183,9 @@ def test_final_migration_rejects_closed_fd_shared_mapping(
     destination_parent.mkdir(mode=0o700)
     backup = backup_parent / "final-source.sqlite3"
     destination = destination_parent / "final-migrated.sqlite3"
+    unrelated = tmp_path / "mäpped-unrelated.bin"
+    unrelated.write_bytes(b"U" * 4096)
+    unrelated.chmod(0o600)
     mapper = subprocess.Popen(
         [
             "/usr/bin/python3.13",
@@ -1200,12 +1203,21 @@ address = libc.mmap(None, size, 3, 1, fd, 0)
 if address == ctypes.c_void_p(-1).value:
     raise OSError(ctypes.get_errno(), "mmap failed")
 os.close(fd)
+other_fd = os.open(sys.argv[2], os.O_RDONLY)
+other_size = os.fstat(other_fd).st_size
+other_address = libc.mmap(None, other_size, 1, 2, other_fd, 0)
+if other_address == ctypes.c_void_p(-1).value:
+    raise OSError(ctypes.get_errno(), "unrelated mmap failed")
+os.close(other_fd)
 print("ready", flush=True)
 sys.stdin.readline()
 if libc.munmap(ctypes.c_void_p(address), size) != 0:
     raise OSError(ctypes.get_errno(), "munmap failed")
+if libc.munmap(ctypes.c_void_p(other_address), other_size) != 0:
+    raise OSError(ctypes.get_errno(), "unrelated munmap failed")
 """,
             str(source),
+            str(unrelated),
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -1253,6 +1265,97 @@ if libc.munmap(ctypes.c_void_p(address), size) != 0:
         mapper.wait(timeout=5)
 
     assert mapper.returncode == 0
+    assert not backup.exists()
+    assert not destination.exists()
+
+
+def test_final_migration_pre_hash_checkpoint_rescans_open_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    _wal_store(source)
+    approved = source.stat()
+    parent = source.parent.stat()
+    parent_mode = stat_mode(source.parent)
+    backup_parent = tmp_path / "executor-state"
+    destination_parent = tmp_path / "authority-state"
+    backup_parent.mkdir(mode=0o700)
+    destination_parent.mkdir(mode=0o700)
+    backup = backup_parent / "final-source.sqlite3"
+    destination = destination_parent / "final-migrated.sqlite3"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_parent_lock_mode", lambda: 0o700)
+    real_chmod = os.chmod
+    holder: subprocess.Popen[str] | None = None
+
+    def spawn_holder_before_hash(
+        path: str | os.PathLike[str],
+        mode: int,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal holder
+        real_chmod(path, mode, *args, **kwargs)
+        if (
+            holder is None
+            and mode == 0o400
+            and str(path).startswith("/proc/self/fd/")
+            and Path(path).name == source.name
+        ):
+            holder = subprocess.Popen(
+                [
+                    "/usr/bin/python3.13",
+                    "-c",
+                    (
+                        "import os,sys;"
+                        "fd=os.open(sys.argv[1],os.O_RDONLY);"
+                        "print('ready',flush=True);"
+                        "sys.stdin.readline();"
+                        "os.close(fd)"
+                    ),
+                    str(source),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+
+    monkeypatch.setattr(os, "chmod", spawn_holder_before_hash)
+    try:
+        with pytest.raises(ActivationPackageError, match="before hashing"):
+            prepare_final_store_migration(
+                source_store=source,
+                backup_store=backup,
+                destination_store=destination,
+                expected_source_device=approved.st_dev,
+                expected_source_inode=approved.st_ino,
+                expected_source_uid=os.geteuid(),
+                expected_source_gid=os.getegid(),
+                expected_parent_device=parent.st_dev,
+                expected_parent_inode=parent.st_ino,
+                expected_parent_mode=parent_mode,
+                destination_uid=os.geteuid(),
+                destination_gid=os.getegid(),
+                sleep_seconds=0,
+            )
+    finally:
+        if holder is not None:
+            assert holder.stdin is not None
+            holder.stdin.write("stop\n")
+            holder.stdin.flush()
+            holder.wait(timeout=5)
+
+    assert holder is not None
+    assert holder.returncode == 0
     assert not backup.exists()
     assert not destination.exists()
 

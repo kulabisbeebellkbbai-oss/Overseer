@@ -1479,6 +1479,109 @@ def test_final_migration_rejects_scm_rights_queued_writable_reference(
     assert stat_mode(source.parent) == parent_mode
 
 
+def test_final_migration_rejects_dequeued_write_closed_before_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    _wal_store(source)
+    approved = source.stat()
+    parent = source.parent.stat()
+    parent_mode = stat_mode(source.parent)
+    backup_parent = tmp_path / "executor-state"
+    destination_parent = tmp_path / "authority-state"
+    backup_parent.mkdir(mode=0o700)
+    destination_parent.mkdir(mode=0o700)
+    backup = backup_parent / "final-source.sqlite3"
+    destination = destination_parent / "final-migrated.sqlite3"
+    receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    queued_descriptor = os.open(source, os.O_RDWR)
+    try:
+        sender.sendmsg(
+            [b"queued-writer"],
+            [
+                (
+                    socket.SOL_SOCKET,
+                    socket.SCM_RIGHTS,
+                    array.array("i", [queued_descriptor]),
+                )
+            ],
+        )
+    finally:
+        os.close(queued_descriptor)
+
+    real_fcntl = activation_package_module.fcntl.fcntl
+    attack_performed = False
+
+    def dequeue_write_and_close(
+        descriptor: int,
+        command: int,
+        *args: object,
+    ) -> object:
+        nonlocal attack_performed
+        if command == activation_package_module.fcntl.F_SETOWN and not attack_performed:
+            attack_performed = True
+            received = array.array("i")
+            _message, ancillary, _flags, _address = receiver.recvmsg(
+                1,
+                socket.CMSG_SPACE(received.itemsize),
+            )
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    received.frombytes(data[: received.itemsize])
+            assert len(received) == 1
+            attack_descriptor = received[0]
+            try:
+                time.sleep(0.01)
+                content = os.pread(attack_descriptor, approved.st_size, 0)
+                offset = content.find(b"three")
+                assert offset >= 0
+                assert os.pwrite(attack_descriptor, b"PWNED", offset) == len(b"PWNED")
+                os.fsync(attack_descriptor)
+            finally:
+                os.close(attack_descriptor)
+        return real_fcntl(descriptor, command, *args)
+
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_parent_lock_mode", lambda: 0o700)
+    monkeypatch.setattr(activation_package_module.fcntl, "fcntl", dequeue_write_and_close)
+    try:
+        with pytest.raises(ActivationPackageError, match="descriptor changed before"):
+            prepare_final_store_migration(
+                source_store=source,
+                backup_store=backup,
+                destination_store=destination,
+                expected_source_device=approved.st_dev,
+                expected_source_inode=approved.st_ino,
+                expected_source_uid=os.geteuid(),
+                expected_source_gid=os.getegid(),
+                expected_parent_device=parent.st_dev,
+                expected_parent_inode=parent.st_ino,
+                expected_parent_mode=parent_mode,
+                destination_uid=os.geteuid(),
+                destination_gid=os.getegid(),
+                sleep_seconds=0,
+            )
+    finally:
+        receiver.close()
+        sender.close()
+
+    assert attack_performed is True
+    assert not backup.exists()
+    assert not destination.exists()
+    with sqlite3.connect(source) as connection:
+        assert connection.execute(
+            "SELECT value FROM retained_items ORDER BY id"
+        ).fetchall()[-1] == ("PWNED",)
+    assert stat_mode(source) == 0o600
+    assert stat_mode(source.parent) == parent_mode
+
+
 def test_kernel_read_lease_barrier_rejects_a_new_writer(tmp_path: Path) -> None:
     source = tmp_path / "lease-target"
     source.write_bytes(b"lease target")

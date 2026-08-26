@@ -1637,11 +1637,7 @@ def _kernel_read_lease_barrier(
             ) from release_error
 
 
-def _artifact_identity(path: Path) -> tuple[int, ...] | None:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return None
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
         metadata.st_ino,
@@ -1653,6 +1649,14 @@ def _artifact_identity(path: Path) -> tuple[int, ...] | None:
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def _artifact_identity(path: Path) -> tuple[int, ...] | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    return _metadata_identity(metadata)
 
 
 def _require_root_activation() -> None:
@@ -1849,6 +1853,7 @@ def prepare_final_store_migration(
     parent_descriptor: int | None = None
     source_descriptor: int | None = None
     legacy_descriptors: list[int] = []
+    captured_descriptor_identities: dict[int, tuple[int, ...]] = {}
     try:
         parent_descriptor = os.open(
             parent,
@@ -1939,6 +1944,7 @@ def prepare_final_store_migration(
                         "legacy store changed while opening under the quiescence lock"
                     )
                 legacy_descriptors.append(descriptor)
+                captured_descriptor_identities[descriptor] = expected_identity
                 if original_path == source:
                     source_descriptor = descriptor
             elif original_path == source or sidecar_before[str(original_path)] is not None:
@@ -1951,6 +1957,37 @@ def prepare_final_store_migration(
         with _kernel_read_lease_barrier(
             tuple(legacy_descriptors)
         ) as require_lease_intact:
+            if any(
+                _metadata_identity(os.fstat(descriptor)) != expected_identity
+                for descriptor, expected_identity in captured_descriptor_identities.items()
+            ):
+                raise ActivationPackageError(
+                    "legacy store descriptor changed before the kernel lease barrier"
+                )
+            for original_path, path in zip(
+                _legacy_store_paths(source),
+                bound_paths,
+                strict=True,
+            ):
+                expected_identity = (
+                    (
+                        source_metadata.st_dev,
+                        source_metadata.st_ino,
+                        source_metadata.st_mode,
+                        source_metadata.st_uid,
+                        source_metadata.st_gid,
+                        source_metadata.st_nlink,
+                        source_metadata.st_size,
+                        source_metadata.st_mtime_ns,
+                        source_metadata.st_ctime_ns,
+                    )
+                    if original_path == source
+                    else sidecar_before[str(original_path)]
+                )
+                if expected_identity is not None and _artifact_identity(path) != expected_identity:
+                    raise ActivationPackageError(
+                        "legacy store pathname changed before the kernel lease barrier"
+                    )
             for descriptor in legacy_descriptors:
                 os.fchown(descriptor, root_uid, root_gid)
                 os.fchmod(descriptor, 0o600)

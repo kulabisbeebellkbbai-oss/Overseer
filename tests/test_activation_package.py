@@ -773,6 +773,45 @@ def _wal_store(path: Path) -> None:
     path.chmod(0o600)
 
 
+def _stale_expression_index_store(path: Path, *, journal_mode: str) -> bytes:
+    old_timestamp = "2026-01-01T00:00:00Z"
+    new_timestamp = "2026-02-01T00:00:00Z"
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            f"PRAGMA journal_mode={journal_mode}"
+        ).fetchone()[0].lower() == journal_mode.lower()
+        connection.execute(
+            "CREATE TABLE host_snapshots (id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_host_snapshots_captured_at ON host_snapshots "
+            "(julianday(json_extract(payload, '$.captured_at')) DESC, id DESC)"
+        )
+        connection.execute(
+            "INSERT INTO host_snapshots(id, payload) VALUES (?, ?)",
+            ("snapshot-1", json.dumps({"captured_at": old_timestamp}, separators=(",", ":"))),
+        )
+        connection.commit()
+        if journal_mode.upper() == "WAL":
+            assert connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()[0] == 0
+    path.chmod(0o600)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            sidecar.chmod(0o600)
+    original = path.read_bytes()
+    assert original.count(old_timestamp.encode("ascii")) == 1
+    changed = original.replace(
+        old_timestamp.encode("ascii"),
+        new_timestamp.encode("ascii"),
+    )
+    path.write_bytes(changed)
+    path.chmod(0o600)
+    return changed
+
+
 def test_rehearsal_backup_is_consistent_and_migrates_only_copies(tmp_path: Path) -> None:
     source_parent = tmp_path / "legacy-state"
     source_parent.mkdir(mode=0o700)
@@ -812,6 +851,69 @@ def test_rehearsal_backup_is_consistent_and_migrates_only_copies(tmp_path: Path)
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
         ).fetchone() == (1,)
+
+
+def test_copied_expression_index_normalization_repairs_only_the_copy(
+    tmp_path: Path,
+) -> None:
+    copied = tmp_path / "copied.sqlite3"
+    changed = _stale_expression_index_store(copied, journal_mode="DELETE")
+    with pytest.raises(ActivationPackageError, match="integrity_check"):
+        activation_package_module._integrity_check(copied)
+
+    result = activation_package_module._normalize_copied_expression_indexes(copied)
+
+    assert result == {
+        "preReindexQuickCheck": "ok",
+        "reindexedExpressionIndexes": ["idx_host_snapshots_captured_at"],
+        "journalMode": "delete",
+        "sourceMutationPerformed": False,
+    }
+    assert activation_package_module._integrity_check(copied) == "ok"
+    assert copied.read_bytes() != changed
+    assert not Path(f"{copied}-wal").exists()
+    assert not Path(f"{copied}-shm").exists()
+
+
+def test_rehearsal_normalizes_expression_index_without_mutating_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    source_before = _stale_expression_index_store(source, journal_mode="WAL")
+
+    report = rehearse_store_migration(
+        tmp_path / "activation-package",
+        source_store=source,
+        pages_per_step=-1,
+        sleep_seconds=0,
+    )
+
+    assert report["copyNormalization"] == {
+        "preReindexQuickCheck": "ok",
+        "reindexedExpressionIndexes": ["idx_host_snapshots_captured_at"],
+        "journalMode": "delete",
+        "sourceMutationPerformed": False,
+    }
+    assert source.read_bytes() == source_before
+    assert report["backup"]["integrityCheck"] == "ok"
+    assert report["migrated"]["integrityCheck"] == "ok"
+
+
+def test_copied_expression_index_normalization_rejects_unapproved_schema(
+    tmp_path: Path,
+) -> None:
+    copied = tmp_path / "copied.sqlite3"
+    with sqlite3.connect(copied) as connection:
+        connection.execute(
+            "CREATE TABLE host_snapshots (id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_host_snapshots_captured_at ON host_snapshots (id)"
+        )
+    copied.chmod(0o600)
+
+    with pytest.raises(ActivationPackageError, match="schema is unapproved"):
+        activation_package_module._normalize_copied_expression_indexes(copied)
 
 
 def test_rehearsal_backup_remains_consistent_while_wal_writer_commits(tmp_path: Path) -> None:
@@ -2168,6 +2270,10 @@ def test_canary_health_retry_handles_an_initially_missing_unix_socket(
         ("backupBounds", "sleepSeconds", 0.01),
         ("backupBounds", "singleStep", False),
         ("backupBounds", "completedUnixNs", 0),
+        ("copyNormalization", "preReindexQuickCheck", "failed"),
+        ("copyNormalization", "journalMode", "wal"),
+        ("copyNormalization", "sourceMutationPerformed", True),
+        ("copyNormalization", "reindexedExpressionIndexes", ["unapproved-index"]),
     ),
 )
 def test_package_finalization_rejects_unapproved_migration_semantics(

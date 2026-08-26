@@ -140,6 +140,12 @@ MIGRATION_KEY_TABLES = (
     "crew_messages",
     "decisions",
 )
+COPIED_EXPRESSION_INDEX_SQL = {
+    "idx_host_snapshots_captured_at": (
+        "CREATE INDEX idx_host_snapshots_captured_at ON host_snapshots "
+        "(julianday(json_extract(payload, '$.captured_at')) DESC, id DESC)"
+    ),
+}
 _HEX = frozenset("0123456789abcdef")
 _SYSTEMD_TEMPLATES = {
     "overseer-admin-executor.socket": "overseer-admin-executor.socket",
@@ -1240,6 +1246,72 @@ def _integrity_check(path: Path) -> str:
     return result
 
 
+def _normalize_copied_expression_indexes(path: Path) -> dict[str, object]:
+    """Rebuild exact approved expression indexes only on a copied store."""
+
+    _validate_store_artifact(path, label="copied migration store")
+    connection = sqlite3.connect(_sqlite_uri(path, mode="rw"), uri=True, timeout=5)
+    reindexed: list[str] = []
+    try:
+        quick_rows = [str(row[0]) for row in connection.execute("PRAGMA quick_check(1)")]
+        if quick_rows != ["ok"]:
+            raise ActivationPackageError(
+                "copied migration store failed pre-reindex quick_check"
+            )
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or int(checkpoint[0]) != 0:
+            raise ActivationPackageError(
+                "copied migration store WAL could not be normalized"
+            )
+        journal = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+        if journal is None or str(journal[0]).lower() != "delete":
+            raise ActivationPackageError(
+                "copied migration store did not leave WAL journal mode"
+            )
+        for name, expected_sql in sorted(COPIED_EXPRESSION_INDEX_SQL.items()):
+            row = connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+                (name,),
+            ).fetchone()
+            if row is None:
+                continue
+            if str(row[0]) != expected_sql:
+                raise ActivationPackageError(
+                    f"copied migration expression index schema is unapproved: {name}"
+                )
+            quoted = name.replace('"', '""')
+            connection.execute(f'REINDEX "{quoted}"')
+            reindexed.append(name)
+        connection.commit()
+    finally:
+        connection.close()
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        try:
+            metadata = sidecar.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            sidecar.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ActivationPackageError(
+                "copied migration store retained an unsafe SQLite sidecar"
+            )
+        sidecar.unlink()
+    os.chmod(path, 0o600)
+    return {
+        "preReindexQuickCheck": "ok",
+        "reindexedExpressionIndexes": reindexed,
+        "journalMode": "delete",
+        "sourceMutationPerformed": False,
+    }
+
+
 def _migration_evidence_from_connection(
     connection: sqlite3.Connection,
     *,
@@ -1379,6 +1451,7 @@ def rehearse_store_migration(
     if stable_identity(before) != stable_identity(after):
         raise ActivationPackageError("source SQLite identity changed during backup")
 
+    copy_normalization = _normalize_copied_expression_indexes(backup)
     backup_integrity = _integrity_check(backup)
     row_counts_before, schema_before = _migration_evidence(backup)
     backup_digest, backup_size = _hash_file(backup)
@@ -1426,6 +1499,7 @@ def rehearse_store_migration(
         "rowCountsAfter": row_counts_after,
         "schemaBefore": schema_before,
         "schemaAfter": schema_after,
+        "copyNormalization": copy_normalization,
         "rowCountPolicy": "fixed-key-tables-or-bounded-fallback",
         "backupBounds": {
             "pagesPerStep": pages_per_step,
@@ -2114,6 +2188,7 @@ def prepare_final_store_migration(
             for original, bound in zip(sidecars, bound_paths[1:], strict=True)
         }
 
+        copy_normalization = _normalize_copied_expression_indexes(backup)
         backup_integrity = _integrity_check(backup)
         before_counts, schema_before = _migration_evidence(backup)
         backup_digest, backup_size = _hash_file(backup)
@@ -2175,6 +2250,7 @@ def prepare_final_store_migration(
             "rowCountsAfter": after_counts,
             "schemaBefore": schema_before,
             "schemaAfter": schema_after,
+            "copyNormalization": copy_normalization,
             "quiescenceLock": "kernel-read-leases-and-write-access-revoked",
             "kernelReadLeaseBarrier": "held-through-source-hashes-and-backup",
             "retainedParentLock": {
@@ -3702,6 +3778,12 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
     completed = bounds.get("completedUnixNs") if isinstance(bounds, dict) else None
     before_counts = report.get("rowCountsBefore") if isinstance(report, dict) else None
     after_counts = report.get("rowCountsAfter") if isinstance(report, dict) else None
+    normalization = report.get("copyNormalization") if isinstance(report, dict) else None
+    reindexed = (
+        normalization.get("reindexedExpressionIndexes")
+        if isinstance(normalization, dict)
+        else None
+    )
     package_owner = package.lstat().st_uid
     backup_path = package / "private" / "migration" / "rehearsal-source.sqlite3"
     migrated_path = package / "private" / "migration" / "rehearsal-migrated.sqlite3"
@@ -3783,6 +3865,15 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         or report.get("status") != "rehearsal_complete"
         or report.get("sourceMutationPerformed") is not False
         or source.get("journalMode") != "wal"
+        or not isinstance(normalization, dict)
+        or normalization.get("preReindexQuickCheck") != "ok"
+        or normalization.get("journalMode") != "delete"
+        or normalization.get("sourceMutationPerformed") is not False
+        or not isinstance(reindexed, list)
+        or any(not isinstance(name, str) for name in reindexed)
+        or reindexed != sorted(reindexed)
+        or len(reindexed) != len(set(reindexed))
+        or any(name not in COPIED_EXPRESSION_INDEX_SQL for name in reindexed)
         or not row_counts_valid
         or not isinstance(bounds, dict)
         or type(bounds.get("pagesPerStep")) is not int

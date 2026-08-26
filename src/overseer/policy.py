@@ -267,6 +267,13 @@ def _residual_scan_findings_check(plan: AdminChangePlan) -> PolicyCheck:
 
 
 def _rollback_check(plan: AdminChangePlan, profile: PolicyProfile) -> PolicyCheck:
+    if AdminChangeKind(plan.kind) == AdminChangeKind.SYSTEM_SERVICE_RESTART:
+        return PolicyCheck(
+            "admin.rollback",
+            PolicyCheckStatus.PASS,
+            plan.owner_domain,
+            "signed executor restart is bounded and has no truthful automatic rollback operation",
+        )
     if not profile.require_rollback_steps:
         return PolicyCheck("admin.rollback", PolicyCheckStatus.WARN, plan.owner_domain, "policy profile allows missing rollback steps")
     if not plan.rollback_steps:
@@ -282,6 +289,13 @@ def _rollback_check(plan: AdminChangePlan, profile: PolicyProfile) -> PolicyChec
 
 
 def _verification_check(plan: AdminChangePlan, profile: PolicyProfile) -> PolicyCheck:
+    if AdminChangeKind(plan.kind) == AdminChangeKind.SYSTEM_SERVICE_RESTART:
+        return PolicyCheck(
+            "admin.verification",
+            PolicyCheckStatus.PASS,
+            OwnerDomain.JULIAN,
+            "signed executor performs allowlisted systemd is-active verification before issuing its receipt",
+        )
     if not profile.require_verification_steps:
         return PolicyCheck("admin.verification", PolicyCheckStatus.WARN, OwnerDomain.JULIAN, "policy profile allows missing verification steps")
     if not plan.verification_steps:

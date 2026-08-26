@@ -25,6 +25,7 @@ SCRYPT_P = 1
 SCRYPT_DKLEN = 32
 APPROVAL_SALT_BYTES = 16
 MAX_APPROVAL_DOCUMENT_BYTES = 2048
+MIN_BEARER_SECRET_BYTES = 20
 MAX_BEARER_SECRET_BYTES = 256
 _APPROVAL_FIELDS = frozenset({"version", "scope", "identity", "kdf", "salt", "digest"})
 _SCOPED_IDENTITIES = {
@@ -54,6 +55,8 @@ def _secret_bytes(secret: object) -> bytes:
         raise ApprovalDocumentError("bearer secret must be valid UTF-8") from error
     if len(encoded) > MAX_BEARER_SECRET_BYTES:
         raise ApprovalDocumentError("bearer secret exceeds its maximum size")
+    if len(encoded) < MIN_BEARER_SECRET_BYTES:
+        raise ApprovalDocumentError("bearer secret is shorter than the required minimum")
     return encoded
 
 
@@ -131,6 +134,65 @@ def create_approval_document(secret: str, scope: str) -> dict[str, object]:
         "salt": base64.b64encode(salt).decode("ascii"),
         "digest": base64.b64encode(digest).decode("ascii"),
     }
+
+
+def write_approval_document(
+    path: str | Path,
+    document: dict[str, object],
+) -> ApprovalVerifier:
+    """Create one owner-only verifier file without replacement or symlinks."""
+
+    encoded = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_APPROVAL_DOCUMENT_BYTES:
+        raise ApprovalDocumentError("approval document exceeds the maximum size")
+    verifier = _document_to_verifier(encoded)
+    selected = Path(path)
+    if selected.name in {"", ".", ".."}:
+        raise ApprovalDocumentError("approval document output path is invalid")
+    parent = selected.parent or Path(".")
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(parent, directory_flags)
+    descriptor: int | None = None
+    created = False
+    try:
+        parent_metadata = os.fstat(directory)
+        if not stat.S_ISDIR(parent_metadata.st_mode):
+            raise ApprovalDocumentError("approval document parent is not a directory")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(selected.name, flags, 0o600, dir_fd=directory)
+        created = True
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short approval document write")
+            view = view[written:]
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        _validate_metadata(metadata, os.geteuid())
+        if metadata.st_size != len(encoded):
+            raise ApprovalDocumentError("approval document write was truncated")
+        os.fsync(directory)
+        return verifier
+    except BaseException:
+        if created:
+            try:
+                os.unlink(selected.name, dir_fd=directory)
+                os.fsync(directory)
+            except OSError:
+                pass
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:

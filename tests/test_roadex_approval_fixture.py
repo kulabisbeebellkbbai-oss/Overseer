@@ -302,7 +302,7 @@ class RoadexApprovalFixtureApiTests(unittest.TestCase):
         self.store_path = str(Path(self.temporary.name) / "state.sqlite3")
         verifier_path = Path(self.temporary.name) / "roadex-fixture-approval.json"
         verifier_path.write_text(
-            json.dumps(create_approval_document("human-secret", "roadex-fixture-approval")),
+            json.dumps(create_approval_document("roadex-human-secret-1", "roadex-fixture-approval")),
             encoding="utf-8",
         )
         verifier_path.chmod(0o600)
@@ -350,7 +350,7 @@ class RoadexApprovalFixtureApiTests(unittest.TestCase):
             "subject": "Harmless smoke",
         }
         self.assertEqual(
-            self._post_status("/roadex/approval-fixtures/stage", stage_payload, "human-secret"),
+            self._post_status("/roadex/approval-fixtures/stage", stage_payload, "roadex-human-secret-1"),
             401,
         )
         status, locator = self._post(
@@ -366,12 +366,12 @@ class RoadexApprovalFixtureApiTests(unittest.TestCase):
             self._post_status(
                 "/roadex/approval-fixtures/approve",
                 {**approval, "outcome": "approved"},
-                "human-secret",
+                "roadex-human-secret-1",
             ),
             400,
         )
         status, projection = self._post(
-            "/roadex/approval-fixtures/approve", approval, "human-secret"
+            "/roadex/approval-fixtures/approve", approval, "roadex-human-secret-1"
         )
         self.assertEqual(status, 200)
         self.assertEqual(projection["decision"], "approved")

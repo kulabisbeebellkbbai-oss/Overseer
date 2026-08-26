@@ -30,6 +30,7 @@ class AdminChangeKind(StrEnum):
     PSYCHLO_RECURRING_CYCLE_ACTIVATION = "psychlo_recurring_cycle_activation"
     CODEX_APP_SERVER_DISPATCH_ACTIVATION = "codex_app_server_dispatch_activation"
     USER_SERVICE_RESTART = "user_service_restart"
+    SYSTEM_SERVICE_RESTART = "system_service_restart"
     APT_INSTALL = "apt_install"
     APT_UPDATE = "apt_update"
     APT_UPGRADE = "apt_upgrade"
@@ -215,12 +216,12 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
     ),
     AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION: AdminExecutionCapability(
         kind=AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION,
-        adapter_name="codex-root-system-service-activation-v2",
-        status=AdminAdapterStatus.DISABLED,
-        summary="external-CLI-only reviewed root helper and immutable system-service migration requires this exact plan",
-        authorization_required_before_enable=True,
-        approval_plan_required=True,
-        supported_commands=(("__overseer_codex_dispatch_system_v1",),),
+        adapter_name="retired-codex-dispatch-activation",
+        status=AdminAdapterStatus.UNSUPPORTED,
+        summary="the v1.1.5 user-service dispatch activation is retired until the typed user bridge exists",
+        authorization_required_before_enable=False,
+        approval_plan_required=False,
+        supported_commands=(),
     ),
     AdminChangeKind.PYTHON_HASHED_VENV_PROVISION: AdminExecutionCapability(
         kind=AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,
@@ -238,12 +239,21 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
     ),
     AdminChangeKind.USER_SERVICE_RESTART: AdminExecutionCapability(
         kind=AdminChangeKind.USER_SERVICE_RESTART,
-        adapter_name="user-systemd-service",
-        status=AdminAdapterStatus.ENABLED,
-        summary="approved user service restart execution is enabled",
+        adapter_name="retired-user-systemd-service",
+        status=AdminAdapterStatus.UNSUPPORTED,
+        summary="direct user service execution is retired in v1.1.6",
         authorization_required_before_enable=False,
         approval_plan_required=False,
-        supported_commands=(("systemctl", "--user", "restart"), ("systemctl", "--user", "status")),
+        supported_commands=(),
+    ),
+    AdminChangeKind.SYSTEM_SERVICE_RESTART: AdminExecutionCapability(
+        kind=AdminChangeKind.SYSTEM_SERVICE_RESTART,
+        adapter_name="signed-systemd-ticket-executor",
+        status=AdminAdapterStatus.ENABLED,
+        summary="approved system service restarts require the signed, root-owned allowlist executor",
+        authorization_required_before_enable=False,
+        approval_plan_required=False,
+        supported_commands=(("__overseer_ticketed_system_service_restart_v1",),),
     ),
     AdminChangeKind.APT_INSTALL: AdminExecutionCapability(
         kind=AdminChangeKind.APT_INSTALL,
@@ -371,8 +381,25 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
 def admin_execution_capability_for(
     kind: AdminChangeKind,
     enabled_adapter_kinds: Iterable[AdminChangeKind | str] = (),
+    *,
+    injected_runner: bool = False,
 ) -> AdminExecutionCapability:
     normalized_kind = AdminChangeKind(kind)
+    if type(injected_runner) is not bool:
+        raise TypeError("injected_runner must be a bool")
+    if normalized_kind in {
+        AdminChangeKind.USER_SERVICE_RESTART,
+        AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION,
+    } and injected_runner:
+        return AdminExecutionCapability(
+            kind=normalized_kind,
+            adapter_name="injected-test-runner",
+            status=AdminAdapterStatus.ENABLED,
+            summary="legacy user-service plan is executable only through an explicitly injected in-process test runner",
+            authorization_required_before_enable=False,
+            approval_plan_required=False,
+            supported_commands=(("systemctl", "--user", "restart"), ("systemctl", "--user", "status")),
+        )
     enabled = {AdminChangeKind(candidate) for candidate in enabled_adapter_kinds}
     capability = DEFAULT_ADMIN_EXECUTION_CAPABILITIES.get(
         normalized_kind,
@@ -460,6 +487,40 @@ def plan_user_service_restart(plan_id: str, service_name: str, reason: str, curr
                 "confirm the service reached the expected active state",
             ),
         ),
+    )
+
+
+def plan_system_service_restart(
+    plan_id: str,
+    service_name: str,
+    reason: str,
+    current_state: str = "unknown",
+) -> AdminChangePlan:
+    """Plan one system-unit restart without embedding privileged argv."""
+
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.SYSTEM_SERVICE_RESTART,
+        owner_domain=OwnerDomain.OBRIEN,
+        risk_level=RiskLevel.MEDIUM,
+        approval_level=ApprovalLevel.SISKO,
+        target=service_name,
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"restart allowlisted system service {service_name} and verify it is active",
+        steps=(
+            AdminCommandStep(
+                "Execute signed system-service restart ticket",
+                ("__overseer_ticketed_system_service_restart_v1", service_name),
+                "delegate the exact approved plan digest to the root-owned allowlist executor",
+            ),
+        ),
+        rollback_steps=(),
+        risks=(
+            "temporary service interruption",
+            "an interrupted executor claim requires explicit reconciliation and is never retried automatically",
+        ),
+        verification_steps=(),
     )
 
 
@@ -1479,6 +1540,7 @@ def plan_block_ip(plan_id: str, address: str, reason: str, current_state: str = 
 
 def missing_admin_change_fields(plan: AdminChangePlan) -> tuple[str, ...]:
     missing = []
+    plan_kind = AdminChangeKind(plan.kind)
     if not plan.current_state.strip():
         missing.append("current_state")
     if not plan.proposed_state.strip():
@@ -1487,13 +1549,13 @@ def missing_admin_change_fields(plan: AdminChangePlan) -> tuple[str, ...]:
         missing.append("reason")
     if not plan.steps:
         missing.append("steps")
-    if not plan.rollback_steps:
+    if not plan.rollback_steps and plan_kind is not AdminChangeKind.SYSTEM_SERVICE_RESTART:
         missing.append("rollback_steps")
     if not plan.risks:
         missing.append("risks")
-    if not plan.verification_steps:
+    if not plan.verification_steps and plan_kind is not AdminChangeKind.SYSTEM_SERVICE_RESTART:
         missing.append("verification_steps")
-    if AdminChangeKind(plan.kind) == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION and not plan.adapter_metadata.get("python_venv"):
+    if plan_kind == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION and not plan.adapter_metadata.get("python_venv"):
         missing.append("python_venv_manifest")
     return tuple(missing)
 
@@ -1617,7 +1679,11 @@ def _execute_admin_change_plan_body(
     runner: AdminCommandRunner | None = None,
     enabled_adapter_kinds: Iterable[AdminChangeKind | str] = (),
 ) -> AdminExecutionResult:
-    capability = admin_execution_capability_for(plan.kind, enabled_adapter_kinds)
+    capability = admin_execution_capability_for(
+        plan.kind,
+        enabled_adapter_kinds,
+        injected_runner=runner is not None,
+    )
     codex_dispatch_activation = AdminChangeKind(plan.kind) == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION
     if not capability.can_execute_live():
         return AdminExecutionResult(
@@ -1762,6 +1828,22 @@ def audit_event_from_admin_execution(plan: AdminChangePlan, result: AdminExecuti
 
 
 def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
+    if step.command[:2] == ("systemctl", "--user"):
+        return AdminCommandResult(
+            step.title,
+            step.command,
+            126,
+            "",
+            "direct user service execution is retired; use a signed ticketed system-service plan",
+        )
+    if step.command and step.command[0] == "__overseer_ticketed_system_service_restart_v1":
+        return AdminCommandResult(
+            step.title,
+            step.command,
+            126,
+            "",
+            "signed system-service restart requires the dedicated ticket executor",
+        )
     if step.command and step.command[0].startswith("__overseer_codex_dispatch_"):
         try:
             from .codex_dispatch_system_activation import execute_codex_dispatch_activation_marker

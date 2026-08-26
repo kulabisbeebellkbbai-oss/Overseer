@@ -9,6 +9,9 @@ Group=overseer
 WorkingDirectory=@OVERSEER_RELEASE@
 Environment=PYTHONPATH=@OVERSEER_RELEASE@/src
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=OVERSEER_DEDICATED_PRINCIPAL=1
+Environment=OVERSEER_ADMIN_TICKET_PRIVATE_KEY=/etc/overseer/admin-ticket-private-key
+Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock
 Environment=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798
 Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-bridge.sqlite3
 Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-peer-secret

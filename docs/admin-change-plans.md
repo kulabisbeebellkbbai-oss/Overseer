@@ -16,6 +16,7 @@ Admin change plans are Overseer's bridge from observed host evidence to real IT 
 ## Supported Plan Types
 
 - `user_service_restart`
+- `system_service_restart` (v1.1.6 signed-ticket executor; root allowlist required)
 - `apt_install`
 - `apt_update`
 - `apt_upgrade`
@@ -31,6 +32,7 @@ Admin change plans are Overseer's bridge from observed host evidence to real IT 
 
 ```bash
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --kind user_service_restart --target overseer-api.service --reason "reload approved code" --current-state active
+PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.restart-system.smoke --kind system_service_restart --target overseer-approval-smoke.service --reason "exercise the independent approval and executor boundary" --current-state inactive
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.install.nmap --kind apt_install --target nmap --reason "enable approved local audit"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.update --kind apt_update --target apt --reason "refresh package metadata"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.upgrade.sqlite --kind apt_upgrade --target sqlite3 --package sqlite3 --reason "apply approved patch"
@@ -40,7 +42,7 @@ PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.firewall.8443 --kind firewall_allow_tcp --target tcp/8443 --port 8443 --reason "publish approved local service"
 PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3
 # Direct CLI approval is disabled. Approve the exact plan through POST /admin/approve
-# with the separately configured human approval credential.
+# with the secret for the scoped admin approval verifier.
 PYTHONPATH=src python3 -m overseer.cli cancel-admin-change --store state/overseer.sqlite3 --plan-id admin.block.example --canceled-by odo --reason "reserved documentation address; no observed hostile traffic"
 PYTHONPATH=src python3 -m overseer.cli execute-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api
 PYTHONPATH=src python3 -m overseer.cli admin-executions --store state/overseer.sqlite3
@@ -55,10 +57,12 @@ Recording approval does not execute the plan. It only updates the stored approva
 
 The HTTP approval route is credential-separated from ordinary API control.
 `POST /admin/approve` accepts only `plan_id`, requires the independent human
-approval bearer token, and records the server-owned `sisko` identity plus a
-server-generated timestamp. Client-supplied identity or timestamp fields are
-rejected. The dashboard keeps this credential only in its password field and
-clears it after every approval attempt.
+approval secret verified against the `admin-plan-approval` verifier, and
+records the server-owned `sisko` identity plus a server-generated timestamp.
+Client-supplied identity or timestamp fields are rejected. The dashboard keeps
+the submitted secret only in its password field and clears it after every
+approval attempt. Overseer stores only the strict scrypt verifier document,
+never the approval secret.
 
 Completed admin execution is replay-safe. Repeating execution for a plan that
 already has a completed result returns the original result with
@@ -84,15 +88,35 @@ until independently recorded approvals satisfy both gates.
 ## Disposable Approval Smoke Test
 
 Use `systemd/overseer-approval-smoke.service` for end-to-end approval testing.
-It is a non-enabled one-shot unit that runs `/usr/bin/true`, remains active so
-restart verification is meaningful, and has private networking plus strict
-systemd hardening. Install only this reviewed unit into the user unit directory,
-stage a `user_service_restart` plan targeting it, approve through the independent
-UI/API credential, and execute once. A second execute request must return the
-same completed result as a replay without running the unit again. Remove the
-fixture unit after acceptance; do not substitute a production service.
+It is a non-enabled one-shot system unit that runs `/usr/bin/true`, remains
+active so restart verification is meaningful, and has private networking plus
+strict systemd hardening. The v1.1.6 executor allowlist contains only this
+exact unit. Stage the ticketed system-service restart plan, approve through the
+independent UI/API verifier, and execute once. A second execute request must
+return the same terminal receipt as a replay without running the unit again.
+Do not substitute a production service or widen the allowlist during the smoke
+test.
 
-Live admin execution is now described by an explicit adapter capability table. Approved user-service restart plans are enabled by default. Package install, package index refresh, package upgrade, firewall allow/deny, and source-block adapters remain disabled unless the same store contains an approved adapter enablement request for that exact kind. The readiness view reports each plan's `adapter_status` so disabled live actions cannot be confused with ready Overseer execution. Use `admin-adapter-enablement-plan` or `GET /admin/adapter-enablement-plan` to generate the required read-only approval plan before any disabled adapter is enabled.
+The former direct `systemctl --user` adapter is a v1.1.5 compatibility surface,
+not the v1.1.6 authority boundary. The dedicated authority issues a
+plan-digest-bound, short-lived Ed25519 ticket. The root-owned executor verifies
+the ticket and durable nonce claim, reconstructs its command from the
+root-owned allowlist, and records a terminal receipt. Package install, package
+index refresh, package upgrade, firewall, Docker, mount, arbitrary service,
+and all other privileged operations remain disabled.
+
+Live admin execution is described by an explicit adapter capability table.
+`system_service_restart` is the only enabled restart capability and it can
+reach only the root-owned executor allowlist, which initially contains the
+disposable smoke unit. `user_service_restart` is unconditionally unsupported
+in v1.1.6. Package install, package index refresh, package upgrade, firewall,
+Docker, mount, and source-block adapters remain disabled unless the same store
+contains an approved adapter enablement request for that exact kind. The
+readiness view reports each plan's `adapter_status` so unavailable actions
+cannot be confused with ready Overseer execution. Use
+`admin-adapter-enablement-plan` or `GET /admin/adapter-enablement-plan` to
+generate the required read-only approval plan before any disabled adapter is
+enabled.
 
 Adapter enablement requests persist the human approval record for that work. Approval changes only the effective adapter capability for that store and kind; it does not approve any specific host change, modify the host, or run commands. Each admin plan must still pass its own approval, IDS review when applicable, command-boundary validation, execution recording, and verification.
 
@@ -100,7 +124,10 @@ Adapter enablement requests persist the human approval record for that work. App
 
 Canceling a plan keeps the record visible but removes it from the pending authorization queue and prevents execution. Use cancellation for placeholders, superseded plans, or plans created from disproven evidence.
 
-Live execution support is controlled by the effective adapter table. User-service restart is enabled by default; package install, package index refresh, package upgrade, firewall allow/deny, and source-block execution require approved adapter enablement for the store plus the specific admin plan approval and any IDS review gate.
+Live execution support is controlled by the effective adapter table. The
+ticketed smoke-unit restart is enabled; all other privileged operations require
+an explicit future adapter contract, store-level enablement where applicable,
+the specific plan approval, and any required IDS review.
 
 Approved apt-family execution uses a noninteractive apt/debconf environment with standard input closed. This keeps package operations from opening terminal dialogs after the command list has already been approved. Package defaults still apply unless the approved plan explicitly includes a different package configuration step.
 

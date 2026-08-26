@@ -13,8 +13,10 @@ def test_overseer_runtime_unit_runs_scheduler_without_bulk_flags() -> None:
     unit = UNIT_PATH.read_text(encoding="utf-8")
 
     assert "Type=simple" in unit
+    assert "ConditionPathExists=@OVERSEER_INSTALL@/.overseer-v1.1.5-rollback-release" in unit
     assert "EnvironmentFile=%h/.config/overseer/runtime.env" in unit
     assert "WorkingDirectory=@OVERSEER_INSTALL@" in unit
+    assert "ConditionPathExists=@OVERSEER_INSTALL@/.overseer-v1.1.5-rollback-release" in unit
     assert "ExecStart=/usr/bin/env -- ${OVERSEER_PYTHON} -m overseer.cli run --store ${OVERSEER_STORE}" in unit
     assert "Restart=on-failure" in unit
     assert "RestartSec=5" in unit

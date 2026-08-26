@@ -2219,6 +2219,10 @@ def make_api_handler(
         def _handle_admin_execute(self) -> None:
             try:
                 payload = self._read_json()
+                if "plan_id" not in payload:
+                    raise KeyError("plan_id")
+                if set(payload) != {"plan_id"}:
+                    raise ValueError("admin execution payload must contain only plan_id")
                 plan_id = str(payload["plan_id"])
             except KeyError as error:
                 self._write_json({"error": f"missing field: {error.args[0]}"}, HTTPStatus.BAD_REQUEST)

@@ -76,13 +76,15 @@ Overview card and resume only the exact staged Psychlo decision.
 ## Run
 
 ```bash
-PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 --host 127.0.0.1 --port 8766 --auth-token-file state/api-token --human-approval-token-file state/human-approval-token --human-approval-identity sisko
+PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 --host 127.0.0.1 --port 8766 --auth-token-file state/api-token --admin-approval-verifier-file state/admin-approval-verifier.json --roadex-fixture-approval-verifier-file state/roadex-fixture-approval-verifier.json
 ```
 
 `GET /health` is always available for local service monitoring. Protected
 agent/control endpoints require the normal API bearer token. `POST
-/admin/approve` requires the separate human approval token and rejects the
-normal API token.
+/admin/approve` requires a secret matching the scoped admin verifier and
+rejects the normal API token. `/roadex/approval-fixtures/approve` uses a
+different verifier, scope, identity, and secret. No plaintext approval secret
+is stored by Overseer.
 
 `GET /ui` serves the local operator console. The console shell does not embed or expose the bearer token; when the API is token-protected, enter the local token in the console to load protected JSON endpoints from the browser session.
 
@@ -410,7 +412,6 @@ from overseer.client import OverseerApiClient
 
 client = OverseerApiClient(
     auth_token_file="state/api-token",
-    approval_token_file="state/human-approval-token",
 )
 runtime = client.runtime_status()
 command = client.command_summary()
@@ -450,9 +451,9 @@ remediation = client.plan_host_security_remediation({"listener": "0.0.0.0:22"})
 plan = client.plan_admin_change(
     {
         "plan_id": "admin.restart.overseer-api",
-        "kind": "user_service_restart",
-        "target": "overseer-api.service",
-        "reason": "reload approved code",
+        "kind": "system_service_restart",
+        "target": "overseer-approval-smoke.service",
+        "reason": "test the signed approval boundary",
     }
 )
 pending = client.authorizations_required()
@@ -482,33 +483,51 @@ For `1.1.x` compatibility, the client also accepts the former approval payload
 shape when `approved_by` is `sisko`; it strips the legacy identity and timestamp
 before sending the request. New callers should pass only the plan ID.
 
-## Installed User Service
+Human approval secrets are accepted only as an explicit in-memory
+`approval_token` for the single approval request. The client deliberately has
+no approval-token-file option. Browser operators enter the secret into the
+approval form; the UI clears it after the attempt.
 
-The approved local service is installed as:
+Create each verifier interactively in a private staging directory. The command
+prompts twice and creates a new owner-only file without replacing an existing
+path:
 
-```text
-/home/god/.config/systemd/user/overseer-api.service
+```bash
+PYTHONPATH=src python3 -m overseer.cli create-approval-verifier \
+  --scope admin-plan-approval \
+  --output /absolute/private/staging/admin-approval-verifier.json
+
+PYTHONPATH=src python3 -m overseer.cli create-approval-verifier \
+  --scope roadex-fixture-approval \
+  --output /absolute/private/staging/roadex-fixture-approval-verifier.json
 ```
 
-The installed service reads its bearer token from an ignored local file:
+Each secret must be at least 20 UTF-8 bytes, contain no whitespace or control
+characters, and differ from the other approval secret and ordinary API token.
+Only the scrypt salt and digest are written. The v1.1.6 system service never
+loads the legacy plaintext human-token file; that old file is retained only
+with the pinned v1.1.5 rollback release and is not migrated or imported.
+
+## Installed Service
+
+The currently deployed v1.1.5 rollback service is installed as a user unit.
+The approved v1.1.6 source design instead renders the system unit templates in
+`systemd/overseer-api-system.service` and
+`systemd/overseer-runtime-system.service` under a dedicated `overseer`
+principal. It preserves the same loopback URL.
+
+The ordinary client bearer token remains available to local API clients at:
 
 ```text
 /home/god/.local/share/overseer/project/state/api-token
 ```
 
-Admin-plan approval uses a different ignored owner-only token file. The API
-service maps that credential to the server-owned `sisko` identity; the client
-does not submit an approver name or timestamp:
+The system service receives a root-managed copy through `LoadCredential`.
+Admin-plan and Roadex fixture approval use separate verifier documents under
+`/etc/overseer`; neither approval secret is stored. The verifier scope maps a
+successful submission to its server-owned identity, and the client does not
+submit an approver name or timestamp.
 
-```text
-/home/god/.local/share/overseer/project/state/human-approval-token
-```
-
-The API service fails closed if the normal API token and human approval token
-are identical.
-
-Rollback:
-
-```bash
-systemctl --user disable --now overseer-api.service
-```
+The API fails closed when the ordinary token authenticates against either
+approval verifier. Live activation and rollback remain governed by
+`v1.1.6-dedicated-principal-activation-plan.md`.

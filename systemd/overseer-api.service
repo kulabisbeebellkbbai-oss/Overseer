@@ -1,6 +1,7 @@
 [Unit]
 Description=Overseer v1.1 localhost API
 After=default.target overseer.service
+ConditionPathExists=@OVERSEER_INSTALL@/.overseer-v1.1.5-rollback-release
 
 [Service]
 Type=simple

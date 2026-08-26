@@ -12,6 +12,7 @@ import overseer.approval_auth as approval_auth
 from overseer.approval_auth import (
     MAX_APPROVAL_DOCUMENT_BYTES,
     MAX_BEARER_SECRET_BYTES,
+    MIN_BEARER_SECRET_BYTES,
     ApprovalVerifier,
     authenticate_bearer_secret,
     create_approval_document,
@@ -89,6 +90,8 @@ def test_creation_rejects_noncanonical_bearer_secrets(secret: str) -> None:
 
 
 def test_bearer_secret_is_bounded_and_type_strict() -> None:
+    with pytest.raises(ValueError, match="minimum"):
+        create_approval_document("x" * (MIN_BEARER_SECRET_BYTES - 1), "admin-plan-approval")
     with pytest.raises(ValueError):
         create_approval_document("x" * (MAX_BEARER_SECRET_BYTES + 1), "admin-plan-approval")
     with pytest.raises(ValueError):

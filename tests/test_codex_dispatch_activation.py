@@ -1640,8 +1640,12 @@ def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_pa
     assert staged["approved"] is False
     approved = cli.approve_admin_change_status(store, "admin.codex-dispatch.e2e", "sisko", "2026-08-18T00:00:00+00:00")
     assert approved["approved"] is True
-    request = cli.request_admin_adapter_enablement_status(store, AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value, "sisko")
-    cli.approve_admin_adapter_enablement_status(store, request["approval_id"], "sisko", "2026-08-18T00:01:00+00:00")
+    with pytest.raises(ValueError, match="does not require enablement approval"):
+        cli.request_admin_adapter_enablement_status(
+            store,
+            AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
+            "sisko",
+        )
     monkeypatch.setattr(system, "_reject_api_context", lambda: None)
     monkeypatch.setattr(system, "_authority_files_present", lambda _spec, _plan_id: True)
     monkeypatch.setattr(system, "verify_system_activation_spec", lambda _spec: None)

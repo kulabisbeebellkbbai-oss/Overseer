@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
@@ -52,10 +53,15 @@ from .admin import (
     plan_firewall_deny_tcp,
     plan_npm_global_install,
     plan_storage_mount_test,
+    plan_system_service_restart,
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
 from .admin_authority import admin_authority_lock
+from .admin_ticket_execution import (
+    execute_system_service_restart_ticket,
+    preflight_system_service_ticket_execution,
+)
 from .python_venv import plan_python_hashed_venv_provision, python_venv_spec_from_metadata
 from .psychlo_cycle_activation import (
     plan_psychlo_recurring_cycle_activation,
@@ -1606,6 +1612,7 @@ def maintenance_summary_status(store_path: str | Path) -> dict[str, object]:
                 or plan.kind
                 in {
                     AdminChangeKind.USER_SERVICE_RESTART,
+                    AdminChangeKind.SYSTEM_SERVICE_RESTART,
                     AdminChangeKind.APT_INSTALL,
                     AdminChangeKind.APT_UPDATE,
                     AdminChangeKind.APT_UPGRADE,
@@ -2427,6 +2434,7 @@ def operator_dashboard_compact_status(store_path: str | Path, service_name: str 
             or plan.kind
             in {
                 AdminChangeKind.USER_SERVICE_RESTART,
+                AdminChangeKind.SYSTEM_SERVICE_RESTART,
                 AdminChangeKind.APT_INSTALL,
                 AdminChangeKind.APT_UPDATE,
                 AdminChangeKind.APT_UPGRADE,
@@ -4715,6 +4723,8 @@ def plan_admin_change_status(
     plan_kind = AdminChangeKind(kind)
     if plan_kind == AdminChangeKind.USER_SERVICE_RESTART:
         plan = plan_user_service_restart(plan_id, target, reason, current_state)
+    elif plan_kind == AdminChangeKind.SYSTEM_SERVICE_RESTART:
+        plan = plan_system_service_restart(plan_id, target, reason, current_state)
     elif plan_kind == AdminChangeKind.APT_INSTALL:
         plan = plan_apt_install(plan_id, tuple(packages or (target,)), reason, current_state)
     elif plan_kind == AdminChangeKind.APT_UPDATE:
@@ -4864,7 +4874,11 @@ def _execute_admin_change_with_claim_status(
             ids_review_packages = store.list_host_security_ids_review_packages_for_plan(plan.id)
             policy_decision = evaluate_admin_change_policy(
                 plan,
-                admin_execution_capability_for(AdminChangeKind(plan.kind), enabled_adapter_kinds),
+                admin_execution_capability_for(
+                    AdminChangeKind(plan.kind),
+                    enabled_adapter_kinds,
+                    injected_runner=runner is not None,
+                ),
                 ids_review_packages,
                 approved_admin_policy_warning_check_ids(store, plan.id),
                 profile,
@@ -4895,6 +4909,11 @@ def _execute_admin_change_with_claim_status(
                     "mutation_performed": False,
                     **admin_execution_status(result),
                 }
+            ticket_execution_config = None
+            if AdminChangeKind(plan.kind) == AdminChangeKind.SYSTEM_SERVICE_RESTART and runner is None:
+                ticket_execution_config = preflight_system_service_ticket_execution(
+                    expected_owner_uid=os.geteuid(),
+                )
             claim = AdminExecutionClaim(
                 id=f"admin.exec.claim.{plan.id}",
                 plan_id=plan.id,
@@ -4906,10 +4925,22 @@ def _execute_admin_change_with_claim_status(
         finally:
             store.close()
 
-    result = replace(
-        execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds),
-        plan_digest=plan_digest,
-    )
+    if ticket_execution_config is not None:
+        result = execute_system_service_restart_ticket(
+            plan,
+            plan_digest,
+            private_key_file=ticket_execution_config.private_key_file,
+            executor_socket=ticket_execution_config.executor_socket,
+            expected_key_owner_uid=os.geteuid(),
+            clock=lambda: datetime.now(UTC),
+            ticket_id_factory=lambda: f"ticket.{secrets.token_hex(16)}",
+            nonce_factory=lambda: f"nonce.{secrets.token_hex(16)}",
+        )
+    else:
+        result = replace(
+            execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds),
+            plan_digest=plan_digest,
+        )
     with admin_authority_lock(store_path):
         store = SQLiteStore(store_path)
         try:
@@ -7060,9 +7091,10 @@ def admin_plan_review_brief(
             "run read-only name-resolution and SMB discovery checks first",
             "choose a different backup provider or mount path",
         )
-    elif kind == AdminChangeKind.USER_SERVICE_RESTART:
-        change = f"Restart user service {plan.target}."
-        remediation = "Recover or refresh an unhealthy local service using the recorded command sequence."
+    elif kind in {AdminChangeKind.USER_SERVICE_RESTART, AdminChangeKind.SYSTEM_SERVICE_RESTART}:
+        service_scope = "system" if kind == AdminChangeKind.SYSTEM_SERVICE_RESTART else "legacy user"
+        change = f"Restart {service_scope} service {plan.target}."
+        remediation = "Recover or refresh an unhealthy local service using the approved execution boundary."
         impact = "Approval may briefly interrupt that service while it restarts."
         alternatives = (
             "leave the current service process running",
@@ -11598,7 +11630,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cancel_admin_parser.add_argument("--canceled-by", required=True)
     cancel_admin_parser.add_argument("--reason", required=True)
     cancel_admin_parser.add_argument("--canceled-at")
-    execute_admin_parser = subparsers.add_parser("execute-admin-change", help="execute an approved user-service admin change plan")
+    execute_admin_parser = subparsers.add_parser("execute-admin-change", help="execute an approved admin change through its registered adapter")
     execute_admin_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     execute_admin_parser.add_argument("--plan-id", required=True)
     execute_admin_parser.add_argument("--policy-profile", help="optional JSON policy profile generated by policy-customization-helper")
@@ -11719,6 +11751,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     api_parser.add_argument("--auth-token-file", help="local file containing the bearer token required for API access")
     api_parser.add_argument("--admin-approval-verifier-file", help="strict scoped verifier document for independent admin-plan approval")
     api_parser.add_argument("--roadex-fixture-approval-verifier-file", help="separate strict scoped verifier document for Roadex fixture approval")
+    verifier_parser = subparsers.add_parser("create-approval-verifier", help="interactively create one owner-only scoped human approval verifier")
+    verifier_parser.add_argument("--scope", required=True, choices=("admin-plan-approval", "roadex-fixture-approval"))
+    verifier_parser.add_argument("--output", required=True)
     health_summary_parser = subparsers.add_parser("health-summary", help="summarize latest health evidence per target")
     health_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
@@ -13240,6 +13275,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.roadex_fixture_approval_verifier_file
             else None,
         )
+        return 0
+
+    if args.command == "create-approval-verifier":
+        import getpass
+
+        from .approval_auth import create_approval_document, write_approval_document
+
+        secret = getpass.getpass("Approval secret: ")
+        confirmation = getpass.getpass("Confirm approval secret: ")
+        if not secrets.compare_digest(secret, confirmation):
+            raise ValueError("approval secret confirmation does not match")
+        verifier = write_approval_document(
+            args.output,
+            create_approval_document(secret, args.scope),
+        )
+        print(json.dumps({
+            "status": "created",
+            "scope": verifier.scope,
+            "identity": verifier.identity,
+            "output": str(Path(args.output)),
+        }, sort_keys=True))
         return 0
 
     if args.command == "health-summary":

@@ -1286,7 +1286,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function postApprovalJson(path, payload = {}) {
       const approvalTokenInput = document.getElementById("admin-approval-token");
       const approvalToken = approvalTokenInput?.value.trim() || "";
-      if (!approvalToken) throw new Error("Independent approval token is required");
+      if (!approvalToken) throw new Error("Independent admin approval secret is required");
       approvalTokenFields.add(approvalTokenInput);
       approvalRequestInFlight = true;
       approvalTokenInput.value = "";
@@ -2754,7 +2754,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             <div class="toolbar"><h3>Approve Plan</h3><button class="action-btn" data-action="approve-admin-change">Approve</button></div>
             <div class="form-grid">
               <div class="field span-6"><label for="admin-approval-plan-id">Plan ID</label><input id="admin-approval-plan-id"></div>
-              <div class="field span-6"><label for="admin-approval-token">Independent Approval Token</label><input id="admin-approval-token" type="password" autocomplete="off"></div>
+              <div class="field span-6"><label for="admin-approval-token">Independent Admin Approval Secret</label><input id="admin-approval-token" type="password" autocomplete="off"></div>
             </div>
           </div>
           <div class="panel span-4">
@@ -3520,10 +3520,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return ["observation", "checkout", "lock", "lease", "hold", "quarantine"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function adminKindOptions() {
-      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "firmware_update", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+      return ["system_service_restart", "apt_install", "apt_update", "apt_upgrade", "firmware_update", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function adminAdapterKindOptions() {
-      return ["psychlo_recurring_cycle_activation", ...["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "firmware_update", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"]].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+      return ["psychlo_recurring_cycle_activation", ...["system_service_restart", "apt_install", "apt_update", "apt_upgrade", "firmware_update", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"]].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function firmwareBlockerRows(items) {
       return (items || []).filter((item) => item.blocker_type).map((item) => ({

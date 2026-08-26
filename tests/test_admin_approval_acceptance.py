@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -14,10 +15,17 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import overseer.cli as cli_module
 from overseer.admin import (
     AdminCommandResult,
 )
+from overseer.admin_executor import (
+    ALLOWLIST_SCHEMA_VERSION,
+    execute_ticket,
+)
+from overseer.admin_ticket_execution import execute_system_service_restart_ticket
 from overseer.approval_auth import create_approval_document, load_approval_verifier
 from overseer.api import make_api_handler
 from overseer.cli import (
@@ -45,8 +53,9 @@ def approval_api(
     store_path: Path,
     *,
     admin_token: str = "agent-token",
-    approval_token: str | None = "approval-token",
+    approval_token: str | None = "approval-token-strong-1",
     approval_identity: str | None = "sisko",
+    roadex_approval_token: str | None = None,
 ):
     admin_verifier = None
     if approval_token is not None:
@@ -57,10 +66,20 @@ def approval_api(
             approval_token,
             "admin-plan-approval",
         )
+    roadex_verifier = (
+        approval_verifier(
+            store_path.parent,
+            roadex_approval_token,
+            "roadex-fixture-approval",
+        )
+        if roadex_approval_token is not None
+        else None
+    )
     handler = make_api_handler(
         str(store_path),
         admin_token,
         admin_approval_verifier=admin_verifier,
+        roadex_fixture_approval_verifier=roadex_verifier,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -136,7 +155,7 @@ def test_admin_approval_api_requires_independent_token_and_derives_identity(
             base_url,
             "/admin/approve",
             {"plan_id": "admin.approval.api"},
-            "approval-token",
+            "approval-token-strong-1",
         )
 
     assert denied.value.code == 403
@@ -169,12 +188,167 @@ def test_admin_approval_api_rejects_client_supplied_identity(tmp_path: Path) -> 
                     "plan_id": "admin.approval.injected-identity",
                     "approved_by": "obrien",
                 },
-                "approval-token",
+                "approval-token-strong-1",
             )
         payload = json.loads(denied.value.read().decode("utf-8"))
 
     assert denied.value.code == 400
     assert payload["error"] == "admin approval payload contains unsupported fields"
+
+
+def test_admin_execute_api_rejects_fields_other_than_plan_id(tmp_path: Path) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    plan_admin_change_status(
+        store_path,
+        "admin.execute.exact-payload",
+        "system_service_restart",
+        "overseer-approval-smoke.service",
+        "reject execution authority supplied by the client",
+        "inactive",
+    )
+
+    with approval_api(store_path) as base_url:
+        with pytest.raises(HTTPError) as denied:
+            post_json(
+                base_url,
+                "/admin/execute",
+                {
+                    "plan_id": "admin.execute.exact-payload",
+                    "executor_socket": "/tmp/attacker.sock",
+                },
+                "agent-token",
+            )
+        payload = json.loads(denied.value.read().decode("utf-8"))
+
+    assert denied.value.code == 400
+    assert payload == {"error": "admin execution payload must contain only plan_id"}
+
+
+def test_ticketed_approval_api_runs_allowlisted_restart_once_and_replays(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    target = "overseer-approval-smoke.service"
+    plan_admin_change_status(
+        store_path,
+        "admin.approval.ticket-e2e",
+        "system_service_restart",
+        target,
+        "exercise the complete independent approval boundary",
+        "inactive",
+    )
+
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    private_key_path = tmp_path / "authority.key"
+    private_key_path.write_bytes(bytes(range(32)))
+    private_key_path.chmod(0o600)
+    public_key_path = tmp_path / "executor-public.key"
+    public_key_path.write_bytes(private_key.public_key().public_bytes_raw())
+    public_key_path.chmod(0o644)
+    allowlist_path = tmp_path / "allowlist.json"
+    allowlist_path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": ALLOWLIST_SCHEMA_VERSION,
+                "allowed": [{"operation": "restart-system-unit", "unit": target}],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    allowlist_path.chmod(0o644)
+    ledger_dir = tmp_path / "executor-state"
+    ledger_dir.mkdir(mode=0o700)
+    ledger_path = ledger_dir / "ledger.sqlite3"
+    socket_path = tmp_path / "executor.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    monkeypatch.setenv("OVERSEER_ADMIN_TICKET_PRIVATE_KEY", str(private_key_path))
+    monkeypatch.setenv("OVERSEER_ADMIN_EXECUTOR_SOCKET", str(socket_path))
+    command_calls: list[tuple[str, ...]] = []
+
+    def runner(argv):
+        command_calls.append(tuple(argv))
+        return 0, b"ok\n", b""
+
+    def adapter(plan, plan_digest, **kwargs):
+        def sender(_socket_address, raw_ticket):
+            receipt = execute_ticket(
+                raw_ticket,
+                allowlist_file=allowlist_path,
+                public_key_file=public_key_path,
+                ledger=ledger_path,
+                expected_owner_uid=os.geteuid(),
+                runner=runner,
+            )
+            return json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+        return execute_system_service_restart_ticket(
+            plan,
+            plan_digest,
+            sender=sender,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(cli_module, "execute_system_service_restart_ticket", adapter)
+    try:
+        with approval_api(
+            store_path,
+            approval_token="admin-approval-secret-1",
+            roadex_approval_token="roadex-approval-secret-1",
+        ) as base_url:
+            with pytest.raises(HTTPError) as ordinary_denied:
+                post_json(
+                    base_url,
+                    "/admin/approve",
+                    {"plan_id": "admin.approval.ticket-e2e"},
+                    "agent-token",
+                )
+            with pytest.raises(HTTPError) as wrong_scope_denied:
+                post_json(
+                    base_url,
+                    "/admin/approve",
+                    {"plan_id": "admin.approval.ticket-e2e"},
+                    "roadex-approval-secret-1",
+                )
+            approval_status, approved = post_json(
+                base_url,
+                "/admin/approve",
+                {"plan_id": "admin.approval.ticket-e2e"},
+                "admin-approval-secret-1",
+            )
+            execution_status, executed = post_json(
+                base_url,
+                "/admin/execute",
+                {"plan_id": "admin.approval.ticket-e2e"},
+                "agent-token",
+            )
+            replay_status, replayed = post_json(
+                base_url,
+                "/admin/execute",
+                {"plan_id": "admin.approval.ticket-e2e"},
+                "agent-token",
+            )
+    finally:
+        listener.close()
+
+    assert ordinary_denied.value.code == 403
+    assert wrong_scope_denied.value.code == 403
+    assert approval_status == 200
+    assert approved["approved_by"] == "sisko"
+    assert execution_status == 200
+    assert executed["status"] == "completed"
+    assert executed["mutation_performed"] is True
+    assert replay_status == 200
+    assert replayed["replayed"] is True
+    assert replayed["mutation_performed"] is False
+    assert command_calls == [
+        ("/usr/bin/systemctl", "restart", "--", target),
+        ("/usr/bin/systemctl", "is-active", "--quiet", "--", target),
+    ]
 
 
 def test_direct_cli_admin_approval_is_retired(tmp_path: Path) -> None:
@@ -212,11 +386,11 @@ def test_direct_cli_admin_approval_is_retired(tmp_path: Path) -> None:
 def test_api_handler_rejects_shared_agent_and_approval_credentials(
     tmp_path: Path,
 ) -> None:
-    verifier = approval_verifier(tmp_path, "shared-token", "admin-plan-approval")
+    verifier = approval_verifier(tmp_path, "shared-token-strong-1", "admin-plan-approval")
     with pytest.raises(ValueError, match="must be independent"):
         make_api_handler(
             str(tmp_path / "overseer.sqlite3"),
-            "shared-token",
+            "shared-token-strong-1",
             admin_approval_verifier=verifier,
         )
 

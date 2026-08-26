@@ -17,15 +17,12 @@ class OverseerApiClient:
         auth_token_file: str | None = None,
         timeout_seconds: float = 5.0,
         approval_token: str | None = None,
-        approval_token_file: str | None = None,
     ) -> None:
         if auth_token and auth_token_file:
             raise ValueError("use auth_token or auth_token_file, not both")
-        if approval_token and approval_token_file:
-            raise ValueError("use approval_token or approval_token_file, not both")
         self.base_url = base_url.rstrip("/")
         self.auth_token = auth_token or _load_token(auth_token_file)
-        self.approval_token = approval_token or _load_token(approval_token_file)
+        self.approval_token = approval_token
         self.timeout_seconds = timeout_seconds
 
     def health(self) -> dict[str, Any]:

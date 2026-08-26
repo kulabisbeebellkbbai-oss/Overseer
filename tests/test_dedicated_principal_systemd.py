@@ -82,6 +82,7 @@ def test_api_and_runtime_use_the_dedicated_system_principal_and_immutable_releas
         assert _one(unit, "StateDirectoryMode") == "0700"
         assert "/etc/overseer" in unit
         assert "/var/lib/overseer/overseer.sqlite3" in unit
+        assert "Environment=OVERSEER_DEDICATED_PRINCIPAL=1" in unit
         assert "ReadOnlyPaths=@OVERSEER_RELEASE@" in unit
         assert "ReadWritePaths=/var/lib/overseer" in unit
         assert "WantedBy=multi-user.target" in unit
@@ -125,6 +126,8 @@ def test_api_uses_independent_credentials_verifiers_and_loopback_peer_channels()
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-relay.sqlite3" in api
     assert "OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798" in api
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780" in api
+    assert "Environment=OVERSEER_ADMIN_TICKET_PRIVATE_KEY=/etc/overseer/admin-ticket-private-key" in api
+    assert "Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock" in api
 
     command = _one(api, "ExecStart")
     assert "--admin-approval-verifier-file /etc/overseer/admin-approval-verifier.json" in command

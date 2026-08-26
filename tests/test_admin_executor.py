@@ -215,6 +215,16 @@ def test_socket_client_and_serve_one_require_peer_and_return_canonical_receipt(t
     assert received == json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode()
 
 
+def test_socket_client_rejects_an_unexpected_executor_peer_uid() -> None:
+    server, client = socket.socketpair()
+    try:
+        with pytest.raises(AdminExecutorError, match="executor peer"):
+            send_ticket(client, _ticket(), expected_peer_uid=os.geteuid() + 1)
+    finally:
+        client.close()
+        server.close()
+
+
 def test_unsafe_ledger_parent_is_rejected_before_database_creation(tmp_path: Path) -> None:
     allowlist, key, ledger = _executor_files(tmp_path)
     os.chmod(ledger.parent, 0o755)

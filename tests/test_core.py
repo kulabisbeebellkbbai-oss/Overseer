@@ -475,7 +475,7 @@ class LocalFakeObsidianServer:
 
 
 class LocalOverseerApiServer:
-    def __init__(self, store_path, auth_token=None, approval_token="approval-secret"):
+    def __init__(self, store_path, auth_token=None, approval_token="approval-secret-strong-1"):
         self.store_path = str(store_path)
         self.auth_token = auth_token
         self.approval_token = approval_token
@@ -1985,7 +1985,7 @@ class HealthSummaryTests(unittest.TestCase):
             status["disabled"],
             sum(1 for item in status["items"] if item["status"] == AdminAdapterStatus.DISABLED.value),
         )
-        self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
+        self.assertEqual(restart["status"], AdminAdapterStatus.UNSUPPORTED.value)
         self.assertFalse(restart["authorization_required_before_enable"])
         self.assertEqual(package["status"], AdminAdapterStatus.DISABLED.value)
         self.assertTrue(package["approval_plan_required"])
@@ -2145,8 +2145,8 @@ class HealthSummaryTests(unittest.TestCase):
             restart = plan_admin_change_status(
                 store_path,
                 "admin.restart.ready",
-                AdminChangeKind.USER_SERVICE_RESTART.value,
-                "overseer-api.service",
+                AdminChangeKind.SYSTEM_SERVICE_RESTART.value,
+                "overseer-approval-smoke.service",
                 "reload approved code",
                 "active",
             )
@@ -4458,6 +4458,10 @@ class OverseerApiTests(unittest.TestCase):
 
 
 class OverseerApiClientTests(unittest.TestCase):
+    def test_client_does_not_load_a_human_approval_secret_from_disk(self):
+        with self.assertRaises(TypeError):
+            OverseerApiClient(approval_token_file="state/human-approval-token")
+
     def test_client_lists_provider_neutral_agent_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -5421,7 +5425,7 @@ class OverseerApiClientTests(unittest.TestCase):
                 client = OverseerApiClient(
                     server.url,
                     auth_token="client-secret",
-                    approval_token="approval-secret",
+                    approval_token="approval-secret-strong-1",
                 )
                 created = client.create_host_security_source_review(
                     {
@@ -6055,7 +6059,7 @@ class OverseerApiClientTests(unittest.TestCase):
                 client = OverseerApiClient(
                     server.url,
                     auth_token="client-secret",
-                    approval_token="approval-secret",
+                    approval_token="approval-secret-strong-1",
                 )
                 client.plan_admin_change(
                     {
@@ -6089,9 +6093,11 @@ class OverseerApiClientTests(unittest.TestCase):
                 client = OverseerApiClient(server.url, auth_token="client-secret")
                 capabilities = client.admin_adapter_capabilities()
 
-            restart = next(item for item in capabilities["items"] if item["kind"] == AdminChangeKind.USER_SERVICE_RESTART.value)
+            restart = next(item for item in capabilities["items"] if item["kind"] == AdminChangeKind.SYSTEM_SERVICE_RESTART.value)
+            legacy_restart = next(item for item in capabilities["items"] if item["kind"] == AdminChangeKind.USER_SERVICE_RESTART.value)
             block = next(item for item in capabilities["items"] if item["kind"] == AdminChangeKind.BLOCK_IP.value)
             self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
+            self.assertEqual(legacy_restart["status"], AdminAdapterStatus.UNSUPPORTED.value)
             self.assertEqual(block["status"], AdminAdapterStatus.DISABLED.value)
             self.assertTrue(block["authorization_required_before_enable"])
 
@@ -6173,7 +6179,7 @@ class OverseerApiClientTests(unittest.TestCase):
                 client = OverseerApiClient(
                     server.url,
                     auth_token="client-secret",
-                    approval_token="approval-secret",
+                    approval_token="approval-secret-strong-1",
                 )
                 adapter_request = client.request_admin_adapter_enablement(
                     {
@@ -8753,9 +8759,9 @@ class AdminChangePlanTests(unittest.TestCase):
 
     def test_non_apt_admin_command_uses_default_environment(self):
         step = AdminCommandStep(
-            "Verify user service status",
-            ("systemctl", "--user", "status", "overseer-api.service", "--no-pager"),
-            "confirm service state",
+            "Run unprivileged probe",
+            ("/usr/bin/true",),
+            "confirm default environment handling",
         )
 
         with patch.object(overseer_admin.subprocess, "run") as run:
@@ -10592,7 +10598,7 @@ class UsageContinuationRequestTests(unittest.TestCase):
         self.assertEqual(messages["items"][0]["related_plan_id"], "admin.host-security.deny-tcp.22")
         self.assertIn("IDS review", messages["items"][0]["subject"])
 
-    def test_odo_advancement_executes_no_approval_ready_plan(self):
+    def test_odo_advancement_does_not_execute_retired_user_service_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
             plan = replace(
@@ -10627,12 +10633,11 @@ class UsageContinuationRequestTests(unittest.TestCase):
             approved = store.load_admin_change_plan("admin.odo.low-risk-restart")
             store.close()
 
-        self.assertEqual(status["readiness_state"], "ready_for_overseer_execution")
-        self.assertEqual(status["execution"]["status"], AdminExecutionStatus.COMPLETED.value)
-        self.assertTrue(status["execution"]["host_mutation_performed"])
-        self.assertTrue(approved.approved)
-        self.assertEqual(approved.approved_by, "odo-auto")
-        execute.assert_called_once_with(store_path, "admin.odo.low-risk-restart")
+        self.assertEqual(status["readiness_state"], "manual_execution_required")
+        self.assertNotIn("execution", status)
+        self.assertFalse(approved.approved)
+        self.assertIsNone(approved.approved_by)
+        execute.assert_not_called()
 
     def test_rejects_invalid_usage_limit_observation(self):
         with tempfile.TemporaryDirectory() as directory:

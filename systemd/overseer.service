@@ -1,6 +1,7 @@
 [Unit]
 Description=Overseer v1.1 autonomous operations runtime
 After=default.target
+ConditionPathExists=@OVERSEER_INSTALL@/.overseer-v1.1.5-rollback-release
 
 [Service]
 Type=simple

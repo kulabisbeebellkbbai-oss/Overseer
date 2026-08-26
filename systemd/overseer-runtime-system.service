@@ -9,6 +9,7 @@ Group=overseer
 WorkingDirectory=@OVERSEER_RELEASE@
 Environment=PYTHONPATH=@OVERSEER_RELEASE@/src
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=OVERSEER_DEDICATED_PRINCIPAL=1
 ExecStart=@OVERSEER_PYTHON@ -m overseer.cli run --store /var/lib/overseer/overseer.sqlite3
 Restart=on-failure
 RestartSec=5

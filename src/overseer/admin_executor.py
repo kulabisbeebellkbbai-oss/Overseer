@@ -446,7 +446,12 @@ def _error_bytes() -> bytes:
     return _canonical_json({"schemaVersion": ERROR_SCHEMA_VERSION, "error": "request rejected"}, label="error")
 
 
-def send_ticket(socket_address: str | os.PathLike[str] | socket.socket, raw_ticket: bytes) -> bytes:
+def send_ticket(
+    socket_address: str | os.PathLike[str] | socket.socket,
+    raw_ticket: bytes,
+    *,
+    expected_peer_uid: int | None = None,
+) -> bytes:
     """Send canonical ticket bytes and read one bounded canonical response."""
 
     try:
@@ -461,6 +466,15 @@ def send_ticket(socket_address: str | os.PathLike[str] | socket.socket, raw_tick
     try:
         if owned:
             sock.connect(os.fspath(socket_address))
+        if expected_peer_uid is not None:
+            if type(expected_peer_uid) is not int or expected_peer_uid < 0:
+                raise AdminExecutorError("expected executor peer UID is invalid")
+            _pid, peer_uid, _gid = struct.unpack(
+                "3i",
+                sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+            )
+            if peer_uid != expected_peer_uid:
+                raise AdminExecutorError("executor peer UID does not match the trusted principal")
         sock.sendall(payload)
         sock.shutdown(socket.SHUT_WR)
         response = _read_socket(sock, MAX_RECEIPT_BYTES)

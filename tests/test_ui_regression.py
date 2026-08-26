@@ -22,7 +22,7 @@ class LocalApiHarness:
     def __init__(self, store_path: Path, auth_token: str = "test-secret", roadex_decision_adapter_factory=None) -> None:
         self.store_path = store_path
         self.auth_token = auth_token
-        self.approval_token = "approval-secret"
+        self.approval_token = "approval-secret-strong-1"
         self.server: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.url = ""

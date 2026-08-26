@@ -91,14 +91,46 @@ def _stdlib(tmp_path: Path) -> Path:
     return root
 
 
+def _sqlite_runtime(
+    tmp_path: Path,
+    *,
+    payload: bytes = b"approved-sqlite-runtime",
+) -> tuple[Path, dict[str, object]]:
+    library = tmp_path / "libsqlite3.so.0"
+    library.write_bytes(payload)
+    library.chmod(0o555)
+    evidence = {
+        "version": activation_package_module.APPROVED_SQLITE_VERSION,
+        "sourceId": activation_package_module.APPROVED_SQLITE_SOURCE_ID,
+        "mappedExpectedLibrary": True,
+        "compileOptions": sorted(activation_package_module.REQUIRED_SQLITE_COMPILE_OPTIONS),
+    }
+    return library, evidence
+
+
 def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Path) -> None:
     checkout = _reviewed_checkout(tmp_path)
     dependencies = _dependencies(tmp_path)
     python = _python(tmp_path)
     stdlib = _stdlib(tmp_path)
+    sqlite_library, sqlite_evidence = _sqlite_runtime(tmp_path)
 
-    first = build_release_manifest(checkout, dependencies, python, stdlib)
-    second = build_release_manifest(checkout, dependencies, python, stdlib)
+    first = build_release_manifest(
+        checkout,
+        dependencies,
+        python,
+        stdlib,
+        sqlite_library,
+        _sqlite_runtime_evidence=sqlite_evidence,
+    )
+    second = build_release_manifest(
+        checkout,
+        dependencies,
+        python,
+        stdlib,
+        sqlite_library,
+        _sqlite_runtime_evidence=sqlite_evidence,
+    )
 
     assert first == second
     assert first["schemaVersion"] == "overseer.dedicated-principal-release.v1"
@@ -124,10 +156,91 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
     assert first["rootPython"]["path"] == str(python)
     assert first["rootPython"]["sha256"] == hashlib.sha256(b"python-runtime").hexdigest()
     assert first["rootPython"]["releasePath"] == "runtime/bin/python3.13"
+    assert first["sqliteRuntime"] == {
+        "path": str(sqlite_library),
+        "releasePath": "lib/libsqlite3.so.0",
+        "sha256": hashlib.sha256(b"approved-sqlite-runtime").hexdigest(),
+        "size": len(b"approved-sqlite-runtime"),
+        "mode": 0o555,
+        "uid": os.geteuid(),
+        "gid": os.getegid(),
+        "version": activation_package_module.APPROVED_SQLITE_VERSION,
+        "sourceId": activation_package_module.APPROVED_SQLITE_SOURCE_ID,
+        "sourceArchiveSha3_256": (
+            activation_package_module.APPROVED_SQLITE_ARCHIVE_SHA3_256
+        ),
+        "compileOptions": sorted(
+            activation_package_module.REQUIRED_SQLITE_COMPILE_OPTIONS
+        ),
+        "walResetFixAttested": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "invalid_field",
+    ("version", "sourceId", "mappedExpectedLibrary", "compileOptions"),
+)
+def test_release_manifest_rejects_unapproved_sqlite_runtime_identity(
+    tmp_path: Path,
+    invalid_field: str,
+) -> None:
+    checkout = _reviewed_checkout(tmp_path)
+    sqlite_library, evidence = _sqlite_runtime(tmp_path)
+    invalid_evidence = dict(evidence)
+    if invalid_field == "mappedExpectedLibrary":
+        invalid_evidence[invalid_field] = False
+    elif invalid_field == "compileOptions":
+        invalid_evidence[invalid_field] = []
+    else:
+        invalid_evidence[invalid_field] = "unapproved"
+
+    with pytest.raises(ActivationPackageError, match="identity or features"):
+        build_release_manifest(
+            checkout,
+            _dependencies(tmp_path),
+            _python(tmp_path),
+            _stdlib(tmp_path),
+            sqlite_library,
+            _sqlite_runtime_evidence=invalid_evidence,
+        )
+
+
+def test_release_manifest_rejects_mutable_or_linked_sqlite_runtime(tmp_path: Path) -> None:
+    checkout = _reviewed_checkout(tmp_path)
+    dependencies = _dependencies(tmp_path)
+    python = _python(tmp_path)
+    stdlib = _stdlib(tmp_path)
+    sqlite_library, evidence = _sqlite_runtime(tmp_path)
+    sqlite_library.chmod(0o755)
+
+    with pytest.raises(ActivationPackageError, match="metadata"):
+        build_release_manifest(
+            checkout,
+            dependencies,
+            python,
+            stdlib,
+            sqlite_library,
+            _sqlite_runtime_evidence=evidence,
+        )
+
+    sqlite_library.chmod(0o555)
+    linked_library = tmp_path / "linked-libsqlite3.so.0"
+    linked_library.symlink_to(sqlite_library)
+    with pytest.raises(ActivationPackageError, match="regular file|metadata"):
+        build_release_manifest(
+            checkout,
+            dependencies,
+            python,
+            stdlib,
+            linked_library,
+            _sqlite_runtime_evidence=evidence,
+        )
 
 
 @pytest.mark.skipif(
-    not Path("/usr/bin/python3.13").is_file() or not Path("/usr/lib/python3.13").is_dir(),
+    not Path("/usr/bin/python3.13").is_file()
+    or not Path("/usr/lib/python3.13").is_dir()
+    or not Path("/usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6").is_file(),
     reason="host Python 3.13 runtime is unavailable",
 )
 def test_copied_release_runtime_executes_with_release_local_pythonhome(tmp_path: Path) -> None:
@@ -135,7 +248,18 @@ def test_copied_release_runtime_executes_with_release_local_pythonhome(tmp_path:
     dependencies = _dependencies(tmp_path)
     python = Path("/usr/bin/python3.13")
     stdlib = Path("/usr/lib/python3.13")
-    manifest = build_release_manifest(checkout, dependencies, python, stdlib)
+    sqlite_library, sqlite_evidence = _sqlite_runtime(
+        tmp_path,
+        payload=Path("/usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6").read_bytes(),
+    )
+    manifest = build_release_manifest(
+        checkout,
+        dependencies,
+        python,
+        stdlib,
+        sqlite_library,
+        _sqlite_runtime_evidence=sqlite_evidence,
+    )
     package = tmp_path / "activation-package"
     release = stage_release_payload(
         manifest,
@@ -162,6 +286,7 @@ def test_copied_release_runtime_executes_with_release_local_pythonhome(tmp_path:
             "PYTHONUSERBASE": str(hostile_userbase),
             "PYTHONNOUSERSITE": "1",
             "PYTHONSAFEPATH": "1",
+            "LD_LIBRARY_PATH": str(release / "lib"),
             "HOSTILE_MARKER": str(hostile_marker),
         },
         capture_output=True,
@@ -179,21 +304,43 @@ def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Pa
     dependencies = _dependencies(tmp_path)
     python = _python(tmp_path)
     stdlib = _stdlib(tmp_path)
+    sqlite_library, sqlite_evidence = _sqlite_runtime(tmp_path)
     (checkout / "src" / "overseer" / "cli.py").write_text("changed\n", encoding="utf-8")
 
     with pytest.raises(ActivationPackageError, match="clean"):
-        build_release_manifest(checkout, dependencies, python, stdlib)
+        build_release_manifest(
+            checkout,
+            dependencies,
+            python,
+            stdlib,
+            sqlite_library,
+            _sqlite_runtime_evidence=sqlite_evidence,
+        )
 
     _git(checkout, "checkout", "--", "src/overseer/cli.py")
     (dependencies / "unsafe").symlink_to(dependencies / "dependency")
     with pytest.raises(ActivationPackageError, match="symlink"):
-        build_release_manifest(checkout, dependencies, python, stdlib)
+        build_release_manifest(
+            checkout,
+            dependencies,
+            python,
+            stdlib,
+            sqlite_library,
+            _sqlite_runtime_evidence=sqlite_evidence,
+        )
 
     (dependencies / "unsafe").unlink()
     linked_root = tmp_path / "linked-site-packages"
     linked_root.symlink_to(dependencies, target_is_directory=True)
     with pytest.raises(ActivationPackageError, match="roots.*symlink"):
-        build_release_manifest(checkout, linked_root, python, stdlib)
+        build_release_manifest(
+            checkout,
+            linked_root,
+            python,
+            stdlib,
+            sqlite_library,
+            _sqlite_runtime_evidence=sqlite_evidence,
+        )
 
 
 def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> None:
@@ -201,7 +348,15 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
     dependencies = _dependencies(tmp_path)
     python = _python(tmp_path)
     stdlib = _stdlib(tmp_path)
-    manifest = build_release_manifest(checkout, dependencies, python, stdlib)
+    sqlite_library, sqlite_evidence = _sqlite_runtime(tmp_path)
+    manifest = build_release_manifest(
+        checkout,
+        dependencies,
+        python,
+        stdlib,
+        sqlite_library,
+        _sqlite_runtime_evidence=sqlite_evidence,
+    )
     package = tmp_path / "activation-package"
 
     staged_release = stage_release_payload(
@@ -226,6 +381,7 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
         assert hashlib.sha256(content).hexdigest() == item["sha256"]
         assert os.stat(staged_release / item["releasePath"]).st_mode & 0o777 == item["mode"]
     assert (staged_release / "runtime" / "bin" / "python3.13").read_bytes() == b"python-runtime"
+    assert (staged_release / "lib" / "libsqlite3.so.0").read_bytes() == b"approved-sqlite-runtime"
     assert (staged_release / "release-manifest.json").read_text(encoding="utf-8") == (
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
     )
@@ -240,6 +396,17 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
         "overseer-runtime.service",
         "overseer-tmpfiles.conf",
     }
+    for name in (
+        "overseer-admin-executor@.service",
+        "overseer-api-canary.service",
+        "overseer-api.service",
+        "overseer-codex-user-bridge.service",
+        "overseer-runtime.service",
+    ):
+        assert (
+            f"Environment=LD_LIBRARY_PATH={manifest['releaseRoot']}/lib"
+            in rendered[name].read_text(encoding="utf-8")
+        )
     allowlist = json.loads(
         (package / "public" / "config" / "admin-executor-allowlist.json").read_text(
             encoding="utf-8"
@@ -511,22 +678,26 @@ def test_rehearsal_backup_remains_consistent_while_wal_writer_commits(tmp_path: 
     connection = sqlite3.connect(source)
     connection.executemany(
         "INSERT INTO retained_items(value) VALUES (?)",
-        (("x" * 2048,) for _ in range(1024)),
+        (("x" * 4096,) for _ in range(8192)),
     )
     connection.commit()
     connection.close()
     errors: list[BaseException] = []
+    commit_times: list[int] = []
+    writer_started = threading.Event()
+    stop_writer = threading.Event()
 
     def writer() -> None:
         writer_connection = sqlite3.connect(source, timeout=2)
         try:
-            for _ in range(64):
+            while not stop_writer.is_set():
                 writer_connection.execute(
                     "INSERT INTO retained_items(value) VALUES (?)",
                     ("concurrent",),
                 )
                 writer_connection.commit()
-                time.sleep(0.002)
+                commit_times.append(time.time_ns())
+                writer_started.set()
         except BaseException as error:
             errors.append(error)
         finally:
@@ -534,19 +705,50 @@ def test_rehearsal_backup_remains_consistent_while_wal_writer_commits(tmp_path: 
 
     thread = threading.Thread(target=writer, daemon=True)
     thread.start()
-    report = rehearse_store_migration(
-        tmp_path / "activation-package",
-        source_store=source,
-        pages_per_step=16,
-        sleep_seconds=0.001,
-    )
+    assert writer_started.wait(timeout=2)
+    try:
+        report = rehearse_store_migration(
+            tmp_path / "activation-package",
+            source_store=source,
+            pages_per_step=-1,
+            sleep_seconds=0,
+        )
+    finally:
+        stop_writer.set()
     thread.join(timeout=5)
 
     assert not errors
     assert not thread.is_alive()
+    backup_bounds = report["backupBounds"]
+    assert backup_bounds["pagesPerStep"] == -1
+    assert backup_bounds["sleepSeconds"] == 0
+    assert backup_bounds["singleStep"] is True
+    assert any(
+        backup_bounds["startedUnixNs"] <= committed_at <= backup_bounds["completedUnixNs"]
+        for committed_at in commit_times
+    )
     assert report["backup"]["integrityCheck"] == "ok"
     assert report["migrated"]["integrityCheck"] == "ok"
     assert report["rowCountsBefore"] == report["rowCountsAfter"]
+
+
+def test_rehearsal_backup_rejects_non_wal_store(tmp_path: Path) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    with sqlite3.connect(source) as connection:
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        connection.execute("CREATE TABLE retained_items(id INTEGER PRIMARY KEY, value TEXT)")
+    source.chmod(0o600)
+    package = tmp_path / "activation-package"
+
+    with pytest.raises(ActivationPackageError, match="WAL mode"):
+        rehearse_store_migration(
+            package,
+            source_store=source,
+            pages_per_step=-1,
+            sleep_seconds=0,
+        )
+
+    assert not (package / "private" / "migration" / "rehearsal-source.sqlite3").exists()
 
 
 def test_rehearsal_backup_rejects_insecure_or_linked_store(tmp_path: Path) -> None:
@@ -716,7 +918,15 @@ def _prepared_package(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
     dependencies = _dependencies(tmp_path)
     python = _python(tmp_path)
     stdlib = _stdlib(tmp_path)
-    manifest = build_release_manifest(checkout, dependencies, python, stdlib)
+    sqlite_library, sqlite_evidence = _sqlite_runtime(tmp_path)
+    manifest = build_release_manifest(
+        checkout,
+        dependencies,
+        python,
+        stdlib,
+        sqlite_library,
+        _sqlite_runtime_evidence=sqlite_evidence,
+    )
     package = tmp_path / "activation-package"
     stage_release_payload(
         manifest,
@@ -779,6 +989,7 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     dependencies = _dependencies(tmp_path)
     python = _python(tmp_path)
     stdlib = _stdlib(tmp_path)
+    sqlite_library, sqlite_evidence = _sqlite_runtime(tmp_path)
     psychlo, roadex, bindings = _credential_sources(tmp_path)
     source = tmp_path / "overseer.sqlite3"
     _wal_store(source)
@@ -790,6 +1001,16 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     package_parent = tmp_path / "activation-packages"
     package_parent.mkdir(mode=0o700)
     monkeypatch.setattr(activation_package_module, "APPROVED_PACKAGE_PARENT", package_parent)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_probe_sqlite_runtime",
+        lambda _python, _library: sqlite_evidence,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_assert_current_sqlite_runtime",
+        lambda _manifest: None,
+    )
     package = package_parent / "v1.1.6-abcdef0"
 
     assert activation_package_module._main(
@@ -803,6 +1024,8 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
             str(python),
             "--stdlib-root",
             str(stdlib),
+            "--sqlite-library",
+            str(sqlite_library),
             "--templates-root",
             str(ROOT / "systemd"),
             "--package-root",
@@ -836,11 +1059,13 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     migration_report = json.loads(
         (package / "private" / "migration" / "migration-report.json").read_text(encoding="utf-8")
     )
-    assert migration_report["backupBounds"] == {
-        "pagesPerStep": -1,
-        "sleepSeconds": 0,
-        "singleStep": True,
-    }
+    assert migration_report["backupBounds"]["pagesPerStep"] == -1
+    assert migration_report["backupBounds"]["sleepSeconds"] == 0
+    assert migration_report["backupBounds"]["singleStep"] is True
+    assert (
+        migration_report["backupBounds"]["startedUnixNs"]
+        <= migration_report["backupBounds"]["completedUnixNs"]
+    )
 
 
 def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_path: Path) -> None:
@@ -966,6 +1191,10 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     assert all("--user" not in command for command in rollback_transients)
     assert all("--uid=god" in command and "--gid=god" in command for command in rollback_transients)
     assert all(
+        f"--setenv=LD_LIBRARY_PATH={manifest['releaseRoot']}/lib" in command
+        for command in rollback_transients
+    )
+    assert all(
         any(value.startswith("--property=Description=overseer.rollback-transient.v1:") for value in command)
         and any(value.startswith("--setenv=OVERSEER_ROLLBACK_TRANSIENT_ID=") for value in command)
         for command in rollback_transients
@@ -981,6 +1210,26 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     assert all(command[command.index("-o") + 1] == "root" for command in rollback_installs)
     assert all(command[command.index("-g") + 1] == "god" for command in rollback_installs)
     assert all(command[command.index("-m") + 1] in {"0440", "0550"} for command in rollback_installs)
+    release_sqlite_installs = [
+        command
+        for command in staging_commands
+        if command[0] == "/usr/bin/install"
+        and command[-1] == f"{manifest['releaseRoot']}/lib/libsqlite3.so.0"
+    ]
+    assert len(release_sqlite_installs) == 1
+    assert release_sqlite_installs[0][release_sqlite_installs[0].index("-o") + 1] == "root"
+    assert release_sqlite_installs[0][release_sqlite_installs[0].index("-g") + 1] == "root"
+    assert release_sqlite_installs[0][release_sqlite_installs[0].index("-m") + 1] == "0555"
+    release_python_commands = [
+        command
+        for command in commands
+        if command and command[0] == "/usr/bin/env" and "overseer.activation_package" in command
+    ]
+    assert release_python_commands
+    assert all(
+        f"LD_LIBRARY_PATH={manifest['releaseRoot']}/lib" in command
+        for command in release_python_commands
+    )
     assert contract["rollbackCommands"][-1] == [
         "/usr/bin/curl",
         "--fail",

@@ -340,6 +340,7 @@ def test_bridge_templates_are_root_socket_activated_and_network_denied() -> None
         "@OVERSEER_RELEASE@/site-packages"
     ) in service_unit
     assert "Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime" in service_unit
+    assert "Environment=LD_LIBRARY_PATH=@OVERSEER_RELEASE@/lib" in service_unit
     assert "Environment=PYTHONNOUSERSITE=1" in service_unit
     assert "Environment=PYTHONSAFEPATH=1" in service_unit
     assert "@OVERSEER_PYTHON@ -s -P -m overseer.user_bridge" in service_unit

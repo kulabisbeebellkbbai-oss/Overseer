@@ -4,7 +4,7 @@
 
 **Goal:** Produce a closed, hash-bound v1.1.6 activation package from the final reviewed successor to baseline commit `c3379ffad988c9ea88ef870008cb341e447ba928` while leaving live v1.1.5 services, accounts, gateway, firewall, and authority database unchanged.
 
-**Architecture:** A new source-only package builder inventories the reviewed runtime source, the fixed installed dependency root, resolved Python interpreter, complete standard library, rendered systemd units, rollback inputs, and non-secret configuration. It writes an owner-only staging package, performs a throttled SQLite online-backup rehearsal into that package, migrates only a copied canary, and emits exact activation and rollback contracts. Human approval verifier secrets remain an explicit local interactive gate; the package cannot report `ready_for_approval` until both verifier documents are present and independently validated. Later activation is additionally gated by a root-owned final-package approval record, installed-artifact verification, and an exact digest-bound canary attestation.
+**Architecture:** A new source-only package builder inventories the reviewed runtime source, the fixed installed dependency root, resolved Python interpreter, complete standard library, approved private SQLite runtime, rendered systemd units, rollback inputs, and non-secret configuration. It writes an owner-only staging package, performs a single-step SQLite online-backup rehearsal into that package, migrates only a copied canary, and emits exact activation and rollback contracts. Human approval verifier secrets remain an explicit local interactive gate; the package cannot report `ready_for_approval` until both verifier documents are present and independently validated. Later activation is additionally gated by a root-owned final-package approval record, installed-artifact verification, and an exact digest-bound canary attestation.
 
 **Tech Stack:** Python 3.13, SQLite backup API, Ed25519 from `cryptography`, systemd unit templates, Git tree identity, SHA-256 canonical JSON, pytest.
 
@@ -81,9 +81,12 @@
 
 **Interfaces:**
 - Consumes: owner-only live SQLite source opened read-only.
-- Produces: throttled online backup, untouched backup digest, migrated canary digest, integrity results, schema ledger, and key-table row-count comparison.
+- Produces: WAL-attested single-step online backup, untouched backup digest, migrated canary digest, integrity results, schema ledger, and key-table row-count comparison.
 
 - [x] Test backup consistency while a WAL writer commits concurrently.
+- [x] Test the exact `pages=-1`, no-sleep path and reject non-WAL sources.
+- [x] Seal a private SQLite runtime carrying the upstream WAL-reset fix and
+  reject runtime identity, mapping, mode, link, or feature drift.
 - [x] Test source identity/mode/link checks and destination exclusive creation.
 - [x] Test migration touches only the copied canary and preserves source/backup digests.
 - [x] Test integrity failure and row-loss fail closed.

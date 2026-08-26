@@ -12,6 +12,7 @@ Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONNOUSERSITE=1
 Environment=PYTHONSAFEPATH=1
+Environment=LD_LIBRARY_PATH=@OVERSEER_RELEASE@/lib
 ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.admin_executor serve-one --allowlist-file /etc/overseer/admin-executor-allowlist.json --public-key-file /etc/overseer/admin-executor-public-key --ledger /var/lib/overseer-executor/ledger.sqlite3
 StandardInput=socket
 StandardOutput=socket

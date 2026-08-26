@@ -86,6 +86,7 @@ def test_api_and_runtime_use_the_dedicated_system_principal_and_immutable_releas
             "@OVERSEER_RELEASE@/site-packages"
         ) in unit
         assert "Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime" in unit
+        assert "Environment=LD_LIBRARY_PATH=@OVERSEER_RELEASE@/lib" in unit
         assert "Environment=PYTHONNOUSERSITE=1" in unit
         assert "Environment=PYTHONSAFEPATH=1" in unit
         assert _one(unit, "StateDirectory") == "overseer"
@@ -198,6 +199,7 @@ def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> 
     assert "ReadWritePaths=/var/lib/overseer-executor" in executor
     assert _one(executor, "CapabilityBoundingSet") == ""
     assert _one(executor, "AmbientCapabilities") == ""
+    assert "Environment=LD_LIBRARY_PATH=@OVERSEER_RELEASE@/lib" in executor
     for setting in COMMON_HARDENING:
         assert setting in executor
 

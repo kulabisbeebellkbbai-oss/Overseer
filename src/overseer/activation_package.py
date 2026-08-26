@@ -50,6 +50,28 @@ APPROVED_OVERSEER_UID = 984
 APPROVED_OVERSEER_GID = 984
 APPROVED_PACKAGE_PARENT = Path("/home/god/.local/share/overseer/activation-packages")
 APPROVED_EXECUTION_PACKAGE = Path("/var/lib/overseer-executor/approved-package")
+APPROVED_SQLITE_VERSION = "3.53.4"
+APPROVED_SQLITE_SOURCE_ID = (
+    "2026-07-24 19:02:57 "
+    "bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc"
+)
+APPROVED_SQLITE_ARCHIVE_SHA3_256 = (
+    "454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338"
+)
+REQUIRED_SQLITE_COMPILE_OPTIONS = frozenset(
+    {
+        "ENABLE_COLUMN_METADATA",
+        "ENABLE_FTS5",
+        "ENABLE_MATH_FUNCTIONS",
+        "ENABLE_PREUPDATE_HOOK",
+        "ENABLE_RTREE",
+        "ENABLE_SESSION",
+        "ENABLE_UNLOCK_NOTIFY",
+        "MAX_VARIABLE_NUMBER=250000",
+        "THREADSAFE=1",
+        "USE_URI",
+    }
+)
 CANARY_REQUIRED_CONTROLS = (
     "apiHealth",
     "usageBridgeBounded",
@@ -360,11 +382,138 @@ def _file_entry(
     }
 
 
+def _probe_sqlite_runtime(
+    root_python: Path,
+    sqlite_library: Path,
+) -> dict[str, object]:
+    script = """
+import json
+import sqlite3
+from pathlib import Path
+
+expected = Path(__import__('os').environ['OVERSEER_EXPECTED_SQLITE_LIBRARY']).resolve()
+mapped = {
+    Path(line.split()[-1]).resolve()
+    for line in Path('/proc/self/maps').read_text(encoding='utf-8').splitlines()
+    if line.split() and line.split()[-1].startswith('/')
+}
+with sqlite3.connect(':memory:') as connection:
+    result = {
+        'version': sqlite3.sqlite_version,
+        'sourceId': connection.execute('SELECT sqlite_source_id()').fetchone()[0],
+        'compileOptions': sorted(row[0] for row in connection.execute('PRAGMA compile_options')),
+        'mappedExpectedLibrary': expected in mapped,
+    }
+print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(',', ':')))
+"""
+    environment = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "LD_LIBRARY_PATH": str(sqlite_library.parent),
+        "OVERSEER_EXPECTED_SQLITE_LIBRARY": str(sqlite_library),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONSAFEPATH": "1",
+    }
+    try:
+        result = subprocess.run(
+            [str(root_python), "-I", "-s", "-P", "-c", script],
+            cwd="/",
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    except OSError as error:
+        raise ActivationPackageError("approved SQLite runtime probe could not start") from error
+    try:
+        evidence = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("approved SQLite runtime probe output is invalid") from error
+    if result.returncode != 0 or not isinstance(evidence, dict):
+        raise ActivationPackageError("approved SQLite runtime probe failed")
+    return evidence
+
+
+def _validated_sqlite_runtime(
+    *,
+    root_python: Path,
+    sqlite_library: Path,
+    supplied_evidence: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    raw, metadata = _stable_read(sqlite_library)
+    if (
+        sqlite_library.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o555
+    ):
+        raise ActivationPackageError("approved SQLite runtime library metadata is invalid")
+    evidence = dict(supplied_evidence) if supplied_evidence is not None else _probe_sqlite_runtime(
+        root_python,
+        sqlite_library,
+    )
+    options = evidence.get("compileOptions")
+    if (
+        evidence.get("version") != APPROVED_SQLITE_VERSION
+        or evidence.get("sourceId") != APPROVED_SQLITE_SOURCE_ID
+        or evidence.get("mappedExpectedLibrary") is not True
+        or not isinstance(options, list)
+        or not all(isinstance(value, str) for value in options)
+        or not REQUIRED_SQLITE_COMPILE_OPTIONS.issubset(set(options))
+    ):
+        raise ActivationPackageError("approved SQLite runtime identity or features are invalid")
+    return {
+        "path": str(sqlite_library),
+        "releasePath": "lib/libsqlite3.so.0",
+        "sha256": _sha256(raw),
+        "size": len(raw),
+        "mode": 0o555,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "version": APPROVED_SQLITE_VERSION,
+        "sourceId": APPROVED_SQLITE_SOURCE_ID,
+        "sourceArchiveSha3_256": APPROVED_SQLITE_ARCHIVE_SHA3_256,
+        "compileOptions": sorted(options),
+        "walResetFixAttested": True,
+    }
+
+
+def _assert_current_sqlite_runtime(manifest: Mapping[str, object]) -> None:
+    sqlite_runtime = manifest.get("sqliteRuntime")
+    if not isinstance(sqlite_runtime, Mapping) or not isinstance(sqlite_runtime.get("path"), str):
+        raise ActivationPackageError("release SQLite runtime manifest is invalid")
+    expected = Path(str(sqlite_runtime["path"])).resolve()
+    try:
+        mapped = {
+            Path(line.split()[-1]).resolve()
+            for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
+            if line.split() and line.split()[-1].startswith("/")
+        }
+        with sqlite3.connect(":memory:") as connection:
+            source_id = str(connection.execute("SELECT sqlite_source_id()").fetchone()[0])
+            options = {str(row[0]) for row in connection.execute("PRAGMA compile_options")}
+    except (OSError, sqlite3.Error, TypeError, IndexError) as error:
+        raise ActivationPackageError("current SQLite runtime could not be attested") from error
+    if (
+        sqlite3.sqlite_version != APPROVED_SQLITE_VERSION
+        or source_id != APPROVED_SQLITE_SOURCE_ID
+        or expected not in mapped
+        or not REQUIRED_SQLITE_COMPILE_OPTIONS.issubset(options)
+    ):
+        raise ActivationPackageError("package preparation is not using the approved SQLite runtime")
+
+
 def build_release_manifest(
     checkout: str | os.PathLike[str],
     dependency_root: str | os.PathLike[str],
     root_python: str | os.PathLike[str],
     stdlib_root: str | os.PathLike[str],
+    sqlite_library: str | os.PathLike[str],
+    *,
+    _sqlite_runtime_evidence: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a deterministic manifest from a clean reviewed checkout."""
 
@@ -377,6 +526,7 @@ def build_release_manifest(
     selected_dependencies = lexical_dependencies.resolve()
     selected_stdlib = lexical_stdlib.resolve()
     selected_python = Path(root_python)
+    selected_sqlite = Path(sqlite_library)
     if _git(selected_checkout, "status", "--porcelain=v1", "--untracked-files=all").strip():
         raise ActivationPackageError("reviewed Git checkout must be clean")
     commit = _git(selected_checkout, "rev-parse", "HEAD^{commit}").strip().decode("ascii").lower()
@@ -421,6 +571,11 @@ def build_release_manifest(
         raise ActivationPackageError("release inventory paths are not unique")
 
     python_content, python_metadata = _stable_read(selected_python)
+    sqlite_runtime = _validated_sqlite_runtime(
+        root_python=selected_python,
+        sqlite_library=selected_sqlite,
+        supplied_evidence=_sqlite_runtime_evidence,
+    )
     unsigned: dict[str, object] = {
         "schemaVersion": RELEASE_SCHEMA,
         "sourceCommit": commit,
@@ -435,6 +590,7 @@ def build_release_manifest(
             "uid": python_metadata.st_uid,
             "gid": python_metadata.st_gid,
         },
+        "sqliteRuntime": sqlite_runtime,
     }
     digest = _sha256(_canonical(unsigned))
     manifest = {
@@ -991,17 +1147,27 @@ def rehearse_store_migration(
     os.close(descriptor)
     source_connection = sqlite3.connect(_sqlite_uri(source), uri=True, timeout=5)
     target_connection = sqlite3.connect(backup, timeout=5)
+    source_journal_mode = ""
+    backup_started_unix_ns = 0
+    backup_completed_unix_ns = 0
     try:
+        journal_row = source_connection.execute("PRAGMA journal_mode").fetchone()
+        source_journal_mode = str(journal_row[0]).lower() if journal_row else ""
+        if source_journal_mode != "wal":
+            raise ActivationPackageError("source SQLite store must remain in WAL mode")
+
         def progress(_status: int, remaining: int, _total: int) -> None:
             if remaining and sleep_seconds:
                 time.sleep(float(sleep_seconds))
 
+        backup_started_unix_ns = time.time_ns()
         source_connection.backup(
             target_connection,
             pages=pages_per_step,
             progress=progress,
             sleep=0,
         )
+        backup_completed_unix_ns = time.time_ns()
         target_connection.commit()
     except BaseException:
         target_connection.close()
@@ -1047,6 +1213,7 @@ def rehearse_store_migration(
             "inode": before.st_ino,
             "mode": "0600",
             "sizeAtStart": before.st_size,
+            "journalMode": source_journal_mode,
         },
         "backup": {
             "path": str(backup),
@@ -1069,6 +1236,8 @@ def rehearse_store_migration(
             "pagesPerStep": pages_per_step,
             "sleepSeconds": sleep_seconds,
             "singleStep": pages_per_step == -1,
+            "startedUnixNs": backup_started_unix_ns,
+            "completedUnixNs": backup_completed_unix_ns,
         },
         "sourceMutationPerformed": False,
         "finalQuiescedBackupRequired": True,
@@ -1525,6 +1694,23 @@ def stage_release_payload(
     if len(python_content) != root_python.get("size") or _sha256(python_content) != root_python.get("sha256"):
         raise ActivationPackageError("root Python drifted after manifest")
     _write_new(target / _safe_relative(python_release_path), python_content, 0o555)
+    sqlite_runtime = manifest.get("sqliteRuntime")
+    if not isinstance(sqlite_runtime, Mapping):
+        raise ActivationPackageError("release SQLite runtime manifest is invalid")
+    sqlite_path = sqlite_runtime.get("path")
+    sqlite_release_path = sqlite_runtime.get("releasePath")
+    if not isinstance(sqlite_path, str) or not isinstance(sqlite_release_path, str):
+        raise ActivationPackageError("release SQLite runtime manifest is invalid")
+    sqlite_content, _sqlite_metadata = _stable_read(Path(sqlite_path))
+    if (
+        len(sqlite_content) != sqlite_runtime.get("size")
+        or _sha256(sqlite_content) != sqlite_runtime.get("sha256")
+        or sqlite_runtime.get("version") != APPROVED_SQLITE_VERSION
+        or sqlite_runtime.get("sourceId") != APPROVED_SQLITE_SOURCE_ID
+        or sqlite_runtime.get("walResetFixAttested") is not True
+    ):
+        raise ActivationPackageError("approved SQLite runtime drifted after manifest")
+    _write_new(target / _safe_relative(sqlite_release_path), sqlite_content, 0o555)
     _write_new(target / "release-manifest.json", _canonical(dict(manifest)) + b"\n", 0o444)
     return target
 
@@ -2091,6 +2277,25 @@ def _release_install_commands(package: Path, manifest: Mapping[str, object]) -> 
             str(python_target),
         ]
     )
+    sqlite_runtime = manifest.get("sqliteRuntime")
+    if not isinstance(sqlite_runtime, Mapping) or not isinstance(sqlite_runtime.get("releasePath"), str):
+        raise ActivationPackageError("release SQLite runtime manifest is invalid")
+    sqlite_relative = Path(_safe_relative(str(sqlite_runtime["releasePath"])))
+    sqlite_target = release_root / sqlite_relative
+    directories.update(sqlite_target.parents)
+    commands.append(
+        [
+            "/usr/bin/install",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0555",
+            str(staged_root / sqlite_relative),
+            str(sqlite_target),
+        ]
+    )
     selected_directories = sorted(
         (directory for directory in directories if str(directory).startswith(str(release_root))),
         key=lambda path: (len(path.parts), str(path)),
@@ -2277,6 +2482,7 @@ def render_activation_contract(
     final_store = Path("/var/lib/overseer/overseer.sqlite3")
     migration_command = [
         "/usr/bin/env",
+        f"LD_LIBRARY_PATH={release_root}/lib",
         f"PYTHONHOME={release_root}/runtime",
         f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
         "PYTHONNOUSERSITE=1",
@@ -2334,6 +2540,7 @@ def render_activation_contract(
     ]
     activation_python = [
         "/usr/bin/env",
+        f"LD_LIBRARY_PATH={release_root}/lib",
         f"PYTHONHOME={release_root}/runtime",
         f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
         "PYTHONNOUSERSITE=1",
@@ -2419,6 +2626,7 @@ def render_activation_contract(
             "--property=RestartSec=5s",
             f"--working-directory={rollback_bundle_root / 'v1.1.5-release'}",
             f"--setenv=PYTHONHOME={release_root}/runtime",
+            f"--setenv=LD_LIBRARY_PATH={release_root}/lib",
             f"--setenv=PYTHONPATH={rollback_bundle_root / 'v1.1.5-release' / 'src'}:{release_root}/site-packages",
             "--setenv=PYTHONNOUSERSITE=1",
             "--setenv=PYTHONSAFEPATH=1",
@@ -2445,6 +2653,7 @@ def render_activation_contract(
             "--property=LoadCredential=roadex-project-human-thread-secret:/home/god/.config/overseer/project-human-thread-relay.secret",
             f"--working-directory={rollback_bundle_root / 'v1.1.5-release'}",
             f"--setenv=PYTHONHOME={release_root}/runtime",
+            f"--setenv=LD_LIBRARY_PATH={release_root}/lib",
             f"--setenv=PYTHONPATH={rollback_bundle_root / 'v1.1.5-release' / 'src'}:{release_root}/site-packages",
             "--setenv=PYTHONDONTWRITEBYTECODE=1",
             "--setenv=PYTHONNOUSERSITE=1",
@@ -4181,6 +4390,7 @@ def _main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--dependency-root", required=True)
     prepare.add_argument("--root-python", required=True)
     prepare.add_argument("--stdlib-root", required=True)
+    prepare.add_argument("--sqlite-library", required=True)
     prepare.add_argument("--templates-root", required=True)
     prepare.add_argument("--package-root", required=True)
     prepare.add_argument("--psychlo-secret-file", required=True)
@@ -4313,7 +4523,9 @@ def _main(argv: list[str] | None = None) -> int:
             args.dependency_root,
             args.root_python,
             args.stdlib_root,
+            args.sqlite_library,
         )
+        _assert_current_sqlite_runtime(manifest)
         stage_release_payload(
             manifest,
             checkout=args.checkout,

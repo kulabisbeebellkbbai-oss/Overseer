@@ -12,6 +12,7 @@ Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONNOUSERSITE=1
 Environment=PYTHONSAFEPATH=1
+Environment=LD_LIBRARY_PATH=@OVERSEER_RELEASE@/lib
 Environment=OVERSEER_DEDICATED_PRINCIPAL=1
 ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.cli run --store /var/lib/overseer/overseer.sqlite3
 Restart=on-failure

@@ -13,6 +13,7 @@ Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONNOUSERSITE=1
 Environment=PYTHONSAFEPATH=1
+Environment=LD_LIBRARY_PATH=@OVERSEER_RELEASE@/lib
 Environment=OVERSEER_DEDICATED_PRINCIPAL=1
 Environment=OVERSEER_ADMIN_TICKET_PRIVATE_KEY=/etc/overseer/admin-ticket-private-key
 Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock

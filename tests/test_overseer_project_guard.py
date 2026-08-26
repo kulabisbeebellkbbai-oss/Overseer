@@ -269,6 +269,15 @@ class OverseerProjectGuardTests(unittest.TestCase):
         self.assertFalse(linked["accepted"])
         self.assertEqual(linked["failure_class"], "unavailable")
 
+    def test_api_token_reader_handles_partial_kernel_reads(self) -> None:
+        original_read = guard.os.read
+
+        def partial_read(descriptor: int, size: int) -> bytes:
+            return original_read(descriptor, min(size, 3))
+
+        with patch.object(guard.os, "read", side_effect=partial_read):
+            self.assertEqual(guard.read_api_token(str(self.token_file)), "ordinary-api-token")
+
     def test_hook_rejects_non_loopback_api_origin_without_disclosing_token(self) -> None:
         claim = {
             "record_type": "crew_message",

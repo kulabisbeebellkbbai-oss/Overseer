@@ -125,6 +125,7 @@ def test_api_uses_independent_credentials_verifiers_and_loopback_peer_channels()
     assert "OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-peer-secret" in api
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_SECRET_FILE=%d/roadex-peer-secret" in api
     assert "OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-bridge.sqlite3" in api
+    assert "OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=/etc/overseer/psychlo-project-bindings.json" in api
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-relay.sqlite3" in api
     assert "OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798" in api
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780" in api
@@ -158,6 +159,8 @@ def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> 
     assert _one(executor, "StateDirectoryMode") == "0700"
     assert "StandardInput=socket" in executor
     assert "StandardOutput=socket" in executor
+    assert _one(executor, "RuntimeMaxSec") == "30s"
+    assert _one(executor, "TimeoutStopSec") == "5s"
     assert _one(executor, "RestrictAddressFamilies") == "AF_UNIX"
     assert "PrivateNetwork=yes" in executor
     assert "ReadOnlyPaths=/etc/overseer" in executor

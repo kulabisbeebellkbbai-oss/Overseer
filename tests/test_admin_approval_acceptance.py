@@ -168,6 +168,68 @@ def test_admin_approval_api_requires_independent_token_and_derives_identity(
     assert approved["approved_by"] == "sisko"
 
 
+def test_admin_approval_api_rejects_secret_reused_by_another_approval_scope(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    plan_admin_change_status(
+        store_path,
+        "admin.approval.scope-collision",
+        "system_service_restart",
+        "overseer-approval-smoke.service",
+        "reject a human credential shared by two approval scopes",
+        "inactive",
+    )
+
+    reused_secret = "reused-human-approval-secret-1"
+    with approval_api(
+        store_path,
+        approval_token=reused_secret,
+        roadex_approval_token=reused_secret,
+    ) as base_url:
+        with pytest.raises(HTTPError) as denied:
+            post_json(
+                base_url,
+                "/admin/approve",
+                {"plan_id": "admin.approval.scope-collision"},
+                reused_secret,
+            )
+        payload = json.loads(denied.value.read().decode("utf-8"))
+
+    assert denied.value.code == 403
+    assert payload == {
+        "error": "unauthorized",
+        "reason": "approval_credential_scope_collision",
+    }
+
+
+def test_roadex_approval_api_rejects_secret_reused_by_another_approval_scope(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    reused_secret = "reused-human-approval-secret-1"
+
+    with approval_api(
+        store_path,
+        approval_token=reused_secret,
+        roadex_approval_token=reused_secret,
+    ) as base_url:
+        with pytest.raises(HTTPError) as denied:
+            post_json(
+                base_url,
+                "/roadex/approval-fixtures/approve",
+                {},
+                reused_secret,
+            )
+        payload = json.loads(denied.value.read().decode("utf-8"))
+
+    assert denied.value.code == 403
+    assert payload == {
+        "error": "unauthorized",
+        "reason": "approval_credential_scope_collision",
+    }
+
+
 def test_admin_approval_api_rejects_client_supplied_identity(tmp_path: Path) -> None:
     store_path = tmp_path / "overseer.sqlite3"
     plan_admin_change_status(

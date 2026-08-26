@@ -225,6 +225,66 @@ def test_socket_client_rejects_an_unexpected_executor_peer_uid() -> None:
         server.close()
 
 
+def test_socket_client_and_server_apply_bounded_io_timeouts(tmp_path: Path) -> None:
+    allowlist, key, ledger = _executor_files(tmp_path)
+    server, client = socket.socketpair()
+    observed: dict[str, float | None] = {}
+
+    def serve() -> None:
+        observed["server"] = None
+
+        def runner(argv):
+            observed["server"] = server.gettimeout()
+            return 0, b"ok\n", b""
+
+        serve_one(
+            server,
+            allowlist_file=allowlist,
+            public_key_file=key,
+            ledger=ledger,
+            authority_uid=os.getuid(),
+            expected_owner_uid=os.getuid(),
+            now=NOW,
+            runner=runner,
+            timeout_seconds=0.25,
+        )
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    send_ticket(client, _ticket(), timeout_seconds=0.25)
+    thread.join(timeout=3)
+    try:
+        assert observed["server"] == 0.25
+        assert client.gettimeout() is None
+        assert server.gettimeout() is None
+    finally:
+        client.close()
+        server.close()
+
+
+def test_socket_client_times_out_when_executor_never_replies() -> None:
+    server, client = socket.socketpair()
+    try:
+        with pytest.raises(AdminExecutorError, match="timed out"):
+            send_ticket(client, _ticket(), timeout_seconds=0.01)
+        assert client.gettimeout() is None
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize("timeout_seconds", [0, -1, 30.01, float("inf"), None, True])
+def test_socket_client_rejects_unbounded_io_timeout(timeout_seconds) -> None:
+    server, client = socket.socketpair()
+    try:
+        with pytest.raises(AdminExecutorError, match="timeout"):
+            send_ticket(client, _ticket(), timeout_seconds=timeout_seconds)
+        assert client.gettimeout() is None
+    finally:
+        client.close()
+        server.close()
+
+
 def test_unsafe_ledger_parent_is_rejected_before_database_creation(tmp_path: Path) -> None:
     allowlist, key, ledger = _executor_files(tmp_path)
     os.chmod(ledger.parent, 0o755)

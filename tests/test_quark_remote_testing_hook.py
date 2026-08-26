@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import subprocess
@@ -5,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -14,6 +16,10 @@ from overseer.store import SQLiteStore
 
 
 HOOK = Path(__file__).resolve().parents[1] / "scripts" / "quark_remote_testing_stop_hook.py"
+SPEC = importlib.util.spec_from_file_location("quark_remote_testing_stop_hook", HOOK)
+assert SPEC and SPEC.loader
+hook = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(hook)
 
 
 def _write_transcript(path: Path, user_text: str, assistant_text: str) -> None:
@@ -219,6 +225,15 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
         self.assertNotIn("import_overseer", source)
         self.assertNotIn("OVERSEER_STORE", source)
         self.assertNotIn("OVERSEER_SOURCE_ROOT", source)
+
+    def test_api_token_reader_handles_partial_kernel_reads(self):
+        original_read = hook.os.read
+
+        def partial_read(descriptor: int, size: int) -> bytes:
+            return original_read(descriptor, min(size, 3))
+
+        with patch.object(hook.os, "read", side_effect=partial_read):
+            self.assertEqual(hook._read_api_token(self.token_file), "ordinary-api-token")
 
     def test_hook_continuation_does_not_queue_without_existing_job(self):
         with tempfile.TemporaryDirectory() as directory:

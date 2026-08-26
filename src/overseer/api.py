@@ -1688,11 +1688,17 @@ def make_api_handler(
                 return
             if path == "/roadex/approval-fixtures/approve":
                 header = self.headers.get("authorization", "")
-                approval_identity = (
-                    roadex_fixture_approval_verifier.authenticate_bearer_header(header)
-                    if roadex_fixture_approval_verifier is not None
-                    else None
+                admin_identity, approval_identity = _approval_scope_identities(
+                    header,
+                    admin_approval_verifier,
+                    roadex_fixture_approval_verifier,
                 )
+                if admin_identity is not None and approval_identity is not None:
+                    self._write_json(
+                        {"error": "unauthorized", "reason": "approval_credential_scope_collision"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
                 if approval_identity is None:
                     self._write_json(
                         {"error": "unauthorized", "reason": "independent_human_token_required"},
@@ -1709,11 +1715,17 @@ def make_api_handler(
                 return
             if path == "/admin/approve":
                 header = self.headers.get("authorization", "")
-                approval_identity = (
-                    admin_approval_verifier.authenticate_bearer_header(header)
-                    if admin_approval_verifier is not None
-                    else None
+                approval_identity, roadex_identity = _approval_scope_identities(
+                    header,
+                    admin_approval_verifier,
+                    roadex_fixture_approval_verifier,
                 )
+                if approval_identity is not None and roadex_identity is not None:
+                    self._write_json(
+                        {"error": "unauthorized", "reason": "approval_credential_scope_collision"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
                 if approval_identity is None:
                     self._write_json(
                         {"error": "unauthorized", "reason": "independent_approval_token_required"},
@@ -2841,6 +2853,26 @@ def _validate_approval_authentication(
             raise ValueError(f"{scope} verifier has the wrong approval scope")
         if verifier is not None and auth_token is not None and verifier.verify(auth_token):
             raise ValueError("Human approval verifier must be independent from the agent token")
+
+
+def _approval_scope_identities(
+    authorization: object,
+    admin_approval_verifier: ApprovalVerifier | None,
+    roadex_fixture_approval_verifier: ApprovalVerifier | None,
+) -> tuple[str | None, str | None]:
+    """Authenticate one header against both human scopes to reject secret reuse."""
+
+    admin_identity = (
+        admin_approval_verifier.authenticate_bearer_header(authorization)
+        if admin_approval_verifier is not None
+        else None
+    )
+    roadex_identity = (
+        roadex_fixture_approval_verifier.authenticate_bearer_header(authorization)
+        if roadex_fixture_approval_verifier is not None
+        else None
+    )
+    return admin_identity, roadex_identity
 
 
 def load_auth_token(token_file: str | None) -> str | None:

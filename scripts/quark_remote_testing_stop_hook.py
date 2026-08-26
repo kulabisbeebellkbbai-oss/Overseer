@@ -161,6 +161,20 @@ def _validate_token_metadata(metadata: os.stat_result) -> None:
         raise OverseerApiError("API token file is too large")
 
 
+def _read_token_bytes(descriptor: int, expected_size: int) -> bytes:
+    raw = bytearray()
+    while len(raw) <= MAX_TOKEN_BYTES:
+        chunk = os.read(descriptor, min(4096, MAX_TOKEN_BYTES + 1 - len(raw)))
+        if not chunk:
+            break
+        raw.extend(chunk)
+    if len(raw) > MAX_TOKEN_BYTES:
+        raise OverseerApiError("API token file is too large")
+    if len(raw) != expected_size:
+        raise OverseerApiError("API token file was not read completely")
+    return bytes(raw)
+
+
 def _read_api_token(path: Path) -> str:
     try:
         before = os.lstat(path)
@@ -172,11 +186,9 @@ def _read_api_token(path: Path) -> str:
         try:
             opened = os.fstat(descriptor)
             _validate_token_metadata(opened)
-            if not _same_file(before, opened):
+            if not _same_file(before, opened) or opened.st_size != before.st_size:
                 raise OverseerApiError("API token file changed while opening")
-            raw = os.read(descriptor, MAX_TOKEN_BYTES + 1)
-            if len(raw) > MAX_TOKEN_BYTES:
-                raise OverseerApiError("API token file is too large")
+            raw = _read_token_bytes(descriptor, opened.st_size)
             after = os.fstat(descriptor)
             _validate_token_metadata(after)
             if not _same_file(opened, after) or after.st_size != before.st_size:

@@ -12,6 +12,8 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=@OVERSEER_PYTHON@ -m overseer.admin_executor serve-one --allowlist-file /etc/overseer/admin-executor-allowlist.json --public-key-file /etc/overseer/admin-executor-public-key --ledger /var/lib/overseer-executor/ledger.sqlite3
 StandardInput=socket
 StandardOutput=socket
+RuntimeMaxSec=30s
+TimeoutStopSec=5s
 StateDirectory=overseer-executor
 StateDirectoryMode=0700
 ReadOnlyPaths=@OVERSEER_RELEASE@

@@ -62,7 +62,11 @@ records the server-owned `sisko` identity plus a server-generated timestamp.
 Client-supplied identity or timestamp fields are rejected. The dashboard keeps
 the submitted secret only in its password field and clears it after every
 approval attempt. Overseer stores only the strict scrypt verifier document,
-never the approval secret.
+never the approval secret. Admin and Roadex verifier documents use separate
+secrets. Since their salted digests are intentionally not directly comparable,
+each approval request is authenticated against both verifiers and is rejected
+with `approval_credential_scope_collision` if the submitted bearer verifies
+for both scopes.
 
 Completed admin execution is replay-safe. Repeating execution for a plan that
 already has a completed result returns the original result with
@@ -103,7 +107,10 @@ plan-digest-bound, short-lived Ed25519 ticket. The root-owned executor verifies
 the ticket and durable nonce claim, reconstructs its command from the
 root-owned allowlist, and records a terminal receipt. Package install, package
 index refresh, package upgrade, firewall, Docker, mount, arbitrary service,
-and all other privileged operations remain disabled.
+and all other privileged operations remain disabled. Executor socket reads and
+writes use a five-second default with a hard thirty-second maximum, caller
+socket timeout state is restored, and the service instance is capped by
+`RuntimeMaxSec=30s` with a five-second stop timeout.
 
 Live admin execution is described by an explicit adapter capability table.
 `system_service_restart` is the only enabled restart capability and it can

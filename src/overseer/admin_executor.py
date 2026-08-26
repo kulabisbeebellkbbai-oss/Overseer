@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pwd
 import socket
@@ -26,6 +27,8 @@ MAX_ALLOWLIST_BYTES = 4096
 MAX_RECEIPT_BYTES = 8192
 MAX_SOCKET_BYTES = 4096
 MAX_OUTPUT_BYTES = 2048
+SOCKET_IO_TIMEOUT_SECONDS = 5.0
+MAX_SOCKET_IO_TIMEOUT_SECONDS = 30.0
 _UNIT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@%_.:-")
 
 
@@ -442,6 +445,17 @@ def _read_socket(sock: socket.socket, limit: int) -> bytes:
     raise AdminExecutorError("socket request exceeds the maximum size")
 
 
+def _bounded_socket_timeout(value: object) -> float:
+    if (
+        type(value) not in (int, float)
+        or not math.isfinite(value)
+        or value <= 0
+        or value > MAX_SOCKET_IO_TIMEOUT_SECONDS
+    ):
+        raise AdminExecutorError("executor socket timeout is outside the bounded range")
+    return float(value)
+
+
 def _error_bytes() -> bytes:
     return _canonical_json({"schemaVersion": ERROR_SCHEMA_VERSION, "error": "request rejected"}, label="error")
 
@@ -451,6 +465,7 @@ def send_ticket(
     raw_ticket: bytes,
     *,
     expected_peer_uid: int | None = None,
+    timeout_seconds: float = SOCKET_IO_TIMEOUT_SECONDS,
 ) -> bytes:
     """Send canonical ticket bytes and read one bounded canonical response."""
 
@@ -461,9 +476,12 @@ def send_ticket(
         raise AdminExecutorError("ticket is not canonical") from error
     if len(payload) > MAX_SOCKET_BYTES:
         raise AdminExecutorError("ticket exceeds the socket limit")
+    timeout = _bounded_socket_timeout(timeout_seconds)
     owned = isinstance(socket_address, (str, os.PathLike))
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) if owned else socket_address
+    previous_timeout = None if owned else sock.gettimeout()
     try:
+        sock.settimeout(timeout)
         if owned:
             sock.connect(os.fspath(socket_address))
         if expected_peer_uid is not None:
@@ -480,9 +498,13 @@ def send_ticket(
         response = _read_socket(sock, MAX_RECEIPT_BYTES)
         _parse_canonical(response, limit=MAX_RECEIPT_BYTES, label="receipt")
         return response
+    except TimeoutError as error:
+        raise AdminExecutorError("executor socket I/O timed out") from error
     finally:
         if owned:
             sock.close()
+        else:
+            sock.settimeout(previous_timeout)
 
 
 def serve_one(
@@ -495,37 +517,46 @@ def serve_one(
     expected_owner_uid: int = 0,
     runner: Callable[[Sequence[str]], object] | None = None,
     now: object | None = None,
+    timeout_seconds: float = SOCKET_IO_TIMEOUT_SECONDS,
 ) -> int:
     """Serve exactly one systemd Accept=yes connection without traceback output."""
 
+    timeout = _bounded_socket_timeout(timeout_seconds)
     owned = isinstance(socket_fd, int)
     sock = socket.socket(fileno=os.dup(socket_fd)) if owned else socket_fd
+    previous_timeout = None if owned else sock.gettimeout()
     try:
-        _pid, peer_uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if peer_uid != authority_uid:
-            raise AdminExecutorError("socket peer is not the authority")
-        raw = _read_socket(sock, MAX_SOCKET_BYTES)
-        response = execute_ticket(
-            raw,
-            allowlist_file=allowlist_file,
-            public_key_file=public_key_file,
-            ledger=ledger,
-            expected_owner_uid=expected_owner_uid,
-            runner=runner,
-            now=now,
-        )
-        encoded = _canonical_json(response, label="receipt")
-    except Exception:
-        encoded = _error_bytes()
-    try:
-        sock.sendall(encoded[:MAX_RECEIPT_BYTES])
+        sock.settimeout(timeout)
         try:
-            sock.shutdown(socket.SHUT_WR)
+            _pid, peer_uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if peer_uid != authority_uid:
+                raise AdminExecutorError("socket peer is not the authority")
+            raw = _read_socket(sock, MAX_SOCKET_BYTES)
+            response = execute_ticket(
+                raw,
+                allowlist_file=allowlist_file,
+                public_key_file=public_key_file,
+                ledger=ledger,
+                expected_owner_uid=expected_owner_uid,
+                runner=runner,
+                now=now,
+            )
+            encoded = _canonical_json(response, label="receipt")
+        except Exception:
+            encoded = _error_bytes()
+        try:
+            sock.sendall(encoded[:MAX_RECEIPT_BYTES])
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
         except OSError:
             pass
     finally:
         if owned:
             sock.close()
+        else:
+            sock.settimeout(previous_timeout)
     return 0
 
 
@@ -569,7 +600,9 @@ __all__ = [
     "MAX_ALLOWLIST_BYTES",
     "MAX_OUTPUT_BYTES",
     "MAX_RECEIPT_BYTES",
+    "MAX_SOCKET_IO_TIMEOUT_SECONDS",
     "RECEIPT_SCHEMA_VERSION",
+    "SOCKET_IO_TIMEOUT_SECONDS",
     "execute_ticket",
     "load_allowlist",
     "main",

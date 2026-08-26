@@ -17,6 +17,7 @@ Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock
 Environment=OVERSEER_USER_BRIDGE_SERVER_UID=@GOD_UID@
 Environment=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798
 Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-bridge.sqlite3
+Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=/etc/overseer/psychlo-project-bindings.json
 Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-peer-secret
 Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-relay.sqlite3
 Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_SECRET_FILE=%d/roadex-peer-secret

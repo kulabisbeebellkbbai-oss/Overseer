@@ -1649,12 +1649,13 @@ def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_pa
     monkeypatch.setattr(system, "_reject_api_context", lambda: None)
     monkeypatch.setattr(system, "_authority_files_present", lambda _spec, _plan_id: True)
     monkeypatch.setattr(system, "verify_system_activation_spec", lambda _spec: None)
-    runner = lambda step: AdminCommandResult(step.title, step.command, 0)
+    runner = lambda step: pytest.fail(f"retired activation ran {step.command}")
     blocked = cli.execute_admin_change_status(store, "admin.codex-dispatch.e2e", runner=runner)
     assert blocked["status"] == "blocked"
-    assert "external isolated CLI" in blocked["summary"]
+    assert "retired" in blocked["summary"]
     with system.external_activation_cli():
         result = cli.execute_admin_change_status(store, "admin.codex-dispatch.e2e", runner=runner)
-    assert result["status"] == "completed", result
+    assert result["status"] == "blocked"
+    assert "retired" in result["summary"]
     with cli.SQLiteStore(store) as persisted:
         assert persisted.load_admin_change_plan("admin.codex-dispatch.e2e").approved is True

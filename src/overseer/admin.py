@@ -387,10 +387,7 @@ def admin_execution_capability_for(
     normalized_kind = AdminChangeKind(kind)
     if type(injected_runner) is not bool:
         raise TypeError("injected_runner must be a bool")
-    if normalized_kind in {
-        AdminChangeKind.USER_SERVICE_RESTART,
-        AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION,
-    } and injected_runner:
+    if normalized_kind == AdminChangeKind.USER_SERVICE_RESTART and injected_runner:
         return AdminExecutionCapability(
             kind=normalized_kind,
             adapter_name="injected-test-runner",

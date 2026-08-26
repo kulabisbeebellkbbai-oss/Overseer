@@ -87,7 +87,7 @@ class CodexAppServerClient:
                     "clientInfo": {
                         "name": "overseer-codex-usage",
                         "title": "Overseer Codex Usage",
-                        "version": "1.1.5",
+                        "version": "1.1.6",
                     },
                     "capabilities": {},
                 },
@@ -131,7 +131,7 @@ class CodexAppServerClient:
                     "clientInfo": {
                         "name": "overseer-codex-meter",
                         "title": "Overseer Codex Meter",
-                        "version": "1.1.5",
+                        "version": "1.1.6",
                     },
                     "capabilities": {},
                 },
@@ -179,7 +179,7 @@ class CodexAppServerClient:
                     "clientInfo": {
                         "name": "overseer-codex-dispatch",
                         "title": "Overseer Codex Dispatch",
-                        "version": "1.1.5",
+                        "version": "1.1.6",
                     },
                     "capabilities": {},
                 },

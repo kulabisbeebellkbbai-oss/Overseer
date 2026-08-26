@@ -235,7 +235,13 @@ class PerformanceRegressionTests(unittest.TestCase):
                 for endpoint, budget in SAFE_POST_BUDGETS.items():
                     payload = SAFE_POST_PAYLOADS[endpoint.removeprefix("/Overseer")]
                     with self.subTest(endpoint=endpoint):
-                        response, elapsed = _timed(lambda endpoint=endpoint, payload=payload: server.post_json(endpoint, payload))
+                        response, elapsed = _timed(
+                            lambda endpoint=endpoint, payload=payload: server.post_json(
+                                endpoint,
+                                payload,
+                                approval=endpoint.endswith("/admin/approve"),
+                            )
+                        )
                         self.assertIsInstance(response, dict)
                         self.assertLess(elapsed, budget)
 

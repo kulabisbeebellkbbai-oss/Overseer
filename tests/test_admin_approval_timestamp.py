@@ -23,7 +23,7 @@ def test_approve_admin_change_status_ui_style_stamps_and_persists_timestamp(tmp_
     store_path = tmp_path / "overseer.sqlite3"
     with SQLiteStore(store_path) as store:
         store.save_admin_change_plan(plan_user_service_restart("admin.test.api-timestamp", "example.service", "test API timestamp", "active"))
-    status = approve_admin_change_status(store_path, "admin.test.api-timestamp", "human")
+    status = approve_admin_change_status(store_path, "admin.test.api-timestamp", "sisko")
     timestamp = datetime.fromisoformat(status["approved_at"])
     assert timestamp.tzinfo is not None
     with SQLiteStore(store_path) as store:

@@ -530,7 +530,7 @@ SAFE_POST_PAYLOADS = {
         "reason": "route smoke only; do not execute",
         "current_state": "inactive",
     },
-    "/admin/approve": {"plan_id": "admin.ui.full", "approved_by": "sisko"},
+    "/admin/approve": {"plan_id": "admin.ui.full"},
     "/admin/policy-customization-helper/profile": {
         "answers": {"name": "ui-full-regression", "description": "Disposable UI regression profile."}
     },
@@ -676,7 +676,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "admin-adapter-kind",
             "admin-adapter-requested-by",
             "admin-approval-plan-id",
-            "admin-approved-by",
+            "admin-approval-token",
             "admin-archive-approval-id",
             "admin-archive-approved-by",
             "admin-archive-execute-approval-id",
@@ -1257,7 +1257,11 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 crew_message = server.post_json("/Overseer/crew/messages", SAFE_POST_PAYLOADS["/crew/messages"])
                 crew_dispatch = server.post_json("/Overseer/crew/dispatch", SAFE_POST_PAYLOADS["/crew/dispatch"])
                 admin_plan = server.post_json("/Overseer/admin/plans", SAFE_POST_PAYLOADS["/admin/plans"])
-                admin_approval = server.post_json("/Overseer/admin/approve", SAFE_POST_PAYLOADS["/admin/approve"])
+                admin_approval = server.post_json(
+                    "/Overseer/admin/approve",
+                    SAFE_POST_PAYLOADS["/admin/approve"],
+                    approval=True,
+                )
                 policy_profile = server.post_json(
                     "/Overseer/admin/policy-customization-helper/profile",
                     SAFE_POST_PAYLOADS["/admin/policy-customization-helper/profile"],

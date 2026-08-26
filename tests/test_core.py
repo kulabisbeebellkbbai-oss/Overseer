@@ -474,12 +474,21 @@ class LocalFakeObsidianServer:
 
 
 class LocalOverseerApiServer:
-    def __init__(self, store_path, auth_token=None):
+    def __init__(self, store_path, auth_token=None, approval_token="approval-secret"):
         self.store_path = str(store_path)
         self.auth_token = auth_token
+        self.approval_token = approval_token
 
     def __enter__(self):
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_api_handler(self.store_path, self.auth_token))
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_api_handler(
+                self.store_path,
+                self.auth_token,
+                human_approval_token=self.approval_token,
+                human_approval_identity="sisko",
+            ),
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address
@@ -5403,7 +5412,11 @@ class OverseerApiClientTests(unittest.TestCase):
             store.close()
 
             with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
-                client = OverseerApiClient(server.url, auth_token="client-secret")
+                client = OverseerApiClient(
+                    server.url,
+                    auth_token="client-secret",
+                    approval_token="approval-secret",
+                )
                 created = client.create_host_security_source_review(
                     {
                         "remote_address": "8.8.8.8",
@@ -5423,12 +5436,12 @@ class OverseerApiClientTests(unittest.TestCase):
                 )
                 block_plan = client.plan_host_security_source_block({"review_id": hostile["id"]})
                 with self.assertRaises(HTTPError):
-                    client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                    client.approve_admin_change(block_plan["id"])
                 ids_package = client.prepare_host_security_ids_review_package(
                     {"plan_id": block_plan["id"], "source_review_id": hostile["id"]}
                 )
                 with self.assertRaises(HTTPError):
-                    client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                    client.approve_admin_change(block_plan["id"])
                 exported = client.export_host_security_ids_review_prompt({"package_id": ids_package["id"]})
                 submitted = client.submit_host_security_ids_review_package(
                     {
@@ -5438,7 +5451,7 @@ class OverseerApiClientTests(unittest.TestCase):
                     }
                 )
                 with self.assertRaises(HTTPError):
-                    client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                    client.approve_admin_change(block_plan["id"])
                 advisory_result = client.record_host_security_ids_review_result(
                     {
                         "package_id": ids_package["id"],
@@ -5447,7 +5460,7 @@ class OverseerApiClientTests(unittest.TestCase):
                         "reviewed_by": "odo",
                     }
                 )
-                approved = client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                approved = client.approve_admin_change(block_plan["id"])
                 packages = client.host_security_ids_review_packages()
                 ids_summary = client.host_security_ids_review_summary()
                 reviews = client.host_security_source_reviews()
@@ -6033,7 +6046,11 @@ class OverseerApiClientTests(unittest.TestCase):
             store_path = Path(directory) / "overseer.sqlite3"
 
             with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
-                client = OverseerApiClient(server.url, auth_token="client-secret")
+                client = OverseerApiClient(
+                    server.url,
+                    auth_token="client-secret",
+                    approval_token="approval-secret",
+                )
                 client.plan_admin_change(
                     {
                         "plan_id": "admin.restart.client",
@@ -6147,7 +6164,11 @@ class OverseerApiClientTests(unittest.TestCase):
             )
 
             with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
-                client = OverseerApiClient(server.url, auth_token="client-secret")
+                client = OverseerApiClient(
+                    server.url,
+                    auth_token="client-secret",
+                    approval_token="approval-secret",
+                )
                 adapter_request = client.request_admin_adapter_enablement(
                     {
                         "kind": AdminChangeKind.APT_UPGRADE.value,
@@ -6170,12 +6191,7 @@ class OverseerApiClientTests(unittest.TestCase):
                         "current_state": "sqlite3 upgrade available",
                     }
                 )
-                client.approve_admin_change(
-                    {
-                        "plan_id": "admin.apt.upgrade.policy-api",
-                        "approved_by": "operator",
-                    }
-                )
+                client.approve_admin_change("admin.apt.upgrade.policy-api")
                 requested = client.request_admin_policy_warning(
                     {
                         "plan_id": "admin.apt.upgrade.policy-api",
@@ -8798,7 +8814,7 @@ class AdminChangePlanTests(unittest.TestCase):
             approve_admin_change_status(
                 store_path,
                 "admin.apt.upgrade.ready",
-                "operator",
+                "sisko",
                 "2026-07-19T05:32:00+00:00",
             )
 
@@ -8872,7 +8888,7 @@ class AdminChangePlanTests(unittest.TestCase):
             )
             requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
             approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
-            approve_admin_change_status(store_path, "admin.apt.upgrade.active-profile", "operator")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.active-profile", "sisko")
 
             status = admin_policy_status(store_path, "admin.apt.upgrade.active-profile")
             item = status["items"][0]
@@ -8905,7 +8921,7 @@ class AdminChangePlanTests(unittest.TestCase):
                 "sisko",
             )
             approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
-            approve_admin_change_status(store_path, "admin.apt.upgrade.warn-blocked", "operator")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.warn-blocked", "sisko")
 
             result = execute_admin_change_status(
                 store_path,
@@ -8936,7 +8952,7 @@ class AdminChangePlanTests(unittest.TestCase):
             )
             requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
             approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
-            approve_admin_change_status(store_path, "admin.apt.upgrade.active-profile-exec", "operator")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.active-profile-exec", "sisko")
 
             result = execute_admin_change_status(
                 store_path,
@@ -9040,7 +9056,7 @@ class AdminChangePlanTests(unittest.TestCase):
                 "sisko",
             )
             approve_admin_adapter_enablement_status(store_path, requested_adapter["approval_id"], "sisko")
-            approve_admin_change_status(store_path, "admin.apt.upgrade.warning-accepted", "operator")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.warning-accepted", "sisko")
 
             warning_request = request_admin_policy_warning_status(
                 store_path,
@@ -9208,7 +9224,7 @@ class AdminChangePlanTests(unittest.TestCase):
             )
             requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
             approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
-            approve_admin_change_status(store_path, "admin.apt.upgrade.profile", "operator")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.profile", "sisko")
 
             result = execute_admin_change_status(
                 store_path,

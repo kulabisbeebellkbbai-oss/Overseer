@@ -76,10 +76,13 @@ Overview card and resume only the exact staged Psychlo decision.
 ## Run
 
 ```bash
-PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 --host 127.0.0.1 --port 8766 --auth-token-file state/api-token
+PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 --host 127.0.0.1 --port 8766 --auth-token-file state/api-token --human-approval-token-file state/human-approval-token --human-approval-identity sisko
 ```
 
-`GET /health` is always available for local service monitoring. All other endpoints require `Authorization: Bearer <token>` when `--auth-token-file` is configured.
+`GET /health` is always available for local service monitoring. Protected
+agent/control endpoints require the normal API bearer token. `POST
+/admin/approve` requires the separate human approval token and rejects the
+normal API token.
 
 `GET /ui` serves the local operator console. The console shell does not embed or expose the bearer token; when the API is token-protected, enter the local token in the console to load protected JSON endpoints from the browser session.
 
@@ -405,7 +408,10 @@ Local Python tools can use `overseer.client.OverseerApiClient` to read the token
 ```python
 from overseer.client import OverseerApiClient
 
-client = OverseerApiClient(auth_token_file="state/api-token")
+client = OverseerApiClient(
+    auth_token_file="state/api-token",
+    approval_token_file="state/human-approval-token",
+)
 runtime = client.runtime_status()
 command = client.command_summary()
 resource = client.record_resource("svc.example", "Example Service", "service", "julian", "low")
@@ -450,7 +456,7 @@ plan = client.plan_admin_change(
     }
 )
 pending = client.authorizations_required()
-approved = client.approve_admin_change({"plan_id": "admin.restart.overseer-api", "approved_by": "sisko"})
+approved = client.approve_admin_change("admin.restart.overseer-api")
 warning_request = client.request_admin_policy_warning(
     {"plan_id": "admin.apt.upgrade.sqlite", "check_id": "admin.rollback", "requested_by": "sisko"}
 )
@@ -472,6 +478,10 @@ canceled = client.cancel_admin_change(
 )
 ```
 
+For `1.1.x` compatibility, the client also accepts the former approval payload
+shape when `approved_by` is `sisko`; it strips the legacy identity and timestamp
+before sending the request. New callers should pass only the plan ID.
+
 ## Installed User Service
 
 The approved local service is installed as:
@@ -485,6 +495,17 @@ The installed service reads its bearer token from an ignored local file:
 ```text
 /home/god/.local/share/overseer/project/state/api-token
 ```
+
+Admin-plan approval uses a different ignored owner-only token file. The API
+service maps that credential to the server-owned `sisko` identity; the client
+does not submit an approver name or timestamp:
+
+```text
+/home/god/.local/share/overseer/project/state/human-approval-token
+```
+
+The API service fails closed if the normal API token and human approval token
+are identical.
 
 Rollback:
 

@@ -16,11 +16,16 @@ class OverseerApiClient:
         auth_token: str | None = None,
         auth_token_file: str | None = None,
         timeout_seconds: float = 5.0,
+        approval_token: str | None = None,
+        approval_token_file: str | None = None,
     ) -> None:
         if auth_token and auth_token_file:
             raise ValueError("use auth_token or auth_token_file, not both")
+        if approval_token and approval_token_file:
+            raise ValueError("use approval_token or approval_token_file, not both")
         self.base_url = base_url.rstrip("/")
         self.auth_token = auth_token or _load_token(auth_token_file)
+        self.approval_token = approval_token or _load_token(approval_token_file)
         self.timeout_seconds = timeout_seconds
 
     def health(self) -> dict[str, Any]:
@@ -1005,8 +1010,29 @@ class OverseerApiClient:
     def admin_summary(self) -> dict[str, Any]:
         return self._get("/admin/summary")
 
-    def approve_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/admin/approve", payload)
+    def approve_admin_change(self, plan_id: str | dict[str, Any]) -> dict[str, Any]:
+        if not self.approval_token:
+            raise ValueError("independent approval token is required")
+        if isinstance(plan_id, dict):
+            unsupported_fields = set(plan_id) - {"plan_id", "approved_by", "approved_at"}
+            if unsupported_fields:
+                raise ValueError("admin approval client payload contains unsupported fields")
+            claimed_identity = plan_id.get("approved_by")
+            if claimed_identity is not None and str(claimed_identity).strip().lower() != "sisko":
+                raise ValueError("legacy admin approval identity must be sisko")
+            plan_id = str(plan_id.get("plan_id", ""))
+        if not isinstance(plan_id, str) or not plan_id.strip():
+            raise ValueError("admin approval plan_id is required")
+        request = Request(
+            f"{self.base_url}/admin/approve",
+            data=json.dumps({"plan_id": plan_id.strip()}).encode("utf-8"),
+            headers={
+                "authorization": f"Bearer {self.approval_token}",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        return self._read(request)
 
     def cancel_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/cancel", payload)

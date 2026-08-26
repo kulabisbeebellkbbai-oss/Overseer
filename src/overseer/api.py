@@ -798,6 +798,11 @@ def make_api_handler(
     psychlo_peer_authority: str = "127.0.0.1:8766",
     roadex_relay_authority: str = "127.0.0.1:8766",
 ):
+    _validate_human_approval_authentication(
+        auth_token,
+        human_approval_token,
+        human_approval_identity,
+    )
     if psychlo_bridge is not None:
         def load_bridge_approval(approval_id: str):
             with SQLiteStore(store_path) as primary:
@@ -1329,6 +1334,27 @@ def make_api_handler(
                     )
                 )
                 return
+            if path == "/admin/approve":
+                header = self.headers.get("authorization", "")
+                prefix = "Bearer "
+                if (
+                    human_approval_token is None
+                    or human_approval_identity is None
+                    or not header.startswith(prefix)
+                    or not secrets.compare_digest(header[len(prefix) :], human_approval_token)
+                ):
+                    self._write_json(
+                        {"error": "unauthorized", "reason": "independent_approval_token_required"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                self._handle_json(
+                    lambda payload: approve_admin_change_status(
+                        store_path,
+                        **_independent_admin_approval_args(payload, human_approval_identity),
+                    )
+                )
+                return
             auth_context = self._authorize_request("POST", raw_path, path)
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
@@ -1769,9 +1795,6 @@ def make_api_handler(
                 return
             if path == "/maintenance/schedules":
                 self._handle_json(lambda payload: record_maintenance_schedule_status(store_path, **_maintenance_schedule_args(payload)))
-                return
-            if path == "/admin/approve":
-                self._handle_json(lambda payload: approve_admin_change_status(store_path, **_approve_admin_plan_args(payload)))
                 return
             if path == "/admin/cancel":
                 self._handle_json(lambda payload: cancel_admin_change_status(store_path, **_cancel_admin_plan_args(payload)))
@@ -2355,10 +2378,11 @@ def run_api_server(
 ) -> None:
     if host not in LOOPBACK_HOSTS:
         raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
-    if (human_approval_token is None) != (human_approval_identity is None):
-        raise ValueError("Human approval token and identity must be configured together")
-    if human_approval_token is not None and auth_token is not None and secrets.compare_digest(human_approval_token, auth_token):
-        raise ValueError("Human approval token must be independent from the agent token")
+    _validate_human_approval_authentication(
+        auth_token,
+        human_approval_token,
+        human_approval_identity,
+    )
     from .backup_host_operations import ConcreteHostProvisioningAdapter, PRIVILEGED_CONFIRMATION
     decision_factory = lambda plan: ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION)
     psychlo_bridge = None
@@ -2386,6 +2410,21 @@ def run_api_server(
         server.server_close()
         if psychlo_bridge is not None:
             psychlo_bridge.close()
+
+
+def _validate_human_approval_authentication(
+    auth_token: str | None,
+    human_approval_token: str | None,
+    human_approval_identity: str | None,
+) -> None:
+    if (human_approval_token is None) != (human_approval_identity is None):
+        raise ValueError("Human approval token and identity must be configured together")
+    if human_approval_token is None:
+        return
+    if not human_approval_token or not human_approval_identity or not human_approval_identity.strip():
+        raise ValueError("Human approval token and identity must be non-empty")
+    if auth_token is not None and secrets.compare_digest(human_approval_token, auth_token):
+        raise ValueError("Human approval token must be independent from the agent token")
 
 
 def load_auth_token(token_file: str | None) -> str | None:
@@ -3728,11 +3767,13 @@ def _package_maintenance_cycle_args(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _approve_admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
+def _independent_admin_approval_args(payload: dict[str, Any], approval_identity: str) -> dict[str, Any]:
+    unsupported_fields = set(payload) - {"plan_id"}
+    if unsupported_fields:
+        raise ValueError("admin approval payload contains unsupported fields")
     return {
         "plan_id": str(payload["plan_id"]),
-        "approved_by": str(payload["approved_by"]),
-        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") else None,
+        "approved_by": approval_identity,
     }
 
 

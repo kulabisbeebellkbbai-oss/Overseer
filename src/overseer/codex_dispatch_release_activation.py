@@ -444,6 +444,9 @@ def release_drop_in_content(manifest: ImmutableReleaseManifest) -> bytes:
         "/home/god/.local/share/overseer/project/state/overseer.sqlite3",
         "--host", "127.0.0.1", "--port", "8766", "--auth-token-file",
         "/home/god/.local/share/overseer/project/state/api-token",
+        "--human-approval-token-file",
+        "/home/god/.local/share/overseer/project/state/human-approval-token",
+        "--human-approval-identity", "sisko",
     )
     # All arguments are closed constants or hex/path components without systemd
     # metacharacters.  Reject instead of quoting an unexpected value.

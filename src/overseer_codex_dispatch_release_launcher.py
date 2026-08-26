@@ -11,6 +11,23 @@ import sys
 from pathlib import Path
 
 
+SERVICE_PAYLOAD = (
+    "serve-api",
+    "--store", "/home/god/.local/share/overseer/project/state/overseer.sqlite3",
+    "--host", "127.0.0.1",
+    "--port", "8766",
+    "--auth-token-file", "/home/god/.local/share/overseer/project/state/api-token",
+    "--human-approval-token-file", "/home/god/.local/share/overseer/project/state/human-approval-token",
+    "--human-approval-identity", "sisko",
+)
+
+
+def _validated_service_payload(payload: list[str]) -> list[str]:
+    if tuple(payload) != ("--", *SERVICE_PAYLOAD):
+        raise RuntimeError("release launcher payload is not the reviewed service entry")
+    return list(SERVICE_PAYLOAD)
+
+
 def _read_stable(path: Path) -> tuple[bytes, os.stat_result]:
     lexical = path.lstat()
     if not stat.S_ISREG(lexical.st_mode) or path.is_symlink() or lexical.st_nlink != 1:
@@ -83,14 +100,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     release_root = Path(args.release_root)
     _verify(release_root, Path(args.manifest), args.manifest_digest)
-    if not args.payload or args.payload[0] != "--" or args.payload[1:2] != ["serve-api"]:
-        raise RuntimeError("release launcher payload is not the reviewed service entry")
+    payload = _validated_service_payload(args.payload)
     # ``-I -S`` retains only root-owned standard-library entries.  Add the two
     # verified release roots explicitly without enabling user/site imports.
     sys.path.insert(0, str(release_root / "site-packages"))
     sys.path.insert(0, str(release_root / "app/src"))
     from overseer.cli import main as overseer_main
-    return overseer_main(args.payload[1:])
+    return overseer_main(payload)
 
 
 if __name__ == "__main__":

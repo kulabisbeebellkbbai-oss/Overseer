@@ -27,6 +27,7 @@ from .admin import (
     AdminExecutionResult,
     AdminExecutionStatus,
     AdminHistoryArchiveRecord,
+    admin_change_authority_digest,
     admin_execution_capability_for,
     archive_admin_change_plan,
     approve_admin_change_plan,
@@ -218,6 +219,7 @@ from .serialization import to_jsonable
 
 
 _CREW_DISPATCH_LOCK = threading.Lock()
+_ADMIN_EXECUTION_LOCK = threading.Lock()
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
 DEFAULT_AGENT_REGISTRY = Path(__file__).parents[2] / "config" / "agent-providers.json"
@@ -4662,6 +4664,7 @@ def admin_execution_status(result: AdminExecutionResult) -> dict[str, object]:
     return {
         "id": result.id,
         "plan_id": result.plan_id,
+        "plan_digest": result.plan_digest,
         "status": AdminExecutionStatus(result.status).value,
         "summary": result.summary,
         "command_results": [_admin_command_result_status(item) for item in result.command_results],
@@ -4794,10 +4797,54 @@ def execute_admin_change_status(
     runner=None,
     policy_profile_path: str | Path | None = None,
 ) -> dict[str, object]:
-    profile, profile_path, profile_source = load_active_policy_profile(store_path, policy_profile_path)
+    database_path = Path(store_path)
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    with _ADMIN_EXECUTION_LOCK, database_path.open("a+b") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        try:
+            return _execute_admin_change_status_unlocked(
+                store_path,
+                plan_id,
+                runner=runner,
+                policy_profile_path=policy_profile_path,
+            )
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def _execute_admin_change_status_unlocked(
+    store_path: str | Path,
+    plan_id: str,
+    runner=None,
+    policy_profile_path: str | Path | None = None,
+) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         plan = store.load_admin_change_plan(plan_id)
+        plan_digest = admin_change_authority_digest(plan)
+        completed_execution = next(
+            (
+                result
+                for result in store.list_admin_executions()
+                if result.plan_id == plan.id and result.status == AdminExecutionStatus.COMPLETED
+            ),
+            None,
+        )
+        if completed_execution is not None:
+            if completed_execution.plan_digest is None:
+                raise ValueError("completed execution lacks an immutable plan binding")
+            if completed_execution.plan_digest != plan_digest:
+                raise ValueError("completed execution plan binding does not match the current plan")
+            return {
+                "store": str(store.path),
+                "policy_profile": None,
+                "policy_profile_source": "completed_execution_replay",
+                "policy_profile_path": None,
+                "replayed": True,
+                "mutation_performed": False,
+                **admin_execution_status(completed_execution),
+            }
+        profile, profile_path, profile_source = load_active_policy_profile(store_path, policy_profile_path)
         enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
         ids_review_packages = store.list_host_security_ids_review_packages_for_plan(plan.id)
         policy_decision = evaluate_admin_change_policy(
@@ -4819,6 +4866,7 @@ def execute_admin_change_status(
                 status=AdminExecutionStatus.BLOCKED,
                 summary=f"admin policy {policy_decision.status.value}: {blocking[0].summary if blocking else 'policy gate blocked execution'}",
                 command_results=(),
+                plan_digest=plan_digest,
             )
             store.save_admin_execution(result)
             store.save_audit_event(audit_event_from_admin_execution(plan, result))
@@ -4828,9 +4876,14 @@ def execute_admin_change_status(
                 "policy_profile_source": profile_source,
                 "policy_profile_path": str(profile_path),
                 "policy": admin_policy_decision_status(policy_decision),
+                "replayed": False,
+                "mutation_performed": False,
                 **admin_execution_status(result),
             }
-        result = execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds)
+        result = replace(
+            execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds),
+            plan_digest=plan_digest,
+        )
         store.save_admin_execution(result)
         store.save_audit_event(audit_event_from_admin_execution(plan, result))
         return {
@@ -4838,6 +4891,8 @@ def execute_admin_change_status(
             "policy_profile": profile.name,
             "policy_profile_source": profile_source,
             "policy_profile_path": str(profile_path),
+            "replayed": False,
+            "mutation_performed": True,
             **admin_execution_status(result),
         }
     finally:
@@ -6761,6 +6816,11 @@ def approve_admin_change_status(
     store = SQLiteStore(store_path)
     try:
         plan = store.load_admin_change_plan(plan_id)
+        normalized_approver = approved_by.strip().lower()
+        if plan.approval_level == ApprovalLevel.SISKO and normalized_approver != OwnerDomain.SISKO.value:
+            raise ValueError("Sisko approval identity is required")
+        if plan.approval_level == ApprovalLevel.ROLE and normalized_approver != OwnerDomain(plan.owner_domain).value:
+            raise ValueError(f"{OwnerDomain(plan.owner_domain).value} role approval identity is required")
         if admin_plan_requires_ids_review(plan) and not any(
             package.satisfies_pre_execution_review_gate()
             for package in store.list_host_security_ids_review_packages_for_plan(plan.id)

@@ -8,7 +8,7 @@ WorkingDirectory=@OVERSEER_INSTALL@
 Environment="PYTHONPATH=@OVERSEER_INSTALL@/src"
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStartPre=/usr/bin/test -d "@OVERSEER_INSTALL@/src"
-ExecStart="@OVERSEER_PYTHON@" -m overseer.cli serve-api --store "@OVERSEER_STORE@" --host 127.0.0.1 --port 8766 --auth-token-file "@OVERSEER_API_TOKEN_FILE@"
+ExecStart="@OVERSEER_PYTHON@" -m overseer.cli serve-api --store "@OVERSEER_STORE@" --host 127.0.0.1 --port 8766 --auth-token-file "@OVERSEER_API_TOKEN_FILE@" --human-approval-token-file "@OVERSEER_HUMAN_APPROVAL_TOKEN_FILE@" --human-approval-identity sisko
 Restart=on-failure
 RestartSec=5
 

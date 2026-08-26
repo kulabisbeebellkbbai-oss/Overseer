@@ -8,13 +8,14 @@ import subprocess
 import re
 from datetime import datetime, timezone
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from dataclasses import field
 from dataclasses import replace
 from enum import StrEnum
 
 from .audit import AuditEvent, AuditEventType
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
+from .psychlo_contracts import canonical_digest
 
 
 class AdminChangeKind(StrEnum):
@@ -81,6 +82,7 @@ class AdminExecutionResult:
     command_results: tuple[AdminCommandResult, ...]
     verification_results: tuple[AdminCommandResult, ...] = ()
     rollback_results: tuple[AdminCommandResult, ...] = ()
+    plan_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,26 @@ class AdminExecutionCapability:
 
 
 AdminCommandRunner = Callable[[AdminCommandStep], AdminCommandResult]
+
+
+def admin_change_authority_digest(plan: AdminChangePlan) -> str:
+    """Bind execution evidence to immutable plan authority, not lifecycle state."""
+    value = asdict(plan)
+    for key in (
+        "approved",
+        "approved_by",
+        "approved_at",
+        "canceled",
+        "canceled_by",
+        "canceled_at",
+        "cancellation_reason",
+        "archived",
+        "archived_by",
+        "archived_at",
+        "archive_record_id",
+    ):
+        value.pop(key, None)
+    return canonical_digest(value)
 
 
 APT_NONINTERACTIVE_ENVIRONMENT: dict[str, str] = {

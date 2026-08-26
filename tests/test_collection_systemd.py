@@ -91,7 +91,9 @@ def test_overseer_api_unit_imports_the_reviewed_release_without_changing_its_lis
     assert (
         'ExecStart="@OVERSEER_PYTHON@" -m overseer.cli serve-api '
         '--store "@OVERSEER_STORE@" --host 127.0.0.1 --port 8766 '
-        '--auth-token-file "@OVERSEER_API_TOKEN_FILE@"'
+        '--auth-token-file "@OVERSEER_API_TOKEN_FILE@" '
+        '--human-approval-token-file "@OVERSEER_HUMAN_APPROVAL_TOKEN_FILE@" '
+        '--human-approval-identity sisko'
     ) in unit
     assert "EnvironmentFile=" not in unit
     assert "Wants=" not in unit
@@ -109,12 +111,15 @@ def test_overseer_api_unit_passes_disposable_systemd_verify(tmp_path: Path) -> N
     store_path.parent.mkdir()
     token_path = tmp_path / "api token with spaces"
     token_path.write_text("not-a-live-secret\n", encoding="utf-8")
+    approval_token_path = tmp_path / "approval token with spaces"
+    approval_token_path.write_text("different-not-a-live-secret\n", encoding="utf-8")
     disposable_unit = tmp_path / "overseer-api.service"
     disposable_unit.write_text(
         unit.replace("@OVERSEER_INSTALL@", str(install_path))
         .replace("@OVERSEER_PYTHON@", "/usr/bin/python3")
         .replace("@OVERSEER_STORE@", str(store_path))
-        .replace("@OVERSEER_API_TOKEN_FILE@", str(token_path)),
+        .replace("@OVERSEER_API_TOKEN_FILE@", str(token_path))
+        .replace("@OVERSEER_HUMAN_APPROVAL_TOKEN_FILE@", str(approval_token_path)),
         encoding="utf-8",
     )
 
@@ -219,6 +224,7 @@ def test_v11_runbook_preserves_exact_state_without_secret_argv_or_globs() -> Non
     assert 'OVERSEER_RENDERED_UNIT=/absolute/path/to/forensic-evidence/overseer-v1.1/activation-output/rendered/overseer.service' in operations
     assert 'OVERSEER_RENDERED_API_UNIT=/absolute/path/to/forensic-evidence/overseer-v1.1/activation-output/rendered/overseer-api.service' in operations
     assert 'OVERSEER_API_TOKEN_FILE' in operations
+    assert 'OVERSEER_HUMAN_APPROVAL_TOKEN_FILE' in operations
     assert 'OVERSEER_LIVE_API_UNIT' in operations
     assert 'OVERSEER_API_DROPIN_DIR' in operations
     assert 'api-dropins.before.sha256' in operations

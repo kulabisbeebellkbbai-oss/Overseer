@@ -1244,6 +1244,26 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (!response.ok) throw new Error(`${path}: ${response.status}`);
       return await response.json();
     }
+    async function postApprovalJson(path, payload = {}) {
+      const approvalTokenInput = document.getElementById("admin-approval-token");
+      const approvalToken = approvalTokenInput?.value.trim() || "";
+      if (!approvalToken) throw new Error("Independent approval token is required");
+      const headers = {
+        "content-type": "application/json",
+        authorization: `Bearer ${approvalToken}`
+      };
+      try {
+        const response = await fetch(`${apiBase}${path}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error(`${path}: ${response.status}`);
+        return await response.json();
+      } finally {
+        approvalTokenInput.value = "";
+      }
+    }
     async function runAction(action, source) {
       const status = document.getElementById("action-status");
       status.hidden = false;
@@ -1882,9 +1902,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       });
     }
     async function approveAdminChange() {
-      return await postJson("/admin/approve", {
-        plan_id: value("admin-approval-plan-id"),
-        approved_by: value("admin-approved-by")
+      return await postApprovalJson("/admin/approve", {
+        plan_id: value("admin-approval-plan-id")
       });
     }
     async function approveAndExecuteAdminChange() {
@@ -2688,7 +2707,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             <div class="toolbar"><h3>Approve Plan</h3><button class="action-btn" data-action="approve-admin-change">Approve</button></div>
             <div class="form-grid">
               <div class="field span-6"><label for="admin-approval-plan-id">Plan ID</label><input id="admin-approval-plan-id"></div>
-              <div class="field span-6"><label for="admin-approved-by">Approved By</label><input id="admin-approved-by" value="sisko"></div>
+              <div class="field span-6"><label for="admin-approval-token">Independent Approval Token</label><input id="admin-approval-token" type="password" autocomplete="off"></div>
             </div>
           </div>
           <div class="panel span-4">

@@ -52,6 +52,34 @@ The planner never runs live commands. It produces the exact change list required
 
 Recording approval does not execute the plan. It only updates the stored approval metadata so the execution adapter can see that a specific command list was approved.
 
+The HTTP approval route is credential-separated from ordinary API control.
+`POST /admin/approve` accepts only `plan_id`, requires the independent human
+approval bearer token, and records the server-owned `sisko` identity plus a
+server-generated timestamp. Client-supplied identity or timestamp fields are
+rejected. The dashboard keeps this credential only in its password field and
+clears it after every approval attempt.
+
+Completed admin execution is replay-safe. Repeating execution for a plan that
+already has a completed result returns the original result with
+`replayed=true` and `mutation_performed=false`; it does not invoke command,
+verification, or rollback runners and does not replace the original audit
+evidence. Concurrent execution requests are serialized against the store, so
+only one request can become the command-running winner. The stored result is
+bound to a digest of the plan's immutable command authority; replacing a plan
+under the same ID cannot inherit prior completion evidence. Legacy completed
+rows without that digest fail closed instead of running or replaying commands.
+
+## Disposable Approval Smoke Test
+
+Use `systemd/overseer-approval-smoke.service` for end-to-end approval testing.
+It is a non-enabled one-shot unit that runs `/usr/bin/true`, remains active so
+restart verification is meaningful, and has private networking plus strict
+systemd hardening. Install only this reviewed unit into the user unit directory,
+stage a `user_service_restart` plan targeting it, approve through the independent
+UI/API credential, and execute once. A second execute request must return the
+same completed result as a replay without running the unit again. Remove the
+fixture unit after acceptance; do not substitute a production service.
+
 Live admin execution is now described by an explicit adapter capability table. Approved user-service restart plans are enabled by default. Package install, package index refresh, package upgrade, firewall allow/deny, and source-block adapters remain disabled unless the same store contains an approved adapter enablement request for that exact kind. The readiness view reports each plan's `adapter_status` so disabled live actions cannot be confused with ready Overseer execution. Use `admin-adapter-enablement-plan` or `GET /admin/adapter-enablement-plan` to generate the required read-only approval plan before any disabled adapter is enabled.
 
 Adapter enablement requests persist the human approval record for that work. Approval changes only the effective adapter capability for that store and kind; it does not approve any specific host change, modify the host, or run commands. Each admin plan must still pass its own approval, IDS review when applicable, command-boundary validation, execution recording, and verification.

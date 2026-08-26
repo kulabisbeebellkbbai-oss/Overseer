@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from overseer_codex_dispatch_release_launcher import SERVICE_PAYLOAD, _validated_service_payload
 
 from overseer import codex_dispatch_release_activation as release_module
 from overseer.codex_dispatch_release_activation import (
@@ -118,8 +119,23 @@ def test_drop_in_executes_only_root_python_and_root_owned_release():
 
     assert "ExecStart=/usr/bin/python3 -I -S " in content
     assert str(manifest.release_root) in content
+    assert "--human-approval-token-file /home/god/.local/share/overseer/project/state/human-approval-token" in content
+    assert "--human-approval-identity sisko" in content
     assert "/home/god/Documents/Codex Workspace/Overseer" not in content
     assert "busctl" not in content and "systemctl" not in content
+
+
+def test_release_launcher_requires_the_exact_credential_separated_payload():
+    assert _validated_service_payload(["--", *SERVICE_PAYLOAD]) == list(SERVICE_PAYLOAD)
+
+    without_approval_credential = list(SERVICE_PAYLOAD[:9])
+    with pytest.raises(RuntimeError, match="reviewed service entry"):
+        _validated_service_payload(["--", *without_approval_credential])
+
+    changed = list(SERVICE_PAYLOAD)
+    changed[changed.index("--human-approval-identity") + 1] = "obrien"
+    with pytest.raises(RuntimeError, match="reviewed service entry"):
+        _validated_service_payload(["--", *changed])
 
 
 def test_sudo_allowlist_rejects_shell_extra_flag_and_alternate_destination():

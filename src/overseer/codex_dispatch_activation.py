@@ -70,6 +70,7 @@ SERVICE_PYTHON = EUID_HOME / ".local/share/overseer/venvs/psychlo-v1-1-cryptogra
 SERVICE_SITE_PACKAGES = SERVICE_PYTHON.parents[1] / "lib/python3.13/site-packages"
 SERVICE_STORE = EUID_HOME / ".local/share/overseer/project/state/overseer.sqlite3"
 SERVICE_TOKEN = EUID_HOME / ".local/share/overseer/project/state/api-token"
+SERVICE_HUMAN_APPROVAL_TOKEN = EUID_HOME / ".local/share/overseer/project/state/human-approval-token"
 RUNTIME_USER_ROOT = Path("/run/user")
 _HEX = set("0123456789abcdef")
 _JOURNAL_KEYS = {
@@ -585,6 +586,8 @@ def _drop_in_content(spec: CodexDispatchActivationSpec) -> bytes:
     service_payload = (
         "serve-api", "--store", str(SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
         "--auth-token-file", str(SERVICE_TOKEN),
+        "--human-approval-token-file", str(SERVICE_HUMAN_APPROVAL_TOKEN),
+        "--human-approval-identity", "sisko",
     )
     command = " ".join(_systemd_quote(item) for item in _isolated_launcher_command(spec, "service", service_payload))
     return (
@@ -1453,6 +1456,8 @@ def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None
         service_payload = (
             "serve-api", "--store", str(SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
             "--auth-token-file", str(SERVICE_TOKEN),
+            "--human-approval-token-file", str(SERVICE_HUMAN_APPROVAL_TOKEN),
+            "--human-approval-identity", "sisko",
         )
         expected = _isolated_launcher_command(spec, "service", service_payload)
         effective = _read_user_bus_property("ExecStart", "a(sasbttttuii)", spec.bus_peer_binding)

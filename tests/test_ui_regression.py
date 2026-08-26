@@ -21,13 +21,20 @@ class LocalApiHarness:
     def __init__(self, store_path: Path, auth_token: str = "test-secret", roadex_decision_adapter_factory=None) -> None:
         self.store_path = store_path
         self.auth_token = auth_token
+        self.approval_token = "approval-secret"
         self.server: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.url = ""
         self.roadex_decision_adapter_factory = roadex_decision_adapter_factory
 
     def __enter__(self):
-        handler = make_api_handler(str(self.store_path), self.auth_token, roadex_decision_adapter_factory=self.roadex_decision_adapter_factory)
+        handler = make_api_handler(
+            str(self.store_path),
+            self.auth_token,
+            roadex_decision_adapter_factory=self.roadex_decision_adapter_factory,
+            human_approval_token=self.approval_token,
+            human_approval_identity="sisko",
+        )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         host, port = self.server.server_address
         self.url = f"http://{host}:{port}"
@@ -63,12 +70,13 @@ class LocalApiHarness:
         with urlopen(f"{self.url}{path}", timeout=5) as response:
             return response.read().decode("utf-8"), response.headers.get("content-type", "")
 
-    def post_json(self, path: str, payload: dict, authenticated: bool = True) -> dict:
+    def post_json(self, path: str, payload: dict, authenticated: bool = True, approval: bool = False) -> dict:
         data = json.dumps(payload).encode("utf-8")
         request = Request(f"{self.url}{path}", data=data, method="POST")
         request.add_header("Content-Type", "application/json")
         if authenticated:
-            request.add_header("Authorization", f"Bearer {self.auth_token}")
+            token = self.approval_token if approval else self.auth_token
+            request.add_header("Authorization", f"Bearer {token}")
         with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 

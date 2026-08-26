@@ -194,6 +194,8 @@ def test_service_bootstrap_rejects_approved_manager_drift_before_launcher_import
     payload = (
         "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
         "--auth-token-file", str(activation.SERVICE_TOKEN),
+        "--human-approval-token-file", str(activation.SERVICE_HUMAN_APPROVAL_TOKEN),
+        "--human-approval-identity", "sisko",
     )
     completed = subprocess.run(
         activation._isolated_launcher_command(spec, "service", payload),
@@ -301,6 +303,9 @@ def test_dispatch_drop_in_uses_isolated_launcher_and_exact_service_arguments():
     assert "--host" in content and "127.0.0.1" in content and "--port" in content and "8766" in content
     assert "--auth-token-file" in content
     assert "/home/god/.local/share/overseer/project/state/api-token" in content
+    assert "--human-approval-token-file" in content
+    assert "/home/god/.local/share/overseer/project/state/human-approval-token" in content
+    assert "--human-approval-identity" in content and "sisko" in content
 
 
 def test_isolated_launcher_rejects_nonisolated_invocation_before_dispatch():
@@ -411,6 +416,8 @@ def test_isolated_launcher_blocks_transient_sitecustomize_and_sourceless_pyc(tmp
         "service", "--",
         "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
         "--auth-token-file", str(activation.SERVICE_TOKEN),
+        "--human-approval-token-file", str(activation.SERVICE_HUMAN_APPROVAL_TOKEN),
+        "--human-approval-identity", "sisko",
     ]
     imported = subprocess.run(service, capture_output=True, text=True, check=False, env=environment)
     assert imported.returncode == 0, imported.stderr
@@ -715,6 +722,8 @@ def test_environment_verification_requires_effective_isolated_execstart(monkeypa
         (
             "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
             "--auth-token-file", str(activation.SERVICE_TOKEN),
+            "--human-approval-token-file", str(activation.SERVICE_HUMAN_APPROVAL_TOKEN),
+            "--human-approval-identity", "sisko",
         ),
     )
 
@@ -746,6 +755,8 @@ def test_environment_verification_rejects_wrapper_containing_expected_tokens(mon
         (
             "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
             "--auth-token-file", str(activation.SERVICE_TOKEN),
+            "--human-approval-token-file", str(activation.SERVICE_HUMAN_APPROVAL_TOKEN),
+            "--human-approval-identity", "sisko",
         ),
     )
 
@@ -769,6 +780,8 @@ def test_restart_rejects_alternate_effective_execstart_before_restart(tmp_path: 
         (
             "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
             "--auth-token-file", str(activation.SERVICE_TOKEN),
+            "--human-approval-token-file", str(activation.SERVICE_HUMAN_APPROVAL_TOKEN),
+            "--human-approval-identity", "sisko",
         ),
     )
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
@@ -808,6 +821,8 @@ def test_busctl_uses_exact_fixed_service_property_contract(monkeypatch: pytest.M
         spec, "service", (
             "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
             "--auth-token-file", str(activation.SERVICE_TOKEN),
+            "--human-approval-token-file", str(activation.SERVICE_HUMAN_APPROVAL_TOKEN),
+            "--human-approval-identity", "sisko",
         ),
     )
     calls: list[tuple[str, ...]] = []
@@ -967,6 +982,8 @@ def test_busctl_execstart_contract_rejects_invalid_runtime_field_types(bad_field
         spec, "service", (
             "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
             "--auth-token-file", str(activation.SERVICE_TOKEN),
+            "--human-approval-token-file", str(activation.SERVICE_HUMAN_APPROVAL_TOKEN),
+            "--human-approval-identity", "sisko",
         ),
     )
     invalid = json.loads(_busctl_execstart(expected))

@@ -38,6 +38,9 @@ SERVICE_PAYLOAD = (
     "serve-api", "--store", "/home/god/.local/share/overseer/project/state/overseer.sqlite3",
     "--host", "127.0.0.1", "--port", "8766", "--auth-token-file",
     "/home/god/.local/share/overseer/project/state/api-token",
+    "--human-approval-token-file",
+    "/home/god/.local/share/overseer/project/state/human-approval-token",
+    "--human-approval-identity", "sisko",
 )
 SERVICE_STORE = "/home/god/.local/share/overseer/project/state/overseer.sqlite3"
 

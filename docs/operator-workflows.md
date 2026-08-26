@@ -153,8 +153,9 @@ Use this when an admin plan is staged and waiting for approval.
 2. Review Approval Decisions and Execution Readiness.
 3. Click the plan id from a table when available; it fills the approval fields.
 4. Confirm the kind, target, reason, readiness state, and policy evidence.
-5. Fill Approved By with `sisko` unless a human approval level is required.
-6. Click Approve.
+5. Enter the independent approval token. Overseer derives the `sisko` identity
+   on the server and clears the field after the request.
+6. Click Approve. The ordinary Overseer API token cannot approve the plan.
 7. Do not click Execute until readiness shows the plan can execute.
 
 ### Approve And Implement An Admin Request

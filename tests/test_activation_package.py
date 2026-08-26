@@ -1098,6 +1098,99 @@ def test_final_migration_requires_quiescence_and_preserves_source(
     assert stat_mode(source) == 0o600
 
 
+def test_final_migration_copies_and_normalizes_a_crash_retained_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    creator = subprocess.run(
+        [
+            "/usr/bin/python3.13",
+            "-c",
+            """
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute("CREATE TABLE retained_items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+connection.executemany(
+    "INSERT INTO retained_items(value) VALUES (?)",
+    [("one",), ("two",), ("three",)],
+)
+connection.commit()
+os._exit(0)
+""",
+            str(source),
+        ],
+        check=False,
+    )
+    assert creator.returncode == 0
+    source.chmod(0o600)
+    source_wal = Path(f"{source}-wal")
+    source_shm = Path(f"{source}-shm")
+    assert source_wal.stat().st_size > 0
+    source_wal.chmod(0o600)
+    if source_shm.exists():
+        source_shm.chmod(0o600)
+    source_before = source.read_bytes()
+    wal_before = source_wal.read_bytes()
+    approved = source.stat()
+    parent = source.parent.stat()
+    parent_mode = stat_mode(source.parent)
+    backup_parent = tmp_path / "executor-state"
+    destination_parent = tmp_path / "authority-state"
+    backup_parent.mkdir(mode=0o700)
+    destination_parent.mkdir(mode=0o700)
+    backup = backup_parent / "final-source.sqlite3"
+    destination = destination_parent / "final-migrated.sqlite3"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_parent_lock_mode", lambda: 0o700)
+
+    report = prepare_final_store_migration(
+        source_store=source,
+        backup_store=backup,
+        destination_store=destination,
+        expected_source_device=approved.st_dev,
+        expected_source_inode=approved.st_ino,
+        expected_source_uid=os.geteuid(),
+        expected_source_gid=os.getegid(),
+        expected_parent_device=parent.st_dev,
+        expected_parent_inode=parent.st_ino,
+        expected_parent_mode=parent_mode,
+        destination_uid=os.geteuid(),
+        destination_gid=os.getegid(),
+        sleep_seconds=0,
+    )
+
+    assert report["source"]["walCheckpoint"] == "isolated_backup_truncate_complete"
+    assert source.read_bytes() == source_before
+    assert source_wal.read_bytes() == wal_before
+    assert not Path(f"{backup}-wal").exists()
+    assert not Path(f"{backup}-shm").exists()
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute(
+            "SELECT value FROM retained_items ORDER BY id"
+        ).fetchall() == [("one",), ("two",), ("three",)]
+    restore_legacy_store_access(
+        source_store=source,
+        expected_source_uid=os.geteuid(),
+        expected_source_gid=os.getegid(),
+        expected_source_device=approved.st_dev,
+        expected_source_inode=approved.st_ino,
+        expected_parent_device=parent.st_dev,
+        expected_parent_inode=parent.st_ino,
+        expected_parent_mode=parent_mode,
+    )
+
+
 def test_final_migration_rejects_source_replacement_during_parent_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1473,7 +1566,7 @@ def test_final_migration_pre_hash_checkpoint_rescans_open_descriptors(
 
     monkeypatch.setattr(os, "chmod", spawn_holder_before_hash)
     try:
-        with pytest.raises(ActivationPackageError, match="before hashing"):
+        with pytest.raises(ActivationPackageError, match="open process or mapping"):
             prepare_final_store_migration(
                 source_store=source,
                 backup_store=backup,

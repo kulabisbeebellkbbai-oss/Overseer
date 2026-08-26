@@ -1840,6 +1840,9 @@ def prepare_final_store_migration(
             raise ActivationPackageError(f"{label} destination already exists")
         if target.parent.is_symlink() or not target.parent.is_dir():
             raise ActivationPackageError(f"{label} parent directory is unsafe")
+    backup_sidecars = tuple(Path(f"{backup}{suffix}") for suffix in ("-wal", "-shm"))
+    if any(path.exists() or path.is_symlink() for path in backup_sidecars):
+        raise ActivationPackageError("final backup sidecar destination already exists")
 
     root_uid, root_gid = _activation_root_identity()
     lock_acquired = False
@@ -1935,8 +1938,6 @@ def prepare_final_store_migration(
                     raise ActivationPackageError(
                         "legacy store changed while opening under the quiescence lock"
                     )
-                os.fchown(descriptor, root_uid, root_gid)
-                os.fchmod(descriptor, 0o600)
                 legacy_descriptors.append(descriptor)
                 if original_path == source:
                     source_descriptor = descriptor
@@ -1947,101 +1948,113 @@ def prepare_final_store_migration(
 
         if source_descriptor is None:
             raise ActivationPackageError("locked legacy authority descriptor is unavailable")
-        wal = bound_paths[1]
-        checkpoint = "not_required"
-        if wal.exists() and wal.stat().st_size:
-            checkpoint_connection = sqlite3.connect(
-                _sqlite_uri(bound_source, mode="rw"),
-                uri=True,
-                timeout=5,
-            )
-            try:
-                row = checkpoint_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            finally:
-                checkpoint_connection.close()
-            if row is None or int(row[0]) != 0:
-                raise ActivationPackageError("final migration WAL checkpoint did not quiesce")
-            checkpoint = "truncate_complete"
-        for path in bound_paths:
-            if not path.exists():
-                continue
-            metadata = path.lstat()
-            if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ActivationPackageError(
-                    "legacy store changed after the final WAL checkpoint"
-                )
-            if not any(
-                (opened.st_dev, opened.st_ino) == (metadata.st_dev, metadata.st_ino)
-                for opened in (os.fstat(descriptor) for descriptor in legacy_descriptors)
-            ):
-                descriptor = os.open(
-                    path,
-                    os.O_RDONLY
-                    | getattr(os, "O_CLOEXEC", 0)
-                    | getattr(os, "O_NOFOLLOW", 0),
-                )
-                opened = os.fstat(descriptor)
-                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
-                    os.close(descriptor)
-                    raise ActivationPackageError(
-                        "legacy store changed while opening after the final WAL checkpoint"
-                    )
-                os.fchown(descriptor, root_uid, root_gid)
-                os.fchmod(descriptor, 0o600)
-                legacy_descriptors.append(descriptor)
-        for path in bound_paths:
-            if path.exists():
-                os.chmod(path, 0o400)
-        quiesced_inode_identities = tuple(
-            (metadata.st_dev, metadata.st_ino)
-            for metadata in (os.fstat(descriptor) for descriptor in legacy_descriptors)
-        )
-        if _legacy_inode_activity(
-            quiesced_inode_identities,
-            include_open_files=True,
-            exclude_current_process=True,
-        ):
-            raise ActivationPackageError(
-                "final migration SQLite artifacts acquired an open process or mapping before hashing"
-            )
-        locked_source = os.fstat(source_descriptor)
         with _kernel_read_lease_barrier(
             tuple(legacy_descriptors)
         ) as require_lease_intact:
+            for descriptor in legacy_descriptors:
+                os.fchown(descriptor, root_uid, root_gid)
+                os.fchmod(descriptor, 0o600)
+            descriptor_by_identity = {
+                (metadata.st_dev, metadata.st_ino): descriptor
+                for descriptor, metadata in (
+                    (descriptor, os.fstat(descriptor))
+                    for descriptor in legacy_descriptors
+                )
+            }
+            for path in bound_paths:
+                if not path.exists():
+                    continue
+                metadata = path.lstat()
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                ):
+                    raise ActivationPackageError(
+                        "legacy store changed under the kernel lease barrier"
+                    )
+                if (metadata.st_dev, metadata.st_ino) not in descriptor_by_identity:
+                    raise ActivationPackageError(
+                        "legacy store pathname changed under the kernel lease barrier"
+                    )
+                os.chmod(path, 0o400)
+            quiesced_inode_identities = tuple(descriptor_by_identity)
+            locked_source = os.fstat(source_descriptor)
+            if _legacy_inode_activity(
+                quiesced_inode_identities,
+                include_open_files=True,
+                exclude_current_process=True,
+            ):
+                raise ActivationPackageError(
+                    "final migration SQLite artifacts retained an open process or mapping"
+                )
+            require_lease_intact()
             source_digest_before = _stream_hash_open_regular(
                 source_descriptor,
                 label="locked legacy authority store",
                 guard=require_lease_intact,
             )
-
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(backup, flags, 0o600)
-            os.close(descriptor)
+            _copy_open_regular_to_new_path(
+                source_descriptor,
+                backup,
+                label="locked legacy authority store",
+                guard=require_lease_intact,
+            )
+            wal = bound_paths[1]
+            source_wal_present = wal.exists() and wal.stat().st_size > 0
+            if source_wal_present:
+                wal_metadata = wal.lstat()
+                wal_descriptor = descriptor_by_identity.get(
+                    (wal_metadata.st_dev, wal_metadata.st_ino)
+                )
+                if wal_descriptor is None:
+                    raise ActivationPackageError(
+                        "locked legacy WAL descriptor is unavailable"
+                    )
+                _copy_open_regular_to_new_path(
+                    wal_descriptor,
+                    backup_sidecars[0],
+                    label="locked legacy WAL",
+                    guard=require_lease_intact,
+                )
             require_lease_intact()
-            source_connection = sqlite3.connect(
-                f"file:/proc/self/fd/{source_descriptor}?mode=ro&immutable=1",
+            checkpoint_connection = sqlite3.connect(
+                _sqlite_uri(backup, mode="rw"),
                 uri=True,
                 timeout=5,
             )
-            target_connection = sqlite3.connect(backup, timeout=5)
             try:
-                def progress(_status: int, remaining: int, _total: int) -> None:
-                    require_lease_intact()
-                    if remaining and sleep_seconds:
-                        time.sleep(float(sleep_seconds))
-
-                source_connection.backup(
-                    target_connection,
-                    pages=pages_per_step,
-                    progress=progress,
-                    sleep=0,
-                )
-                target_connection.commit()
-                require_lease_intact()
+                row = checkpoint_connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                journal_row = checkpoint_connection.execute(
+                    "PRAGMA journal_mode=DELETE"
+                ).fetchone()
             finally:
-                target_connection.close()
-                source_connection.close()
+                checkpoint_connection.close()
+            if row is None or int(row[0]) != 0:
+                raise ActivationPackageError(
+                    "isolated final backup WAL checkpoint did not quiesce"
+                )
+            if journal_row is None or str(journal_row[0]).lower() != "delete":
+                raise ActivationPackageError(
+                    "isolated final backup did not leave WAL journal mode"
+                )
+            checkpoint = (
+                "isolated_backup_truncate_complete"
+                if source_wal_present
+                else "not_required"
+            )
+            require_lease_intact()
+            if backup_sidecars[0].exists() and backup_sidecars[0].stat().st_size:
+                raise ActivationPackageError(
+                    "isolated final backup retained WAL content after checkpoint"
+                )
+            for path in backup_sidecars:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
             os.chmod(backup, 0o600)
             source_digest_after = _stream_hash_open_regular(
                 source_descriptor,
@@ -2170,6 +2183,7 @@ def prepare_final_store_migration(
         for target in (
             destination,
             backup,
+            *backup_sidecars,
             backup.with_suffix(f"{backup.suffix}.report.json"),
         ):
             try:
@@ -2388,6 +2402,68 @@ def _stream_hash_open_regular(
         "gid": before.st_gid,
         "links": before.st_nlink,
     }
+
+
+def _copy_open_regular_to_new_path(
+    source_descriptor: int,
+    target: Path,
+    *,
+    label: str,
+    guard: Callable[[], None],
+) -> None:
+    """Copy one descriptor-bound regular file while a caller-owned guard holds."""
+
+    before = os.fstat(source_descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ActivationPackageError(f"{label} descriptor is not a single-link regular file")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    target_descriptor: int | None = None
+    try:
+        target_descriptor = os.open(target, flags, 0o600)
+        copied = 0
+        while copied < before.st_size:
+            guard()
+            chunk = os.pread(
+                source_descriptor,
+                min(1024 * 1024, before.st_size - copied),
+                copied,
+            )
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_descriptor, view)
+                if written <= 0:
+                    raise OSError("descriptor-bound migration copy made no progress")
+                copied += written
+                view = view[written:]
+        guard()
+        after = os.fstat(source_descriptor)
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_mode,
+            item.st_uid,
+            item.st_gid,
+            item.st_nlink,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if identity(before) != identity(after) or copied != before.st_size:
+            raise ActivationPackageError(f"{label} changed during descriptor-bound copy")
+        os.fchmod(target_descriptor, 0o600)
+        os.fsync(target_descriptor)
+    except BaseException:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if target_descriptor is not None:
+            os.close(target_descriptor)
 
 
 def _stream_hash_regular(path: Path, *, label: str) -> dict[str, object]:

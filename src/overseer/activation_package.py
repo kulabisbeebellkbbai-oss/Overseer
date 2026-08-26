@@ -1463,12 +1463,24 @@ def _processes_with_open_inode(
         descriptors = process / "fd"
         try:
             open_descriptors = tuple(descriptors.iterdir())
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as error:
+            if os.geteuid() == 0:
+                raise ActivationPackageError(
+                    "open-process preflight could not inspect a live process descriptor table"
+                ) from error
             continue
         for descriptor in open_descriptors:
             try:
                 metadata = descriptor.stat()
-            except (FileNotFoundError, PermissionError, ProcessLookupError):
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except PermissionError as error:
+                if os.geteuid() == 0:
+                    raise ActivationPackageError(
+                        "open-process preflight could not inspect a live process descriptor"
+                    ) from error
                 continue
             if (metadata.st_dev, metadata.st_ino) == (device, inode):
                 result.add(process_id)

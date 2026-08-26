@@ -1269,6 +1269,52 @@ if libc.munmap(ctypes.c_void_p(other_address), other_size) != 0:
     assert not destination.exists()
 
 
+@pytest.mark.parametrize(
+    ("failure_location", "expected_message"),
+    (
+        ("fd-table", "descriptor table"),
+        ("descriptor", "live process descriptor"),
+    ),
+)
+def test_open_inode_scan_fails_closed_for_root_permission_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_location: str,
+    expected_message: str,
+) -> None:
+    class ProcNode:
+        def __init__(self, kind: str, name: str = "") -> None:
+            self.kind = kind
+            self.name = name
+
+        def __truediv__(self, child: str) -> ProcNode:
+            assert self.kind == "process"
+            assert child == "fd"
+            return ProcNode("fd")
+
+        def iterdir(self) -> tuple[ProcNode, ...]:
+            if self.kind == "proc":
+                return (ProcNode("process", "4242"),)
+            if self.kind == "fd" and failure_location == "fd-table":
+                raise PermissionError("descriptor table denied")
+            if self.kind == "fd":
+                return (ProcNode("descriptor"),)
+            raise AssertionError(f"unexpected node kind: {self.kind}")
+
+        def stat(self) -> os.stat_result:
+            assert self.kind == "descriptor"
+            raise PermissionError("descriptor denied")
+
+    def fake_path(value: str) -> ProcNode:
+        assert value == "/proc"
+        return ProcNode("proc")
+
+    monkeypatch.setattr(activation_package_module, "Path", fake_path)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    with pytest.raises(ActivationPackageError, match=expected_message):
+        activation_package_module._processes_with_open_inode(1, 2)
+
+
 def test_final_migration_pre_hash_checkpoint_rescans_open_descriptors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

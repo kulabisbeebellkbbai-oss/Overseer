@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -10,7 +12,8 @@ from urllib.request import Request, urlopen
 import pytest
 
 from overseer import api as api_module
-from overseer.api import make_api_handler
+from overseer.api import BoundedThreadingUnixHTTPServer, make_api_handler
+from overseer.client import OverseerApiClient
 from overseer.store import SQLiteStore
 
 
@@ -210,3 +213,76 @@ def test_deferred_user_integrations_report_disabled_without_fallback(
     assert response["status"] == "disabled"
     assert response["reason"] == "typed_user_bridge_method_not_available"
     assert response["host_mutation_performed"] is False
+
+
+def test_unix_api_listener_and_client_authenticate_kernel_peer_uids(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "state.sqlite3"
+    SQLiteStore(store).close()
+    socket_path = tmp_path / "api.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    listener.listen()
+    server = BoundedThreadingUnixHTTPServer(
+        listener.fileno(),
+        make_api_handler(str(store), "ordinary-token"),
+        socket_path=str(socket_path),
+        allowed_peer_uid=os.geteuid(),
+        socket_owner_uid=os.geteuid(),
+        socket_owner_gid=os.getegid(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = OverseerApiClient(
+            base_url="http://localhost",
+            auth_token="ordinary-token",
+            unix_socket_path=str(socket_path),
+            expected_server_uid=os.geteuid(),
+        )
+        health = client.health()
+        assert health["ok"] is True
+        assert health["service"] == "overseer-api"
+    finally:
+        server.shutdown()
+        server.server_close()
+        listener.close()
+        thread.join(timeout=5)
+
+
+def test_unix_client_sends_no_http_or_secret_to_wrong_uid_peer(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "impersonator.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    listener.listen()
+    received: list[bytes] = []
+
+    def capture() -> None:
+        peer, _address = listener.accept()
+        try:
+            peer.settimeout(2)
+            received.append(peer.recv(4096))
+        finally:
+            peer.close()
+
+    thread = threading.Thread(target=capture, daemon=True)
+    thread.start()
+    client = OverseerApiClient(
+        base_url="http://localhost",
+        auth_token="must-not-leak",
+        unix_socket_path=str(socket_path),
+        expected_server_uid=os.geteuid() + 1,
+    )
+    try:
+        with pytest.raises(PermissionError, match="peer UID"):
+            client.service_status()
+    finally:
+        thread.join(timeout=5)
+        listener.close()
+
+    assert received == [b""]

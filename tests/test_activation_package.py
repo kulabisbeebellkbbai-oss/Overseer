@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -529,6 +530,7 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
         "overseer-admin-executor.socket",
         "overseer-admin-executor@.service",
         "overseer-api-canary.service",
+        "overseer-api-canary.socket",
         "overseer-api.service",
         "overseer-approval-smoke.service",
         "overseer-codex-user-bridge.service",
@@ -903,6 +905,48 @@ def test_rehearsal_backup_rejects_insecure_or_linked_store(tmp_path: Path) -> No
     linked.symlink_to(source)
     with pytest.raises(ActivationPackageError, match="symlink"):
         rehearse_store_migration(tmp_path / "package-linked", source_store=linked)
+
+
+def test_activation_contract_rejects_a_different_source_than_the_rehearsal(
+    tmp_path: Path,
+) -> None:
+    package, manifest, _source = _prepared_package(tmp_path)
+    replacement = tmp_path / "different-overseer.sqlite3"
+    _wal_store(replacement)
+    rollback = tmp_path / "rollback"
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
+
+    with pytest.raises(ActivationPackageError, match="rehearsal source"):
+        render_activation_contract(
+            package,
+            manifest,
+            source_store=replacement,
+            overseer_uid=984,
+            overseer_gid=984,
+            rollback_inputs={"v1.1.5-release": rollback},
+        )
+
+
+def test_activation_contract_rejects_source_inode_replacement_after_rehearsal(
+    tmp_path: Path,
+) -> None:
+    package, manifest, source = _prepared_package(tmp_path)
+    source.unlink()
+    _wal_store(source)
+    rollback = tmp_path / "rollback"
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
+
+    with pytest.raises(ActivationPackageError, match="rehearsal source"):
+        render_activation_contract(
+            package,
+            manifest,
+            source_store=source,
+            overseer_uid=984,
+            overseer_gid=984,
+            rollback_inputs={"v1.1.5-release": rollback},
+        )
 
 
 @pytest.mark.parametrize("pages_per_step", [-2, 0, 4097])
@@ -1318,7 +1362,13 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     assert token_verify[token_verify.index("--expected-target-gid") + 1] == str(os.getgid())
     assert token_verify[token_verify.index("--expected-target-uid") + 1] != str(os.getuid())
     canary_health_index = next(
-        index for index, command in enumerate(commands) if command[-1] == "http://127.0.0.1:18766/health"
+        index
+        for index, command in enumerate(commands)
+        if command[-3:] == [
+            "--unix-socket",
+            "/run/overseer/api-canary.sock",
+            "http://localhost/health",
+        ]
     )
     assert canary_health_index < stop_index < migration_index < system_start_index < token_copy_index
     assert all("overseer.service" not in command for command in staging_commands)
@@ -1337,9 +1387,27 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     canary_start_index = next(
         index
         for index, command in enumerate(staging_commands)
-        if command[-2:] == ["start", "overseer-api-canary.service"]
+        if command[-2:] == ["start", "overseer-api-canary.socket"]
     )
     assert staging_verify_index < canary_start_index
+    assert contract["canary"] == {
+        "store": "/var/lib/overseer/overseer-canary.sqlite3",
+        "unixSocket": "/run/overseer/api-canary.sock",
+        "serverPeerUid": 984,
+        "allowedClientUid": 0,
+        "mustPassBeforeLegacyStop": True,
+        "mutatingExecutorAcceptanceRequiresInteractiveAdminApproval": True,
+        "failureCleanupCommands": [
+            [
+                "/usr/bin/systemctl",
+                "stop",
+                "overseer-api-canary.service",
+                "overseer-api-canary.socket",
+                "overseer-admin-executor.socket",
+                "overseer-codex-user-bridge.socket",
+            ]
+        ],
+    }
     assert contract["acceptanceControls"]["negative"] == [
         "ordinary API token cannot approve",
         "wrong human scope cannot approve",
@@ -1487,6 +1555,39 @@ def test_package_verification_rejects_self_consistent_unapproved_migration_repor
 
     with pytest.raises(ActivationPackageError, match="approved semantics"):
         verify_activation_package(package, replacement_digest)
+
+
+def test_package_finalization_rejects_contract_rehearsal_source_mismatch(
+    tmp_path: Path,
+) -> None:
+    package, manifest, source = _prepared_package(tmp_path)
+    rollback = tmp_path / "rollback"
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
+    render_activation_contract(
+        package,
+        manifest,
+        source_store=source,
+        overseer_uid=984,
+        overseer_gid=984,
+        rollback_inputs={"v1.1.5-release": rollback},
+    )
+    create_human_verifiers(
+        package,
+        admin_secret="admin-approval-secret-123456",
+        roadex_secret="roadex-approval-secret-12345",
+    )
+    contract_path = package / "public" / "activation-contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["sourceStore"]["inode"] += 1
+    contract_path.write_text(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    contract_path.chmod(0o644)
+
+    with pytest.raises(ActivationPackageError, match="rehearsal source"):
+        finalize_activation_package(package)
 
 
 def test_package_finalization_rejects_missing_migration_database(tmp_path: Path) -> None:
@@ -1761,11 +1862,28 @@ def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls
         "_canary_attestation_path",
         lambda _digest: attestation,
     )
+    canary_socket = tmp_path / "api-canary.sock"
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_canary_socket",
+        lambda *_args, **_kwargs: None,
+    )
 
     class FakeClient:
         executions: dict[str, int] = {}
 
-        def __init__(self, *, base_url: str, auth_token: str, approval_token: str | None = None) -> None:
+        def __init__(
+            self,
+            *,
+            base_url: str,
+            auth_token: str,
+            unix_socket_path: str,
+            expected_server_uid: int,
+            approval_token: str | None = None,
+        ) -> None:
+            assert base_url == "http://localhost"
+            assert unix_socket_path == str(canary_socket)
+            assert expected_server_uid == os.geteuid()
             self.base_url = base_url
             self.auth_token = auth_token
             self.approval_token = approval_token
@@ -1819,6 +1937,7 @@ def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls
         admin_secret="admin-approval-secret-123456",
         roadex_secret="roadex-approval-secret-12345",
         attestation_path=attestation,
+        unix_socket_path=canary_socket,
     )
 
     assert result["status"] == "passed"
@@ -1830,6 +1949,47 @@ def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls
         expected_package_digest=digest,
         attestation_path=attestation,
     )["verified"] is True
+
+
+def test_live_canary_rejects_prebound_socket_before_connecting_or_attesting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, digest = _finalized_package(tmp_path)
+    canary_socket = tmp_path / "prebound-api-canary.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(canary_socket))
+    canary_socket.chmod(0o600)
+    listener.listen()
+    listener.setblocking(False)
+    attestation = tmp_path / "canary-attestation.json"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_installed_staging",
+        lambda *_args, **_kwargs: {"verified": True},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid() + 1, os.getegid() + 1),
+    )
+    try:
+        with pytest.raises(ActivationPackageError, match="socket identity"):
+            run_canary_acceptance(
+                package,
+                expected_package_digest=digest,
+                admin_secret="must-not-be-sent",
+                roadex_secret="must-not-be-sent-either",
+                attestation_path=attestation,
+                unix_socket_path=canary_socket,
+            )
+        with pytest.raises(BlockingIOError):
+            listener.accept()
+    finally:
+        listener.close()
+
+    assert not attestation.exists()
 
 
 def test_root_rollback_bundle_is_exact_and_drift_detected(

@@ -1,7 +1,8 @@
 [Unit]
 Description=Overseer disposable dedicated-principal API canary
 Wants=overseer-codex-user-bridge.socket
-After=local-fs.target overseer-codex-user-bridge.socket
+Requires=overseer-api-canary.socket
+After=local-fs.target overseer-codex-user-bridge.socket overseer-api-canary.socket
 
 [Service]
 Type=simple
@@ -29,7 +30,7 @@ Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.
 LoadCredential=api-token:/etc/overseer/api-token
 LoadCredential=psychlo-peer-secret:/etc/overseer/psychlo-peer-secret
 LoadCredential=roadex-peer-secret:/etc/overseer/roadex-project-human-thread-secret
-ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.cli serve-api --store /var/lib/overseer/overseer-canary.sqlite3 --host 127.0.0.1 --port 18766 --auth-token-file %d/api-token --admin-approval-verifier-file /etc/overseer/admin-approval-verifier.json --roadex-fixture-approval-verifier-file /etc/overseer/roadex-fixture-approval-verifier.json
+ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.cli serve-api --store /var/lib/overseer/overseer-canary.sqlite3 --socket-fd 3 --socket-path /run/overseer/api-canary.sock --socket-peer-uid 0 --socket-owner-uid 0 --socket-owner-gid 0 --auth-token-file %d/api-token --admin-approval-verifier-file /etc/overseer/admin-approval-verifier.json --roadex-fixture-approval-verifier-file /etc/overseer/roadex-fixture-approval-verifier.json
 RuntimeMaxSec=10min
 TimeoutStopSec=10s
 StateDirectory=overseer
@@ -50,8 +51,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 UMask=0077
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
-IPAddressAllow=localhost
 CapabilityBoundingSet=
 AmbientCapabilities=

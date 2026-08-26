@@ -9,6 +9,8 @@ import re
 import secrets
 import socket
 import sqlite3
+import stat
+import struct
 import threading
 import time
 from contextlib import contextmanager
@@ -16,6 +18,7 @@ from datetime import UTC, datetime
 from json import JSONDecodeError
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import BaseServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -703,6 +706,84 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
             pass
         finally:
+            request.close()
+
+
+class BoundedThreadingUnixHTTPServer(BoundedThreadingHTTPServer):
+    """Bounded HTTP server on one pre-opened, identity-checked Unix listener."""
+
+    address_family = socket.AF_UNIX
+
+    def __init__(
+        self,
+        listener_fd: int,
+        handler_class,
+        *,
+        socket_path: str,
+        allowed_peer_uid: int,
+        socket_owner_uid: int,
+        socket_owner_gid: int,
+        max_workers: int = API_MAX_REQUEST_THREADS,
+    ) -> None:
+        if (
+            type(listener_fd) is not int
+            or listener_fd < 0
+            or type(allowed_peer_uid) is not int
+            or allowed_peer_uid < 0
+            or type(socket_owner_uid) is not int
+            or socket_owner_uid < 0
+            or type(socket_owner_gid) is not int
+            or socket_owner_gid < 0
+            or not Path(socket_path).is_absolute()
+            or max_workers < 1
+        ):
+            raise ValueError("Unix API listener configuration is invalid")
+        listener = socket.fromfd(listener_fd, socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            path = Path(socket_path)
+            path_metadata = path.lstat()
+            parent_metadata = path.parent.lstat()
+            if (
+                listener.family != socket.AF_UNIX
+                or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
+                or listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1
+                or listener.getsockname() != socket_path
+                or path.is_symlink()
+                or not stat.S_ISSOCK(path_metadata.st_mode)
+                or path_metadata.st_nlink != 1
+                or path_metadata.st_uid != socket_owner_uid
+                or path_metadata.st_gid != socket_owner_gid
+                or stat.S_IMODE(path_metadata.st_mode) != 0o600
+                or path.parent.is_symlink()
+                or not stat.S_ISDIR(parent_metadata.st_mode)
+                or parent_metadata.st_uid != socket_owner_uid
+                or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+            ):
+                raise ValueError("Unix API listener identity is invalid")
+        except BaseException:
+            listener.close()
+            raise
+        self.max_workers = max_workers
+        self._request_slots = threading.BoundedSemaphore(max_workers)
+        self.allowed_peer_uid = allowed_peer_uid
+        self.socket = listener
+        BaseServer.__init__(self, socket_path, handler_class)
+        self.server_name = "localhost"
+        self.server_port = 0
+
+    def get_request(self):
+        while True:
+            request, client_address = self.socket.accept()
+            try:
+                _pid, uid, _gid = struct.unpack(
+                    "3i",
+                    request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+                )
+            except BaseException:
+                request.close()
+                raise
+            if uid == self.allowed_peer_uid:
+                return request, client_address
             request.close()
 
 
@@ -2796,6 +2877,11 @@ def run_api_server(
     admin_approval_verifier: ApprovalVerifier | None = None,
     roadex_fixture_approval_verifier: ApprovalVerifier | None = None,
     user_bridge_client: Any | None = None,
+    socket_fd: int | None = None,
+    socket_path: str | None = None,
+    socket_peer_uid: int | None = None,
+    socket_owner_uid: int | None = None,
+    socket_owner_gid: int | None = None,
 ) -> None:
     if host not in LOOPBACK_HOSTS:
         raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
@@ -2819,18 +2905,36 @@ def run_api_server(
         # SQLite database.
         bridge_environment["OVERSEER_STORE_DATABASE"] = str(Path(store_path))
         psychlo_bridge = create_bridge_from_environment(bridge_environment)
-    server = BoundedThreadingHTTPServer(
-        (host, port),
-        make_api_handler(
-            store_path,
-            auth_token,
-            roadex_decision_adapter_factory=decision_factory,
-            admin_approval_verifier=admin_approval_verifier,
-            roadex_fixture_approval_verifier=roadex_fixture_approval_verifier,
-            psychlo_bridge=psychlo_bridge,
-            user_bridge_client=selected_user_bridge_client,
-        ),
+    handler = make_api_handler(
+        store_path,
+        auth_token,
+        roadex_decision_adapter_factory=decision_factory,
+        admin_approval_verifier=admin_approval_verifier,
+        roadex_fixture_approval_verifier=roadex_fixture_approval_verifier,
+        psychlo_bridge=psychlo_bridge,
+        user_bridge_client=selected_user_bridge_client,
     )
+    unix_values = (
+        socket_path,
+        socket_peer_uid,
+        socket_owner_uid,
+        socket_owner_gid,
+    )
+    if socket_fd is None:
+        if any(value is not None for value in unix_values):
+            raise ValueError("Unix API listener arguments require socket_fd")
+        server = BoundedThreadingHTTPServer((host, port), handler)
+    else:
+        if any(value is None for value in unix_values):
+            raise ValueError("Unix API listener arguments are incomplete")
+        server = BoundedThreadingUnixHTTPServer(
+            socket_fd,
+            handler,
+            socket_path=str(socket_path),
+            allowed_peer_uid=int(socket_peer_uid),
+            socket_owner_uid=int(socket_owner_uid),
+            socket_owner_gid=int(socket_owner_gid),
+        )
     try:
         server.serve_forever()
     finally:

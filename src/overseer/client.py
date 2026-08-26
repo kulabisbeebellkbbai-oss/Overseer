@@ -3,10 +3,44 @@
 from __future__ import annotations
 
 import json
+import http.client
+import io
+import socket
+import struct
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.error import HTTPError
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
+
+
+class _AuthenticatedUnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(
+        self,
+        socket_path: str,
+        *,
+        expected_server_uid: int,
+        timeout: float,
+    ) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+        self.expected_server_uid = expected_server_uid
+
+    def connect(self) -> None:
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        peer.settimeout(self.timeout)
+        try:
+            peer.connect(self.socket_path)
+            _pid, uid, _gid = struct.unpack(
+                "3i",
+                peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+            )
+            if uid != self.expected_server_uid:
+                raise PermissionError("Overseer Unix API peer UID is not approved")
+        except BaseException:
+            peer.close()
+            raise
+        self.sock = peer
 
 
 class OverseerApiClient:
@@ -17,6 +51,8 @@ class OverseerApiClient:
         auth_token_file: str | None = None,
         timeout_seconds: float = 5.0,
         approval_token: str | None = None,
+        unix_socket_path: str | None = None,
+        expected_server_uid: int | None = None,
     ) -> None:
         if auth_token and auth_token_file:
             raise ValueError("use auth_token or auth_token_file, not both")
@@ -24,6 +60,16 @@ class OverseerApiClient:
         self.auth_token = auth_token or _load_token(auth_token_file)
         self.approval_token = approval_token
         self.timeout_seconds = timeout_seconds
+        if (unix_socket_path is None) != (expected_server_uid is None):
+            raise ValueError("unix_socket_path and expected_server_uid must be supplied together")
+        if unix_socket_path is not None and (
+            not Path(unix_socket_path).is_absolute()
+            or type(expected_server_uid) is not int
+            or expected_server_uid < 0
+        ):
+            raise ValueError("Unix API peer configuration is invalid")
+        self.unix_socket_path = unix_socket_path
+        self.expected_server_uid = expected_server_uid
 
     def health(self) -> dict[str, Any]:
         return self._get("/health", authenticated=False)
@@ -1057,6 +1103,37 @@ class OverseerApiClient:
         return merged
 
     def _read(self, request: Request) -> dict[str, Any]:
+        if self.unix_socket_path is not None:
+            assert self.expected_server_uid is not None
+            parsed = urlsplit(request.full_url)
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            connection = _AuthenticatedUnixHTTPConnection(
+                self.unix_socket_path,
+                expected_server_uid=self.expected_server_uid,
+                timeout=self.timeout_seconds,
+            )
+            try:
+                connection.request(
+                    request.get_method(),
+                    path,
+                    body=request.data,
+                    headers=dict(request.header_items()),
+                )
+                response = connection.getresponse()
+                body = response.read()
+                if response.status >= 400:
+                    raise HTTPError(
+                        request.full_url,
+                        response.status,
+                        response.reason,
+                        response.headers,
+                        io.BytesIO(body),
+                    )
+                return json.loads(body.decode("utf-8"))
+            finally:
+                connection.close()
         with urlopen(request, timeout=self.timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
 

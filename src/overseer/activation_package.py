@@ -50,6 +50,7 @@ APPROVED_OVERSEER_UID = 984
 APPROVED_OVERSEER_GID = 984
 APPROVED_PACKAGE_PARENT = Path("/home/god/.local/share/overseer/activation-packages")
 APPROVED_EXECUTION_PACKAGE = Path("/var/lib/overseer-executor/approved-package")
+CANARY_API_SOCKET = Path("/run/overseer/api-canary.sock")
 APPROVED_SQLITE_VERSION = "3.53.4"
 APPROVED_SQLITE_SOURCE_ID = (
     "2026-07-24 19:02:57 "
@@ -143,6 +144,7 @@ _SYSTEMD_TEMPLATES = {
     "overseer-admin-executor.socket": "overseer-admin-executor.socket",
     "overseer-admin-executor@.service": "overseer-admin-executor@.service",
     "overseer-api-canary.service": "overseer-api-canary.service",
+    "overseer-api-canary.socket": "overseer-api-canary.socket",
     "overseer-api-system.service": "overseer-api.service",
     "overseer-approval-smoke.service": "overseer-approval-smoke.service",
     "overseer-codex-user-bridge.service": "overseer-codex-user-bridge.service",
@@ -1399,9 +1401,11 @@ def rehearse_store_migration(
         "schemaVersion": "overseer.activation-migration-rehearsal.v1",
         "status": "rehearsal_complete",
         "source": {
-            "path": str(source),
+            "path": str(source.resolve()),
             "device": before.st_dev,
             "inode": before.st_ino,
+            "uid": before.st_uid,
+            "gid": before.st_gid,
             "mode": "0600",
             "sizeAtStart": before.st_size,
             "journalMode": source_journal_mode,
@@ -2519,6 +2523,38 @@ def _release_install_commands(package: Path, manifest: Mapping[str, object]) -> 
     return [*directory_commands, *commands, manifest_command, *freeze_commands]
 
 
+def _source_store_identity(path: Path, metadata: os.stat_result) -> dict[str, object]:
+    return {
+        "path": str(path.resolve()),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+    }
+
+
+def _validate_rehearsal_source_binding(
+    package: Path,
+    source: Path,
+    source_metadata: os.stat_result,
+) -> None:
+    report_path = package / "private" / "migration" / "migration-report.json"
+    try:
+        raw, _metadata = _stable_read(report_path)
+        report = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("migration rehearsal report is invalid") from error
+    recorded = report.get("source") if isinstance(report, dict) else None
+    expected = _source_store_identity(source, source_metadata)
+    if not isinstance(recorded, dict) or any(
+        recorded.get(field) != value for field, value in expected.items()
+    ):
+        raise ActivationPackageError(
+            "activation source store does not match the migration rehearsal source"
+        )
+
+
 def render_activation_contract(
     package_root: str | os.PathLike[str],
     release_manifest: Mapping[str, object],
@@ -2539,6 +2575,7 @@ def render_activation_contract(
     package = Path(package_root).resolve()
     source = Path(source_store)
     source_metadata = _validate_store_artifact(source, label="activation source SQLite store")
+    _validate_rehearsal_source_binding(package, source, source_metadata)
     try:
         god = pwd.getpwnam("god")
     except KeyError as error:
@@ -2645,6 +2682,7 @@ def render_activation_contract(
         "overseer-admin-executor.socket": "/etc/systemd/system/overseer-admin-executor.socket",
         "overseer-admin-executor@.service": "/etc/systemd/system/overseer-admin-executor@.service",
         "overseer-api-canary.service": "/etc/systemd/system/overseer-api-canary.service",
+        "overseer-api-canary.socket": "/etc/systemd/system/overseer-api-canary.socket",
         "overseer-api.service": "/etc/systemd/system/overseer-api.service",
         "overseer-approval-smoke.service": "/etc/systemd/system/overseer-approval-smoke.service",
         "overseer-codex-user-bridge.service": "/etc/systemd/system/overseer-codex-user-bridge.service",
@@ -2772,10 +2810,23 @@ def render_activation_contract(
             "overseer-codex-user-bridge.socket",
             "overseer-admin-executor.socket",
         ],
-        ["/usr/bin/systemctl", "start", "overseer-api-canary.service"],
-        ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18766/health"],
+        ["/usr/bin/systemctl", "start", "overseer-api-canary.socket"],
+        [
+            "/usr/bin/curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--unix-socket",
+            str(CANARY_API_SOCKET),
+            "http://localhost/health",
+        ],
         [*activation_python, "run-approved-canary", "--package-root", str(execution_package)],
-        ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"],
+        [
+            "/usr/bin/systemctl",
+            "stop",
+            "overseer-api-canary.service",
+            "overseer-api-canary.socket",
+        ],
     ]
     cutover_commands = [
         [*activation_python, "verify-approved-cutover", "--package-root", str(execution_package)],
@@ -2972,7 +3023,9 @@ def render_activation_contract(
         },
         "canary": {
             "store": "/var/lib/overseer/overseer-canary.sqlite3",
-            "loopbackHealth": "http://127.0.0.1:18766/health",
+            "unixSocket": str(CANARY_API_SOCKET),
+            "serverPeerUid": overseer_uid,
+            "allowedClientUid": 0,
             "mustPassBeforeLegacyStop": True,
             "mutatingExecutorAcceptanceRequiresInteractiveAdminApproval": True,
             "failureCleanupCommands": [
@@ -2980,6 +3033,7 @@ def render_activation_contract(
                     "/usr/bin/systemctl",
                     "stop",
                     "overseer-api-canary.service",
+                    "overseer-api-canary.socket",
                     "overseer-admin-executor.socket",
                     "overseer-codex-user-bridge.socket",
                 ]
@@ -2987,7 +3041,7 @@ def render_activation_contract(
         },
         "acceptanceControls": {
             "positive": [
-                "direct loopback canary health",
+                "authenticated Unix-socket canary health",
                 "bounded user-bridge session projection",
                 "bounded user-bridge usage projection",
                 "admin approval of the exact smoke-plan digest",
@@ -3113,8 +3167,16 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         report = json.loads(raw)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ActivationPackageError("migration rehearsal report is invalid") from error
+    try:
+        contract_raw, _contract_metadata = _stable_read(
+            package / "public" / "activation-contract.json"
+        )
+        contract = json.loads(contract_raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("activation contract is invalid") from error
     bounds = report.get("backupBounds") if isinstance(report, dict) else None
     source = report.get("source") if isinstance(report, dict) else None
+    contract_source = contract.get("sourceStore") if isinstance(contract, dict) else None
     backup = report.get("backup") if isinstance(report, dict) else None
     migrated = report.get("migrated") if isinstance(report, dict) else None
     started = bounds.get("startedUnixNs") if isinstance(bounds, dict) else None
@@ -3185,6 +3247,15 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
     )
     if not artifact_evidence_valid:
         raise ActivationPackageError("migration rehearsal artifact evidence does not match sealed databases")
+    source_binding_fields = ("path", "device", "inode", "uid", "gid", "mode")
+    if (
+        not isinstance(source, dict)
+        or not isinstance(contract_source, dict)
+        or any(source.get(field) != contract_source.get(field) for field in source_binding_fields)
+    ):
+        raise ActivationPackageError(
+            "activation contract source does not match the migration rehearsal source"
+        )
     if (
         metadata.st_uid != package_owner
         or stat.S_IMODE(metadata.st_mode) != 0o600
@@ -3192,7 +3263,6 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         or report.get("schemaVersion") != "overseer.activation-migration-rehearsal.v1"
         or report.get("status") != "rehearsal_complete"
         or report.get("sourceMutationPerformed") is not False
-        or not isinstance(source, dict)
         or source.get("journalMode") != "wal"
         or not row_counts_valid
         or not isinstance(bounds, dict)
@@ -3658,6 +3728,29 @@ def verify_compatibility_token(
     }
 
 
+def _validate_canary_socket(
+    socket_path: Path,
+    *,
+    expected_owner_uid: int,
+    expected_owner_gid: int,
+) -> os.stat_result:
+    if not socket_path.is_absolute() or socket_path.is_symlink():
+        raise ActivationPackageError("canary API socket path is invalid")
+    try:
+        metadata = socket_path.lstat()
+    except OSError as error:
+        raise ActivationPackageError("canary API socket is unavailable") from error
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != expected_owner_uid
+        or metadata.st_gid != expected_owner_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise ActivationPackageError("canary API socket identity is invalid")
+    return metadata
+
+
 def run_canary_acceptance(
     package_root: str | os.PathLike[str],
     *,
@@ -3665,7 +3758,8 @@ def run_canary_acceptance(
     admin_secret: str,
     roadex_secret: str,
     attestation_path: str | os.PathLike[str],
-    base_url: str = "http://127.0.0.1:18766",
+    base_url: str = "http://localhost",
+    unix_socket_path: str | os.PathLike[str] = CANARY_API_SOCKET,
 ) -> dict[str, object]:
     """Run mandatory live canary controls and create a root-owned attestation."""
 
@@ -3677,6 +3771,13 @@ def run_canary_acceptance(
     package = Path(package_root)
     verified = verify_activation_package(package, expected_package_digest)
     verify_installed_staging(package, expected_package_digest=expected_package_digest)
+    root_uid, root_gid = _activation_root_identity()
+    canary_socket = Path(unix_socket_path)
+    _validate_canary_socket(
+        canary_socket,
+        expected_owner_uid=root_uid,
+        expected_owner_gid=root_gid,
+    )
     credential_root = _installed_credential_root()
     admin_verifier = load_approval_verifier(
         credential_root / "admin-approval-verifier.json",
@@ -3687,7 +3788,6 @@ def run_canary_acceptance(
         expected_owner_uid=APPROVED_OVERSEER_UID,
     )
     token_raw, token_metadata = _stable_read(credential_root / "api-token")
-    root_uid, root_gid = _activation_root_identity()
     if (
         token_metadata.st_uid != root_uid
         or token_metadata.st_gid != root_gid
@@ -3703,20 +3803,23 @@ def run_canary_acceptance(
     if not roadex_verifier.verify(roadex_secret) or admin_verifier.verify(roadex_secret):
         raise ActivationPackageError("Roadex canary secret does not match exactly one approved scope")
 
-    ordinary = OverseerApiClient(base_url=base_url, auth_token=api_token)
+    client_transport = {
+        "base_url": base_url,
+        "auth_token": api_token,
+        "unix_socket_path": str(canary_socket),
+        "expected_server_uid": APPROVED_OVERSEER_UID,
+    }
+    ordinary = OverseerApiClient(**client_transport)
     admin = OverseerApiClient(
-        base_url=base_url,
-        auth_token=api_token,
+        **client_transport,
         approval_token=admin_secret,
     )
     wrong_scope = OverseerApiClient(
-        base_url=base_url,
-        auth_token=api_token,
+        **client_transport,
         approval_token=roadex_secret,
     )
     ordinary_as_approval = OverseerApiClient(
-        base_url=base_url,
-        auth_token=api_token,
+        **client_transport,
         approval_token=api_token,
     )
 

@@ -934,6 +934,17 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         any("overseer-v1-1-5-rollback-runtime-" in value for value in command)
         for command in contract["rollbackCommands"]
     )
+    rollback_transients = [
+        command for command in contract["rollbackCommands"] if command[0] == "/usr/bin/systemd-run"
+    ]
+    assert len(rollback_transients) == 2
+    assert all("--user" not in command for command in rollback_transients)
+    assert all("--uid=god" in command and "--gid=god" in command for command in rollback_transients)
+    assert all(
+        any(value.startswith("--property=Description=overseer.rollback-transient.v1:") for value in command)
+        and any(value.startswith("--setenv=OVERSEER_ROLLBACK_TRANSIENT_ID=") for value in command)
+        for command in rollback_transients
+    )
     rollback_installs = [
         command
         for command in staging_commands
@@ -1497,22 +1508,32 @@ def test_interrupted_staging_recovery_runs_and_records_cleanup(
     assert state["status"] == "aborted_before_cutover"
 
 
-def test_interrupted_rollback_verifies_active_transient_instead_of_restarting_it(
+def _rollback_transient_command() -> list[str]:
+    return activation_package_module._bind_rollback_transient_identity(
+        [
+            "/usr/bin/systemd-run",
+            "--collect",
+            "--uid=god",
+            "--gid=god",
+            "--unit=overseer-v1-1-5-rollback-runtime-dddddddddddddddd.service",
+            "--service-type=simple",
+            "--property=Restart=on-failure",
+            "--property=RestartSec=5s",
+            "--working-directory=/opt/overseer/rollback/" + "d" * 64 + "/v1.1.5-release",
+            "--setenv=PYTHONNOUSERSITE=1",
+            "--setenv=PYTHONSAFEPATH=1",
+            "--",
+            "/bin/true",
+        ]
+    )
+
+
+def test_interrupted_rollback_verifies_active_root_transient_instead_of_restarting_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     digest = "d" * 64
-    transient = [
-        "/usr/sbin/runuser",
-        "--user",
-        "god",
-        "--",
-        "/usr/bin/systemd-run",
-        "--user",
-        "--unit=overseer-rollback-d.service",
-        "--",
-        "/bin/true",
-    ]
+    transient = _rollback_transient_command()
     contract = {
         "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
         "liveExecutionApproved": False,
@@ -1537,17 +1558,16 @@ def test_interrupted_rollback_verifies_active_transient_instead_of_restarting_it
     )
     monkeypatch.setattr(
         activation_package_module,
-        "_rollback_transient_unit_active",
-        lambda command: command == transient,
+        "_inspect_rollback_transient_unit",
+        lambda spec: "active",
     )
-    prior_state = {
-        "phase": "rollback",
-        "status": "rollback_command_running",
-        "commandIndex": 1,
-        "commandDigest": hashlib.sha256(
-            json.dumps(transient, sort_keys=True, separators=(",", ":")).encode("ascii")
-        ).hexdigest(),
-    }
+    prior_state = activation_package_module._runner_state(
+        package_digest=digest,
+        status="rollback_command_running",
+        phase="rollback",
+        command_index=1,
+        command=transient,
+    )
 
     activation_package_module._execute_rollback_sequence(
         contract,
@@ -1558,6 +1578,178 @@ def test_interrupted_rollback_verifies_active_transient_instead_of_restarting_it
     assert calls == [("/bin/true", "verify")]
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["status"] == "rolled_back"
+
+
+@pytest.mark.parametrize(
+    ("states", "expected_command"),
+    [
+        (["active"], None),
+        (["activating", "active"], ["/usr/bin/systemctl", "start"]),
+        (["inactive", "active"], ["/usr/bin/systemctl", "restart"]),
+        (["failed", "active"], ["/usr/bin/systemctl", "restart"]),
+        (["deactivating", "active"], ["/usr/bin/systemctl", "restart"]),
+        (["unloaded", "active"], ["/usr/bin/systemd-run"]),
+    ],
+)
+def test_rollback_transient_reconciles_each_interrupted_unit_state(
+    monkeypatch: pytest.MonkeyPatch,
+    states: list[str],
+    expected_command: list[str] | None,
+) -> None:
+    command = _rollback_transient_command()
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+    }
+    observed_states = iter(states)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_inspect_rollback_transient_unit",
+        lambda spec: next(observed_states),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda selected: calls.append(selected) or 0,
+    )
+
+    activation_package_module._execute_rollback_transient(contract, command, resume=True)
+
+    if expected_command is None:
+        assert calls == []
+    else:
+        assert calls and calls[0][: len(expected_command)] == expected_command
+
+
+def test_rollback_transient_rejects_loaded_unit_without_saved_recovery_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = _rollback_transient_command()
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+    }
+    monkeypatch.setattr(
+        activation_package_module,
+        "_inspect_rollback_transient_unit",
+        lambda spec: "active",
+    )
+
+    with pytest.raises(ActivationPackageError, match="pre-existing"):
+        activation_package_module._execute_rollback_transient(contract, command, resume=False)
+
+
+def test_rollback_transient_snapshot_is_bound_to_all_sealed_properties(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = _rollback_transient_command()
+    spec = activation_package_module._rollback_transient_spec(command)
+    assert spec is not None
+    unit = str(spec["unit"])
+    environment = " ".join(str(value) for value in spec["environment"])
+    snapshot = {
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "running",
+        "Transient": "yes",
+        "FragmentPath": f"/run/systemd/transient/{unit}",
+        "Description": str(spec["description"]),
+        "User": "god",
+        "Group": "god",
+        "WorkingDirectory": str(spec["workingDirectory"]),
+        "Type": "simple",
+        "Restart": "on-failure",
+        "RestartUSec": "5s",
+        "CollectMode": "inactive-or-failed",
+        "Environment": environment,
+        "ExecStart": "{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; start_time=[n/a] }",
+        "After": "basic.target",
+        "LoadCredential": "",
+        "InvocationID": "1" * 32,
+    }
+    monkeypatch.setattr(
+        activation_package_module,
+        "_systemctl_show_rollback_unit",
+        lambda selected: snapshot,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_verify_rollback_transient_fragment",
+        lambda fragment, *, unit: None,
+    )
+
+    assert activation_package_module._inspect_rollback_transient_unit(spec) == "active"
+    snapshot["Description"] = "unsealed"
+    with pytest.raises(ActivationPackageError, match="identity drifted"):
+        activation_package_module._inspect_rollback_transient_unit(spec)
+
+
+def test_rollback_transient_identity_rejects_sealed_argv_drift() -> None:
+    command = _rollback_transient_command()
+    command[-1] = "/bin/false"
+
+    with pytest.raises(ActivationPackageError, match="identity digest drifted"):
+        activation_package_module._rollback_transient_spec(command)
+
+
+def test_rollback_transient_retries_sealed_start_after_loaded_unit_is_collected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = _rollback_transient_command()
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+    }
+    states = iter(["failed", "unloaded", "active"])
+    returncodes = iter([1, 0])
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_inspect_rollback_transient_unit",
+        lambda spec: next(states),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda selected: calls.append(selected) or next(returncodes),
+    )
+
+    activation_package_module._execute_rollback_transient(contract, command, resume=True)
+
+    assert calls[0][:2] == ["/usr/bin/systemctl", "restart"]
+    assert calls[1] == command
+
+
+def test_rollback_recovery_rejects_saved_command_digest_mismatch() -> None:
+    commands = [["/bin/true", "verify"], ["/bin/true", "restore"]]
+    prior_state = {
+        "schemaVersion": "overseer.activation-runner-state.v1",
+        "packageDigest": "d" * 64,
+        "phase": "rollback",
+        "status": "rollback_command_running",
+        "commandIndex": 1,
+        "commandDigest": "0" * 64,
+    }
+
+    with pytest.raises(ActivationPackageError, match="command digest"):
+        activation_package_module._rollback_recovery_boundary(
+            prior_state,
+            commands=commands,
+            package_digest="d" * 64,
+        )
 
 
 def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(

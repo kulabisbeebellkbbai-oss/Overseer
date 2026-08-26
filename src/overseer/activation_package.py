@@ -18,6 +18,7 @@ import os
 import pwd
 import re
 import secrets
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -60,6 +61,7 @@ CANARY_REQUIRED_CONTROLS = (
     "samePlanReplayNoMutation",
     "unlistedUnitRejected",
 )
+ROLLBACK_TRANSIENT_MARKER = "overseer.rollback-transient.v1:"
 MIGRATION_KEY_TABLES = (
     "schema_migrations",
     "agent_schema_migrations",
@@ -1949,6 +1951,24 @@ def verify_rollback_inputs(package_root: str | os.PathLike[str]) -> dict[str, ob
     }
 
 
+def _bind_rollback_transient_identity(command: list[str]) -> list[str]:
+    """Bind one root-manager transient unit to every sealed launch argument."""
+
+    if command.count("--") != 1 or command[0] != "/usr/bin/systemd-run":
+        raise ActivationPackageError("rollback transient command is invalid")
+    if any(ROLLBACK_TRANSIENT_MARKER in value for value in command):
+        raise ActivationPackageError("rollback transient command is already identity-bound")
+    separator = command.index("--")
+    digest = _sha256(_canonical(command))
+    marker = f"{ROLLBACK_TRANSIENT_MARKER}{digest}"
+    return [
+        *command[:separator],
+        f"--property=Description={marker}",
+        f"--setenv=OVERSEER_ROLLBACK_TRANSIENT_ID={digest}",
+        *command[separator:],
+    ]
+
+
 def _package_file_inventory(package: Path) -> list[dict[str, object]]:
     if package.is_symlink() or not package.is_dir():
         raise ActivationPackageError("activation package root is unsafe")
@@ -2299,15 +2319,11 @@ def render_activation_contract(
         "/usr/bin/systemctl",
         "--user",
     ]
-    user_systemd_run = [
-        "/usr/sbin/runuser",
-        "--user",
-        "god",
-        "--",
-        "/usr/bin/env",
-        f"XDG_RUNTIME_DIR=/run/user/{source_metadata.st_uid}",
+    rollback_systemd_run = [
         "/usr/bin/systemd-run",
-        "--user",
+        "--collect",
+        "--uid=god",
+        "--gid=god",
     ]
     activation_python = [
         "/usr/bin/env",
@@ -2387,40 +2403,9 @@ def render_activation_contract(
         ],
         ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8766/health"],
     ]
-    rollback_commands = [
+    rollback_runtime_command = _bind_rollback_transient_identity(
         [
-            *activation_python,
-            "verify-rollback-bundle",
-            "--bundle-root",
-            str(rollback_bundle_root),
-            "--rollback-manifest",
-            "/var/lib/overseer-executor/activation-package/public/rollback-manifest.json",
-        ],
-        ["/usr/bin/systemctl", "stop", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
-        ["/usr/bin/systemctl", "disable", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
-        ["/usr/bin/systemctl", "daemon-reload"],
-        [
-            *activation_python,
-            "restore-legacy-store-access",
-            "--source-store",
-            str(source.resolve()),
-            "--expected-source-uid",
-            str(source_metadata.st_uid),
-            "--expected-source-gid",
-            str(source_metadata.st_gid),
-            "--expected-source-device",
-            str(source_metadata.st_dev),
-            "--expected-source-inode",
-            str(source_metadata.st_ino),
-            "--expected-parent-device",
-            str(parent_metadata.st_dev),
-            "--expected-parent-inode",
-            str(parent_metadata.st_ino),
-            "--expected-parent-mode",
-            str(parent_mode),
-        ],
-        [
-            *user_systemd_run,
+            *rollback_systemd_run,
             f"--unit={rollback_runtime_unit}",
             "--service-type=simple",
             "--property=Restart=on-failure",
@@ -2439,9 +2424,11 @@ def render_activation_contract(
             "run",
             "--store",
             str(source.resolve()),
-        ],
+        ]
+    )
+    rollback_api_command = _bind_rollback_transient_identity(
         [
-            *user_systemd_run,
+            *rollback_systemd_run,
             f"--unit={rollback_api_unit}",
             "--service-type=simple",
             "--property=Restart=on-failure",
@@ -2478,7 +2465,42 @@ def render_activation_contract(
             "8766",
             "--auth-token-file",
             "/home/god/.local/share/overseer/project/state/api-token",
+        ]
+    )
+    rollback_commands = [
+        [
+            *activation_python,
+            "verify-rollback-bundle",
+            "--bundle-root",
+            str(rollback_bundle_root),
+            "--rollback-manifest",
+            "/var/lib/overseer-executor/activation-package/public/rollback-manifest.json",
         ],
+        ["/usr/bin/systemctl", "stop", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
+        ["/usr/bin/systemctl", "disable", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
+        ["/usr/bin/systemctl", "daemon-reload"],
+        [
+            *activation_python,
+            "restore-legacy-store-access",
+            "--source-store",
+            str(source.resolve()),
+            "--expected-source-uid",
+            str(source_metadata.st_uid),
+            "--expected-source-gid",
+            str(source_metadata.st_gid),
+            "--expected-source-device",
+            str(source_metadata.st_dev),
+            "--expected-source-inode",
+            str(source_metadata.st_ino),
+            "--expected-parent-device",
+            str(parent_metadata.st_dev),
+            "--expected-parent-inode",
+            str(parent_metadata.st_ino),
+            "--expected-parent-mode",
+            str(parent_mode),
+        ],
+        rollback_runtime_command,
+        rollback_api_command,
         ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8766/health"],
     ]
     contract: dict[str, object] = {
@@ -3540,24 +3562,313 @@ def _execute_cleanup_sequence(
         )
 
 
-def _rollback_transient_unit_active(command: list[str]) -> bool:
-    try:
-        runner_index = command.index("/usr/bin/systemd-run")
-    except ValueError:
-        return False
-    unit_argument = next((value for value in command if value.startswith("--unit=")), None)
-    if unit_argument is None:
-        return False
-    probe = [
-        *command[:runner_index],
-        "/usr/bin/systemctl",
-        "--user",
-        "is-active",
-        "--quiet",
-        unit_argument.removeprefix("--unit="),
+def _rollback_transient_spec(command: list[str]) -> dict[str, object] | None:
+    if not command or command[0] != "/usr/bin/systemd-run":
+        return None
+    if (
+        command.count("--") != 1
+        or command.count("--collect") != 1
+        or command.count("--uid=god") != 1
+        or command.count("--gid=god") != 1
+        or command.count("--service-type=simple") != 1
+        or any(value.startswith("--uid=") and value != "--uid=god" for value in command)
+        or any(value.startswith("--gid=") and value != "--gid=god" for value in command)
+        or any(value.startswith("--service-type=") and value != "--service-type=simple" for value in command)
+        or "--user" in command
+    ):
+        raise ActivationPackageError("sealed rollback transient command is invalid")
+    unit_values = [value.removeprefix("--unit=") for value in command if value.startswith("--unit=")]
+    working_values = [
+        value.removeprefix("--working-directory=")
+        for value in command
+        if value.startswith("--working-directory=")
     ]
-    returncode, _start_error = _command_outcome(probe)
-    return returncode == 0
+    description_values = [
+        value.removeprefix("--property=Description=")
+        for value in command
+        if value.startswith("--property=Description=")
+    ]
+    marker_values = [
+        value.removeprefix("--setenv=OVERSEER_ROLLBACK_TRANSIENT_ID=")
+        for value in command
+        if value.startswith("--setenv=OVERSEER_ROLLBACK_TRANSIENT_ID=")
+    ]
+    if (
+        len(unit_values) != 1
+        or re.fullmatch(r"overseer-v1-1-5-rollback-(runtime|api)-[0-9a-f]{16}\.service", unit_values[0]) is None
+        or len(working_values) != 1
+        or not working_values[0].startswith("/opt/overseer/rollback/")
+        or len(description_values) != 1
+        or len(marker_values) != 1
+        or not description_values[0].startswith(ROLLBACK_TRANSIENT_MARKER)
+    ):
+        raise ActivationPackageError("rollback transient identity fields are invalid")
+    marker_digest = description_values[0].removeprefix(ROLLBACK_TRANSIENT_MARKER)
+    if marker_digest != marker_values[0] or len(marker_digest) != 64 or set(marker_digest) - _HEX:
+        raise ActivationPackageError("rollback transient identity marker is invalid")
+    marker_arguments = {
+        f"--property=Description={description_values[0]}",
+        f"--setenv=OVERSEER_ROLLBACK_TRANSIENT_ID={marker_digest}",
+    }
+    unbound = [value for value in command if value not in marker_arguments]
+    if _sha256(_canonical(unbound)) != marker_digest:
+        raise ActivationPackageError("rollback transient identity digest drifted")
+    separator = command.index("--")
+    argv = command[separator + 1 :]
+    if not argv or not argv[0].startswith("/"):
+        raise ActivationPackageError("rollback transient executable is invalid")
+    properties: dict[str, list[str]] = {}
+    for value in command[:separator]:
+        if not value.startswith("--property="):
+            continue
+        assignment = value.removeprefix("--property=")
+        key, separator_value, property_value = assignment.partition("=")
+        if not key or not separator_value:
+            raise ActivationPackageError("rollback transient property is invalid")
+        properties.setdefault(key, []).append(property_value)
+    environment = [
+        value.removeprefix("--setenv=")
+        for value in command[:separator]
+        if value.startswith("--setenv=")
+    ]
+    environment_names = [value.partition("=")[0] for value in environment]
+    unit_kind = "runtime" if "-runtime-" in unit_values[0] else "api"
+    expected_runtime_unit = unit_values[0].replace("-api-", "-runtime-")
+    expected_credentials = {
+        "psychlo-overseer-peer-secret:/home/god/.config/psychlo/overseer-peer-secret",
+        "roadex-project-human-thread-secret:/home/god/.config/overseer/project-human-thread-relay.secret",
+    }
+    expected_property_names = {"Description", "Restart", "RestartSec"}
+    if unit_kind == "api":
+        expected_property_names.update({"After", "LoadCredential"})
+    if (
+        set(properties) != expected_property_names
+        or len(properties["Description"]) != 1
+        or properties.get("Restart") != ["on-failure"]
+        or properties.get("RestartSec") != ["5s"]
+        or (unit_kind == "runtime" and ("After" in properties or "LoadCredential" in properties))
+        or (unit_kind == "api" and properties.get("After") != [expected_runtime_unit])
+        or (unit_kind == "api" and set(properties.get("LoadCredential", [])) != expected_credentials)
+        or len(environment_names) != len(set(environment_names))
+        or any(not name for name in environment_names)
+    ):
+        raise ActivationPackageError("rollback transient sealed properties are invalid")
+    return {
+        "unit": unit_values[0],
+        "workingDirectory": working_values[0],
+        "description": description_values[0],
+        "environment": environment,
+        "properties": properties,
+        "argv": argv,
+    }
+
+
+def _systemctl_show_rollback_unit(unit: str) -> dict[str, str]:
+    names = (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "Transient",
+        "FragmentPath",
+        "Description",
+        "User",
+        "Group",
+        "WorkingDirectory",
+        "Type",
+        "Restart",
+        "RestartUSec",
+        "CollectMode",
+        "Environment",
+        "ExecStart",
+        "After",
+        "LoadCredential",
+        "InvocationID",
+    )
+    command = [
+        "/usr/bin/systemctl",
+        "show",
+        "--no-pager",
+        *[f"--property={name}" for name in names],
+        unit,
+    ]
+    environment = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    except OSError as error:
+        raise ActivationPackageError("rollback transient unit inspection could not start") from error
+    if result.returncode != 0:
+        raise ActivationPackageError("rollback transient unit inspection failed")
+    observed: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in names and key not in observed:
+            observed[key] = value
+    if "LoadState" not in observed or "ActiveState" not in observed:
+        raise ActivationPackageError("rollback transient unit inspection was incomplete")
+    return observed
+
+
+def _show_words(value: str, *, label: str) -> list[str]:
+    try:
+        return shlex.split(value, posix=True)
+    except ValueError as error:
+        raise ActivationPackageError(f"rollback transient {label} is invalid") from error
+
+
+def _verify_rollback_transient_fragment(fragment: Path, *, unit: str) -> None:
+    expected_fragment = Path("/run/systemd/transient") / unit
+    try:
+        fragment_metadata = fragment.lstat()
+    except OSError as error:
+        raise ActivationPackageError("rollback transient unit file is unavailable") from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        fragment != expected_fragment
+        or fragment.is_symlink()
+        or not stat.S_ISREG(fragment_metadata.st_mode)
+        or fragment_metadata.st_uid != root_uid
+        or fragment_metadata.st_gid != root_gid
+        or fragment_metadata.st_nlink != 1
+        or stat.S_IMODE(fragment_metadata.st_mode) & 0o022
+    ):
+        raise ActivationPackageError("rollback transient unit file identity drifted")
+
+
+def _inspect_rollback_transient_unit(spec: Mapping[str, object]) -> str:
+    unit = str(spec["unit"])
+    observed = _systemctl_show_rollback_unit(unit)
+    load_state = observed.get("LoadState")
+    active_state = observed.get("ActiveState")
+    if load_state == "not-found":
+        return "unloaded"
+    if load_state != "loaded" or not active_state:
+        raise ActivationPackageError("rollback transient unit load state is invalid")
+    fragment = Path(observed.get("FragmentPath", ""))
+    _verify_rollback_transient_fragment(fragment, unit=unit)
+    invocation_id = observed.get("InvocationID", "")
+    allowed_substates = {
+        "active": {"running"},
+        "activating": {"start", "start-pre", "start-post", "auto-restart"},
+        "inactive": {"dead"},
+        "failed": {"failed"},
+        "deactivating": {
+            "stop",
+            "stop-sigterm",
+            "stop-sigkill",
+            "final-sigterm",
+            "final-sigkill",
+        },
+    }
+    if (
+        observed.get("Transient") != "yes"
+        or observed.get("Description") != spec["description"]
+        or observed.get("User") != "god"
+        or observed.get("Group") != "god"
+        or observed.get("WorkingDirectory") != spec["workingDirectory"]
+        or observed.get("Type") != "simple"
+        or observed.get("CollectMode") != "inactive-or-failed"
+        or observed.get("SubState") not in allowed_substates.get(active_state, set())
+        or (invocation_id and re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None)
+        or (active_state != "inactive" and not invocation_id)
+    ):
+        raise ActivationPackageError("rollback transient unit identity drifted")
+    properties = spec.get("properties")
+    if not isinstance(properties, Mapping):
+        raise ActivationPackageError("rollback transient sealed properties are invalid")
+    if observed.get("Restart") != properties.get("Restart", [None])[0]:
+        raise ActivationPackageError("rollback transient restart policy drifted")
+    if observed.get("RestartUSec") != properties.get("RestartSec", [None])[0]:
+        raise ActivationPackageError("rollback transient restart timing drifted")
+    expected_after = set(properties.get("After", []))
+    if not expected_after.issubset(set(_show_words(observed.get("After", ""), label="ordering"))):
+        raise ActivationPackageError("rollback transient ordering drifted")
+    expected_credentials = set(properties.get("LoadCredential", []))
+    if expected_credentials and observed.get("LoadCredential") != "[unprintable]":
+        raise ActivationPackageError("rollback transient credential binding drifted")
+    if not expected_credentials and observed.get("LoadCredential"):
+        raise ActivationPackageError("rollback transient unexpected credential binding")
+    credential_directory = f"/run/credentials/{unit}"
+    expected_environment = {
+        str(value).replace("%d", credential_directory) for value in spec["environment"]
+    }
+    if set(_show_words(observed.get("Environment", ""), label="environment")) != expected_environment:
+        raise ActivationPackageError("rollback transient environment drifted")
+    exec_match = re.search(r"(?:^| ; )argv\[\]=(.*?) ; ignore_errors=", observed.get("ExecStart", ""))
+    if exec_match is None or _show_words(exec_match.group(1), label="command") != spec["argv"]:
+        raise ActivationPackageError("rollback transient executable drifted")
+    return active_state
+
+
+def _rollback_recovery_boundary(
+    prior_state: Mapping[str, object] | None,
+    *,
+    commands: list[list[str]],
+    package_digest: str,
+) -> int | None:
+    if prior_state is None or prior_state.get("phase") != "rollback":
+        return None
+    if (
+        prior_state.get("schemaVersion") != "overseer.activation-runner-state.v1"
+        or prior_state.get("packageDigest") != package_digest
+        or prior_state.get("status")
+        not in {"rollback_command_running", "rollback_command_complete", "rollback_failed"}
+    ):
+        raise ActivationPackageError("rollback recovery state binding is invalid")
+    index = prior_state.get("commandIndex")
+    if type(index) is not int or not 0 <= index < len(commands):
+        raise ActivationPackageError("rollback recovery command index is invalid")
+    if prior_state.get("commandDigest") != _sha256(_canonical(commands[index])):
+        raise ActivationPackageError("rollback recovery command digest is invalid")
+    return index
+
+
+def _execute_rollback_transient(
+    contract: Mapping[str, object],
+    command: list[str],
+    *,
+    resume: bool,
+) -> None:
+    spec = _rollback_transient_spec(command)
+    if spec is None:
+        raise ActivationPackageError("rollback transient command is unavailable")
+
+    def inspect() -> str:
+        _validate_contract_principal_binding(contract)
+        return _inspect_rollback_transient_unit(spec)
+
+    state = inspect()
+    if not resume and state != "unloaded":
+        raise ActivationPackageError("unexpected pre-existing rollback transient unit")
+    if state == "active":
+        return
+    action = command
+    if state == "activating":
+        action = ["/usr/bin/systemctl", "start", str(spec["unit"])]
+    elif state in {"inactive", "failed", "deactivating"}:
+        action = ["/usr/bin/systemctl", "restart", str(spec["unit"])]
+    elif state != "unloaded":
+        raise ActivationPackageError("rollback transient unit state is not recoverable")
+    returncode, start_error = _validated_command_outcome(contract, action)
+    if returncode != 0 and action is not command:
+        raced_state = inspect()
+        if raced_state == "unloaded":
+            returncode, start_error = _validated_command_outcome(contract, command)
+    if returncode != 0:
+        detail = start_error or f"exit-{returncode}"
+        raise ActivationPackageError(f"rollback transient unit start failed: {detail}")
+    if inspect() != "active":
+        raise ActivationPackageError("rollback transient unit did not become active")
 
 
 def _execute_rollback_sequence(
@@ -3568,6 +3879,11 @@ def _execute_rollback_sequence(
     originating_failure: str | None = None,
 ) -> None:
     commands = _contract_commands(contract, "rollbackCommands")
+    recovery_boundary = _rollback_recovery_boundary(
+        prior_state,
+        commands=commands,
+        package_digest=package_digest,
+    )
     for index, command in enumerate(commands):
         try:
             _validate_contract_principal_binding(contract)
@@ -3583,24 +3899,37 @@ def _execute_rollback_sequence(
                 )
             )
             raise ActivationPackageError("rollback principal binding drifted") from error
-        replayed_interrupted_transient = (
-            prior_state is not None
-            and prior_state.get("phase") == "rollback"
-            and prior_state.get("status")
-            in {"rollback_command_running", "rollback_command_complete", "rollback_failed"}
-            and _rollback_transient_unit_active(command)
-        )
-        if not replayed_interrupted_transient:
-            _write_activation_state(
-                _runner_state(
-                    package_digest=package_digest,
-                    status="rollback_command_running",
-                    phase="rollback",
-                    command_index=index,
-                    command=command,
-                    failure=originating_failure,
-                )
+        _write_activation_state(
+            _runner_state(
+                package_digest=package_digest,
+                status="rollback_command_running",
+                phase="rollback",
+                command_index=index,
+                command=command,
+                failure=originating_failure,
             )
+        )
+        transient = _rollback_transient_spec(command)
+        if transient is not None:
+            try:
+                _execute_rollback_transient(
+                    contract,
+                    command,
+                    resume=recovery_boundary is not None and index <= recovery_boundary,
+                )
+            except Exception as error:
+                _write_activation_state(
+                    _runner_state(
+                        package_digest=package_digest,
+                        status="rollback_failed",
+                        phase="rollback",
+                        command_index=index,
+                        command=command,
+                        failure=type(error).__name__,
+                    )
+                )
+                raise ActivationPackageError("sealed rollback transient command failed") from error
+        else:
             returncode, start_error = _command_outcome(command)
             if returncode != 0:
                 _write_activation_state(
@@ -3624,8 +3953,6 @@ def _execute_rollback_sequence(
                 failure=originating_failure,
             )
         )
-        if prior_state is not None and prior_state.get("commandIndex") == index:
-            prior_state = None
     _write_activation_state(
         _runner_state(
             package_digest=package_digest,

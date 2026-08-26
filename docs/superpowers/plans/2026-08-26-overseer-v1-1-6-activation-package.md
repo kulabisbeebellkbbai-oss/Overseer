@@ -101,7 +101,7 @@
 - Consumes: release/config/unit/rollback/credential/backup manifests.
 - Produces: exact command JSON, a root-only state-machine runner, a root-only final-migration primitive, an immutable rollback bundle, and a closed package manifest. No preparation artifact grants activation without a separate digest-bound root approval record.
 
-- [x] Test exact account UID/GID, paths, units, allowlist, install modes, hostile user-site exclusion, canary order, root-owned digest approval, installed-artifact verification, execution locking, interrupted cleanup/rollback, exact live controls, cutover order, and rollback order.
+- [x] Test exact account UID/GID, paths, units, allowlist, install modes, hostile user-site exclusion, canary order, root-owned digest approval, installed-artifact verification, execution locking, interrupted cleanup/rollback, root-manager transient identity and every recovery state, exact live controls, cutover order, and rollback order.
 - [x] Test no unresolved angle-bracket values, globs, recursive copies, token argv, or unapproved service names.
 - [x] Test finalization refuses missing interactive verifier documents and any artifact drift.
 - [x] Implement command rendering, package self-verification, state-machine execution, interrupted-cutover rollback recovery, and status reporting.

@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from overseer.approval_auth import create_approval_document, load_approval_verifier
 from overseer.api import make_api_handler
 from overseer.admin import plan_user_service_restart
 from overseer.roadex_approval_status import RoadexApprovalBindingDraft, stage_bound_roadex_approval
@@ -28,12 +29,17 @@ class LocalApiHarness:
         self.roadex_decision_adapter_factory = roadex_decision_adapter_factory
 
     def __enter__(self):
+        verifier_path = Path(self.store_path).parent / "admin-plan-approval.json"
+        verifier_path.write_text(
+            json.dumps(create_approval_document(self.approval_token, "admin-plan-approval")),
+            encoding="utf-8",
+        )
+        verifier_path.chmod(0o600)
         handler = make_api_handler(
             str(self.store_path),
             self.auth_token,
             roadex_decision_adapter_factory=self.roadex_decision_adapter_factory,
-            human_approval_token=self.approval_token,
-            human_approval_identity="sisko",
+            admin_approval_verifier=load_approval_verifier(verifier_path),
         )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         host, port = self.server.server_address

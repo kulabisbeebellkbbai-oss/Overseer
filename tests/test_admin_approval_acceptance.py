@@ -18,6 +18,7 @@ import pytest
 from overseer.admin import (
     AdminCommandResult,
 )
+from overseer.approval_auth import create_approval_document, load_approval_verifier
 from overseer.api import make_api_handler
 from overseer.cli import (
     approve_admin_change_status,
@@ -32,6 +33,13 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_UNIT = ROOT / "systemd" / "overseer-approval-smoke.service"
 
 
+def approval_verifier(tmp_path: Path, secret: str, scope: str):
+    path = tmp_path / f"{scope}.json"
+    path.write_text(json.dumps(create_approval_document(secret, scope)), encoding="utf-8")
+    path.chmod(0o600)
+    return load_approval_verifier(path)
+
+
 @contextmanager
 def approval_api(
     store_path: Path,
@@ -40,11 +48,19 @@ def approval_api(
     approval_token: str | None = "approval-token",
     approval_identity: str | None = "sisko",
 ):
+    admin_verifier = None
+    if approval_token is not None:
+        if approval_identity != "sisko":
+            raise ValueError("test verifier identity is fixed by scope")
+        admin_verifier = approval_verifier(
+            store_path.parent,
+            approval_token,
+            "admin-plan-approval",
+        )
     handler = make_api_handler(
         str(store_path),
         admin_token,
-        human_approval_token=approval_token,
-        human_approval_identity=approval_identity,
+        admin_approval_verifier=admin_verifier,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -196,12 +212,12 @@ def test_direct_cli_admin_approval_is_retired(tmp_path: Path) -> None:
 def test_api_handler_rejects_shared_agent_and_approval_credentials(
     tmp_path: Path,
 ) -> None:
+    verifier = approval_verifier(tmp_path, "shared-token", "admin-plan-approval")
     with pytest.raises(ValueError, match="must be independent"):
         make_api_handler(
             str(tmp_path / "overseer.sqlite3"),
             "shared-token",
-            human_approval_token="shared-token",
-            human_approval_identity="sisko",
+            admin_approval_verifier=verifier,
         )
 
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .approval_auth import ApprovalVerifier
 from .backup_provisioning import approve_plan_api as approve_backup_provisioning_plan_api, decide_roadex_human_plan_api, execute_plan_api as execute_backup_provisioning_plan_api, list_plans as list_backup_provisioning_plans, list_roadex_human_decisions, stage_plan_api as stage_backup_provisioning_plan_api
 from .roadex_approval_status import (
     MissingRoadexApprovalError,
@@ -792,16 +793,16 @@ def make_api_handler(
     backup_provisioning_adapter_factory=None,
     roadex_decision_adapter_factory=None,
     *,
-    human_approval_token: str | None = None,
-    human_approval_identity: str | None = None,
+    admin_approval_verifier: ApprovalVerifier | None = None,
+    roadex_fixture_approval_verifier: ApprovalVerifier | None = None,
     psychlo_bridge: PsychloBridge | None = None,
     psychlo_peer_authority: str = "127.0.0.1:8766",
     roadex_relay_authority: str = "127.0.0.1:8766",
 ):
-    _validate_human_approval_authentication(
+    _validate_approval_authentication(
         auth_token,
-        human_approval_token,
-        human_approval_identity,
+        admin_approval_verifier,
+        roadex_fixture_approval_verifier,
     )
     if psychlo_bridge is not None:
         def load_bridge_approval(approval_id: str):
@@ -1314,13 +1315,12 @@ def make_api_handler(
                 return
             if path == "/roadex/approval-fixtures/approve":
                 header = self.headers.get("authorization", "")
-                prefix = "Bearer "
-                if (
-                    human_approval_token is None
-                    or human_approval_identity is None
-                    or not header.startswith(prefix)
-                    or not secrets.compare_digest(header[len(prefix) :], human_approval_token)
-                ):
+                approval_identity = (
+                    roadex_fixture_approval_verifier.authenticate_bearer_header(header)
+                    if roadex_fixture_approval_verifier is not None
+                    else None
+                )
+                if approval_identity is None:
                     self._write_json(
                         {"error": "unauthorized", "reason": "independent_human_token_required"},
                         HTTPStatus.FORBIDDEN,
@@ -1330,19 +1330,18 @@ def make_api_handler(
                     lambda payload: approve_roadex_approval_fixture_api(
                         store_path,
                         payload,
-                        human_identity=human_approval_identity,
+                        human_identity=approval_identity,
                     )
                 )
                 return
             if path == "/admin/approve":
                 header = self.headers.get("authorization", "")
-                prefix = "Bearer "
-                if (
-                    human_approval_token is None
-                    or human_approval_identity is None
-                    or not header.startswith(prefix)
-                    or not secrets.compare_digest(header[len(prefix) :], human_approval_token)
-                ):
+                approval_identity = (
+                    admin_approval_verifier.authenticate_bearer_header(header)
+                    if admin_approval_verifier is not None
+                    else None
+                )
+                if approval_identity is None:
                     self._write_json(
                         {"error": "unauthorized", "reason": "independent_approval_token_required"},
                         HTTPStatus.FORBIDDEN,
@@ -1351,7 +1350,7 @@ def make_api_handler(
                 self._handle_json(
                     lambda payload: approve_admin_change_status(
                         store_path,
-                        **_independent_admin_approval_args(payload, human_approval_identity),
+                        **_independent_admin_approval_args(payload, approval_identity),
                     )
                 )
                 return
@@ -2373,15 +2372,15 @@ def run_api_server(
     host: str = "127.0.0.1",
     port: int = 8766,
     auth_token: str | None = None,
-    human_approval_token: str | None = None,
-    human_approval_identity: str | None = None,
+    admin_approval_verifier: ApprovalVerifier | None = None,
+    roadex_fixture_approval_verifier: ApprovalVerifier | None = None,
 ) -> None:
     if host not in LOOPBACK_HOSTS:
         raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
-    _validate_human_approval_authentication(
+    _validate_approval_authentication(
         auth_token,
-        human_approval_token,
-        human_approval_identity,
+        admin_approval_verifier,
+        roadex_fixture_approval_verifier,
     )
     from .backup_host_operations import ConcreteHostProvisioningAdapter, PRIVILEGED_CONFIRMATION
     decision_factory = lambda plan: ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION)
@@ -2399,8 +2398,8 @@ def run_api_server(
             store_path,
             auth_token,
             roadex_decision_adapter_factory=decision_factory,
-            human_approval_token=human_approval_token,
-            human_approval_identity=human_approval_identity,
+            admin_approval_verifier=admin_approval_verifier,
+            roadex_fixture_approval_verifier=roadex_fixture_approval_verifier,
             psychlo_bridge=psychlo_bridge,
         ),
     )
@@ -2412,19 +2411,20 @@ def run_api_server(
             psychlo_bridge.close()
 
 
-def _validate_human_approval_authentication(
+def _validate_approval_authentication(
     auth_token: str | None,
-    human_approval_token: str | None,
-    human_approval_identity: str | None,
+    admin_approval_verifier: ApprovalVerifier | None,
+    roadex_fixture_approval_verifier: ApprovalVerifier | None,
 ) -> None:
-    if (human_approval_token is None) != (human_approval_identity is None):
-        raise ValueError("Human approval token and identity must be configured together")
-    if human_approval_token is None:
-        return
-    if not human_approval_token or not human_approval_identity or not human_approval_identity.strip():
-        raise ValueError("Human approval token and identity must be non-empty")
-    if auth_token is not None and secrets.compare_digest(human_approval_token, auth_token):
-        raise ValueError("Human approval token must be independent from the agent token")
+    expected = (
+        (admin_approval_verifier, "admin-plan-approval"),
+        (roadex_fixture_approval_verifier, "roadex-fixture-approval"),
+    )
+    for verifier, scope in expected:
+        if verifier is not None and verifier.scope != scope:
+            raise ValueError(f"{scope} verifier has the wrong approval scope")
+        if verifier is not None and auth_token is not None and verifier.verify(auth_token):
+            raise ValueError("Human approval verifier must be independent from the agent token")
 
 
 def load_auth_token(token_file: str | None) -> str | None:

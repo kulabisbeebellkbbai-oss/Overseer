@@ -159,6 +159,7 @@ from overseer import (
     SourceReviewDisposition,
 )
 from overseer.git import capture_git_status_projection, git_status_projection_status
+from overseer.approval_auth import create_approval_document, load_approval_verifier
 from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
 from overseer.host import run_read_only_command
@@ -480,13 +481,18 @@ class LocalOverseerApiServer:
         self.approval_token = approval_token
 
     def __enter__(self):
+        verifier_path = Path(self.store_path).parent / "admin-plan-approval.json"
+        verifier_path.write_text(
+            json.dumps(create_approval_document(self.approval_token, "admin-plan-approval")),
+            encoding="utf-8",
+        )
+        verifier_path.chmod(0o600)
         self.server = ThreadingHTTPServer(
             ("127.0.0.1", 0),
             make_api_handler(
                 self.store_path,
                 self.auth_token,
-                human_approval_token=self.approval_token,
-                human_approval_identity="sisko",
+                admin_approval_verifier=load_approval_verifier(verifier_path),
             ),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

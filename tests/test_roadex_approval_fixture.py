@@ -9,6 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http.server import ThreadingHTTPServer
 
+from overseer.approval_auth import create_approval_document, load_approval_verifier
 from overseer.api import make_api_handler
 from overseer.roadex_approval_fixture import (
     approve_roadex_approval_fixture_api,
@@ -299,11 +300,16 @@ class RoadexApprovalFixtureApiTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.store_path = str(Path(self.temporary.name) / "state.sqlite3")
+        verifier_path = Path(self.temporary.name) / "roadex-fixture-approval.json"
+        verifier_path.write_text(
+            json.dumps(create_approval_document("human-secret", "roadex-fixture-approval")),
+            encoding="utf-8",
+        )
+        verifier_path.chmod(0o600)
         handler = make_api_handler(
             self.store_path,
             "agent-secret",
-            human_approval_token="human-secret",
-            human_approval_identity="fixture-human",
+            roadex_fixture_approval_verifier=load_approval_verifier(verifier_path),
         )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

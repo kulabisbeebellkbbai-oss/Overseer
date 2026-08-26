@@ -40,6 +40,7 @@
 
 **Files:**
 - Create: `src/overseer/activation_package.py`
+- Create: `scripts/build_sqlite_runtime.sh`
 - Create: `tests/test_activation_package.py`
 - Modify: `systemd/overseer-api-system.service`
 - Modify: `systemd/overseer-runtime-system.service`
@@ -87,6 +88,8 @@
 - [x] Test the exact `pages=-1`, no-sleep path and reject non-WAL sources.
 - [x] Seal a private SQLite runtime carrying the upstream WAL-reset fix and
   reject runtime identity, mapping, mode, link, or feature drift.
+- [x] Bind an independently reviewed binary SHA-256 to a reproducible build
+  recipe, then stage and probe the exact package-owned inode.
 - [x] Test source identity/mode/link checks and destination exclusive creation.
 - [x] Test migration touches only the copied canary and preserves source/backup digests.
 - [x] Test integrity failure and row-loss fail closed.
@@ -107,6 +110,8 @@
 - [x] Test exact account UID/GID, paths, units, allowlist, install modes, hostile user-site exclusion, canary order, root-owned digest approval, installed-artifact verification, execution locking, interrupted cleanup/rollback, root-manager transient identity and every recovery state, exact live controls, cutover order, and rollback order.
 - [x] Test no unresolved angle-bracket values, globs, recursive copies, token argv, or unapproved service names.
 - [x] Test finalization refuses missing interactive verifier documents and any artifact drift.
+- [x] Test finalization and package approval reject a self-consistent report
+  unless it proves the mandatory WAL/single-step/no-sleep rehearsal semantics.
 - [x] Implement command rendering, package self-verification, state-machine execution, interrupted-cutover rollback recovery, and status reporting.
 - [x] Run focused tests, `systemd-analyze verify`, and `git diff --check`.
 

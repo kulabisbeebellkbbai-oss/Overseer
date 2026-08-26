@@ -29,6 +29,7 @@ from overseer.activation_package import (
     run_canary_acceptance,
     stage_credentials,
     stage_release_payload,
+    stage_sqlite_runtime_input,
     verify_activation_package,
     verify_canary_attestation,
     verify_rollback_inputs,
@@ -37,6 +38,17 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PRODUCTION_SQLITE_BINARY_SHA256 = activation_package_module.APPROVED_SQLITE_BINARY_SHA256
+PRODUCTION_SQLITE_PROBE = activation_package_module._probe_sqlite_runtime
+
+
+@pytest.fixture(autouse=True)
+def _restore_production_sqlite_digest() -> object:
+    yield
+    activation_package_module.APPROVED_SQLITE_BINARY_SHA256 = (
+        PRODUCTION_SQLITE_BINARY_SHA256
+    )
+    activation_package_module._probe_sqlite_runtime = PRODUCTION_SQLITE_PROBE
 
 
 def _git(checkout: Path, *args: str) -> str:
@@ -95,17 +107,92 @@ def _sqlite_runtime(
     tmp_path: Path,
     *,
     payload: bytes = b"approved-sqlite-runtime",
+    package_root: Path | None = None,
 ) -> tuple[Path, dict[str, object]]:
-    library = tmp_path / "libsqlite3.so.0"
-    library.write_bytes(payload)
-    library.chmod(0o555)
+    source = tmp_path / "sqlite-runtime-source.so.0"
+    source.write_bytes(payload)
+    source.chmod(0o555)
+    activation_package_module.APPROVED_SQLITE_BINARY_SHA256 = hashlib.sha256(
+        payload
+    ).hexdigest()
+    package = package_root or (tmp_path / "activation-package")
+    staged = stage_sqlite_runtime_input(package, source_library=source)
+    library = Path(str(staged["path"]))
+    metadata = library.stat()
     evidence = {
         "version": activation_package_module.APPROVED_SQLITE_VERSION,
         "sourceId": activation_package_module.APPROVED_SQLITE_SOURCE_ID,
         "mappedExpectedLibrary": True,
+        "mappedDevice": metadata.st_dev,
+        "mappedInode": metadata.st_ino,
         "compileOptions": sorted(activation_package_module.REQUIRED_SQLITE_COMPILE_OPTIONS),
     }
+    activation_package_module._probe_sqlite_runtime = (
+        lambda _python, _library, _metadata: evidence
+    )
     return library, evidence
+
+
+def test_sqlite_runtime_has_independent_binary_digest_and_reproducible_recipe(
+    tmp_path: Path,
+) -> None:
+    assert PRODUCTION_SQLITE_BINARY_SHA256 == (
+        "ca4c66d9a6b3d24b27e05f8d1cfd7ae620e5862df39c96164910885797d6fc2e"
+    )
+    script = ROOT / "scripts" / "build_sqlite_runtime.sh"
+    content = script.read_text(encoding="utf-8")
+    assert PRODUCTION_SQLITE_BINARY_SHA256 in content
+    assert activation_package_module.APPROVED_SQLITE_ARCHIVE_SHA3_256 in content
+    assert "/usr/bin/gcc" in content
+    assert stat_mode(script) == 0o555
+
+    unapproved = tmp_path / "unapproved-libsqlite3.so.0"
+    unapproved.write_bytes(b"unapproved")
+    unapproved.chmod(0o555)
+    with pytest.raises(ActivationPackageError, match="independently approved"):
+        stage_sqlite_runtime_input(
+            tmp_path / "activation-package",
+            source_library=unapproved,
+        )
+
+
+def test_sqlite_runtime_stage_cli_creates_only_closed_approved_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload = b"approved-cli-sqlite-runtime"
+    source = tmp_path / "libsqlite3.so.0"
+    source.write_bytes(payload)
+    source.chmod(0o555)
+    package_parent = tmp_path / "activation-packages"
+    package_parent.mkdir(mode=0o700)
+    package = package_parent / "v1.1.6-abcdef0"
+    monkeypatch.setattr(activation_package_module, "APPROVED_PACKAGE_PARENT", package_parent)
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_SQLITE_BINARY_SHA256",
+        hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert activation_package_module._main(
+        [
+            "stage-sqlite-runtime",
+            "--source-library",
+            str(source),
+            "--package-root",
+            str(package),
+        ]
+    ) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    target = package / activation_package_module.STAGED_SQLITE_RUNTIME
+    assert result["status"] == "staged"
+    assert result["path"] == str(target)
+    assert target.read_bytes() == payload
+    assert stat_mode(target) == 0o555
+    assert stat_mode(target.parent) == 0o500
+    assert activation_package_module._validate_sqlite_staged_package_destination(package) == package
 
 
 def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Path) -> None:
@@ -121,7 +208,6 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
         python,
         stdlib,
         sqlite_library,
-        _sqlite_runtime_evidence=sqlite_evidence,
     )
     second = build_release_manifest(
         checkout,
@@ -129,7 +215,6 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
         python,
         stdlib,
         sqlite_library,
-        _sqlite_runtime_evidence=sqlite_evidence,
     )
 
     assert first == second
@@ -158,17 +243,34 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
     assert first["rootPython"]["releasePath"] == "runtime/bin/python3.13"
     assert first["sqliteRuntime"] == {
         "path": str(sqlite_library),
+        "stagedInputPackage": str(tmp_path / "activation-package"),
         "releasePath": "lib/libsqlite3.so.0",
         "sha256": hashlib.sha256(b"approved-sqlite-runtime").hexdigest(),
         "size": len(b"approved-sqlite-runtime"),
         "mode": 0o555,
         "uid": os.geteuid(),
         "gid": os.getegid(),
+        "device": sqlite_library.stat().st_dev,
+        "inode": sqlite_library.stat().st_ino,
         "version": activation_package_module.APPROVED_SQLITE_VERSION,
         "sourceId": activation_package_module.APPROVED_SQLITE_SOURCE_ID,
         "sourceArchiveSha3_256": (
             activation_package_module.APPROVED_SQLITE_ARCHIVE_SHA3_256
         ),
+        "buildProvenance": {
+            "recipe": activation_package_module.APPROVED_SQLITE_BUILD_RECIPE,
+            "compiler": activation_package_module.APPROVED_SQLITE_COMPILER,
+            "sourceArchiveUrl": (
+                "https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz"
+            ),
+            "sourceArchiveSha3_256": (
+                activation_package_module.APPROVED_SQLITE_ARCHIVE_SHA3_256
+            ),
+            "binarySha256": hashlib.sha256(b"approved-sqlite-runtime").hexdigest(),
+            "compileDefinitions": list(
+                activation_package_module.APPROVED_SQLITE_BUILD_DEFINITIONS
+            ),
+        },
         "compileOptions": sorted(
             activation_package_module.REQUIRED_SQLITE_COMPILE_OPTIONS
         ),
@@ -178,7 +280,14 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
 
 @pytest.mark.parametrize(
     "invalid_field",
-    ("version", "sourceId", "mappedExpectedLibrary", "compileOptions"),
+    (
+        "version",
+        "sourceId",
+        "mappedExpectedLibrary",
+        "mappedDevice",
+        "mappedInode",
+        "compileOptions",
+    ),
 )
 def test_release_manifest_rejects_unapproved_sqlite_runtime_identity(
     tmp_path: Path,
@@ -189,10 +298,15 @@ def test_release_manifest_rejects_unapproved_sqlite_runtime_identity(
     invalid_evidence = dict(evidence)
     if invalid_field == "mappedExpectedLibrary":
         invalid_evidence[invalid_field] = False
+    elif invalid_field in {"mappedDevice", "mappedInode"}:
+        invalid_evidence[invalid_field] = -1
     elif invalid_field == "compileOptions":
         invalid_evidence[invalid_field] = []
     else:
         invalid_evidence[invalid_field] = "unapproved"
+    activation_package_module._probe_sqlite_runtime = (
+        lambda _python, _library, _metadata: invalid_evidence
+    )
 
     with pytest.raises(ActivationPackageError, match="identity or features"):
         build_release_manifest(
@@ -201,7 +315,6 @@ def test_release_manifest_rejects_unapproved_sqlite_runtime_identity(
             _python(tmp_path),
             _stdlib(tmp_path),
             sqlite_library,
-            _sqlite_runtime_evidence=invalid_evidence,
         )
 
 
@@ -220,7 +333,6 @@ def test_release_manifest_rejects_mutable_or_linked_sqlite_runtime(tmp_path: Pat
             python,
             stdlib,
             sqlite_library,
-            _sqlite_runtime_evidence=evidence,
         )
 
     sqlite_library.chmod(0o555)
@@ -233,9 +345,42 @@ def test_release_manifest_rejects_mutable_or_linked_sqlite_runtime(tmp_path: Pat
             python,
             stdlib,
             linked_library,
-            _sqlite_runtime_evidence=evidence,
         )
 
+
+def test_release_manifest_rejects_sqlite_inode_replacement_during_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = _reviewed_checkout(tmp_path)
+    sqlite_library, evidence = _sqlite_runtime(tmp_path)
+    runtime_directory = sqlite_library.parent
+
+    def replace_during_probe(
+        _root_python: Path,
+        _sqlite_library: Path,
+        _metadata: os.stat_result,
+    ) -> dict[str, object]:
+        runtime_directory.chmod(0o700)
+        sqlite_library.unlink()
+        sqlite_library.write_bytes(b"approved-sqlite-runtime")
+        sqlite_library.chmod(0o555)
+        runtime_directory.chmod(0o500)
+        return evidence
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_probe_sqlite_runtime",
+        replace_during_probe,
+    )
+    with pytest.raises(ActivationPackageError, match="drifted during attestation"):
+        build_release_manifest(
+            checkout,
+            _dependencies(tmp_path),
+            _python(tmp_path),
+            _stdlib(tmp_path),
+            sqlite_library,
+        )
 
 @pytest.mark.skipif(
     not Path("/usr/bin/python3.13").is_file()
@@ -258,7 +403,6 @@ def test_copied_release_runtime_executes_with_release_local_pythonhome(tmp_path:
         python,
         stdlib,
         sqlite_library,
-        _sqlite_runtime_evidence=sqlite_evidence,
     )
     package = tmp_path / "activation-package"
     release = stage_release_payload(
@@ -314,7 +458,6 @@ def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Pa
             python,
             stdlib,
             sqlite_library,
-            _sqlite_runtime_evidence=sqlite_evidence,
         )
 
     _git(checkout, "checkout", "--", "src/overseer/cli.py")
@@ -326,7 +469,6 @@ def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Pa
             python,
             stdlib,
             sqlite_library,
-            _sqlite_runtime_evidence=sqlite_evidence,
         )
 
     (dependencies / "unsafe").unlink()
@@ -339,7 +481,6 @@ def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Pa
             python,
             stdlib,
             sqlite_library,
-            _sqlite_runtime_evidence=sqlite_evidence,
         )
 
 
@@ -355,7 +496,6 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
         python,
         stdlib,
         sqlite_library,
-        _sqlite_runtime_evidence=sqlite_evidence,
     )
     package = tmp_path / "activation-package"
 
@@ -925,7 +1065,6 @@ def _prepared_package(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
         python,
         stdlib,
         sqlite_library,
-        _sqlite_runtime_evidence=sqlite_evidence,
     )
     package = tmp_path / "activation-package"
     stage_release_payload(
@@ -954,7 +1093,12 @@ def _prepared_package(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
     )
     source = tmp_path / "overseer.sqlite3"
     _wal_store(source)
-    rehearse_store_migration(package, source_store=source, sleep_seconds=0)
+    rehearse_store_migration(
+        package,
+        source_store=source,
+        pages_per_step=-1,
+        sleep_seconds=0,
+    )
     return package, manifest, source
 
 
@@ -989,7 +1133,6 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     dependencies = _dependencies(tmp_path)
     python = _python(tmp_path)
     stdlib = _stdlib(tmp_path)
-    sqlite_library, sqlite_evidence = _sqlite_runtime(tmp_path)
     psychlo, roadex, bindings = _credential_sources(tmp_path)
     source = tmp_path / "overseer.sqlite3"
     _wal_store(source)
@@ -1001,18 +1144,21 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     package_parent = tmp_path / "activation-packages"
     package_parent.mkdir(mode=0o700)
     monkeypatch.setattr(activation_package_module, "APPROVED_PACKAGE_PARENT", package_parent)
+    package = package_parent / "v1.1.6-abcdef0"
+    sqlite_library, sqlite_evidence = _sqlite_runtime(
+        tmp_path,
+        package_root=package,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_probe_sqlite_runtime",
-        lambda _python, _library: sqlite_evidence,
+        lambda _python, _library, _metadata: sqlite_evidence,
     )
     monkeypatch.setattr(
         activation_package_module,
         "_assert_current_sqlite_runtime",
         lambda _manifest: None,
     )
-    package = package_parent / "v1.1.6-abcdef0"
-
     assert activation_package_module._main(
         [
             "prepare-package",
@@ -1246,6 +1392,93 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     rollback_unit.write_text("drift\n", encoding="utf-8")
     with pytest.raises(ActivationPackageError, match="rollback input drift"):
         verify_rollback_inputs(package)
+
+
+@pytest.mark.parametrize(
+    "section, field, value",
+    (
+        (None, "status", "failed"),
+        (None, "sourceMutationPerformed", True),
+        ("source", "journalMode", "delete"),
+        ("backupBounds", "pagesPerStep", 128),
+        ("backupBounds", "sleepSeconds", 0.01),
+        ("backupBounds", "singleStep", False),
+        ("backupBounds", "completedUnixNs", 0),
+    ),
+)
+def test_package_finalization_rejects_unapproved_migration_semantics(
+    tmp_path: Path,
+    section: str | None,
+    field: str,
+    value: object,
+) -> None:
+    package, manifest, source = _prepared_package(tmp_path)
+    rollback = tmp_path / "rollback"
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
+    render_activation_contract(
+        package,
+        manifest,
+        source_store=source,
+        overseer_uid=984,
+        overseer_gid=984,
+        rollback_inputs={"v1.1.5-release": rollback},
+    )
+    create_human_verifiers(
+        package,
+        admin_secret="admin-approval-secret-123456",
+        roadex_secret="roadex-approval-secret-12345",
+    )
+    report_path = package / "private" / "migration" / "migration-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    target = report if section is None else report[section]
+    target[field] = value
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    report_path.chmod(0o600)
+
+    with pytest.raises(ActivationPackageError, match="approved semantics"):
+        finalize_activation_package(package)
+
+
+def test_package_verification_rejects_self_consistent_unapproved_migration_report(
+    tmp_path: Path,
+) -> None:
+    package, _digest = _finalized_package(tmp_path)
+    report_path = package / "private" / "migration" / "migration-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["backupBounds"]["pagesPerStep"] = 128
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    report_path.chmod(0o600)
+    manifest_path = package / "public" / "package-manifest.json"
+    manifest_path.unlink()
+    unsigned = {
+        "schemaVersion": activation_package_module.PACKAGE_MANIFEST_SCHEMA,
+        "liveExecutionApproved": False,
+        "files": activation_package_module._package_file_inventory(package),
+        "directories": activation_package_module._package_directory_inventory(package),
+    }
+    replacement_digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(
+            {**unsigned, "packageDigest": replacement_digest},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o644)
+
+    with pytest.raises(ActivationPackageError, match="approved semantics"):
+        verify_activation_package(package, replacement_digest)
 
 
 def test_package_finalization_requires_human_gate_and_detects_drift(

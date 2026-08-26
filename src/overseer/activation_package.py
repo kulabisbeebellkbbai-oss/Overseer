@@ -58,6 +58,42 @@ APPROVED_SQLITE_SOURCE_ID = (
 APPROVED_SQLITE_ARCHIVE_SHA3_256 = (
     "454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338"
 )
+APPROVED_SQLITE_BINARY_SHA256 = (
+    "ca4c66d9a6b3d24b27e05f8d1cfd7ae620e5862df39c96164910885797d6fc2e"
+)
+APPROVED_SQLITE_BUILD_RECIPE = "overseer.sqlite-3.53.4-gcc-14.2.0.v1"
+APPROVED_SQLITE_COMPILER = "gcc (Debian 14.2.0-19) 14.2.0"
+APPROVED_SQLITE_BUILD_DEFINITIONS = (
+    "SQLITE_DEFAULT_AUTOVACUUM=1",
+    "SQLITE_DEFAULT_CACHE_SIZE=-2000",
+    "SQLITE_DEFAULT_RECURSIVE_TRIGGERS=1",
+    "SQLITE_DEFAULT_SYNCHRONOUS=2",
+    "SQLITE_DEFAULT_WAL_SYNCHRONOUS=2",
+    "SQLITE_DEFAULT_WORKER_THREADS=0",
+    "SQLITE_DIRECT_OVERFLOW_READ",
+    "SQLITE_ENABLE_COLUMN_METADATA",
+    "SQLITE_ENABLE_DBPAGE_VTAB",
+    "SQLITE_ENABLE_DBSTAT_VTAB",
+    "SQLITE_ENABLE_FTS3",
+    "SQLITE_ENABLE_FTS3_PARENTHESIS",
+    "SQLITE_ENABLE_FTS3_TOKENIZER",
+    "SQLITE_ENABLE_FTS4",
+    "SQLITE_ENABLE_FTS5",
+    "SQLITE_ENABLE_LOAD_EXTENSION",
+    "SQLITE_ENABLE_MATH_FUNCTIONS",
+    "SQLITE_ENABLE_PREUPDATE_HOOK",
+    "SQLITE_ENABLE_RTREE",
+    "SQLITE_ENABLE_SESSION",
+    "SQLITE_ENABLE_STMTVTAB",
+    "SQLITE_ENABLE_UNLOCK_NOTIFY",
+    "SQLITE_ENABLE_UPDATE_DELETE_LIMIT",
+    "SQLITE_MAX_VARIABLE_NUMBER=250000",
+    "SQLITE_SECURE_DELETE",
+    "SQLITE_SOUNDEX",
+    "SQLITE_THREADSAFE=1",
+    "SQLITE_USE_URI",
+)
+STAGED_SQLITE_RUNTIME = PurePosixPath("private/runtime-input/libsqlite3.so.0")
 REQUIRED_SQLITE_COMPILE_OPTIONS = frozenset(
     {
         "ENABLE_COLUMN_METADATA",
@@ -198,6 +234,31 @@ def _validate_existing_package_destination(package_root: str | os.PathLike[str])
         or stat.S_IMODE(package_metadata.st_mode) != 0o700
     ):
         raise ActivationPackageError("activation package ownership or mode is invalid")
+    return package
+
+
+def _validate_sqlite_staged_package_destination(
+    package_root: str | os.PathLike[str],
+) -> Path:
+    package = _validate_existing_package_destination(package_root)
+    observed_files: list[str] = []
+    observed_directories: list[str] = []
+    for directory, directories, files in os.walk(package, followlinks=False):
+        base = Path(directory)
+        for name in directories:
+            child = base / name
+            if child.is_symlink():
+                raise ActivationPackageError("SQLite-staged package contains a directory symlink")
+            observed_directories.append(child.relative_to(package).as_posix())
+        for name in files:
+            child = base / name
+            if child.is_symlink():
+                raise ActivationPackageError("SQLite-staged package contains a file symlink")
+            observed_files.append(child.relative_to(package).as_posix())
+    if sorted(observed_directories) != ["private", "private/runtime-input"] or sorted(
+        observed_files
+    ) != [STAGED_SQLITE_RUNTIME.as_posix()]:
+        raise ActivationPackageError("package must contain only the staged SQLite runtime")
     return package
 
 
@@ -385,48 +446,86 @@ def _file_entry(
 def _probe_sqlite_runtime(
     root_python: Path,
     sqlite_library: Path,
+    expected_metadata: os.stat_result,
 ) -> dict[str, object]:
     script = """
 import json
+import os
 import sqlite3
 from pathlib import Path
 
-expected = Path(__import__('os').environ['OVERSEER_EXPECTED_SQLITE_LIBRARY']).resolve()
-mapped = {
-    Path(line.split()[-1]).resolve()
-    for line in Path('/proc/self/maps').read_text(encoding='utf-8').splitlines()
-    if line.split() and line.split()[-1].startswith('/')
-}
+expected_device = int(os.environ['OVERSEER_EXPECTED_SQLITE_DEVICE'])
+expected_inode = int(os.environ['OVERSEER_EXPECTED_SQLITE_INODE'])
+mapped_expected = False
+for line in Path('/proc/self/maps').read_text(encoding='utf-8').splitlines():
+    fields = line.split()
+    if len(fields) < 5 or ':' not in fields[3]:
+        continue
+    major, minor = (int(value, 16) for value in fields[3].split(':', 1))
+    if os.makedev(major, minor) == expected_device and int(fields[4]) == expected_inode:
+        mapped_expected = True
+        break
 with sqlite3.connect(':memory:') as connection:
     result = {
         'version': sqlite3.sqlite_version,
         'sourceId': connection.execute('SELECT sqlite_source_id()').fetchone()[0],
         'compileOptions': sorted(row[0] for row in connection.execute('PRAGMA compile_options')),
-        'mappedExpectedLibrary': expected in mapped,
+        'mappedExpectedLibrary': mapped_expected,
+        'mappedDevice': expected_device if mapped_expected else None,
+        'mappedInode': expected_inode if mapped_expected else None,
     }
 print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(',', ':')))
 """
-    environment = {
-        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME": "/nonexistent",
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "LD_LIBRARY_PATH": str(sqlite_library.parent),
-        "OVERSEER_EXPECTED_SQLITE_LIBRARY": str(sqlite_library),
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONSAFEPATH": "1",
-    }
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        result = subprocess.run(
-            [str(root_python), "-I", "-s", "-P", "-c", script],
-            cwd="/",
-            capture_output=True,
-            text=True,
-            check=False,
-            env=environment,
-        )
+        descriptor = os.open(sqlite_library, flags)
     except OSError as error:
-        raise ActivationPackageError("approved SQLite runtime probe could not start") from error
+        raise ActivationPackageError("approved SQLite runtime could not be opened for probing") from error
+    state = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    try:
+        opened_before = os.fstat(descriptor)
+        if state(opened_before) != state(expected_metadata):
+            raise ActivationPackageError("approved SQLite runtime changed before probing")
+        environment = {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "LD_LIBRARY_PATH": str(sqlite_library.parent),
+            "LD_PRELOAD": f"/proc/self/fd/{descriptor}",
+            "OVERSEER_EXPECTED_SQLITE_DEVICE": str(expected_metadata.st_dev),
+            "OVERSEER_EXPECTED_SQLITE_INODE": str(expected_metadata.st_ino),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONSAFEPATH": "1",
+        }
+        try:
+            result = subprocess.run(
+                [str(root_python), "-I", "-s", "-P", "-c", script],
+                cwd="/",
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                pass_fds=(descriptor,),
+            )
+        except OSError as error:
+            raise ActivationPackageError("approved SQLite runtime probe could not start") from error
+        opened_after = os.fstat(descriptor)
+        lexical_after = sqlite_library.lstat()
+        if state(opened_after) != state(expected_metadata) or state(lexical_after) != state(
+            expected_metadata
+        ):
+            raise ActivationPackageError("approved SQLite runtime changed during probing")
+    finally:
+        os.close(descriptor)
     try:
         evidence = json.loads(result.stdout)
     except (TypeError, json.JSONDecodeError) as error:
@@ -440,42 +539,79 @@ def _validated_sqlite_runtime(
     *,
     root_python: Path,
     sqlite_library: Path,
-    supplied_evidence: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     raw, metadata = _stable_read(sqlite_library)
+    package = sqlite_library.parent.parent.parent
+    expected_path = package / STAGED_SQLITE_RUNTIME
+    directory_metadata: list[tuple[Path, int]] = [
+        (package, 0o700),
+        (package / "private", 0o700),
+        (package / "private" / "runtime-input", 0o500),
+    ]
     if (
-        sqlite_library.is_symlink()
+        sqlite_library.absolute() != expected_path.absolute()
+        or sqlite_library.is_symlink()
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
         or metadata.st_uid != os.geteuid()
         or stat.S_IMODE(metadata.st_mode) != 0o555
+        or _sha256(raw) != APPROVED_SQLITE_BINARY_SHA256
     ):
         raise ActivationPackageError("approved SQLite runtime library metadata is invalid")
-    evidence = dict(supplied_evidence) if supplied_evidence is not None else _probe_sqlite_runtime(
-        root_python,
-        sqlite_library,
-    )
+    for directory, expected_mode in directory_metadata:
+        try:
+            directory_stat = directory.lstat()
+        except OSError as error:
+            raise ActivationPackageError("approved SQLite staging directory is unavailable") from error
+        if (
+            directory.is_symlink()
+            or not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_stat.st_mode) != expected_mode
+        ):
+            raise ActivationPackageError("approved SQLite staging directory metadata is invalid")
+    evidence = _probe_sqlite_runtime(root_python, sqlite_library, metadata)
     options = evidence.get("compileOptions")
     if (
         evidence.get("version") != APPROVED_SQLITE_VERSION
         or evidence.get("sourceId") != APPROVED_SQLITE_SOURCE_ID
         or evidence.get("mappedExpectedLibrary") is not True
+        or evidence.get("mappedDevice") != metadata.st_dev
+        or evidence.get("mappedInode") != metadata.st_ino
         or not isinstance(options, list)
         or not all(isinstance(value, str) for value in options)
         or not REQUIRED_SQLITE_COMPILE_OPTIONS.issubset(set(options))
     ):
         raise ActivationPackageError("approved SQLite runtime identity or features are invalid")
+    confirmed_raw, confirmed_metadata = _stable_read(sqlite_library)
+    if (
+        confirmed_metadata.st_dev != metadata.st_dev
+        or confirmed_metadata.st_ino != metadata.st_ino
+        or _sha256(confirmed_raw) != APPROVED_SQLITE_BINARY_SHA256
+    ):
+        raise ActivationPackageError("approved SQLite runtime drifted during attestation")
     return {
         "path": str(sqlite_library),
+        "stagedInputPackage": str(package),
         "releasePath": "lib/libsqlite3.so.0",
-        "sha256": _sha256(raw),
+        "sha256": APPROVED_SQLITE_BINARY_SHA256,
         "size": len(raw),
         "mode": 0o555,
         "uid": metadata.st_uid,
         "gid": metadata.st_gid,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
         "version": APPROVED_SQLITE_VERSION,
         "sourceId": APPROVED_SQLITE_SOURCE_ID,
         "sourceArchiveSha3_256": APPROVED_SQLITE_ARCHIVE_SHA3_256,
+        "buildProvenance": {
+            "recipe": APPROVED_SQLITE_BUILD_RECIPE,
+            "compiler": APPROVED_SQLITE_COMPILER,
+            "sourceArchiveUrl": "https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz",
+            "sourceArchiveSha3_256": APPROVED_SQLITE_ARCHIVE_SHA3_256,
+            "binarySha256": APPROVED_SQLITE_BINARY_SHA256,
+            "compileDefinitions": list(APPROVED_SQLITE_BUILD_DEFINITIONS),
+        },
         "compileOptions": sorted(options),
         "walResetFixAttested": True,
     }
@@ -485,22 +621,28 @@ def _assert_current_sqlite_runtime(manifest: Mapping[str, object]) -> None:
     sqlite_runtime = manifest.get("sqliteRuntime")
     if not isinstance(sqlite_runtime, Mapping) or not isinstance(sqlite_runtime.get("path"), str):
         raise ActivationPackageError("release SQLite runtime manifest is invalid")
-    expected = Path(str(sqlite_runtime["path"])).resolve()
+    expected = Path(str(sqlite_runtime["path"]))
     try:
-        mapped = {
-            Path(line.split()[-1]).resolve()
-            for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
-            if line.split() and line.split()[-1].startswith("/")
-        }
+        raw, metadata = _stable_read(expected)
+        mapped: set[tuple[int, int]] = set()
+        for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if len(fields) < 5 or ":" not in fields[3]:
+                continue
+            major, minor = (int(value, 16) for value in fields[3].split(":", 1))
+            mapped.add((os.makedev(major, minor), int(fields[4])))
         with sqlite3.connect(":memory:") as connection:
             source_id = str(connection.execute("SELECT sqlite_source_id()").fetchone()[0])
             options = {str(row[0]) for row in connection.execute("PRAGMA compile_options")}
-    except (OSError, sqlite3.Error, TypeError, IndexError) as error:
+    except (OSError, ValueError, sqlite3.Error, TypeError, IndexError) as error:
         raise ActivationPackageError("current SQLite runtime could not be attested") from error
     if (
         sqlite3.sqlite_version != APPROVED_SQLITE_VERSION
         or source_id != APPROVED_SQLITE_SOURCE_ID
-        or expected not in mapped
+        or _sha256(raw) != APPROVED_SQLITE_BINARY_SHA256
+        or metadata.st_dev != sqlite_runtime.get("device")
+        or metadata.st_ino != sqlite_runtime.get("inode")
+        or (metadata.st_dev, metadata.st_ino) not in mapped
         or not REQUIRED_SQLITE_COMPILE_OPTIONS.issubset(options)
     ):
         raise ActivationPackageError("package preparation is not using the approved SQLite runtime")
@@ -512,8 +654,6 @@ def build_release_manifest(
     root_python: str | os.PathLike[str],
     stdlib_root: str | os.PathLike[str],
     sqlite_library: str | os.PathLike[str],
-    *,
-    _sqlite_runtime_evidence: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a deterministic manifest from a clean reviewed checkout."""
 
@@ -574,7 +714,6 @@ def build_release_manifest(
     sqlite_runtime = _validated_sqlite_runtime(
         root_python=selected_python,
         sqlite_library=selected_sqlite,
-        supplied_evidence=_sqlite_runtime_evidence,
     )
     unsigned: dict[str, object] = {
         "schemaVersion": RELEASE_SCHEMA,
@@ -672,6 +811,47 @@ def _write_new(path: Path, content: bytes, mode: int) -> None:
             os.close(descriptor)
     except FileExistsError as error:
         raise ActivationPackageError(f"package artifact already exists: {path}") from error
+
+
+def stage_sqlite_runtime_input(
+    package_root: str | os.PathLike[str],
+    *,
+    source_library: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Copy the independently approved SQLite binary to a closed package inode."""
+
+    source = Path(source_library)
+    raw, metadata = _stable_read(source)
+    if (
+        source.is_symlink()
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o555
+        or _sha256(raw) != APPROVED_SQLITE_BINARY_SHA256
+    ):
+        raise ActivationPackageError("SQLite runtime source is not the independently approved binary")
+    package = Path(package_root)
+    _ensure_directory(package)
+    _ensure_directory(package / "private")
+    runtime_input = package / "private" / "runtime-input"
+    _ensure_directory(runtime_input)
+    target = package / STAGED_SQLITE_RUNTIME
+    _write_new(target, raw, 0o555)
+    confirmed, confirmed_metadata = _stable_read(target)
+    if (
+        _sha256(confirmed) != APPROVED_SQLITE_BINARY_SHA256
+        or confirmed_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(confirmed_metadata.st_mode) != 0o555
+    ):
+        raise ActivationPackageError("staged SQLite runtime identity is invalid")
+    os.chmod(runtime_input, 0o500)
+    return {
+        "status": "staged",
+        "path": str(target.absolute()),
+        "sha256": APPROVED_SQLITE_BINARY_SHA256,
+        "device": confirmed_metadata.st_dev,
+        "inode": confirmed_metadata.st_ino,
+        "buildRecipe": APPROVED_SQLITE_BUILD_RECIPE,
+    }
 
 
 def _read_secret(path: Path, *, label: str) -> bytes:
@@ -1701,10 +1881,15 @@ def stage_release_payload(
     sqlite_release_path = sqlite_runtime.get("releasePath")
     if not isinstance(sqlite_path, str) or not isinstance(sqlite_release_path, str):
         raise ActivationPackageError("release SQLite runtime manifest is invalid")
-    sqlite_content, _sqlite_metadata = _stable_read(Path(sqlite_path))
+    if sqlite_runtime.get("stagedInputPackage") != str(package.absolute()):
+        raise ActivationPackageError("release SQLite runtime is bound to a different package")
+    sqlite_content, sqlite_metadata = _stable_read(Path(sqlite_path))
     if (
         len(sqlite_content) != sqlite_runtime.get("size")
-        or _sha256(sqlite_content) != sqlite_runtime.get("sha256")
+        or _sha256(sqlite_content) != APPROVED_SQLITE_BINARY_SHA256
+        or sqlite_runtime.get("sha256") != APPROVED_SQLITE_BINARY_SHA256
+        or sqlite_metadata.st_dev != sqlite_runtime.get("device")
+        or sqlite_metadata.st_ino != sqlite_runtime.get("inode")
         or sqlite_runtime.get("version") != APPROVED_SQLITE_VERSION
         or sqlite_runtime.get("sourceId") != APPROVED_SQLITE_SOURCE_ID
         or sqlite_runtime.get("walResetFixAttested") is not True
@@ -2206,11 +2391,12 @@ def _package_directory_inventory(package: Path) -> list[dict[str, object]]:
     for directory, directories, _files in os.walk(package, followlinks=False):
         path = Path(directory)
         metadata = path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
         if (
             path.is_symlink()
             or not stat.S_ISDIR(metadata.st_mode)
             or metadata.st_uid != package_owner
-            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or mode not in {0o500, 0o700}
         ):
             raise ActivationPackageError("activation package directory ownership or mode is invalid")
         for name in directories:
@@ -2220,7 +2406,7 @@ def _package_directory_inventory(package: Path) -> list[dict[str, object]]:
         result.append(
             {
                 "path": relative,
-                "mode": "0700",
+                "mode": f"{mode:04o}",
                 "ownerBinding": "package-root-owner",
             }
         )
@@ -2833,6 +3019,69 @@ def render_activation_contract(
     return contract
 
 
+def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
+    report_path = package / "private" / "migration" / "migration-report.json"
+    try:
+        raw, metadata = _stable_read(report_path)
+        report = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("migration rehearsal report is invalid") from error
+    bounds = report.get("backupBounds") if isinstance(report, dict) else None
+    source = report.get("source") if isinstance(report, dict) else None
+    backup = report.get("backup") if isinstance(report, dict) else None
+    migrated = report.get("migrated") if isinstance(report, dict) else None
+    started = bounds.get("startedUnixNs") if isinstance(bounds, dict) else None
+    completed = bounds.get("completedUnixNs") if isinstance(bounds, dict) else None
+    before_counts = report.get("rowCountsBefore") if isinstance(report, dict) else None
+    after_counts = report.get("rowCountsAfter") if isinstance(report, dict) else None
+    row_counts_valid = isinstance(before_counts, dict) and isinstance(after_counts, dict)
+    if row_counts_valid:
+        for table, count in before_counts.items():
+            observed = after_counts.get(table)
+            if (
+                not isinstance(table, str)
+                or type(count) is not int
+                or type(observed) is not int
+                or count < 0
+                or observed < 0
+                or (
+                    observed < count
+                    if table in {"schema_migrations", "agent_schema_migrations"}
+                    else observed != count
+                )
+            ):
+                row_counts_valid = False
+                break
+    package_owner = package.lstat().st_uid
+    if (
+        metadata.st_uid != package_owner
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not isinstance(report, dict)
+        or report.get("schemaVersion") != "overseer.activation-migration-rehearsal.v1"
+        or report.get("status") != "rehearsal_complete"
+        or report.get("sourceMutationPerformed") is not False
+        or not isinstance(source, dict)
+        or source.get("journalMode") != "wal"
+        or not isinstance(backup, dict)
+        or backup.get("integrityCheck") != "ok"
+        or not isinstance(migrated, dict)
+        or migrated.get("integrityCheck") != "ok"
+        or not row_counts_valid
+        or not isinstance(bounds, dict)
+        or type(bounds.get("pagesPerStep")) is not int
+        or bounds.get("pagesPerStep") != -1
+        or type(bounds.get("sleepSeconds")) not in (int, float)
+        or bounds.get("sleepSeconds") != 0
+        or bounds.get("singleStep") is not True
+        or type(started) is not int
+        or type(completed) is not int
+        or started <= 0
+        or completed <= started
+    ):
+        raise ActivationPackageError("migration rehearsal report does not prove approved semantics")
+    return report
+
+
 def finalize_activation_package(package_root: str | os.PathLike[str]) -> dict[str, object]:
     """Seal every currently staged byte after the interactive verifier gate."""
 
@@ -2849,6 +3098,7 @@ def finalize_activation_package(package_root: str | os.PathLike[str]) -> dict[st
     )
     if any(not path.is_file() or path.is_symlink() for path in required):
         raise ActivationPackageError("activation package is missing a required artifact")
+    _validate_migration_rehearsal_semantics(package)
     files = _package_file_inventory(package)
     directories = _package_directory_inventory(package)
     unsigned = {
@@ -2891,6 +3141,7 @@ def verify_activation_package(
     observed_directories = _package_directory_inventory(package)
     if document.get("files") != observed_files or document.get("directories") != observed_directories:
         raise ActivationPackageError("activation package artifact drift detected")
+    _validate_migration_rehearsal_semantics(package)
     return {"verified": True, "packageDigest": expected_digest, "fileCount": len(observed_files)}
 
 
@@ -2912,11 +3163,21 @@ def _import_approved_execution_package(
         raise ActivationPackageError("approved execution package destination already exists")
     _ensure_directory(destination.parent)
     _ensure_directory(destination)
+    directory_modes: list[tuple[Path, int]] = []
     for directory, directories, files in os.walk(source_package, followlinks=False):
         source_directory = Path(directory)
         relative_directory = source_directory.relative_to(source_package)
         target_directory = destination / relative_directory
+        source_directory_metadata = source_directory.lstat()
+        source_directory_mode = stat.S_IMODE(source_directory_metadata.st_mode)
+        if (
+            source_directory.is_symlink()
+            or source_directory_metadata.st_uid != source_package.lstat().st_uid
+            or source_directory_mode not in {0o500, 0o700}
+        ):
+            raise ActivationPackageError("source activation package directory mode is invalid")
         _ensure_directory(target_directory)
+        directory_modes.append((target_directory, source_directory_mode))
         for name in directories:
             source_child = source_directory / name
             if source_child.is_symlink():
@@ -2930,6 +3191,12 @@ def _import_approved_execution_package(
             if mode not in {0o400, 0o444, 0o500, 0o555, 0o600, 0o644}:
                 raise ActivationPackageError("source activation package file mode is invalid")
             _write_new(destination / relative, raw, mode)
+    for target_directory, mode in sorted(
+        directory_modes,
+        key=lambda item: len(item[0].parts),
+        reverse=True,
+    ):
+        os.chmod(target_directory, mode)
     verify_activation_package(destination, expected_package_digest)
     return destination
 
@@ -4382,6 +4649,12 @@ def _main(argv: list[str] | None = None) -> int:
         description="Run one exact activation-package primitive.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    sqlite_stage = commands.add_parser(
+        "stage-sqlite-runtime",
+        help="copy the independently approved SQLite binary to a closed package inode",
+    )
+    sqlite_stage.add_argument("--source-library", required=True)
+    sqlite_stage.add_argument("--package-root", required=True)
     prepare = commands.add_parser(
         "prepare-package",
         help="stage a closed owner-only package without activating it",
@@ -4505,8 +4778,16 @@ def _main(argv: list[str] | None = None) -> int:
     final_store.add_argument("--pages-per-step", required=True, type=int)
     final_store.add_argument("--sleep-seconds", required=True, type=float)
     args = parser.parse_args(argv)
-    if args.command == "prepare-package":
+    if args.command == "stage-sqlite-runtime":
         package_root = _validate_new_package_destination(args.package_root)
+        result = stage_sqlite_runtime_input(
+            package_root,
+            source_library=args.source_library,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "prepare-package":
+        package_root = _validate_sqlite_staged_package_destination(args.package_root)
         _validate_principal_binding(
             god_uid=args.god_uid,
             overseer_uid=args.overseer_uid,

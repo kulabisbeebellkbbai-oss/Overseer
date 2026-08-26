@@ -16,5 +16,9 @@ def test_v11_release_metadata_is_consistent() -> None:
 
     assert project["project"]["version"] == "1.1.6"
     assert "Version: 1.1.6\n" in package_metadata
+    assert "--human-approval-token-file" not in package_metadata
+    assert "--human-approval-identity" not in package_metadata
+    assert "--admin-approval-verifier-file" in package_metadata
+    assert "--roadex-fixture-approval-verifier-file" in package_metadata
     assert '"version": "0.1.0"' not in codex_usage_source
     assert codex_usage_source.count('"version": "1.1.6"') == 3

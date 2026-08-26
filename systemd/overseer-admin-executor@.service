@@ -7,7 +7,8 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/var/lib/overseer-executor
-Environment=PYTHONPATH=@OVERSEER_RELEASE@/src
+Environment=PYTHONPATH=@OVERSEER_RELEASE@/app/src:@OVERSEER_RELEASE@/site-packages
+Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=@OVERSEER_PYTHON@ -m overseer.admin_executor serve-one --allowlist-file /etc/overseer/admin-executor-allowlist.json --public-key-file /etc/overseer/admin-executor-public-key --ledger /var/lib/overseer-executor/ledger.sqlite3
 StandardInput=socket
@@ -25,6 +26,8 @@ ProtectHome=true
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=yes
+ProtectProc=invisible
+ProcSubset=pid
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -32,6 +35,10 @@ ProtectClock=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 UMask=0077
 RestrictAddressFamilies=AF_UNIX
 CapabilityBoundingSet=

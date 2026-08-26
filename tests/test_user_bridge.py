@@ -335,6 +335,11 @@ def test_bridge_templates_are_root_socket_activated_and_network_denied() -> None
     assert "SocketGroup=overseer" in socket_unit
     assert "SocketMode=0660" in socket_unit
     assert "User=god" in service_unit
+    assert (
+        "Environment=PYTHONPATH=@OVERSEER_RELEASE@/app/src:"
+        "@OVERSEER_RELEASE@/site-packages"
+    ) in service_unit
+    assert "Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime" in service_unit
     assert "--socket-fd=3" in service_unit
     assert "--peer-uid=@OVERSEER_UID@" in service_unit
     assert "RestrictAddressFamilies=AF_UNIX" in service_unit
@@ -607,7 +612,10 @@ def test_usage_provider_is_read_only_bounded_and_redacted(tmp_path: Path) -> Non
     )
     before = database.stat()
 
-    projection = CodexUsageProjectionProvider(db_path=database).snapshot()
+    projection = CodexUsageProjectionProvider(
+        db_path=database,
+        clock=lambda: datetime(2026, 8, 26, 12, 5, tzinfo=UTC),
+    ).snapshot()
     encoded = json.dumps(projection)
 
     assert projection["state"] == "available"

@@ -1,0 +1,3118 @@
+"""Prepare a closed dedicated-principal activation package without activation.
+
+This module performs only owner-scoped staging.  It never invokes sudo,
+systemctl, useradd, groupadd, a shell, or a gateway operation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import grp
+import hashlib
+import json
+import math
+import os
+import pwd
+import re
+import secrets
+import sqlite3
+import stat
+import subprocess
+import time
+from urllib.parse import quote
+from pathlib import Path, PurePosixPath
+from typing import Mapping
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from .approval_auth import (
+    create_approval_document,
+    load_approval_verifier,
+    write_approval_document,
+)
+from .store import SQLiteStore
+
+
+RELEASE_SCHEMA = "overseer.dedicated-principal-release.v1"
+ACTIVATION_CONTRACT_SCHEMA = "overseer.dedicated-principal-activation-contract.v1"
+ROLLBACK_MANIFEST_SCHEMA = "overseer.dedicated-principal-rollback.v1"
+PACKAGE_MANIFEST_SCHEMA = "overseer.dedicated-principal-package.v1"
+ACTIVATION_APPROVAL_SCHEMA = "overseer.activation-package-approval.v1"
+RELEASES_ROOT = PurePosixPath("/opt/overseer/releases")
+MAX_RELEASE_FILE_BYTES = 128 * 1024 * 1024
+MAX_STAGED_SECRET_BYTES = 512
+APPROVED_OVERSEER_UID = 984
+APPROVED_OVERSEER_GID = 984
+APPROVED_PACKAGE_PARENT = Path("/home/god/.local/share/overseer/activation-packages")
+CANARY_REQUIRED_CONTROLS = (
+    "apiHealth",
+    "usageBridgeBounded",
+    "sessionBridgeReadOnly",
+    "ordinaryTokenApprovalRejected",
+    "wrongScopeApprovalRejected",
+    "adminScopeApprovedBySisko",
+    "allowlistedSmokeExecutedOnce",
+    "samePlanReplayNoMutation",
+    "unlistedUnitRejected",
+)
+MIGRATION_KEY_TABLES = (
+    "schema_migrations",
+    "agent_schema_migrations",
+    "resources",
+    "claims",
+    "approvals",
+    "audit_events",
+    "admin_change_plans",
+    "admin_executions",
+    "collection_jobs",
+    "collection_runs",
+    "dashboard_projections",
+    "runtime_heartbeats",
+    "triage_incidents",
+    "repair_attempts",
+    "crew_messages",
+    "decisions",
+)
+_HEX = frozenset("0123456789abcdef")
+_SYSTEMD_TEMPLATES = {
+    "overseer-admin-executor.socket": "overseer-admin-executor.socket",
+    "overseer-admin-executor@.service": "overseer-admin-executor@.service",
+    "overseer-api-canary.service": "overseer-api-canary.service",
+    "overseer-api-system.service": "overseer-api.service",
+    "overseer-approval-smoke.service": "overseer-approval-smoke.service",
+    "overseer-codex-user-bridge.service": "overseer-codex-user-bridge.service",
+    "overseer-codex-user-bridge.socket": "overseer-codex-user-bridge.socket",
+    "overseer-runtime-system.service": "overseer-runtime.service",
+    "overseer-tmpfiles.conf": "overseer-tmpfiles.conf",
+}
+
+
+class ActivationPackageError(ValueError):
+    """Raised when a package input or staged artifact is unsafe or unstable."""
+
+
+def _validate_principal_binding(*, god_uid: int, overseer_uid: int, overseer_gid: int) -> None:
+    if (overseer_uid, overseer_gid) != (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID):
+        raise ActivationPackageError("dedicated principal must use the approved UID/GID 984")
+    try:
+        god = pwd.getpwnam("god")
+    except KeyError as error:
+        raise ActivationPackageError("approved god account is unavailable") from error
+    if god.pw_uid != god_uid:
+        raise ActivationPackageError("god UID does not match the approved local account")
+    try:
+        existing_user = pwd.getpwuid(overseer_uid)
+    except KeyError:
+        existing_user = None
+    if existing_user is not None and (
+        existing_user.pw_name != "overseer" or existing_user.pw_gid != overseer_gid
+    ):
+        raise ActivationPackageError("approved Overseer UID is assigned to another account")
+    try:
+        existing_group = grp.getgrgid(overseer_gid)
+    except KeyError:
+        existing_group = None
+    if existing_group is not None and existing_group.gr_name != "overseer":
+        raise ActivationPackageError("approved Overseer GID is assigned to another group")
+
+
+def _validate_new_package_destination(package_root: str | os.PathLike[str]) -> Path:
+    package = Path(package_root).absolute()
+    parent = APPROVED_PACKAGE_PARENT.absolute()
+    _ensure_directory(parent)
+    if package.parent != parent:
+        raise ActivationPackageError("activation package must be staged below the approved Overseer package root")
+    if re.fullmatch(r"v1\.1\.6-[0-9a-f]{7,40}", package.name) is None:
+        raise ActivationPackageError("activation package directory name is invalid")
+    if package.exists() or package.is_symlink():
+        raise ActivationPackageError("activation package destination must not already exist")
+    return package
+
+
+def _validate_existing_package_destination(package_root: str | os.PathLike[str]) -> Path:
+    package = Path(package_root).absolute()
+    parent = APPROVED_PACKAGE_PARENT.absolute()
+    if package.parent != parent or re.fullmatch(r"v1\.1\.6-[0-9a-f]{7,40}", package.name) is None:
+        raise ActivationPackageError("activation package is outside the approved Overseer package root")
+    try:
+        parent_metadata = parent.lstat()
+        package_metadata = package.lstat()
+    except OSError as error:
+        raise ActivationPackageError("activation package is unavailable") from error
+    if (
+        parent.is_symlink()
+        or package.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or not stat.S_ISDIR(package_metadata.st_mode)
+        or parent_metadata.st_uid != package_metadata.st_uid
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        or stat.S_IMODE(package_metadata.st_mode) != 0o700
+    ):
+        raise ActivationPackageError("activation package ownership or mode is invalid")
+    return package
+
+
+def _canonical(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ActivationPackageError("activation package value is not canonical JSON") from error
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _git(checkout: Path, *args: str) -> bytes:
+    result = subprocess.run(
+        ("git", "-C", str(checkout), *args),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ActivationPackageError("reviewed Git checkout could not be inspected")
+    return result.stdout
+
+
+def _stable_read(path: Path) -> tuple[bytes, os.stat_result]:
+    try:
+        before = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+            raise ActivationPackageError(f"release input is not a regular file: {path}")
+        if before.st_nlink != 1:
+            raise ActivationPackageError(f"release input must be single-link: {path}")
+        if before.st_size > MAX_RELEASE_FILE_BYTES:
+            raise ActivationPackageError(f"release input exceeds the per-file bound: {path}")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or opened.st_size != before.st_size
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+            ):
+                raise ActivationPackageError(f"release input changed while opening: {path}")
+            data = bytearray()
+            while len(data) <= MAX_RELEASE_FILE_BYTES:
+                chunk = os.read(
+                    descriptor,
+                    min(1024 * 1024, MAX_RELEASE_FILE_BYTES + 1 - len(data)),
+                )
+                if not chunk:
+                    break
+                data.extend(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        lexical_after = path.lstat()
+        state = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_mode,
+            item.st_nlink,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if state(before) != state(after) or state(before) != state(lexical_after):
+            raise ActivationPackageError(f"release input changed while reading: {path}")
+        if len(data) != opened.st_size or len(data) > MAX_RELEASE_FILE_BYTES:
+            raise ActivationPackageError(f"release input was not read completely: {path}")
+        return bytes(data), opened
+    except ActivationPackageError:
+        raise
+    except OSError as error:
+        raise ActivationPackageError(f"release input could not be safely read: {path}") from error
+
+
+def _safe_relative(value: str) -> str:
+    path = PurePosixPath(value)
+    if not value or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ActivationPackageError("release path is unsafe")
+    return path.as_posix()
+
+
+def _source_inventory(checkout: Path) -> tuple[str, ...]:
+    raw = _git(checkout, "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", "src/overseer")
+    result = tuple(sorted(item.decode("utf-8", "strict") for item in raw.split(b"\0") if item))
+    if not result:
+        raise ActivationPackageError("reviewed runtime source inventory is empty")
+    return result
+
+
+def _dependency_inventory(root: Path) -> tuple[str, ...]:
+    if not root.is_dir() or root.is_symlink():
+        raise ActivationPackageError("dependency root is unavailable or is a symlink")
+    result: list[str] = []
+    for directory, directories, files in os.walk(root, followlinks=False):
+        base = Path(directory)
+        for name in tuple(directories):
+            path = base / name
+            if path.is_symlink():
+                raise ActivationPackageError("dependency runtime contains a symlink")
+            if name == "__pycache__":
+                directories.remove(name)
+        for name in files:
+            path = base / name
+            if path.is_symlink():
+                raise ActivationPackageError("dependency runtime contains a symlink")
+            if path.suffix in {".pyc", ".pyo"}:
+                continue
+            result.append(_safe_relative(path.relative_to(root).as_posix()))
+    if not result:
+        raise ActivationPackageError("dependency runtime inventory is empty")
+    return tuple(sorted(result))
+
+
+def _runtime_inventory(root: Path) -> tuple[str, ...]:
+    if not root.is_dir() or root.is_symlink():
+        raise ActivationPackageError("standard-library root is unavailable or is a symlink")
+    result: list[str] = []
+    for directory, directories, files in os.walk(root, followlinks=False):
+        base = Path(directory)
+        for name in tuple(directories):
+            path = base / name
+            if path.is_symlink():
+                raise ActivationPackageError("standard-library runtime contains a directory symlink")
+            if name == "__pycache__":
+                directories.remove(name)
+        for name in files:
+            path = base / name
+            if path.suffix in {".pyc", ".pyo"}:
+                continue
+            if path.is_symlink():
+                try:
+                    resolved = path.resolve(strict=True)
+                except OSError as error:
+                    raise ActivationPackageError("standard-library runtime contains a broken symlink") from error
+                if not resolved.is_file() or resolved.is_symlink():
+                    raise ActivationPackageError("standard-library symlink target is not a regular file")
+            result.append(_safe_relative(path.relative_to(root).as_posix()))
+    if not result:
+        raise ActivationPackageError("standard-library runtime inventory is empty")
+    return tuple(sorted(result))
+
+
+def _runtime_read(root: Path, source_path: str) -> tuple[bytes, os.stat_result, str]:
+    lexical = root / _safe_relative(source_path)
+    selected = lexical
+    if lexical.is_symlink():
+        try:
+            selected = lexical.resolve(strict=True)
+        except OSError as error:
+            raise ActivationPackageError("standard-library symlink could not be resolved") from error
+    content, metadata = _stable_read(selected)
+    return content, metadata, str(selected)
+
+
+def _file_entry(
+    *,
+    source_kind: str,
+    source_root: Path,
+    source_path: str,
+    release_path: str,
+) -> dict[str, object]:
+    content, metadata = _stable_read(source_root / source_path)
+    return {
+        "releasePath": _safe_relative(release_path),
+        "sourceKind": source_kind,
+        "sourcePath": _safe_relative(source_path),
+        "sha256": _sha256(content),
+        "size": len(content),
+        "mode": 0o555 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o444,
+    }
+
+
+def build_release_manifest(
+    checkout: str | os.PathLike[str],
+    dependency_root: str | os.PathLike[str],
+    root_python: str | os.PathLike[str],
+    stdlib_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Build a deterministic manifest from a clean reviewed checkout."""
+
+    lexical_checkout = Path(checkout)
+    lexical_dependencies = Path(dependency_root)
+    lexical_stdlib = Path(stdlib_root)
+    if lexical_checkout.is_symlink() or lexical_dependencies.is_symlink() or lexical_stdlib.is_symlink():
+        raise ActivationPackageError("release roots must not be symlinks")
+    selected_checkout = lexical_checkout.resolve()
+    selected_dependencies = lexical_dependencies.resolve()
+    selected_stdlib = lexical_stdlib.resolve()
+    selected_python = Path(root_python)
+    if _git(selected_checkout, "status", "--porcelain=v1", "--untracked-files=all").strip():
+        raise ActivationPackageError("reviewed Git checkout must be clean")
+    commit = _git(selected_checkout, "rev-parse", "HEAD^{commit}").strip().decode("ascii").lower()
+    tree = _git(selected_checkout, "rev-parse", "HEAD^{tree}").strip().decode("ascii").lower()
+    if len(commit) != 40 or set(commit) - _HEX or len(tree) != 40 or set(tree) - _HEX:
+        raise ActivationPackageError("reviewed Git identity is invalid")
+
+    files = [
+        _file_entry(
+            source_kind="checkout",
+            source_root=selected_checkout,
+            source_path=path,
+            release_path=f"app/{path}",
+        )
+        for path in _source_inventory(selected_checkout)
+    ]
+    files.extend(
+        _file_entry(
+            source_kind="dependency",
+            source_root=selected_dependencies,
+            source_path=path,
+            release_path=f"site-packages/{path}",
+        )
+        for path in _dependency_inventory(selected_dependencies)
+    )
+    for path in _runtime_inventory(selected_stdlib):
+        content, metadata, resolved = _runtime_read(selected_stdlib, path)
+        files.append(
+            {
+                "releasePath": _safe_relative(f"runtime/lib/python3.13/{path}"),
+                "sourceKind": "stdlib",
+                "sourcePath": path,
+                "sourceResolvedPath": resolved,
+                "sha256": _sha256(content),
+                "size": len(content),
+                "mode": 0o555 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o444,
+            }
+        )
+    files.sort(key=lambda item: str(item["releasePath"]))
+    paths = [str(item["releasePath"]) for item in files]
+    if paths != sorted(set(paths)):
+        raise ActivationPackageError("release inventory paths are not unique")
+
+    python_content, python_metadata = _stable_read(selected_python)
+    unsigned: dict[str, object] = {
+        "schemaVersion": RELEASE_SCHEMA,
+        "sourceCommit": commit,
+        "sourceTree": tree,
+        "files": files,
+        "rootPython": {
+            "path": str(selected_python),
+            "releasePath": "runtime/bin/python3.13",
+            "sha256": _sha256(python_content),
+            "size": len(python_content),
+            "mode": stat.S_IMODE(python_metadata.st_mode),
+            "uid": python_metadata.st_uid,
+            "gid": python_metadata.st_gid,
+        },
+    }
+    digest = _sha256(_canonical(unsigned))
+    manifest = {
+        **unsigned,
+        "manifestDigest": digest,
+        "releaseRoot": str(RELEASES_ROOT / f"{commit}-{digest}"),
+    }
+    if (
+        _git(selected_checkout, "rev-parse", "HEAD^{commit}").strip().decode("ascii").lower() != commit
+        or _git(selected_checkout, "rev-parse", "HEAD^{tree}").strip().decode("ascii").lower() != tree
+        or _git(selected_checkout, "status", "--porcelain=v1", "--untracked-files=all").strip()
+    ):
+        raise ActivationPackageError("reviewed Git checkout changed while building the manifest")
+    return manifest
+
+
+def _ensure_directory(
+    path: Path,
+    mode: int = 0o700,
+    *,
+    enforce_existing_mode: bool = True,
+) -> None:
+    """Create a directory chain without following or chmodding existing parents."""
+
+    selected = path.absolute()
+    missing: list[Path] = []
+    cursor = selected
+    while True:
+        try:
+            metadata = cursor.lstat()
+        except FileNotFoundError:
+            missing.append(cursor)
+            parent = cursor.parent
+            if parent == cursor:
+                raise ActivationPackageError(f"package directory has no existing anchor: {path}")
+            cursor = parent
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ActivationPackageError(f"package directory chain is unsafe: {cursor}")
+        break
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=mode)
+        except FileExistsError:
+            metadata = directory.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise ActivationPackageError(f"package directory chain changed: {directory}")
+        else:
+            os.chmod(directory, mode)
+    metadata = selected.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ActivationPackageError(f"package directory is unsafe: {path}")
+    if missing:
+        os.chmod(selected, mode)
+    elif enforce_existing_mode and (
+        metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise ActivationPackageError(
+            f"existing package directory must be owner-controlled mode {mode:04o}: {path}"
+        )
+
+
+def _write_new(path: Path, content: bytes, mode: int) -> None:
+    _ensure_directory(path.parent, enforce_existing_mode=False)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, mode)
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("package write made no progress")
+                view = view[written:]
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except FileExistsError as error:
+        raise ActivationPackageError(f"package artifact already exists: {path}") from error
+
+
+def _read_secret(path: Path, *, label: str) -> bytes:
+    try:
+        lexical = path.lstat()
+    except OSError as error:
+        raise ActivationPackageError(f"{label} could not be inspected") from error
+    if path.is_symlink():
+        raise ActivationPackageError(f"{label} must not be a symlink")
+    if not stat.S_ISREG(lexical.st_mode) or lexical.st_nlink != 1:
+        raise ActivationPackageError(f"{label} must be a single-link regular file")
+    if lexical.st_uid != os.geteuid():
+        raise ActivationPackageError(f"{label} has an unexpected owner")
+    if stat.S_IMODE(lexical.st_mode) != 0o600:
+        raise ActivationPackageError(f"{label} must have mode 0600")
+    content, opened = _stable_read(path)
+    if opened.st_uid != os.geteuid() or stat.S_IMODE(opened.st_mode) != 0o600:
+        raise ActivationPackageError(f"{label} metadata changed")
+    if not content or len(content) > MAX_STAGED_SECRET_BYTES:
+        raise ActivationPackageError(f"{label} has an invalid size")
+    if any(byte <= 0x20 or byte == 0x7F for byte in content):
+        raise ActivationPackageError(f"{label} is not canonical secret data")
+    return content
+
+
+def _credential_entry(*, target: str, content: bytes, source: str | None, mode: int) -> dict[str, object]:
+    return {
+        "target": target,
+        "source": source,
+        "mode": f"{mode:04o}",
+        "size": len(content),
+        "sha256": _sha256(content),
+    }
+
+
+def stage_credentials(
+    package_root: str | os.PathLike[str],
+    *,
+    psychlo_secret_file: str | os.PathLike[str],
+    roadex_secret_file: str | os.PathLike[str],
+    psychlo_bindings_file: str | os.PathLike[str],
+    random_bytes=secrets.token_bytes,
+    ticket_private_key: Ed25519PrivateKey | None = None,
+) -> dict[str, object]:
+    """Stage machine credentials without printing or exposing their values."""
+
+    package = Path(package_root)
+    _ensure_directory(package)
+    private = package / "private" / "credentials"
+    public_config = package / "public" / "config"
+    _ensure_directory(private)
+    _ensure_directory(public_config)
+
+    psychlo_path = Path(psychlo_secret_file)
+    roadex_path = Path(roadex_secret_file)
+    bindings_path = Path(psychlo_bindings_file)
+    psychlo = _read_secret(psychlo_path, label="Psychlo peer secret")
+    roadex = _read_secret(roadex_path, label="Roadex relay secret")
+    bindings, bindings_metadata = _stable_read(bindings_path)
+    if bindings_metadata.st_uid != os.geteuid() or stat.S_IMODE(bindings_metadata.st_mode) != 0o600:
+        raise ActivationPackageError("Psychlo bindings snapshot must be owner-only mode 0600")
+    try:
+        parsed_bindings = json.loads(bindings)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("Psychlo bindings snapshot is not valid JSON") from error
+    if not isinstance(parsed_bindings, dict):
+        raise ActivationPackageError("Psychlo bindings snapshot must be a JSON object")
+
+    generated = random_bytes(48)
+    if type(generated) is not bytes or len(generated) != 48:
+        raise ActivationPackageError("API token entropy source returned an invalid value")
+    api_token = base64.urlsafe_b64encode(generated).rstrip(b"=")
+    key = ticket_private_key or Ed25519PrivateKey.generate()
+    private_key = key.private_bytes_raw()
+    public_key = key.public_key().public_bytes_raw()
+
+    staged = {
+        private / "api-token": (api_token, 0o600),
+        private / "psychlo-peer-secret": (psychlo, 0o600),
+        private / "roadex-project-human-thread-secret": (roadex, 0o600),
+        private / "admin-ticket-private-key": (private_key, 0o600),
+        public_config / "admin-executor-public-key": (public_key, 0o644),
+        public_config / "psychlo-project-bindings.json": (bindings, 0o644),
+    }
+    for path, (content, mode) in staged.items():
+        _write_new(path, content, mode)
+
+    metadata: dict[str, object] = {
+        "schemaVersion": "overseer.activation-credentials.v1",
+        "apiToken": {
+            **_credential_entry(
+                target="/etc/overseer/api-token",
+                content=api_token,
+                source=None,
+                mode=0o600,
+            ),
+            "rotationRequired": True,
+            "compatibilityCopy": "/home/god/.local/share/overseer/project/state/api-token",
+        },
+        "psychloPeerSecret": _credential_entry(
+            target="/etc/overseer/psychlo-peer-secret",
+            content=psychlo,
+            source=str(psychlo_path),
+            mode=0o600,
+        ),
+        "roadexRelaySecret": _credential_entry(
+            target="/etc/overseer/roadex-project-human-thread-secret",
+            content=roadex,
+            source=str(roadex_path),
+            mode=0o600,
+        ),
+        "psychloBindings": _credential_entry(
+            target="/etc/overseer/psychlo-project-bindings.json",
+            content=bindings,
+            source=str(bindings_path),
+            mode=0o644,
+        ),
+        "adminTicketPrivateKey": _credential_entry(
+            target="/etc/overseer/admin-ticket-private-key",
+            content=private_key,
+            source=None,
+            mode=0o600,
+        ),
+        "adminTicketPublicKey": _credential_entry(
+            target="/etc/overseer/admin-executor-public-key",
+            content=public_key,
+            source=None,
+            mode=0o644,
+        ),
+        "humanVerifiers": {
+            "status": "awaiting_interactive_input",
+            "adminScope": "admin-plan-approval",
+            "roadexScope": "roadex-fixture-approval",
+            "secretsMustDiffer": True,
+            "secretsMustDifferFromApiToken": True,
+        },
+    }
+    _write_new(
+        package / "public" / "credential-metadata.json",
+        _canonical(metadata) + b"\n",
+        0o644,
+    )
+    return metadata
+
+
+def create_human_verifiers(
+    package_root: str | os.PathLike[str],
+    *,
+    admin_secret: str,
+    roadex_secret: str,
+) -> dict[str, object]:
+    """Create both scoped verifier documents after one local interactive entry."""
+
+    if secrets.compare_digest(admin_secret, roadex_secret):
+        raise ActivationPackageError("admin and Roadex approval secrets must be different")
+    package = Path(package_root)
+    private = package / "private" / "credentials"
+    api_path = private / "api-token"
+    try:
+        api_raw, api_metadata = _stable_read(api_path)
+        if api_metadata.st_uid != os.geteuid() or stat.S_IMODE(api_metadata.st_mode) != 0o600:
+            raise ActivationPackageError("staged API token metadata is invalid")
+        api_token = api_raw.decode("ascii", "strict")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ActivationPackageError("staged API token is unavailable") from error
+    if secrets.compare_digest(admin_secret, api_token) or secrets.compare_digest(roadex_secret, api_token):
+        raise ActivationPackageError("human approval secrets must differ from the API token")
+
+    admin_path = private / "admin-approval-verifier.json"
+    roadex_path = private / "roadex-fixture-approval-verifier.json"
+    attestation_path = package / "public" / "human-verifier-separation.json"
+    if any(path.exists() or path.is_symlink() for path in (admin_path, roadex_path, attestation_path)):
+        raise ActivationPackageError("human verifier artifacts already exist")
+    try:
+        admin_document = create_approval_document(admin_secret, "admin-plan-approval")
+        roadex_document = create_approval_document(roadex_secret, "roadex-fixture-approval")
+        admin_verifier = write_approval_document(admin_path, admin_document)
+        roadex_verifier = write_approval_document(roadex_path, roadex_document)
+        admin_raw, _ = _stable_read(admin_path)
+        roadex_raw, _ = _stable_read(roadex_path)
+        attestation = {
+            "schemaVersion": "overseer.human-verifier-separation.v1",
+            "adminScope": admin_verifier.scope,
+            "roadexScope": roadex_verifier.scope,
+            "adminDocumentSha256": _sha256(admin_raw),
+            "roadexDocumentSha256": _sha256(roadex_raw),
+            "differentSecretsConfirmed": True,
+            "apiTokenExcluded": True,
+        }
+        _write_new(attestation_path, _canonical(attestation) + b"\n", 0o644)
+    except BaseException:
+        for path in (admin_path, roadex_path, attestation_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    return {"status": "created", "adminScope": admin_verifier.scope, "roadexScope": roadex_verifier.scope}
+
+
+def activation_package_status(package_root: str | os.PathLike[str]) -> dict[str, object]:
+    """Report the credential gate without returning credential contents."""
+
+    package = Path(package_root)
+    package_manifest = package / "public" / "package-manifest.json"
+    if package_manifest.exists() or package_manifest.is_symlink():
+        if package_manifest.is_symlink() or not package_manifest.is_file():
+            raise ActivationPackageError("package manifest is unsafe")
+        try:
+            document = json.loads(package_manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ActivationPackageError("package manifest is invalid") from error
+        digest = document.get("packageDigest") if isinstance(document, dict) else None
+        if not isinstance(digest, str):
+            raise ActivationPackageError("package manifest digest is invalid")
+        verify_activation_package(package, digest)
+        return {
+            "status": "ready_for_approval",
+            "readyForApproval": True,
+            "packageDigest": digest,
+        }
+    private = package / "private" / "credentials"
+    admin_path = private / "admin-approval-verifier.json"
+    roadex_path = private / "roadex-fixture-approval-verifier.json"
+    attestation_path = package / "public" / "human-verifier-separation.json"
+    present = tuple(path.is_file() and not path.is_symlink() for path in (admin_path, roadex_path, attestation_path))
+    if not any(present):
+        return {"status": "awaiting_human_verifiers", "readyForApproval": False}
+    if not all(present):
+        raise ActivationPackageError("human verifier gate is only partially staged")
+    admin = load_approval_verifier(admin_path)
+    roadex = load_approval_verifier(roadex_path)
+    api_raw, api_metadata = _stable_read(private / "api-token")
+    if api_metadata.st_uid != os.geteuid() or stat.S_IMODE(api_metadata.st_mode) != 0o600:
+        raise ActivationPackageError("staged API token metadata is invalid")
+    try:
+        api_token = api_raw.decode("ascii", "strict")
+    except UnicodeDecodeError as error:
+        raise ActivationPackageError("staged API token is invalid") from error
+    if admin.scope != "admin-plan-approval" or roadex.scope != "roadex-fixture-approval":
+        raise ActivationPackageError("human verifier scopes are invalid")
+    if admin.verify(api_token) or roadex.verify(api_token):
+        raise ActivationPackageError("staged API token authenticates as a human approval secret")
+    admin_raw, _ = _stable_read(admin_path)
+    roadex_raw, _ = _stable_read(roadex_path)
+    try:
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("human verifier separation attestation is invalid") from error
+    expected = {
+        "schemaVersion": "overseer.human-verifier-separation.v1",
+        "adminScope": "admin-plan-approval",
+        "roadexScope": "roadex-fixture-approval",
+        "adminDocumentSha256": _sha256(admin_raw),
+        "roadexDocumentSha256": _sha256(roadex_raw),
+        "differentSecretsConfirmed": True,
+        "apiTokenExcluded": True,
+    }
+    if attestation != expected:
+        raise ActivationPackageError("human verifier separation attestation does not match the documents")
+    return {"status": "credentials_complete", "readyForApproval": False}
+
+
+def _validate_store_artifact(
+    path: Path,
+    *,
+    label: str,
+    expected_uid: int | None = None,
+) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ActivationPackageError(f"{label} could not be inspected") from error
+    if path.is_symlink():
+        raise ActivationPackageError(f"{label} must not be a symlink")
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ActivationPackageError(f"{label} must be a single-link regular file")
+    selected_uid = os.geteuid() if expected_uid is None else expected_uid
+    if metadata.st_uid != selected_uid:
+        raise ActivationPackageError(f"{label} has an unexpected owner")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ActivationPackageError(f"{label} must have mode 0600")
+    return metadata
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    metadata = _validate_store_artifact(path, label="migration artifact")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ActivationPackageError("migration artifact changed while opening")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    lexical_after = path.lstat()
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    if identity(metadata) != identity(after) or identity(metadata) != identity(lexical_after):
+        raise ActivationPackageError("migration artifact changed while hashing")
+    if size != metadata.st_size:
+        raise ActivationPackageError("migration artifact was not read completely")
+    return digest.hexdigest(), size
+
+
+def _copy_store(source: Path, target: Path) -> None:
+    source_metadata = _validate_store_artifact(source, label="rehearsal backup")
+    _ensure_directory(target.parent)
+    source_fd = os.open(
+        source,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    target_fd: int | None = None
+    try:
+        opened = os.fstat(source_fd)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+            source_metadata.st_size,
+        ):
+            raise ActivationPackageError("rehearsal backup changed while opening")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        target_fd = os.open(target, flags, 0o600)
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_fd, view)
+                if written <= 0:
+                    raise OSError("migration copy made no progress")
+                copied += written
+                view = view[written:]
+        if copied != opened.st_size:
+            raise ActivationPackageError("rehearsal backup copy was truncated")
+        os.fchmod(target_fd, 0o600)
+        os.fsync(target_fd)
+    except BaseException:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(source_fd)
+        if target_fd is not None:
+            os.close(target_fd)
+
+
+def _sqlite_uri(path: Path, mode: str = "ro") -> str:
+    return f"file:{quote(path.as_posix(), safe='/')}?mode={mode}"
+
+
+def _integrity_check(path: Path) -> str:
+    connection = sqlite3.connect(_sqlite_uri(path), uri=True, timeout=5)
+    try:
+        row = connection.execute("PRAGMA integrity_check").fetchone()
+    finally:
+        connection.close()
+    result = str(row[0]) if row else "missing"
+    if result != "ok":
+        raise ActivationPackageError("migration artifact failed SQLite integrity_check")
+    return result
+
+
+def _migration_evidence(
+    path: Path,
+    *,
+    counted_tables: tuple[str, ...] | None = None,
+) -> tuple[dict[str, int], dict[str, object]]:
+    connection = sqlite3.connect(_sqlite_uri(path), uri=True, timeout=5)
+    try:
+        names = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        selected = list(counted_tables) if counted_tables is not None else [
+            name for name in MIGRATION_KEY_TABLES if name in names
+        ]
+        if counted_tables is not None and any(name not in names for name in selected):
+            raise ActivationPackageError("migration lost a counted table")
+        if counted_tables is None and not selected:
+            if len(names) > 32:
+                raise ActivationPackageError("migration store has no known key tables and exceeds fallback bounds")
+            selected = names
+        result: dict[str, int] = {}
+        for name in selected:
+            quoted = name.replace('"', '""')
+            result[name] = int(connection.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0])
+        schema_rows = [
+            {
+                "type": str(row[0]),
+                "name": str(row[1]),
+                "table": str(row[2]),
+                "sqlSha256": _sha256(str(row[3] or "").encode("utf-8")),
+            }
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            )
+        ]
+        schema = {
+            "objectCount": len(schema_rows),
+            "digest": _sha256(_canonical(schema_rows)),
+            "tableNames": names,
+            "countedTables": selected,
+        }
+        return result, schema
+    finally:
+        connection.close()
+
+
+def rehearse_store_migration(
+    package_root: str | os.PathLike[str],
+    *,
+    source_store: str | os.PathLike[str],
+    pages_per_step: int = 128,
+    sleep_seconds: float = 0.02,
+) -> dict[str, object]:
+    """Create an online backup and migrate only a second copied canary."""
+
+    if type(pages_per_step) is not int or not 1 <= pages_per_step <= 4096:
+        raise ActivationPackageError("backup pages_per_step is outside the bounded range")
+    if (
+        type(sleep_seconds) not in (int, float)
+        or not math.isfinite(sleep_seconds)
+        or not 0 <= sleep_seconds <= 1
+    ):
+        raise ActivationPackageError("backup sleep_seconds is outside the bounded range")
+    source = Path(source_store)
+    before = _validate_store_artifact(source, label="source SQLite store")
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{source}{suffix}")
+        if sidecar.exists() or sidecar.is_symlink():
+            _validate_store_artifact(sidecar, label=f"source SQLite {suffix} sidecar")
+
+    package = Path(package_root)
+    migration = package / "private" / "migration"
+    _ensure_directory(package)
+    if migration.exists() or migration.is_symlink():
+        raise ActivationPackageError("migration rehearsal destination already exists")
+    _ensure_directory(migration)
+    backup = migration / "rehearsal-source.sqlite3"
+    migrated = migration / "rehearsal-migrated.sqlite3"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(backup, flags, 0o600)
+    os.close(descriptor)
+    source_connection = sqlite3.connect(_sqlite_uri(source), uri=True, timeout=5)
+    target_connection = sqlite3.connect(backup, timeout=5)
+    try:
+        def progress(_status: int, remaining: int, _total: int) -> None:
+            if remaining and sleep_seconds:
+                time.sleep(float(sleep_seconds))
+
+        source_connection.backup(
+            target_connection,
+            pages=pages_per_step,
+            progress=progress,
+            sleep=0,
+        )
+        target_connection.commit()
+    except BaseException:
+        target_connection.close()
+        source_connection.close()
+        try:
+            backup.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    else:
+        target_connection.close()
+        source_connection.close()
+    os.chmod(backup, 0o600)
+    after = source.lstat()
+    stable_identity = lambda item: (item.st_dev, item.st_ino, item.st_uid, item.st_mode, item.st_nlink)
+    if stable_identity(before) != stable_identity(after):
+        raise ActivationPackageError("source SQLite identity changed during backup")
+
+    backup_integrity = _integrity_check(backup)
+    row_counts_before, schema_before = _migration_evidence(backup)
+    backup_digest, backup_size = _hash_file(backup)
+    _copy_store(backup, migrated)
+    store = SQLiteStore(migrated)
+    store.close()
+    migrated_integrity = _integrity_check(migrated)
+    row_counts_after, schema_after = _migration_evidence(
+        migrated,
+        counted_tables=tuple(str(name) for name in schema_before["countedTables"]),
+    )
+    for table, count in row_counts_before.items():
+        if table in {"schema_migrations", "agent_schema_migrations"}:
+            if row_counts_after.get(table, 0) < count:
+                raise ActivationPackageError(f"schema history lost rows during migration: {table}")
+        elif row_counts_after.get(table) != count:
+            raise ActivationPackageError(f"migration changed retained row count: {table}")
+    migrated_digest, migrated_size = _hash_file(migrated)
+    report: dict[str, object] = {
+        "schemaVersion": "overseer.activation-migration-rehearsal.v1",
+        "status": "rehearsal_complete",
+        "source": {
+            "path": str(source),
+            "device": before.st_dev,
+            "inode": before.st_ino,
+            "mode": "0600",
+            "sizeAtStart": before.st_size,
+        },
+        "backup": {
+            "path": str(backup),
+            "sha256": backup_digest,
+            "size": backup_size,
+            "integrityCheck": backup_integrity,
+        },
+        "migrated": {
+            "path": str(migrated),
+            "sha256": migrated_digest,
+            "size": migrated_size,
+            "integrityCheck": migrated_integrity,
+        },
+        "rowCountsBefore": row_counts_before,
+        "rowCountsAfter": row_counts_after,
+        "schemaBefore": schema_before,
+        "schemaAfter": schema_after,
+        "rowCountPolicy": "fixed-key-tables-or-bounded-fallback",
+        "sourceMutationPerformed": False,
+        "finalQuiescedBackupRequired": True,
+    }
+    _write_new(migration / "migration-report.json", _canonical(report) + b"\n", 0o600)
+    return report
+
+
+def _processes_with_open_inode(device: int, inode: int) -> tuple[int, ...]:
+    """Return processes with the exact source inode open, without shell tools."""
+
+    result: set[int] = set()
+    proc = Path("/proc")
+    try:
+        process_directories = tuple(proc.iterdir())
+    except OSError as error:
+        raise ActivationPackageError("open-process preflight could not inspect /proc") from error
+    for process in process_directories:
+        if not process.name.isdecimal():
+            continue
+        descriptors = process / "fd"
+        try:
+            open_descriptors = tuple(descriptors.iterdir())
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        for descriptor in open_descriptors:
+            try:
+                metadata = descriptor.stat()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if (metadata.st_dev, metadata.st_ino) == (device, inode):
+                result.add(int(process.name))
+                break
+    return tuple(sorted(result))
+
+
+def _artifact_identity(path: Path) -> tuple[int, ...] | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _require_root_activation() -> None:
+    if os.geteuid() != 0:
+        raise ActivationPackageError("final store migration must run as root after explicit activation approval")
+
+
+def _activation_root_identity() -> tuple[int, int]:
+    return 0, 0
+
+
+def _activation_parent_lock_mode() -> int:
+    return 0o500
+
+
+def _legacy_store_paths(source: Path) -> tuple[Path, ...]:
+    return (source, Path(f"{source}-wal"), Path(f"{source}-shm"))
+
+
+def restore_legacy_store_access(
+    *,
+    source_store: str | os.PathLike[str],
+    expected_source_uid: int,
+    expected_source_gid: int,
+    expected_source_device: int,
+    expected_source_inode: int,
+    expected_parent_device: int,
+    expected_parent_inode: int,
+    expected_parent_mode: int,
+) -> dict[str, object]:
+    """Restore only the captured v1.1.5 store access needed for rollback."""
+
+    for value, label in (
+        (expected_source_uid, "source UID"),
+        (expected_source_gid, "source GID"),
+        (expected_source_device, "source device"),
+        (expected_source_inode, "source inode"),
+        (expected_parent_device, "source parent device"),
+        (expected_parent_inode, "source parent inode"),
+    ):
+        if type(value) is not int or value < 0:
+            raise ActivationPackageError(f"legacy store {label} is invalid")
+    _require_root_activation()
+    source = Path(source_store)
+    parent = source.parent
+    parent_metadata = parent.lstat()
+    if (
+        parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_dev != expected_parent_device
+        or parent_metadata.st_ino != expected_parent_inode
+    ):
+        raise ActivationPackageError("legacy store parent is unsafe")
+    restored: list[str] = []
+    for path in _legacy_store_paths(source):
+        if not path.exists() and not path.is_symlink():
+            continue
+        metadata = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ActivationPackageError("legacy store rollback artifact is unsafe")
+        if path == source and (
+            metadata.st_dev != expected_source_device
+            or metadata.st_ino != expected_source_inode
+        ):
+            raise ActivationPackageError("legacy authority store identity drifted during rollback")
+        os.chown(path, expected_source_uid, expected_source_gid)
+        os.chmod(path, 0o600)
+        restored.append(str(path))
+    if str(source) not in restored:
+        raise ActivationPackageError("legacy authority store is missing during rollback")
+    if type(expected_parent_mode) is not int or expected_parent_mode not in {0o700, 0o750, 0o770, 0o775}:
+        raise ActivationPackageError("legacy store parent rollback mode is invalid")
+    os.chown(parent, expected_source_uid, expected_source_gid)
+    os.chmod(parent, expected_parent_mode)
+    return {
+        "restored": True,
+        "sourceStore": str(source),
+        "restoredArtifacts": restored,
+        "uid": expected_source_uid,
+        "gid": expected_source_gid,
+        "mode": "0600",
+        "parentMode": f"{expected_parent_mode:04o}",
+    }
+
+
+def prepare_final_store_migration(
+    *,
+    source_store: str | os.PathLike[str],
+    backup_store: str | os.PathLike[str],
+    destination_store: str | os.PathLike[str],
+    expected_source_device: int,
+    expected_source_inode: int,
+    expected_source_uid: int,
+    expected_source_gid: int,
+    expected_parent_device: int,
+    expected_parent_inode: int,
+    expected_parent_mode: int,
+    destination_uid: int,
+    destination_gid: int,
+    pages_per_step: int = 128,
+    sleep_seconds: float = 0.02,
+) -> dict[str, object]:
+    """Create the final backup and migrated store after all legacy writers stop.
+
+    This is an activation-only primitive.  It never stops services and refuses
+    to start when any process already has the exact source inode open.
+    """
+
+    for value, label in (
+        (expected_source_device, "source device"),
+        (expected_source_inode, "source inode"),
+        (expected_source_uid, "source UID"),
+        (expected_source_gid, "source GID"),
+        (expected_parent_device, "source parent device"),
+        (expected_parent_inode, "source parent inode"),
+        (expected_parent_mode, "source parent mode"),
+        (destination_uid, "destination UID"),
+        (destination_gid, "destination GID"),
+    ):
+        if type(value) is not int or value < 0:
+            raise ActivationPackageError(f"{label} is invalid")
+    if type(pages_per_step) is not int or not 1 <= pages_per_step <= 4096:
+        raise ActivationPackageError("backup pages_per_step is outside the bounded range")
+    if (
+        type(sleep_seconds) not in (int, float)
+        or not math.isfinite(sleep_seconds)
+        or not 0 <= sleep_seconds <= 1
+    ):
+        raise ActivationPackageError("backup sleep_seconds is outside the bounded range")
+    if expected_parent_mode not in {0o700, 0o750, 0o770, 0o775}:
+        raise ActivationPackageError("final migration source parent mode is unsupported")
+    _require_root_activation()
+
+    source = Path(source_store)
+    backup = Path(backup_store)
+    destination = Path(destination_store)
+    source_metadata = _validate_store_artifact(
+        source,
+        label="final migration source SQLite store",
+        expected_uid=expected_source_uid,
+    )
+    if (source_metadata.st_dev, source_metadata.st_ino) != (
+        expected_source_device,
+        expected_source_inode,
+    ):
+        raise ActivationPackageError("final migration source identity drifted")
+    if source_metadata.st_gid != expected_source_gid:
+        raise ActivationPackageError("final migration source group drifted")
+    parent = source.parent
+    try:
+        parent_metadata = parent.lstat()
+    except OSError as error:
+        raise ActivationPackageError("final migration source parent could not be inspected") from error
+    if (
+        parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != expected_source_uid
+        or parent_metadata.st_gid != expected_source_gid
+        or parent_metadata.st_dev != expected_parent_device
+        or parent_metadata.st_ino != expected_parent_inode
+        or stat.S_IMODE(parent_metadata.st_mode) != expected_parent_mode
+    ):
+        raise ActivationPackageError("final migration source parent is not the approved private directory")
+    sidecars = tuple(Path(f"{source}{suffix}") for suffix in ("-wal", "-shm"))
+    sidecar_before = {str(path): _artifact_identity(path) for path in sidecars}
+    for path in sidecars:
+        if path.exists() or path.is_symlink():
+            _validate_store_artifact(
+                path,
+                label="final migration SQLite sidecar",
+                expected_uid=expected_source_uid,
+            )
+            if path.lstat().st_gid != expected_source_gid:
+                raise ActivationPackageError("final migration SQLite sidecar group drifted")
+    for target, label in ((backup, "final backup"), (destination, "final migrated store")):
+        if target.exists() or target.is_symlink():
+            raise ActivationPackageError(f"{label} destination already exists")
+        if target.parent.is_symlink() or not target.parent.is_dir():
+            raise ActivationPackageError(f"{label} parent directory is unsafe")
+
+    root_uid, root_gid = _activation_root_identity()
+    lock_acquired = False
+    try:
+        os.chown(parent, root_uid, root_gid)
+        os.chmod(parent, _activation_parent_lock_mode())
+        for path in _legacy_store_paths(source):
+            if path.exists() or path.is_symlink():
+                metadata = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ActivationPackageError("legacy store changed while acquiring the quiescence lock")
+                os.chown(path, root_uid, root_gid)
+                os.chmod(path, 0o600)
+        lock_acquired = True
+        if _processes_with_open_inode(source_metadata.st_dev, source_metadata.st_ino):
+            raise ActivationPackageError("final migration source still has an open process")
+
+        wal = sidecars[0]
+        checkpoint = "not_required"
+        if wal.exists() and wal.stat().st_size:
+            checkpoint_connection = sqlite3.connect(source, timeout=5)
+            try:
+                row = checkpoint_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            finally:
+                checkpoint_connection.close()
+            if row is None or int(row[0]) != 0:
+                raise ActivationPackageError("final migration WAL checkpoint did not quiesce")
+            checkpoint = "truncate_complete"
+        for path in _legacy_store_paths(source):
+            if path.exists():
+                os.chmod(path, 0o400)
+        locked_source = source.lstat()
+        source_digest_before = _stream_hash_regular(
+            source,
+            label="locked legacy authority store",
+        )
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(backup, flags, 0o600)
+        os.close(descriptor)
+        source_connection = sqlite3.connect(_sqlite_uri(source), uri=True, timeout=5)
+        target_connection = sqlite3.connect(backup, timeout=5)
+        try:
+            def progress(_status: int, remaining: int, _total: int) -> None:
+                if remaining and sleep_seconds:
+                    time.sleep(float(sleep_seconds))
+
+            source_connection.backup(
+                target_connection,
+                pages=pages_per_step,
+                progress=progress,
+                sleep=0,
+            )
+            target_connection.commit()
+        finally:
+            target_connection.close()
+            source_connection.close()
+        os.chmod(backup, 0o600)
+        source_digest_after = _stream_hash_regular(
+            source,
+            label="locked legacy authority store",
+        )
+        if source_digest_before != source_digest_after:
+            raise ActivationPackageError("final migration source content changed during backup")
+        if _processes_with_open_inode(source_metadata.st_dev, source_metadata.st_ino):
+            raise ActivationPackageError("final migration source acquired another open process")
+        sidecar_after = {str(path): _artifact_identity(path) for path in sidecars}
+        os.chown(parent, expected_source_uid, expected_source_gid)
+        os.chmod(parent, expected_parent_mode)
+
+        backup_integrity = _integrity_check(backup)
+        before_counts, schema_before = _migration_evidence(backup)
+        backup_digest, backup_size = _hash_file(backup)
+        _copy_store(backup, destination)
+        migrated_store = SQLiteStore(destination)
+        migrated_store.close()
+        migrated_integrity = _integrity_check(destination)
+        after_counts, schema_after = _migration_evidence(
+            destination,
+            counted_tables=tuple(str(name) for name in schema_before["countedTables"]),
+        )
+        for table, count in before_counts.items():
+            if table in {"schema_migrations", "agent_schema_migrations"}:
+                if after_counts.get(table, 0) < count:
+                    raise ActivationPackageError(f"schema history lost rows during final migration: {table}")
+            elif after_counts.get(table) != count:
+                raise ActivationPackageError(f"final migration changed retained row count: {table}")
+        migrated_digest, migrated_size = _hash_file(destination)
+        os.chown(destination, destination_uid, destination_gid)
+        os.chmod(destination, 0o600)
+        final_metadata = destination.lstat()
+        if (
+            final_metadata.st_uid != destination_uid
+            or final_metadata.st_gid != destination_gid
+            or stat.S_IMODE(final_metadata.st_mode) != 0o600
+        ):
+            raise ActivationPackageError("final migrated store ownership is invalid")
+        report: dict[str, object] = {
+            "schemaVersion": "overseer.activation-final-migration.v1",
+            "status": "final_migration_complete",
+            "source": {
+                "path": str(source.resolve()),
+                "device": source_metadata.st_dev,
+                "inode": source_metadata.st_ino,
+                "originalUid": source_metadata.st_uid,
+                "originalGid": source_metadata.st_gid,
+                "retainedUid": locked_source.st_uid,
+                "retainedGid": locked_source.st_gid,
+                "retainedMode": "0400",
+                "sha256": source_digest_after["sha256"],
+                "walCheckpoint": checkpoint,
+            },
+            "backup": {
+                "path": str(backup.resolve()),
+                "sha256": backup_digest,
+                "size": backup_size,
+                "integrityCheck": backup_integrity,
+            },
+            "migrated": {
+                "path": str(destination.resolve()),
+                "sha256BeforeOwnershipChange": migrated_digest,
+                "size": migrated_size,
+                "uid": destination_uid,
+                "gid": destination_gid,
+                "mode": "0600",
+                "integrityCheck": migrated_integrity,
+            },
+            "rowCountsBefore": before_counts,
+            "rowCountsAfter": after_counts,
+            "schemaBefore": schema_before,
+            "schemaAfter": schema_after,
+            "quiescenceLock": "parent-and-store-write-access-revoked",
+            "openProcessPreflight": "clear",
+            "sidecarsAtStart": sidecar_before,
+            "sidecarsAfterBackup": sidecar_after,
+        }
+        report_path = backup.with_suffix(f"{backup.suffix}.report.json")
+        _write_new(report_path, _canonical(report) + b"\n", 0o600)
+        return report
+    except BaseException:
+        if lock_acquired:
+            try:
+                restore_legacy_store_access(
+                    source_store=source,
+                    expected_source_uid=expected_source_uid,
+                    expected_source_gid=expected_source_gid,
+                    expected_source_device=expected_source_device,
+                    expected_source_inode=expected_source_inode,
+                    expected_parent_device=expected_parent_device,
+                    expected_parent_inode=expected_parent_inode,
+                    expected_parent_mode=expected_parent_mode,
+                )
+            except BaseException as restore_error:
+                raise ActivationPackageError(
+                    "final migration failed and legacy store access restoration also failed"
+                ) from restore_error
+        for target in (destination, backup):
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def stage_release_payload(
+    manifest: Mapping[str, object],
+    *,
+    checkout: str | os.PathLike[str],
+    dependency_root: str | os.PathLike[str],
+    stdlib_root: str | os.PathLike[str],
+    package_root: str | os.PathLike[str],
+) -> Path:
+    """Copy every manifest-bound byte into a new owner-only package payload."""
+
+    files = manifest.get("files")
+    release_root = manifest.get("releaseRoot")
+    if manifest.get("schemaVersion") != RELEASE_SCHEMA or not isinstance(files, list) or not isinstance(release_root, str):
+        raise ActivationPackageError("release manifest is invalid")
+    package = Path(package_root)
+    _ensure_directory(package)
+    target = package / "public" / "release" / Path(release_root).name
+    if target.exists() or target.is_symlink():
+        raise ActivationPackageError("staged release destination already exists")
+    _ensure_directory(target)
+    roots = {
+        "checkout": Path(checkout).resolve(),
+        "dependency": Path(dependency_root).resolve(),
+        "stdlib": Path(stdlib_root).resolve(),
+    }
+    for item in files:
+        if not isinstance(item, Mapping) or item.get("sourceKind") not in roots:
+            raise ActivationPackageError("release file manifest is invalid")
+        source_path = str(item.get("sourcePath", ""))
+        release_path = str(item.get("releasePath", ""))
+        if item["sourceKind"] == "stdlib":
+            content, _metadata, resolved = _runtime_read(roots["stdlib"], source_path)
+            if resolved != item.get("sourceResolvedPath"):
+                raise ActivationPackageError(f"standard-library source drifted after manifest: {source_path}")
+        else:
+            content, _metadata = _stable_read(roots[str(item["sourceKind"])] / _safe_relative(source_path))
+        if (
+            len(content) != item.get("size")
+            or _sha256(content) != item.get("sha256")
+            or item.get("mode") not in {0o444, 0o555}
+        ):
+            raise ActivationPackageError(f"release source drifted after manifest: {source_path}")
+        _write_new(target / _safe_relative(release_path), content, int(item["mode"]))
+    root_python = manifest.get("rootPython")
+    if not isinstance(root_python, Mapping):
+        raise ActivationPackageError("release Python manifest is invalid")
+    python_path = root_python.get("path")
+    python_release_path = root_python.get("releasePath")
+    if not isinstance(python_path, str) or not isinstance(python_release_path, str):
+        raise ActivationPackageError("release Python manifest is invalid")
+    python_content, _python_metadata = _stable_read(Path(python_path))
+    if len(python_content) != root_python.get("size") or _sha256(python_content) != root_python.get("sha256"):
+        raise ActivationPackageError("root Python drifted after manifest")
+    _write_new(target / _safe_relative(python_release_path), python_content, 0o555)
+    _write_new(target / "release-manifest.json", _canonical(dict(manifest)) + b"\n", 0o444)
+    return target
+
+
+def render_systemd_units(
+    manifest: Mapping[str, object],
+    *,
+    templates_root: str | os.PathLike[str],
+    output_root: str | os.PathLike[str],
+    god_uid: int,
+    overseer_uid: int,
+    python_path: str | os.PathLike[str],
+) -> dict[str, Path]:
+    """Render the closed systemd contract into a new package directory."""
+
+    release_root = manifest.get("releaseRoot")
+    if not isinstance(release_root, str) or not release_root.startswith("/opt/overseer/releases/"):
+        raise ActivationPackageError("release root is invalid")
+    for value, label in ((god_uid, "god UID"), (overseer_uid, "overseer UID")):
+        if type(value) is not int or value < 1:
+            raise ActivationPackageError(f"{label} is invalid")
+    _validate_principal_binding(
+        god_uid=god_uid,
+        overseer_uid=overseer_uid,
+        overseer_gid=overseer_uid,
+    )
+    templates = Path(templates_root)
+    output = Path(output_root)
+    if output.exists() or output.is_symlink():
+        raise ActivationPackageError("rendered unit destination already exists")
+    _ensure_directory(output)
+    root_python = manifest.get("rootPython")
+    if not isinstance(root_python, Mapping):
+        raise ActivationPackageError("release Python manifest is invalid")
+    source_python = root_python.get("path")
+    release_python = root_python.get("releasePath")
+    if source_python != str(Path(python_path)) or not isinstance(release_python, str):
+        raise ActivationPackageError("rendered interpreter does not match the release manifest")
+    replacements = {
+        "@OVERSEER_RELEASE@": release_root,
+        "@OVERSEER_PYTHON@": str(PurePosixPath(release_root) / _safe_relative(release_python)),
+        "@GOD_UID@": str(god_uid),
+        "@OVERSEER_UID@": str(overseer_uid),
+    }
+    result: dict[str, Path] = {}
+    for source_name, target_name in _SYSTEMD_TEMPLATES.items():
+        content, _metadata = _stable_read(templates / source_name)
+        text = content.decode("utf-8", "strict")
+        for placeholder, value in replacements.items():
+            text = text.replace(placeholder, value)
+        if "@OVERSEER_" in text or "@GOD_UID@" in text:
+            raise ActivationPackageError(f"rendered unit has an unresolved placeholder: {source_name}")
+        target = output / target_name
+        _write_new(target, text.encode("utf-8"), 0o644)
+        result[target_name] = target
+    allowlist_source = templates.parent / "config" / "admin-executor-allowlist.json"
+    allowlist, _metadata = _stable_read(allowlist_source)
+    try:
+        parsed_allowlist = json.loads(allowlist)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("admin executor allowlist is not valid JSON") from error
+    expected_allowlist = {
+        "schemaVersion": "overseer.admin-executor-allowlist.v1",
+        "allowed": [
+            {
+                "operation": "restart-system-unit",
+                "unit": "overseer-approval-smoke.service",
+            }
+        ],
+    }
+    if parsed_allowlist != expected_allowlist:
+        raise ActivationPackageError("admin executor allowlist exceeds the v1.1.6 smoke boundary")
+    allowlist_target = output.parent / "config" / "admin-executor-allowlist.json"
+    _write_new(allowlist_target, _canonical(parsed_allowlist) + b"\n", 0o644)
+    return result
+
+
+def _stream_hash_regular(path: Path, *, label: str) -> dict[str, object]:
+    """Hash one regular file while binding its complete descriptor identity."""
+
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise ActivationPackageError(f"{label} could not be inspected") from error
+    if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+        raise ActivationPackageError(f"{label} must be a regular file, not a symlink")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink, opened.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+        ):
+            raise ActivationPackageError(f"{label} changed while opening")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    lexical_after = path.lstat()
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    if identity(before) != identity(after) or identity(before) != identity(lexical_after):
+        raise ActivationPackageError(f"{label} changed while hashing")
+    if size != before.st_size:
+        raise ActivationPackageError(f"{label} was not read completely")
+    return {
+        "sha256": digest.hexdigest(),
+        "size": size,
+        "mode": f"{stat.S_IMODE(before.st_mode):04o}",
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+        "links": before.st_nlink,
+    }
+
+
+def _tree_inventory(root: Path, *, label: str) -> list[dict[str, object]]:
+    if root.is_symlink() or not root.is_dir():
+        raise ActivationPackageError(f"{label} must be a directory, not a symlink")
+    result: list[dict[str, object]] = []
+    for directory, directories, files in os.walk(root, followlinks=False):
+        base = Path(directory)
+        for name in directories:
+            path = base / name
+            if path.is_symlink():
+                raise ActivationPackageError(f"{label} contains a symlink")
+        for name in files:
+            path = base / name
+            relative = _safe_relative(path.relative_to(root).as_posix())
+            result.append(
+                {
+                    "relativePath": relative,
+                    **_stream_hash_regular(path, label=f"{label} file"),
+                }
+            )
+    result.sort(key=lambda item: str(item["relativePath"]))
+    return result
+
+
+def _rollback_input(label: str, path: Path) -> dict[str, object]:
+    if _safe_relative(label) != label or "/" in label:
+        raise ActivationPackageError("rollback input label is unsafe")
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ActivationPackageError(f"rollback input is unavailable: {label}") from error
+    if path.is_symlink():
+        raise ActivationPackageError(f"rollback input is a symlink: {label}")
+    if stat.S_ISREG(metadata.st_mode):
+        return {
+            "label": label,
+            "path": str(path.resolve()),
+            "kind": "file",
+            **_stream_hash_regular(path, label=f"rollback input {label}"),
+        }
+    if stat.S_ISDIR(metadata.st_mode):
+        entries = _tree_inventory(path, label=f"rollback input {label}")
+        return {
+            "label": label,
+            "path": str(path.resolve()),
+            "kind": "directory",
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
+            "entries": entries,
+            "treeDigest": _sha256(_canonical(entries)),
+        }
+    raise ActivationPackageError(f"rollback input has an unsupported type: {label}")
+
+
+def verify_rollback_inputs(package_root: str | os.PathLike[str]) -> dict[str, object]:
+    """Re-hash every captured rollback input and fail closed on any drift."""
+
+    package = Path(package_root)
+    try:
+        package_owner = package.lstat().st_uid
+    except OSError as error:
+        raise ActivationPackageError("activation package root is unavailable") from error
+    manifest_path = package / "public" / "rollback-manifest.json"
+    try:
+        raw, metadata = _stable_read(manifest_path)
+        document = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("rollback manifest is invalid") from error
+    if metadata.st_uid != package_owner or stat.S_IMODE(metadata.st_mode) != 0o644:
+        raise ActivationPackageError("rollback manifest metadata is invalid")
+    if (
+        not isinstance(document, dict)
+        or document.get("schemaVersion") != ROLLBACK_MANIFEST_SCHEMA
+        or document.get("preserveInputs") is not True
+        or document.get("restoreMigratedDatabaseToLegacyAuthority") is not False
+        or not isinstance(document.get("inputs"), list)
+    ):
+        raise ActivationPackageError("rollback manifest schema is invalid")
+    observed: list[dict[str, object]] = []
+    for item in document["inputs"]:
+        if not isinstance(item, dict) or not isinstance(item.get("label"), str) or not isinstance(item.get("path"), str):
+            raise ActivationPackageError("rollback manifest input is invalid")
+        observed.append(_rollback_input(item["label"], Path(item["path"])))
+    if observed != document["inputs"]:
+        raise ActivationPackageError("rollback input drift detected")
+    return {
+        "verified": True,
+        "inputCount": len(observed),
+        "rollbackManifestSha256": _sha256(raw),
+    }
+
+
+def _package_file_inventory(package: Path) -> list[dict[str, object]]:
+    if package.is_symlink() or not package.is_dir():
+        raise ActivationPackageError("activation package root is unsafe")
+    package_owner = package.lstat().st_uid
+    manifest_relative = "public/package-manifest.json"
+    result: list[dict[str, object]] = []
+    for directory, directories, files in os.walk(package, followlinks=False):
+        base = Path(directory)
+        for name in directories:
+            child = base / name
+            if child.is_symlink():
+                raise ActivationPackageError("activation package contains a directory symlink")
+        for name in files:
+            path = base / name
+            relative = _safe_relative(path.relative_to(package).as_posix())
+            if relative == manifest_relative:
+                continue
+            details = _stream_hash_regular(path, label="activation package artifact")
+            if details["uid"] != package_owner:
+                raise ActivationPackageError("activation package artifact has an unexpected owner")
+            if details["links"] != 1:
+                raise ActivationPackageError("activation package artifact must be single-link")
+            result.append({"path": relative, **details})
+    result.sort(key=lambda item: str(item["path"]))
+    if not result:
+        raise ActivationPackageError("activation package is empty")
+    return result
+
+
+def _package_directory_inventory(package: Path) -> list[dict[str, object]]:
+    package_owner = package.lstat().st_uid
+    result: list[dict[str, object]] = []
+    for directory, directories, _files in os.walk(package, followlinks=False):
+        path = Path(directory)
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != package_owner
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ActivationPackageError("activation package directory ownership or mode is invalid")
+        for name in directories:
+            if (path / name).is_symlink():
+                raise ActivationPackageError("activation package contains a directory symlink")
+        relative = "." if path == package else _safe_relative(path.relative_to(package).as_posix())
+        result.append(
+            {
+                "path": relative,
+                "mode": "0700",
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+            }
+        )
+    result.sort(key=lambda item: str(item["path"]))
+    return result
+
+
+def _release_install_commands(package: Path, manifest: Mapping[str, object]) -> list[list[str]]:
+    release_root = Path(str(manifest["releaseRoot"]))
+    staged_root = package / "public" / "release" / release_root.name
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise ActivationPackageError("release file manifest is invalid")
+    directories = {release_root}
+    commands: list[list[str]] = []
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise ActivationPackageError("release file manifest is invalid")
+        relative = Path(_safe_relative(str(item.get("releasePath", ""))))
+        target = release_root / relative
+        directories.update(target.parents)
+        mode = item.get("mode")
+        if mode not in {0o444, 0o555}:
+            raise ActivationPackageError("release file mode is invalid")
+        commands.append(
+            [
+                "/usr/bin/install",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                f"{int(mode):04o}",
+                str(staged_root / relative),
+                str(target),
+            ]
+        )
+    root_python = manifest.get("rootPython")
+    if not isinstance(root_python, Mapping) or not isinstance(root_python.get("releasePath"), str):
+        raise ActivationPackageError("release Python manifest is invalid")
+    python_relative = Path(_safe_relative(str(root_python["releasePath"])))
+    python_target = release_root / python_relative
+    directories.update(python_target.parents)
+    commands.append(
+        [
+            "/usr/bin/install",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0555",
+            str(staged_root / python_relative),
+            str(python_target),
+        ]
+    )
+    selected_directories = sorted(
+        (directory for directory in directories if str(directory).startswith(str(release_root))),
+        key=lambda path: (len(path.parts), str(path)),
+    )
+    directory_commands = [
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", str(path)]
+        for path in selected_directories
+    ]
+    manifest_command = [
+        "/usr/bin/install",
+        "-o",
+        "root",
+        "-g",
+        "root",
+        "-m",
+        "0444",
+        str(staged_root / "release-manifest.json"),
+        str(release_root / "release-manifest.json"),
+    ]
+    freeze_commands = [
+        ["/usr/bin/chmod", "0555", str(path)]
+        for path in reversed(selected_directories)
+    ]
+    return [*directory_commands, *commands, manifest_command, *freeze_commands]
+
+
+def render_activation_contract(
+    package_root: str | os.PathLike[str],
+    release_manifest: Mapping[str, object],
+    *,
+    source_store: str | os.PathLike[str],
+    overseer_uid: int,
+    overseer_gid: int,
+    rollback_inputs: Mapping[str, str | os.PathLike[str]],
+) -> dict[str, object]:
+    """Render, but never execute, exact root activation and rollback argv."""
+
+    if type(overseer_uid) is not int or type(overseer_gid) is not int:
+        raise ActivationPackageError("dedicated principal UID and GID must be integers")
+    if overseer_uid < 1 or overseer_gid < 1:
+        raise ActivationPackageError("dedicated principal UID and GID must be positive")
+    if release_manifest.get("schemaVersion") != RELEASE_SCHEMA:
+        raise ActivationPackageError("release manifest is invalid")
+    package = Path(package_root).resolve()
+    source = Path(source_store)
+    source_metadata = _validate_store_artifact(source, label="activation source SQLite store")
+    try:
+        god = pwd.getpwnam("god")
+    except KeyError as error:
+        raise ActivationPackageError("approved god account is unavailable") from error
+    _validate_principal_binding(
+        god_uid=god.pw_uid,
+        overseer_uid=overseer_uid,
+        overseer_gid=overseer_gid,
+    )
+    if (source_metadata.st_uid, source_metadata.st_gid) != (god.pw_uid, god.pw_gid):
+        raise ActivationPackageError("activation source store is not owned by the approved god account")
+    source_parent = source.parent
+    parent_metadata = source_parent.lstat()
+    parent_mode = stat.S_IMODE(parent_metadata.st_mode)
+    if (
+        source_parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or (parent_metadata.st_uid, parent_metadata.st_gid) != (god.pw_uid, god.pw_gid)
+        or parent_mode not in {0o700, 0o750, 0o770, 0o775}
+    ):
+        raise ActivationPackageError("activation source parent identity or mode is unsupported")
+    if not rollback_inputs:
+        raise ActivationPackageError("rollback inputs are required")
+    rollback_items = [
+        _rollback_input(label, Path(path)) for label, path in sorted(rollback_inputs.items())
+    ]
+    rollback_manifest = {
+        "schemaVersion": ROLLBACK_MANIFEST_SCHEMA,
+        "preserveInputs": True,
+        "restoreMigratedDatabaseToLegacyAuthority": False,
+        "inputs": rollback_items,
+    }
+    rollback_path = package / "public" / "rollback-manifest.json"
+    _write_new(rollback_path, _canonical(rollback_manifest) + b"\n", 0o644)
+
+    public = package / "public"
+    private = package / "private"
+    release_root = str(release_manifest["releaseRoot"])
+    install_commands: list[list[str]] = [
+        ["/usr/sbin/groupadd", "--system", "--gid", str(overseer_gid), "overseer"],
+        [
+            "/usr/sbin/useradd",
+            "--system",
+            "--uid",
+            str(overseer_uid),
+            "--gid",
+            str(overseer_gid),
+            "--home-dir",
+            "/var/lib/overseer",
+            "--shell",
+            "/usr/sbin/nologin",
+            "overseer",
+        ],
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer"],
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer/releases"],
+        ["/usr/bin/install", "-d", "-o", "overseer", "-g", "overseer", "-m", "0700", "/var/lib/overseer"],
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor"],
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor/activation-package"],
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor/activation-package/public"],
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "overseer", "-m", "0750", "/etc/overseer"],
+        *_release_install_commands(package, release_manifest),
+        [
+            "/usr/bin/install",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0644",
+            str(package / "public" / "rollback-manifest.json"),
+            "/var/lib/overseer-executor/activation-package/public/rollback-manifest.json",
+        ],
+    ]
+    config_installs = (
+        (private / "credentials" / "admin-approval-verifier.json", "/etc/overseer/admin-approval-verifier.json", "overseer", "overseer", "0600"),
+        (private / "credentials" / "roadex-fixture-approval-verifier.json", "/etc/overseer/roadex-fixture-approval-verifier.json", "overseer", "overseer", "0600"),
+        (private / "credentials" / "api-token", "/etc/overseer/api-token", "root", "root", "0600"),
+        (private / "credentials" / "psychlo-peer-secret", "/etc/overseer/psychlo-peer-secret", "root", "root", "0600"),
+        (private / "credentials" / "roadex-project-human-thread-secret", "/etc/overseer/roadex-project-human-thread-secret", "root", "root", "0600"),
+        (public / "config" / "psychlo-project-bindings.json", "/etc/overseer/psychlo-project-bindings.json", "root", "root", "0644"),
+        (public / "config" / "admin-executor-public-key", "/etc/overseer/admin-executor-public-key", "root", "root", "0644"),
+        (public / "config" / "admin-executor-allowlist.json", "/etc/overseer/admin-executor-allowlist.json", "root", "root", "0644"),
+        (private / "credentials" / "admin-ticket-private-key", "/etc/overseer/admin-ticket-private-key", "overseer", "overseer", "0600"),
+    )
+    install_commands.extend(
+        ["/usr/bin/install", "-o", owner, "-g", group, "-m", mode, str(source_path), target]
+        for source_path, target, owner, group, mode in config_installs
+    )
+    unit_targets = {
+        "overseer-admin-executor.socket": "/etc/systemd/system/overseer-admin-executor.socket",
+        "overseer-admin-executor@.service": "/etc/systemd/system/overseer-admin-executor@.service",
+        "overseer-api-canary.service": "/etc/systemd/system/overseer-api-canary.service",
+        "overseer-api.service": "/etc/systemd/system/overseer-api.service",
+        "overseer-approval-smoke.service": "/etc/systemd/system/overseer-approval-smoke.service",
+        "overseer-codex-user-bridge.service": "/etc/systemd/system/overseer-codex-user-bridge.service",
+        "overseer-codex-user-bridge.socket": "/etc/systemd/system/overseer-codex-user-bridge.socket",
+        "overseer-runtime.service": "/etc/systemd/system/overseer-runtime.service",
+        "overseer-tmpfiles.conf": "/etc/tmpfiles.d/overseer.conf",
+    }
+    install_commands.extend(
+        [
+            "/usr/bin/install",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0644",
+            str(public / "systemd" / name),
+            target,
+        ]
+        for name, target in unit_targets.items()
+    )
+    release_python = release_manifest.get("rootPython")
+    if (
+        not isinstance(release_python, Mapping)
+        or not isinstance(release_python.get("path"), str)
+        or not isinstance(release_python.get("releasePath"), str)
+    ):
+        raise ActivationPackageError("release Python manifest is invalid")
+    manifest_digest = release_manifest.get("manifestDigest")
+    if not isinstance(manifest_digest, str) or len(manifest_digest) != 64 or set(manifest_digest) - _HEX:
+        raise ActivationPackageError("release manifest digest is invalid")
+    final_backup = Path(
+        f"/var/lib/overseer-executor/v1.1.6-source-{manifest_digest}.sqlite3"
+    )
+    final_store = Path("/var/lib/overseer/overseer.sqlite3")
+    migration_command = [
+        "/usr/bin/env",
+        f"PYTHONHOME={release_root}/runtime",
+        f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+        "-m",
+        "overseer.activation_package",
+        "prepare-final-store",
+        "--source-store",
+        str(source.resolve()),
+        "--backup-store",
+        str(final_backup),
+        "--destination-store",
+        str(final_store),
+        "--expected-source-device",
+        str(source_metadata.st_dev),
+        "--expected-source-inode",
+        str(source_metadata.st_ino),
+        "--expected-source-uid",
+        str(source_metadata.st_uid),
+        "--expected-source-gid",
+        str(source_metadata.st_gid),
+        "--expected-parent-device",
+        str(parent_metadata.st_dev),
+        "--expected-parent-inode",
+        str(parent_metadata.st_ino),
+        "--expected-parent-mode",
+        str(parent_mode),
+        "--destination-uid",
+        str(overseer_uid),
+        "--destination-gid",
+        str(overseer_gid),
+        "--pages-per-step",
+        "128",
+        "--sleep-seconds",
+        "0.02",
+    ]
+    user_systemctl = [
+        "/usr/sbin/runuser",
+        "--user",
+        "god",
+        "--",
+        "/usr/bin/env",
+        f"XDG_RUNTIME_DIR=/run/user/{source_metadata.st_uid}",
+        "/usr/bin/systemctl",
+        "--user",
+    ]
+    activation_python = [
+        "/usr/bin/env",
+        f"PYTHONHOME={release_root}/runtime",
+        f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+        "-m",
+        "overseer.activation_package",
+    ]
+    canary_commands = [
+        [
+            "/usr/bin/install",
+            "-o",
+            "overseer",
+            "-g",
+            "overseer",
+            "-m",
+            "0600",
+            str(private / "migration" / "rehearsal-migrated.sqlite3"),
+            "/var/lib/overseer/overseer-canary.sqlite3",
+        ],
+        [*activation_python, "verify-approved-staging", "--package-root", str(package)],
+        ["/usr/bin/systemctl", "daemon-reload"],
+        ["/usr/bin/systemd-tmpfiles", "--create", "/etc/tmpfiles.d/overseer.conf"],
+        [
+            "/usr/bin/systemctl",
+            "start",
+            "overseer-codex-user-bridge.socket",
+            "overseer-admin-executor.socket",
+        ],
+        ["/usr/bin/systemctl", "start", "overseer-api-canary.service"],
+        ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18766/health"],
+        [*activation_python, "run-approved-canary", "--package-root", str(package)],
+        ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"],
+    ]
+    cutover_commands = [
+        [*activation_python, "verify-approved-cutover", "--package-root", str(package)],
+        [*user_systemctl, "stop", "overseer.service", "overseer-api.service"],
+        migration_command,
+        ["/usr/bin/systemctl", "daemon-reload"],
+        ["/usr/bin/systemd-tmpfiles", "--create", "/etc/tmpfiles.d/overseer.conf"],
+        ["/usr/bin/systemctl", "enable", "--now", "overseer-codex-user-bridge.socket", "overseer-admin-executor.socket"],
+        ["/usr/bin/systemctl", "enable", "--now", "overseer-runtime.service", "overseer-api.service"],
+        [
+            "/usr/bin/install",
+            "-o",
+            "god",
+            "-g",
+            "god",
+            "-m",
+            "0600",
+            str(private / "credentials" / "api-token"),
+            "/home/god/.local/share/overseer/project/state/api-token",
+        ],
+        ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8766/health"],
+    ]
+    rollback_commands = [
+        [
+            "/usr/bin/env",
+            f"PYTHONHOME={release_root}/runtime",
+            f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+            str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+            "-m",
+            "overseer.activation_package",
+            "verify-rollback",
+            "--package-root",
+            "/var/lib/overseer-executor/activation-package",
+        ],
+        ["/usr/bin/systemctl", "stop", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
+        ["/usr/bin/systemctl", "disable", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
+        ["/usr/bin/systemctl", "daemon-reload"],
+        [
+            "/usr/bin/env",
+            f"PYTHONHOME={release_root}/runtime",
+            f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+            str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+            "-m",
+            "overseer.activation_package",
+            "restore-legacy-store-access",
+            "--source-store",
+            str(source.resolve()),
+            "--expected-source-uid",
+            str(source_metadata.st_uid),
+            "--expected-source-gid",
+            str(source_metadata.st_gid),
+            "--expected-source-device",
+            str(source_metadata.st_dev),
+            "--expected-source-inode",
+            str(source_metadata.st_ino),
+            "--expected-parent-device",
+            str(parent_metadata.st_dev),
+            "--expected-parent-inode",
+            str(parent_metadata.st_ino),
+            "--expected-parent-mode",
+            str(parent_mode),
+        ],
+        [*user_systemctl, "start", "overseer.service", "overseer-api.service"],
+        ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8766/health"],
+    ]
+    contract: dict[str, object] = {
+        "schemaVersion": ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package),
+        "releaseRoot": release_root,
+        "releaseManifestDigest": release_manifest.get("manifestDigest"),
+        "approvalRecord": {
+            "path": str(_activation_approval_record_path()),
+            "schemaVersion": ACTIVATION_APPROVAL_SCHEMA,
+            "mustBeRootOwnedMode": "0600",
+            "mustBindFinalPackageDigest": True,
+        },
+        "account": {
+            "user": "overseer",
+            "uid": overseer_uid,
+            "group": "overseer",
+            "gid": overseer_gid,
+        },
+        "sourceStore": {
+            "path": str(source.resolve()),
+            "device": source_metadata.st_dev,
+            "inode": source_metadata.st_ino,
+            "uid": source_metadata.st_uid,
+            "gid": source_metadata.st_gid,
+            "mode": "0600",
+            "parent": {
+                "path": str(source_parent.resolve()),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": f"{parent_mode:04o}",
+            },
+        },
+        "requiredAtExecution": [
+            {
+                "kind": "quiesced-source-store",
+                "path": str(source.resolve()),
+                "mustHaveNoOpenProcesses": True,
+                "migrationBackup": str(final_backup),
+                "migrationDestination": str(final_store),
+            }
+        ],
+        "stagingAndCanaryCommands": [*install_commands, *canary_commands],
+        "cutoverCommands": cutover_commands,
+        "cutoverGate": {
+            "requiredFunction": "overseer.activation_package.verify_approved_cutover",
+            "requiresApprovedPackageDigest": True,
+            "requiresRootOwnedApprovalRecord": True,
+            "requiresRootOwnedDigestBoundAttestation": True,
+            "manualCommandExtractionForbidden": True,
+        },
+        "canary": {
+            "store": "/var/lib/overseer/overseer-canary.sqlite3",
+            "loopbackHealth": "http://127.0.0.1:18766/health",
+            "mustPassBeforeLegacyStop": True,
+            "mutatingExecutorAcceptanceRequiresInteractiveAdminApproval": True,
+            "failureCleanupCommands": [
+                ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"]
+            ],
+        },
+        "acceptanceControls": {
+            "positive": [
+                "direct loopback canary health",
+                "bounded user-bridge session projection",
+                "bounded user-bridge usage projection",
+                "admin approval of the exact smoke-plan digest",
+                "single allowlisted approval-smoke restart receipt",
+                "same-nonce replay returns the stored receipt without execution",
+            ],
+            "negative": [
+                "ordinary API token cannot approve",
+                "wrong human scope cannot approve",
+                "cross-scope credential collision is rejected",
+                "modified ticket is rejected",
+                "expired ticket is rejected",
+                "unlisted system unit is rejected",
+                "user-service restart operation is rejected",
+                "executor socket timeout fails closed",
+                "crash-after-claim retry does not issue a second command",
+            ],
+        },
+        "rollbackCommands": rollback_commands,
+        "rollbackManifest": str(rollback_path),
+        "stopConditions": [
+            "package digest or artifact identity drift",
+            "UID or GID 984 is no longer free or resolves to a different account",
+            "human verifier gate is incomplete",
+            "final quiesced migration artifact is absent or unverified",
+            "v1.1.5 rollback input hash drift",
+            "direct or protected-gateway health check failure",
+        ],
+    }
+    encoded = _canonical(contract)
+    if b"<" in encoded or b">" in encoded:
+        raise ActivationPackageError("activation contract contains an unresolved value")
+    _write_new(package / "public" / "activation-contract.json", encoded + b"\n", 0o644)
+    return contract
+
+
+def finalize_activation_package(package_root: str | os.PathLike[str]) -> dict[str, object]:
+    """Seal every currently staged byte after the interactive verifier gate."""
+
+    package = Path(package_root).resolve()
+    status = activation_package_status(package)
+    if status["status"] == "ready_for_approval":
+        raise ActivationPackageError("activation package is already finalized")
+    if status["status"] != "credentials_complete":
+        raise ActivationPackageError("human verifier gate is incomplete")
+    required = (
+        package / "public" / "activation-contract.json",
+        package / "public" / "rollback-manifest.json",
+        package / "private" / "migration" / "migration-report.json",
+    )
+    if any(not path.is_file() or path.is_symlink() for path in required):
+        raise ActivationPackageError("activation package is missing a required artifact")
+    files = _package_file_inventory(package)
+    directories = _package_directory_inventory(package)
+    unsigned = {
+        "schemaVersion": PACKAGE_MANIFEST_SCHEMA,
+        "liveExecutionApproved": False,
+        "files": files,
+        "directories": directories,
+    }
+    digest = _sha256(_canonical(unsigned))
+    document = {**unsigned, "packageDigest": digest}
+    _write_new(package / "public" / "package-manifest.json", _canonical(document) + b"\n", 0o644)
+    return {"status": "ready_for_approval", "packageDigest": digest, "fileCount": len(files)}
+
+
+def verify_activation_package(
+    package_root: str | os.PathLike[str],
+    expected_digest: str,
+) -> dict[str, object]:
+    """Verify the sealed package without returning any private contents."""
+
+    if len(expected_digest) != 64 or set(expected_digest) - _HEX:
+        raise ActivationPackageError("expected package digest is invalid")
+    package = Path(package_root).resolve()
+    manifest_path = package / "public" / "package-manifest.json"
+    try:
+        raw, metadata = _stable_read(manifest_path)
+        document = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("package manifest is invalid") from error
+    package_owner = package.lstat().st_uid
+    if metadata.st_uid != package_owner or stat.S_IMODE(metadata.st_mode) != 0o644:
+        raise ActivationPackageError("package manifest metadata is invalid")
+    if not isinstance(document, dict) or document.get("schemaVersion") != PACKAGE_MANIFEST_SCHEMA:
+        raise ActivationPackageError("package manifest schema is invalid")
+    recorded_digest = document.get("packageDigest")
+    unsigned = {key: value for key, value in document.items() if key != "packageDigest"}
+    if recorded_digest != expected_digest or _sha256(_canonical(unsigned)) != expected_digest:
+        raise ActivationPackageError("package manifest digest drift detected")
+    observed_files = _package_file_inventory(package)
+    observed_directories = _package_directory_inventory(package)
+    if document.get("files") != observed_files or document.get("directories") != observed_directories:
+        raise ActivationPackageError("activation package artifact drift detected")
+    return {"verified": True, "packageDigest": expected_digest, "fileCount": len(observed_files)}
+
+
+def _activation_approval_record_path() -> Path:
+    return Path("/var/lib/overseer-executor/approved-activation-package.json")
+
+
+def _installed_credential_root() -> Path:
+    return Path("/etc/overseer")
+
+
+def record_activation_approval(
+    package_root: str | os.PathLike[str],
+    *,
+    expected_package_digest: str,
+) -> dict[str, object]:
+    """Record one explicit, root-owned approval for an exact sealed package."""
+
+    _require_root_activation()
+    package = Path(package_root).resolve()
+    verified = verify_activation_package(package, expected_package_digest)
+    target = _activation_approval_record_path()
+    document = {
+        "schemaVersion": ACTIVATION_APPROVAL_SCHEMA,
+        "approved": True,
+        "packageRoot": str(package),
+        "packageDigest": expected_package_digest,
+        "packageFileCount": verified["fileCount"],
+        "liveExecutionScope": "staging-canary-and-cutover-for-this-package-only",
+    }
+    _write_new(target, _canonical(document) + b"\n", 0o600)
+    return document
+
+
+def _load_activation_approval(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    package = Path(package_root).resolve()
+    target = _activation_approval_record_path()
+    try:
+        raw, metadata = _stable_read(target)
+        document = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("activation approval record is unavailable or invalid") from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        metadata.st_uid != root_uid
+        or metadata.st_gid != root_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not isinstance(document, dict)
+        or document.get("schemaVersion") != ACTIVATION_APPROVAL_SCHEMA
+        or document.get("approved") is not True
+        or document.get("packageRoot") != str(package)
+        or document.get("liveExecutionScope")
+        != "staging-canary-and-cutover-for-this-package-only"
+    ):
+        raise ActivationPackageError("activation approval record metadata or scope is invalid")
+    digest = document.get("packageDigest")
+    if not isinstance(digest, str):
+        raise ActivationPackageError("activation approval record digest is invalid")
+    verified = verify_activation_package(package, digest)
+    if document.get("packageFileCount") != verified["fileCount"]:
+        raise ActivationPackageError("activation approval record file count drifted")
+    return document
+
+
+def _sealed_package_json(
+    package: Path,
+    *,
+    expected_package_digest: str,
+    relative_path: str,
+) -> dict[str, object]:
+    verify_activation_package(package, expected_package_digest)
+    manifest = _read_bound_package_manifest(package, expected_package_digest)
+    entries = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list):
+        raise ActivationPackageError("sealed package file inventory is invalid")
+    expected = next(
+        (
+            item
+            for item in entries
+            if isinstance(item, dict) and item.get("path") == relative_path
+        ),
+        None,
+    )
+    if expected is None:
+        raise ActivationPackageError("sealed package document is not inventoried")
+    raw, metadata = _stable_read(package / _safe_relative(relative_path))
+    if (
+        len(raw) != expected.get("size")
+        or _sha256(raw) != expected.get("sha256")
+        or f"{stat.S_IMODE(metadata.st_mode):04o}" != expected.get("mode")
+    ):
+        raise ActivationPackageError("sealed package document drifted while loading")
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("sealed package document is invalid JSON") from error
+    if not isinstance(document, dict):
+        raise ActivationPackageError("sealed package document must be a JSON object")
+    return document
+
+
+def _read_bound_package_manifest(
+    package: Path,
+    expected_package_digest: str,
+) -> dict[str, object]:
+    try:
+        raw, metadata = _stable_read(package / "public" / "package-manifest.json")
+        document = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("package manifest is invalid") from error
+    package_owner = package.lstat().st_uid
+    if (
+        metadata.st_uid != package_owner
+        or stat.S_IMODE(metadata.st_mode) != 0o644
+        or not isinstance(document, dict)
+        or document.get("schemaVersion") != PACKAGE_MANIFEST_SCHEMA
+    ):
+        raise ActivationPackageError("package manifest metadata or schema is invalid")
+    recorded_digest = document.get("packageDigest")
+    unsigned = {key: value for key, value in document.items() if key != "packageDigest"}
+    if (
+        recorded_digest != expected_package_digest
+        or _sha256(_canonical(unsigned)) != expected_package_digest
+    ):
+        raise ActivationPackageError("package manifest digest drift detected")
+    return document
+
+
+def _account_ids(owner: str, group: str) -> tuple[int, int]:
+    try:
+        return pwd.getpwnam(owner).pw_uid, grp.getgrnam(group).gr_gid
+    except KeyError as error:
+        raise ActivationPackageError("installed activation owner or group is unavailable") from error
+
+
+def _verify_install_results(
+    package: Path,
+    *,
+    expected_package_digest: str,
+    commands: list[object],
+) -> dict[str, object]:
+    verify_activation_package(package, expected_package_digest)
+    manifest = _read_bound_package_manifest(package, expected_package_digest)
+    entries = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list):
+        raise ActivationPackageError("sealed package file inventory is invalid")
+    package_files = {
+        str(item["path"]): item
+        for item in entries
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    expected_files: dict[Path, tuple[dict[str, object], int, int, int]] = {}
+    expected_directories: dict[Path, tuple[int, int, int]] = {}
+    for raw_command in commands:
+        if not isinstance(raw_command, list) or not all(isinstance(value, str) for value in raw_command):
+            raise ActivationPackageError("activation install command is invalid")
+        command = list(raw_command)
+        if command[:2] == ["/usr/bin/chmod", "0555"] and len(command) == 3:
+            target = Path(command[2])
+            if target not in expected_directories:
+                raise ActivationPackageError("activation directory freeze target was not installed")
+            uid, gid, _mode = expected_directories[target]
+            expected_directories[target] = (uid, gid, 0o555)
+            continue
+        if not command or command[0] != "/usr/bin/install":
+            continue
+        try:
+            owner = command[command.index("-o") + 1]
+            group = command[command.index("-g") + 1]
+            mode = int(command[command.index("-m") + 1], 8)
+        except (ValueError, IndexError) as error:
+            raise ActivationPackageError("activation install command metadata is invalid") from error
+        uid, gid = _account_ids(owner, group)
+        if "-d" in command:
+            targets = command[command.index("-m") + 2 :]
+            if not targets:
+                raise ActivationPackageError("activation directory install has no target")
+            for target in targets:
+                expected_directories[Path(target)] = (uid, gid, mode)
+            continue
+        source = Path(command[-2])
+        target = Path(command[-1])
+        try:
+            relative = _safe_relative(source.relative_to(package).as_posix())
+        except ValueError as error:
+            raise ActivationPackageError("activation file install source is outside the sealed package") from error
+        expected = package_files.get(relative)
+        if expected is None:
+            raise ActivationPackageError("activation file install source is not package-bound")
+        expected_files[target] = (expected, uid, gid, mode)
+    for target, (uid, gid, mode) in expected_directories.items():
+        metadata = target.lstat()
+        if (
+            target.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != uid
+            or metadata.st_gid != gid
+            or stat.S_IMODE(metadata.st_mode) != mode
+        ):
+            raise ActivationPackageError(f"installed activation directory is invalid: {target}")
+    for target, (expected, uid, gid, mode) in expected_files.items():
+        observed = _stream_hash_regular(target, label="installed activation artifact")
+        if (
+            observed["sha256"] != expected.get("sha256")
+            or observed["size"] != expected.get("size")
+            or observed["uid"] != uid
+            or observed["gid"] != gid
+            or observed["mode"] != f"{mode:04o}"
+            or observed["links"] != 1
+        ):
+            raise ActivationPackageError(f"installed activation artifact is invalid: {target}")
+    if not expected_files or not expected_directories:
+        raise ActivationPackageError("activation install contract is empty")
+    return {
+        "verified": True,
+        "installedFileCount": len(expected_files),
+        "installedDirectoryCount": len(expected_directories),
+    }
+
+
+def verify_installed_staging(
+    package_root: str | os.PathLike[str],
+    *,
+    expected_package_digest: str,
+) -> dict[str, object]:
+    """Verify every installed staging artifact against the approved package."""
+
+    _require_root_activation()
+    package = Path(package_root).resolve()
+    contract = _sealed_package_json(
+        package,
+        expected_package_digest=expected_package_digest,
+        relative_path="public/activation-contract.json",
+    )
+    commands = contract.get("stagingAndCanaryCommands")
+    if not isinstance(commands, list):
+        raise ActivationPackageError("activation staging command contract is invalid")
+    return _verify_install_results(
+        package,
+        expected_package_digest=expected_package_digest,
+        commands=commands,
+    )
+
+
+def run_canary_acceptance(
+    package_root: str | os.PathLike[str],
+    *,
+    expected_package_digest: str,
+    admin_secret: str,
+    roadex_secret: str,
+    attestation_path: str | os.PathLike[str],
+    base_url: str = "http://127.0.0.1:18766",
+) -> dict[str, object]:
+    """Run mandatory live canary controls and create a root-owned attestation."""
+
+    from urllib.error import HTTPError
+
+    from .client import OverseerApiClient
+
+    _require_root_activation()
+    package = Path(package_root)
+    verified = verify_activation_package(package, expected_package_digest)
+    verify_installed_staging(package, expected_package_digest=expected_package_digest)
+    credential_root = _installed_credential_root()
+    admin_verifier = load_approval_verifier(
+        credential_root / "admin-approval-verifier.json",
+        expected_owner_uid=APPROVED_OVERSEER_UID,
+    )
+    roadex_verifier = load_approval_verifier(
+        credential_root / "roadex-fixture-approval-verifier.json",
+        expected_owner_uid=APPROVED_OVERSEER_UID,
+    )
+    token_raw, token_metadata = _stable_read(credential_root / "api-token")
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        token_metadata.st_uid != root_uid
+        or token_metadata.st_gid != root_gid
+        or stat.S_IMODE(token_metadata.st_mode) != 0o600
+    ):
+        raise ActivationPackageError("canary API token metadata is invalid")
+    try:
+        api_token = token_raw.decode("ascii", "strict")
+    except UnicodeDecodeError as error:
+        raise ActivationPackageError("canary API token is invalid") from error
+    if not admin_verifier.verify(admin_secret) or roadex_verifier.verify(admin_secret):
+        raise ActivationPackageError("admin canary secret does not match exactly one approved scope")
+    if not roadex_verifier.verify(roadex_secret) or admin_verifier.verify(roadex_secret):
+        raise ActivationPackageError("Roadex canary secret does not match exactly one approved scope")
+
+    ordinary = OverseerApiClient(base_url=base_url, auth_token=api_token)
+    admin = OverseerApiClient(
+        base_url=base_url,
+        auth_token=api_token,
+        approval_token=admin_secret,
+    )
+    wrong_scope = OverseerApiClient(
+        base_url=base_url,
+        auth_token=api_token,
+        approval_token=roadex_secret,
+    )
+    ordinary_as_approval = OverseerApiClient(
+        base_url=base_url,
+        auth_token=api_token,
+        approval_token=api_token,
+    )
+
+    def denied_reason(call) -> str:
+        try:
+            call()
+        except HTTPError as error:
+            try:
+                payload = json.loads(error.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as parse_error:
+                raise ActivationPackageError("canary denial response is invalid") from parse_error
+            if error.code != 403 or not isinstance(payload, dict):
+                raise ActivationPackageError("canary denial did not fail closed")
+            return str(payload.get("reason") or payload.get("error") or "")
+        raise ActivationPackageError("canary negative control was unexpectedly accepted")
+
+    health = ordinary.health()
+    if health.get("ok") is not True or health.get("service") != "overseer-api":
+        raise ActivationPackageError("canary API health control failed")
+    usage = ordinary._get("/health/codex-usage")
+    if usage.get("source") != "codex.usage.snapshot.v1" or usage.get("bridge_state") not in {
+        "available",
+        "stale",
+        "unavailable",
+        "error",
+    }:
+        raise ActivationPackageError("canary usage bridge control failed")
+    sessions = ordinary._post(
+        "/agent-sessions/discover",
+        {"provider_id": "codex", "instance_id": "overseer.activation-canary"},
+    )
+    if (
+        sessions.get("mutation_performed") is not False
+        or sessions.get("host_mutation_performed") is not False
+        or sessions.get("bridge_state") not in {"available", "stale", "unavailable", "error"}
+    ):
+        raise ActivationPackageError("canary session bridge control failed")
+
+    suffix = expected_package_digest[:16]
+    smoke_plan_id = f"admin.activation-canary.smoke.{suffix}"
+    smoke_payload = {
+        "plan_id": smoke_plan_id,
+        "kind": "system_service_restart",
+        "target": "overseer-approval-smoke.service",
+        "reason": "verify the v1.1.6 dedicated-principal approval boundary",
+        "current_state": "inactive",
+    }
+    ordinary.plan_admin_change(smoke_payload)
+    ordinary_denial = denied_reason(lambda: ordinary_as_approval.approve_admin_change(smoke_plan_id))
+    wrong_scope_denial = denied_reason(lambda: wrong_scope.approve_admin_change(smoke_plan_id))
+    approved = admin.approve_admin_change(smoke_plan_id)
+    if approved.get("approved") is not True or approved.get("approved_by") != "sisko":
+        raise ActivationPackageError("canary admin approval control failed")
+    executed = ordinary.execute_admin_change({"plan_id": smoke_plan_id})
+    replayed = ordinary.execute_admin_change({"plan_id": smoke_plan_id})
+    if (
+        executed.get("status") != "completed"
+        or executed.get("mutation_performed") is not True
+        or replayed.get("replayed") is not True
+        or replayed.get("mutation_performed") is not False
+        or replayed.get("id") != executed.get("id")
+    ):
+        raise ActivationPackageError("canary executor replay control failed")
+
+    unlisted_plan_id = f"admin.activation-canary.unlisted.{suffix}"
+    ordinary.plan_admin_change(
+        {
+            "plan_id": unlisted_plan_id,
+            "kind": "system_service_restart",
+            "target": "overseer-api.service",
+            "reason": "prove the canary executor rejects an unlisted system unit",
+            "current_state": "inactive",
+        }
+    )
+    admin.approve_admin_change(unlisted_plan_id)
+    unlisted = ordinary.execute_admin_change({"plan_id": unlisted_plan_id})
+    if unlisted.get("status") not in {"blocked", "failed"} or unlisted.get("mutation_performed") is not False:
+        raise ActivationPackageError("canary unlisted-unit control did not fail closed")
+
+    controls = {
+        "apiHealth": True,
+        "usageBridgeBounded": True,
+        "sessionBridgeReadOnly": True,
+        "ordinaryTokenApprovalRejected": ordinary_denial == "independent_approval_token_required",
+        "wrongScopeApprovalRejected": wrong_scope_denial == "independent_approval_token_required",
+        "adminScopeApprovedBySisko": True,
+        "allowlistedSmokeExecutedOnce": True,
+        "samePlanReplayNoMutation": True,
+        "unlistedUnitRejected": True,
+    }
+    if (
+        len(controls) != len(CANARY_REQUIRED_CONTROLS)
+        or set(controls) != set(CANARY_REQUIRED_CONTROLS)
+        or not all(controls.values())
+    ):
+        raise ActivationPackageError("one or more canary controls did not pass exactly")
+    sealed_contract = _sealed_package_json(
+        package.resolve(),
+        expected_package_digest=expected_package_digest,
+        relative_path="public/activation-contract.json",
+    )
+    release_manifest_digest = sealed_contract.get("releaseManifestDigest")
+    if not isinstance(release_manifest_digest, str):
+        raise ActivationPackageError("canary activation contract release digest is invalid")
+    attestation = {
+        "schemaVersion": "overseer.activation-canary-acceptance.v1",
+        "status": "passed",
+        "packageDigest": expected_package_digest,
+        "packageFileCount": verified["fileCount"],
+        "releaseManifestDigest": release_manifest_digest,
+        "controls": controls,
+        "smokeExecutionId": executed["id"],
+        "smokeReplayId": replayed["id"],
+        "secretValuesRecorded": False,
+    }
+    target = Path(attestation_path)
+    if target != _canary_attestation_path(expected_package_digest):
+        raise ActivationPackageError("canary attestation path is not digest-bound")
+    _write_new(target, _canonical(attestation) + b"\n", 0o600)
+    return attestation
+
+
+def verify_canary_attestation(
+    package_root: str | os.PathLike[str],
+    *,
+    expected_package_digest: str,
+    attestation_path: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Verify the root-owned live canary gate before exposing cutover commands."""
+
+    verify_activation_package(package_root, expected_package_digest)
+    target = Path(attestation_path)
+    expected_path = _canary_attestation_path(expected_package_digest)
+    if target != expected_path:
+        raise ActivationPackageError("canary attestation path is not digest-bound")
+    raw, metadata = _stable_read(target)
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        metadata.st_uid != root_uid
+        or metadata.st_gid != root_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ActivationPackageError("canary attestation metadata is invalid")
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("canary attestation is invalid") from error
+    controls = document.get("controls") if isinstance(document, dict) else None
+    if (
+        document.get("schemaVersion") != "overseer.activation-canary-acceptance.v1"
+        or document.get("status") != "passed"
+        or document.get("packageDigest") != expected_package_digest
+        or not isinstance(controls, dict)
+        or len(controls) != len(CANARY_REQUIRED_CONTROLS)
+        or set(controls) != set(CANARY_REQUIRED_CONTROLS)
+        or not all(value is True for value in controls.values())
+        or document.get("secretValuesRecorded") is not False
+        or document.get("smokeExecutionId") != document.get("smokeReplayId")
+    ):
+        raise ActivationPackageError("canary attestation controls are incomplete")
+    return {"verified": True, "packageDigest": expected_package_digest, "controls": controls}
+
+
+def verify_approved_cutover(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Enforce the root-owned package approval and live canary gates."""
+
+    _require_root_activation()
+    approval = _load_activation_approval(package_root)
+    digest = str(approval["packageDigest"])
+    installed = verify_installed_staging(
+        package_root,
+        expected_package_digest=digest,
+    )
+    canary = verify_canary_attestation(
+        package_root,
+        expected_package_digest=digest,
+        attestation_path=_canary_attestation_path(digest),
+    )
+    return {
+        "verified": True,
+        "packageDigest": digest,
+        "approvalRecord": str(_activation_approval_record_path()),
+        "installed": installed,
+        "canary": canary,
+    }
+
+
+def verify_approved_staging(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Verify root approval and installed bytes before any staged service starts."""
+
+    _require_root_activation()
+    approval = _load_activation_approval(package_root)
+    digest = str(approval["packageDigest"])
+    installed = verify_installed_staging(
+        package_root,
+        expected_package_digest=digest,
+    )
+    return {
+        "verified": True,
+        "packageDigest": digest,
+        "approvalRecord": str(_activation_approval_record_path()),
+        "installed": installed,
+    }
+
+
+def _canary_attestation_path(package_digest: str) -> Path:
+    return Path(f"/var/lib/overseer-executor/canary-{package_digest}.json")
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m overseer.activation_package",
+        description="Run one exact activation-package primitive.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    prepare = commands.add_parser(
+        "prepare-package",
+        help="stage a closed owner-only package without activating it",
+    )
+    prepare.add_argument("--checkout", required=True)
+    prepare.add_argument("--dependency-root", required=True)
+    prepare.add_argument("--root-python", required=True)
+    prepare.add_argument("--stdlib-root", required=True)
+    prepare.add_argument("--templates-root", required=True)
+    prepare.add_argument("--package-root", required=True)
+    prepare.add_argument("--psychlo-secret-file", required=True)
+    prepare.add_argument("--roadex-secret-file", required=True)
+    prepare.add_argument("--psychlo-bindings-file", required=True)
+    prepare.add_argument("--source-store", required=True)
+    prepare.add_argument("--god-uid", required=True, type=int)
+    prepare.add_argument("--overseer-uid", required=True, type=int)
+    prepare.add_argument("--overseer-gid", required=True, type=int)
+    prepare.add_argument("--rollback-input", required=True, action="append")
+    human_verifiers = commands.add_parser(
+        "create-human-verifiers",
+        help="interactively create both separate scoped human approval verifiers",
+    )
+    human_verifiers.add_argument("--package-root", required=True)
+    finalize = commands.add_parser(
+        "finalize-package",
+        help="seal a prepared package after the human-verifier gate",
+    )
+    finalize.add_argument("--package-root", required=True)
+    verify = commands.add_parser(
+        "verify-package",
+        help="verify every byte in a sealed package against its expected digest",
+    )
+    verify.add_argument("--package-root", required=True)
+    verify.add_argument("--expected-digest", required=True)
+    status = commands.add_parser(
+        "status",
+        help="report the current package gate without returning private contents",
+    )
+    status.add_argument("--package-root", required=True)
+    verify_rollback = commands.add_parser(
+        "verify-rollback",
+        help="verify every captured rollback input before restoration",
+    )
+    verify_rollback.add_argument("--package-root", required=True)
+    restore_legacy = commands.add_parser(
+        "restore-legacy-store-access",
+        help="restore the exact legacy store access needed for approved rollback",
+    )
+    restore_legacy.add_argument("--source-store", required=True)
+    restore_legacy.add_argument("--expected-source-uid", required=True, type=int)
+    restore_legacy.add_argument("--expected-source-gid", required=True, type=int)
+    restore_legacy.add_argument("--expected-source-device", required=True, type=int)
+    restore_legacy.add_argument("--expected-source-inode", required=True, type=int)
+    restore_legacy.add_argument("--expected-parent-device", required=True, type=int)
+    restore_legacy.add_argument("--expected-parent-inode", required=True, type=int)
+    restore_legacy.add_argument("--expected-parent-mode", required=True, type=int)
+    record_approval = commands.add_parser(
+        "record-activation-approval",
+        help="record a root-owned approval for one exact sealed package digest",
+    )
+    record_approval.add_argument("--package-root", required=True)
+    record_approval.add_argument("--expected-package-digest", required=True)
+    approved_canary = commands.add_parser(
+        "run-approved-canary",
+        help="run mandatory live canary controls for the root-approved package",
+    )
+    approved_canary.add_argument("--package-root", required=True)
+    approved_staging = commands.add_parser(
+        "verify-approved-staging",
+        help="verify approval and installed artifacts before staged services start",
+    )
+    approved_staging.add_argument("--package-root", required=True)
+    approved_cutover = commands.add_parser(
+        "verify-approved-cutover",
+        help="verify package approval, installed artifacts, and canary attestation",
+    )
+    approved_cutover.add_argument("--package-root", required=True)
+    final_store = commands.add_parser(
+        "prepare-final-store",
+        help="create the final migrated authority store after legacy writers are stopped",
+    )
+    final_store.add_argument("--source-store", required=True)
+    final_store.add_argument("--backup-store", required=True)
+    final_store.add_argument("--destination-store", required=True)
+    final_store.add_argument("--expected-source-device", required=True, type=int)
+    final_store.add_argument("--expected-source-inode", required=True, type=int)
+    final_store.add_argument("--expected-source-uid", required=True, type=int)
+    final_store.add_argument("--expected-source-gid", required=True, type=int)
+    final_store.add_argument("--expected-parent-device", required=True, type=int)
+    final_store.add_argument("--expected-parent-inode", required=True, type=int)
+    final_store.add_argument("--expected-parent-mode", required=True, type=int)
+    final_store.add_argument("--destination-uid", required=True, type=int)
+    final_store.add_argument("--destination-gid", required=True, type=int)
+    final_store.add_argument("--pages-per-step", required=True, type=int)
+    final_store.add_argument("--sleep-seconds", required=True, type=float)
+    args = parser.parse_args(argv)
+    if args.command == "prepare-package":
+        package_root = _validate_new_package_destination(args.package_root)
+        _validate_principal_binding(
+            god_uid=args.god_uid,
+            overseer_uid=args.overseer_uid,
+            overseer_gid=args.overseer_gid,
+        )
+        rollback_inputs: dict[str, str] = {}
+        for raw in args.rollback_input:
+            label, separator, path = raw.partition("=")
+            if not separator or not label or not path or label in rollback_inputs:
+                raise ActivationPackageError("rollback input must be a unique LABEL=PATH value")
+            rollback_inputs[label] = path
+        manifest = build_release_manifest(
+            args.checkout,
+            args.dependency_root,
+            args.root_python,
+            args.stdlib_root,
+        )
+        stage_release_payload(
+            manifest,
+            checkout=args.checkout,
+            dependency_root=args.dependency_root,
+            stdlib_root=args.stdlib_root,
+            package_root=package_root,
+        )
+        render_systemd_units(
+            manifest,
+            templates_root=args.templates_root,
+            output_root=package_root / "public" / "systemd",
+            god_uid=args.god_uid,
+            overseer_uid=args.overseer_uid,
+            python_path=args.root_python,
+        )
+        stage_credentials(
+            package_root,
+            psychlo_secret_file=args.psychlo_secret_file,
+            roadex_secret_file=args.roadex_secret_file,
+            psychlo_bindings_file=args.psychlo_bindings_file,
+        )
+        rehearse_store_migration(
+            package_root,
+            source_store=args.source_store,
+        )
+        render_activation_contract(
+            package_root,
+            manifest,
+            source_store=args.source_store,
+            overseer_uid=args.overseer_uid,
+            overseer_gid=args.overseer_gid,
+            rollback_inputs=rollback_inputs,
+        )
+        result = {
+            **activation_package_status(package_root),
+            "packageRoot": str(package_root),
+            "releaseManifestDigest": manifest["manifestDigest"],
+            "sourceCommit": manifest["sourceCommit"],
+        }
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "create-human-verifiers":
+        package_root = _validate_existing_package_destination(args.package_root)
+        admin_secret = getpass.getpass("Admin approval secret: ")
+        admin_confirmation = getpass.getpass("Confirm admin approval secret: ")
+        if not secrets.compare_digest(admin_secret, admin_confirmation):
+            raise ActivationPackageError("admin approval secret confirmation does not match")
+        roadex_secret = getpass.getpass("Roadex fixture approval secret: ")
+        roadex_confirmation = getpass.getpass("Confirm Roadex fixture approval secret: ")
+        if not secrets.compare_digest(roadex_secret, roadex_confirmation):
+            raise ActivationPackageError("Roadex approval secret confirmation does not match")
+        result = create_human_verifiers(
+            package_root,
+            admin_secret=admin_secret,
+            roadex_secret=roadex_secret,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "finalize-package":
+        result = finalize_activation_package(_validate_existing_package_destination(args.package_root))
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "verify-package":
+        result = verify_activation_package(
+            _validate_existing_package_destination(args.package_root),
+            args.expected_digest,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "status":
+        result = activation_package_status(_validate_existing_package_destination(args.package_root))
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "verify-rollback":
+        result = verify_rollback_inputs(args.package_root)
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "restore-legacy-store-access":
+        result = restore_legacy_store_access(
+            source_store=args.source_store,
+            expected_source_uid=args.expected_source_uid,
+            expected_source_gid=args.expected_source_gid,
+            expected_source_device=args.expected_source_device,
+            expected_source_inode=args.expected_source_inode,
+            expected_parent_device=args.expected_parent_device,
+            expected_parent_inode=args.expected_parent_inode,
+            expected_parent_mode=args.expected_parent_mode,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "record-activation-approval":
+        result = record_activation_approval(
+            _validate_existing_package_destination(args.package_root),
+            expected_package_digest=args.expected_package_digest,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "run-approved-canary":
+        package = _validate_existing_package_destination(args.package_root)
+        approval = _load_activation_approval(package)
+        digest = str(approval["packageDigest"])
+        admin_secret = getpass.getpass("Admin approval secret for canary: ")
+        roadex_secret = getpass.getpass("Roadex fixture approval secret for negative control: ")
+        result = run_canary_acceptance(
+            package,
+            expected_package_digest=digest,
+            admin_secret=admin_secret,
+            roadex_secret=roadex_secret,
+            attestation_path=_canary_attestation_path(digest),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "verify-approved-staging":
+        result = verify_approved_staging(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "verify-approved-cutover":
+        result = verify_approved_cutover(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "prepare-final-store":
+        report = prepare_final_store_migration(
+            source_store=args.source_store,
+            backup_store=args.backup_store,
+            destination_store=args.destination_store,
+            expected_source_device=args.expected_source_device,
+            expected_source_inode=args.expected_source_inode,
+            expected_source_uid=args.expected_source_uid,
+            expected_source_gid=args.expected_source_gid,
+            expected_parent_device=args.expected_parent_device,
+            expected_parent_inode=args.expected_parent_inode,
+            expected_parent_mode=args.expected_parent_mode,
+            destination_uid=args.destination_uid,
+            destination_gid=args.destination_gid,
+            pages_per_step=args.pages_per_step,
+            sleep_seconds=args.sleep_seconds,
+        )
+        print(json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    raise AssertionError("unreachable activation package command")
+
+
+__all__ = [
+    "ACTIVATION_CONTRACT_SCHEMA",
+    "ActivationPackageError",
+    "PACKAGE_MANIFEST_SCHEMA",
+    "RELEASE_SCHEMA",
+    "ROLLBACK_MANIFEST_SCHEMA",
+    "activation_package_status",
+    "build_release_manifest",
+    "create_human_verifiers",
+    "finalize_activation_package",
+    "prepare_final_store_migration",
+    "record_activation_approval",
+    "rehearse_store_migration",
+    "render_activation_contract",
+    "render_systemd_units",
+    "restore_legacy_store_access",
+    "run_canary_acceptance",
+    "stage_credentials",
+    "stage_release_payload",
+    "verify_activation_package",
+    "verify_approved_cutover",
+    "verify_approved_staging",
+    "verify_canary_attestation",
+    "verify_installed_staging",
+    "verify_rollback_inputs",
+]
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

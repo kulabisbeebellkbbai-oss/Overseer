@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SYSTEMD = ROOT / "systemd"
 API_UNIT = SYSTEMD / "overseer-api-system.service"
+CANARY_UNIT = SYSTEMD / "overseer-api-canary.service"
 RUNTIME_UNIT = SYSTEMD / "overseer-runtime-system.service"
 SOCKET_UNIT = SYSTEMD / "overseer-admin-executor.socket"
 EXECUTOR_UNIT = SYSTEMD / "overseer-admin-executor@.service"
@@ -62,7 +63,7 @@ def _render_units(tmp_path: Path) -> list[Path]:
         "@OVERSEER_PYTHON@": str(python_path),
         "@GOD_UID@": "1000",
     }
-    for source in (API_UNIT, RUNTIME_UNIT, SOCKET_UNIT, EXECUTOR_UNIT):
+    for source in (API_UNIT, CANARY_UNIT, RUNTIME_UNIT, SOCKET_UNIT, EXECUTOR_UNIT):
         target = tmp_path / source.name
         content = _read(source)
         for placeholder, value in replacements.items():
@@ -80,6 +81,11 @@ def test_api_and_runtime_use_the_dedicated_system_principal_and_immutable_releas
         assert _one(unit, "User") == "overseer"
         assert _one(unit, "Group") == "overseer"
         assert _one(unit, "WorkingDirectory") == "@OVERSEER_RELEASE@"
+        assert (
+            "Environment=PYTHONPATH=@OVERSEER_RELEASE@/app/src:"
+            "@OVERSEER_RELEASE@/site-packages"
+        ) in unit
+        assert "Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime" in unit
         assert _one(unit, "StateDirectory") == "overseer"
         assert _one(unit, "StateDirectoryMode") == "0700"
         assert "/etc/overseer" in unit
@@ -143,6 +149,22 @@ def test_api_uses_independent_credentials_verifiers_and_loopback_peer_channels()
     assert "api-token:/etc/overseer/roadex-fixture-approval-verifier.json" not in api
 
 
+def test_disposable_api_canary_is_separate_bounded_and_not_enabled() -> None:
+    canary = _read(CANARY_UNIT)
+    command = _one(canary, "ExecStart")
+    assert _one(canary, "User") == "overseer"
+    assert _one(canary, "Group") == "overseer"
+    assert "--store /var/lib/overseer/overseer-canary.sqlite3" in command
+    assert "--host 127.0.0.1 --port 18766" in command
+    assert "OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-canary-bridge.sqlite3" in canary
+    assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-canary-relay.sqlite3" in canary
+    assert _one(canary, "RuntimeMaxSec") == "10min"
+    assert _one(canary, "TimeoutStopSec") == "10s"
+    assert "[Install]" not in canary
+    for setting in COMMON_HARDENING:
+        assert setting in canary
+
+
 def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> None:
     socket = _read(SOCKET_UNIT)
     assert "Accept=yes" in socket
@@ -163,6 +185,12 @@ def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> 
     assert _one(executor, "TimeoutStopSec") == "5s"
     assert _one(executor, "RestrictAddressFamilies") == "AF_UNIX"
     assert "PrivateNetwork=yes" in executor
+    assert "ProtectProc=invisible" in executor
+    assert "ProcSubset=pid" in executor
+    assert "RestrictNamespaces=yes" in executor
+    assert "SystemCallArchitectures=native" in executor
+    assert "SystemCallFilter=@system-service" in executor
+    assert "SystemCallErrorNumber=EPERM" in executor
     assert "ReadOnlyPaths=/etc/overseer" in executor
     assert "ReadWritePaths=/var/lib/overseer-executor" in executor
     assert _one(executor, "CapabilityBoundingSet") == ""

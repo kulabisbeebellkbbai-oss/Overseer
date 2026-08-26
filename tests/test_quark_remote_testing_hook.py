@@ -3,9 +3,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from overseer.api import make_api_handler
 from overseer.remote_testing import remote_testing_status
 from overseer.store import SQLiteStore
 
@@ -22,7 +25,38 @@ def _write_transcript(path: Path, user_text: str, assistant_text: str) -> None:
 
 
 class QuarkRemoteTestingHookTests(unittest.TestCase):
-    def _run_hook(self, root: Path, transcript: Path, dry_run: bool = False) -> subprocess.CompletedProcess[str]:
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.store = self.root / "state" / "overseer.sqlite3"
+        self.store.parent.mkdir()
+        SQLiteStore(self.store).close()
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), make_api_handler(str(self.store), "ordinary-api-token")
+        )
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        host, port = self.server.server_address
+        self.api_url = f"http://{host}:{port}"
+        self.token_file = self.root / "api-token"
+        self.token_file.write_text("ordinary-api-token\n", encoding="utf-8")
+        self.token_file.chmod(0o600)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=5)
+        self.temporary.cleanup()
+
+    def _run_hook(
+        self,
+        root: Path,
+        transcript: Path,
+        dry_run: bool = False,
+        *,
+        api_url: str | None = None,
+        token_file: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         payload = {
             "session_id": "session.test",
             "cwd": str(root / "Overseer"),
@@ -30,10 +64,9 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
             "hook_event_name": "Stop",
         }
         env = os.environ.copy()
-        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-        env["OVERSEER_PROJECT_ROOT"] = str(root)
-        env["OVERSEER_SOURCE_ROOT"] = str(Path(__file__).resolve().parents[1] / "src")
-        env["OVERSEER_STORE"] = str(root / "state" / "overseer.sqlite3")
+        env.pop("PYTHONPATH", None)
+        env["OVERSEER_API_URL"] = api_url or self.api_url
+        env["OVERSEER_TOKEN_FILE"] = str(token_file or self.token_file)
         args = [sys.executable, str(HOOK), "--from-stdin", "--stop-check"]
         if dry_run:
             args.append("--dry-run")
@@ -111,14 +144,12 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
     def test_hook_queues_quark_job_and_crew_message(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "state").mkdir()
-            SQLiteStore(root / "state" / "overseer.sqlite3").close()
             transcript = root / "transcript.jsonl"
             _write_transcript(transcript, "have Quark run a remote browser regression test", "Added the authenticated UI page and protected gateway panel.")
 
             result = self._run_hook(root, transcript)
-            status = remote_testing_status(root)
-            store = SQLiteStore(root / "state" / "overseer.sqlite3")
+            status = remote_testing_status(self.root)
+            store = SQLiteStore(self.store)
             try:
                 messages = store.list_crew_messages()
             finally:
@@ -133,16 +164,14 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
     def test_hook_collects_existing_result_for_same_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "state").mkdir()
-            SQLiteStore(root / "state" / "overseer.sqlite3").close()
             transcript = root / "transcript.jsonl"
             _write_transcript(transcript, "run the remote UI regression test through Tank", "Fixed the protected gateway UI panel.")
             first = self._run_hook(root, transcript)
-            status = remote_testing_status(root)
+            status = remote_testing_status(self.root)
             job_id = status["pending_jobs"][0]["job_id"]
-            pending_file = next((root / "local-secrets" / "remote-testing" / "jobs" / "pending").glob("*.json"))
+            pending_file = next((self.root / "local-secrets" / "remote-testing" / "jobs" / "pending").glob("*.json"))
             pending_file.unlink()
-            done = root / "local-secrets" / "remote-testing" / "jobs" / "done"
+            done = self.root / "local-secrets" / "remote-testing" / "jobs" / "done"
             done.mkdir(parents=True, exist_ok=True)
             (done / "result.json").write_text(
                 json.dumps(
@@ -163,6 +192,33 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
             self.assertEqual(second.returncode, 2)
             self.assertIn("Quark remote testing evidence collected for requested test", second.stderr)
             self.assertIn("passed", second.stderr)
+
+    def test_hook_fails_closed_when_triggered_and_api_is_unavailable(self):
+        transcript = self.root / "unavailable.jsonl"
+        _write_transcript(
+            transcript,
+            "run a remote UI regression test through Tank",
+            "Fixed the protected gateway UI panel.",
+        )
+
+        result = self._run_hook(
+            self.root,
+            transcript,
+            api_url="http://127.0.0.1:1",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unable to coordinate requested remote test", result.stderr)
+        self.assertNotIn("ordinary-api-token", result.stderr)
+
+    def test_hook_has_no_authority_store_or_project_source_fallback(self):
+        source = HOOK.read_text(encoding="utf-8")
+
+        self.assertNotIn("sqlite3", source)
+        self.assertNotIn("SQLiteStore", source)
+        self.assertNotIn("import_overseer", source)
+        self.assertNotIn("OVERSEER_STORE", source)
+        self.assertNotIn("OVERSEER_SOURCE_ROOT", source)
 
     def test_hook_continuation_does_not_queue_without_existing_job(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -133,6 +133,39 @@ def test_default_collection_seeding_fails_closed_for_external_action_families(tm
     assert jobs["collection.host.inspection"].timeout_seconds == 5
 
 
+def test_dedicated_principal_reseeding_disables_all_user_session_collectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    user_session_ids = {
+        "collection.dispatch.crew",
+        "collection.usage.continuation",
+        "collection.knowledge.capture",
+        "collection.station.audit",
+        "collection.freshness.psychlo-usage",
+        "collection.freshness.quark-scheduler",
+        "collection.git.overseer",
+    }
+    with SQLiteStore(path) as store:
+        for job_id in user_session_ids:
+            job = store.load_collection_job(job_id)
+            store.save_collection_job(job.__class__(**{**job.__dict__, "enabled": True}))
+
+    monkeypatch.setenv("OVERSEER_DEDICATED_PRINCIPAL", "1")
+    result = seed_default_collection_jobs(path)
+
+    with SQLiteStore(path) as store:
+        jobs = {job.id: job for job in store.list_collection_jobs()}
+    assert all(not jobs[job_id].enabled for job_id in user_session_ids)
+    assert jobs["collection.health.health.api"].enabled is True
+    disabled = {item["job_id"]: item["reason"] for item in result["disabled"]}
+    assert all(
+        disabled[job_id] == "user-session bridge is required in dedicated-principal mode"
+        for job_id in user_session_ids
+    )
+
+
 def test_legacy_action_flags_do_not_authorize_unsafe_jobs(tmp_path: Path) -> None:
     path = _seed_resource_and_target(tmp_path)
 

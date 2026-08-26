@@ -5,9 +5,15 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from unittest.mock import patch
+
+from overseer.api import make_api_handler
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts/overseer_project_guard.py"
@@ -50,14 +56,30 @@ class OverseerProjectGuardTests(unittest.TestCase):
         )
         connection.commit()
         connection.close()
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), make_api_handler(str(self.store), "ordinary-api-token")
+        )
+        self.server_thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.server_thread.start()
+        host, port = self.server.server_address
+        self.api_url = f"http://{host}:{port}"
+        self.token_file = self.root / "api-token"
+        self.token_file.write_text("ordinary-api-token\n", encoding="utf-8")
+        self.token_file.chmod(0o600)
         self.environment = patch.dict(os.environ, {
-            "OVERSEER_STORE": str(self.store),
+            "OVERSEER_API_URL": self.api_url,
+            "OVERSEER_TOKEN_FILE": str(self.token_file),
             "OVERSEER_EVIDENCE_FINDINGS": str(self.findings),
         })
         self.environment.start()
 
     def tearDown(self) -> None:
         self.environment.stop()
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=5)
         self.temporary.cleanup()
 
     def transcript(self, name: str, assistant: str, tool: str | None = None) -> Path:
@@ -123,14 +145,14 @@ class OverseerProjectGuardTests(unittest.TestCase):
             "record_id": "crew.kira.real",
             "expected": {"owner_domain": "odo", "status": "acknowledged", "review_status": "approved", "requested_by": "TheUnderdark", "related_plan_id": "backup-provision.fake"},
         }
-        result = guard.verify_claim(claim, self.store)
+        result = guard.verify_claim(claim)
         self.assertFalse(result["accepted"])
         self.assertEqual(result["failure_class"], "field_mismatch")
         self.assertEqual(result["mismatches"], ["owner_domain", "related_plan_id"])
 
     def test_stop_denies_claim_that_omits_required_exact_fields(self) -> None:
         claim = {"record_type": "crew_message", "record_id": "crew.kira.real", "expected": {"owner_domain": "kira"}}
-        result = guard.verify_claim(claim, self.store)
+        result = guard.verify_claim(claim)
         self.assertFalse(result["accepted"])
         self.assertEqual(result["failure_class"], "malformed")
         self.assertIn("required exact fields missing", result["reason"])
@@ -169,6 +191,127 @@ class OverseerProjectGuardTests(unittest.TestCase):
             tool="command failed: crew.kira.real",
         )
         self.assertEqual(guard.stop_check(self.payload(transcript)), 2)
+
+    def test_evidence_api_returns_only_allowlisted_record_fields(self) -> None:
+        request = Request(
+            f"{self.api_url}/evidence/records/crew_message/crew.kira.real",
+            headers={"Authorization": "Bearer ordinary-api-token"},
+        )
+        with urlopen(request, timeout=5) as response:
+            body = json.loads(response.read())
+        self.assertEqual(body["record_type"], "crew_message")
+        self.assertEqual(body["record_id"], "crew.kira.real")
+        self.assertEqual(
+            body["fields"],
+            {
+                "id": "crew.kira.real",
+                "owner_domain": "kira",
+                "status": "acknowledged",
+                "review_status": "approved",
+                "related_plan_id": "backup-provision.real",
+                "related_resource_id": "storage.real",
+                "requested_by": "TheUnderdark",
+                "decided_by": "kira",
+            },
+        )
+        self.assertNotIn("payload", body["fields"])
+
+    def test_evidence_api_uses_exact_not_found_response(self) -> None:
+        request = Request(
+            f"{self.api_url}/evidence/records/crew_message/crew.kira.missing",
+            headers={"Authorization": "Bearer ordinary-api-token"},
+        )
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(request, timeout=5)
+        self.assertEqual(raised.exception.code, 404)
+        self.assertEqual(
+            json.loads(raised.exception.read()),
+            {
+                "error": "record_not_found",
+                "record_type": "crew_message",
+                "record_id": "crew.kira.missing",
+            },
+        )
+
+    def test_hook_verifies_authoritative_record_over_authenticated_api(self) -> None:
+        claim = {
+            "record_type": "crew_message",
+            "record_id": "crew.kira.real",
+            "expected": {
+                "owner_domain": "kira",
+                "status": "acknowledged",
+                "review_status": "approved",
+                "requested_by": "TheUnderdark",
+            },
+        }
+        self.assertEqual(guard.verify_claim(claim), {"accepted": True, "record_type": "crew_message", "record_id": "crew.kira.real"})
+
+    def test_hook_rejects_insecure_or_linked_token_files(self) -> None:
+        claim = {
+            "record_type": "crew_message",
+            "record_id": "crew.kira.real",
+            "expected": {
+                "owner_domain": "kira",
+                "status": "acknowledged",
+                "review_status": "approved",
+                "requested_by": "TheUnderdark",
+            },
+        }
+        self.token_file.chmod(0o644)
+        insecure = guard.verify_claim(claim)
+        self.assertFalse(insecure["accepted"])
+        self.assertEqual(insecure["failure_class"], "unavailable")
+
+        self.token_file.chmod(0o600)
+        link = self.root / "linked-token"
+        link.symlink_to(self.token_file)
+        linked = guard.verify_claim(claim, token_file=str(link))
+        self.assertFalse(linked["accepted"])
+        self.assertEqual(linked["failure_class"], "unavailable")
+
+    def test_hook_rejects_non_loopback_api_origin_without_disclosing_token(self) -> None:
+        claim = {
+            "record_type": "crew_message",
+            "record_id": "crew.kira.real",
+            "expected": {
+                "owner_domain": "kira",
+                "status": "acknowledged",
+                "review_status": "approved",
+                "requested_by": "TheUnderdark",
+            },
+        }
+
+        result = guard.verify_claim(claim, api_url="https://example.com")
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["failure_class"], "unavailable")
+        self.assertNotIn("ordinary-api-token", result["reason"])
+
+    def test_repeated_failure_escalates_through_authenticated_crew_api(self) -> None:
+        claim = {
+            "record_type": "crew_message",
+            "record_id": "crew.kira.fake",
+            "expected": {
+                "owner_domain": "kira",
+                "status": "acknowledged",
+                "review_status": "approved",
+                "requested_by": "TheUnderdark",
+            },
+        }
+        assistant = f"Fixed the workflow.\nOverseer evidence: {json.dumps(claim)}"
+        self.assertEqual(guard.stop_check(self.payload(self.transcript("http-one", assistant))), 2)
+        self.assertEqual(guard.stop_check(self.payload(self.transcript("http-two", assistant))), 2)
+        state = json.loads(self.findings.read_text(encoding="utf-8"))
+        finding = next(iter(state["findings"].values()))
+        self.assertTrue(finding["odo_message_id"].startswith("crew.odo.hook-evidence."))
+        request = Request(
+            f"{self.api_url}/evidence/records/crew_message/{finding['odo_message_id']}",
+            headers={"Authorization": "Bearer ordinary-api-token"},
+        )
+        with urlopen(request, timeout=5) as response:
+            message = json.loads(response.read())
+        self.assertEqual(message["record_id"], finding["odo_message_id"])
+        self.assertEqual(message["fields"]["requested_by"], "overseer_project_guard")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -16,7 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .approval_auth import ApprovalVerifier
 from .backup_provisioning import approve_plan_api as approve_backup_provisioning_plan_api, decide_roadex_human_plan_api, execute_plan_api as execute_backup_provisioning_plan_api, list_plans as list_backup_provisioning_plans, list_roadex_human_decisions, stage_plan_api as stage_backup_provisioning_plan_api
@@ -327,6 +328,145 @@ API_MAX_REQUEST_THREADS = 8
 API_CONNECTION_READ_TIMEOUT_SECONDS = 5.0
 API_HEADER_READ_TIMEOUT_SECONDS = 5.0
 API_BODY_READ_TIMEOUT_SECONDS = 5.0
+
+EVIDENCE_RECORD_SPECS: dict[str, tuple[str, frozenset[str]]] = {
+    "crew_message": (
+        "crew_messages",
+        frozenset(
+            {
+                "id",
+                "owner_domain",
+                "status",
+                "review_status",
+                "related_plan_id",
+                "related_resource_id",
+                "requested_by",
+                "decided_by",
+            }
+        ),
+    ),
+    "admin_plan": (
+        "admin_change_plans",
+        frozenset(
+            {
+                "id",
+                "kind",
+                "owner_domain",
+                "target",
+                "risk_level",
+                "approval_level",
+                "approved",
+                "approved_by",
+                "canceled",
+                "archived",
+            }
+        ),
+    ),
+    "claim": (
+        "claims",
+        frozenset(
+            {
+                "id",
+                "resource_id",
+                "claim_type",
+                "owner_thread",
+                "owner_role",
+                "status",
+                "risk_level",
+            }
+        ),
+    ),
+    "usage_continuation": (
+        "usage_continuation_requests",
+        frozenset(
+            {
+                "id",
+                "limit_id",
+                "resource_id",
+                "owner_thread",
+                "requested_units",
+                "risk_level",
+                "requested_by",
+            }
+        ),
+    ),
+    "backup_provisioning_plan": (
+        "backup_provisioning_plans",
+        frozenset(
+            {
+                "id",
+                "plan_id",
+                "kind",
+                "status",
+                "approved_by",
+                "plan_digest",
+                "evidence_digest",
+                "root_authorization_refs",
+            }
+        ),
+    ),
+    "storage_root_authorization": (
+        "storage_root_authorizations",
+        frozenset(
+            {
+                "id",
+                "authorization_ref",
+                "project_id",
+                "root_id",
+                "status",
+                "root_identity",
+                "approval_id",
+                "target_digest",
+            }
+        ),
+    ),
+}
+EVIDENCE_RECORD_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
+
+
+class EvidenceRecordNotFound(LookupError):
+    def __init__(self, record_type: str, record_id: str) -> None:
+        super().__init__(record_id)
+        self.record_type = record_type
+        self.record_id = record_id
+
+
+def authoritative_evidence_record(
+    store_path: str | Path, record_type: str, record_id: str
+) -> dict[str, object]:
+    spec = EVIDENCE_RECORD_SPECS.get(record_type)
+    if spec is None:
+        raise ValueError("unsupported_record_type")
+    if EVIDENCE_RECORD_ID_RE.fullmatch(record_id) is None:
+        raise ValueError("invalid_record_id")
+    table, allowed_fields = spec
+    try:
+        connection = sqlite3.connect(
+            f"file:{Path(store_path)}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            row = connection.execute(
+                f"SELECT payload FROM {table} WHERE id = ?", (record_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise RuntimeError("authoritative_store_unavailable") from error
+    if row is None:
+        raise EvidenceRecordNotFound(record_type, record_id)
+    try:
+        decoded = json.loads(row[0])
+    except (TypeError, JSONDecodeError) as error:
+        raise RuntimeError("authoritative_record_malformed") from error
+    if not isinstance(decoded, dict):
+        raise RuntimeError("authoritative_record_malformed")
+    fields = {
+        field: decoded[field]
+        for field in sorted(allowed_fields)
+        if field in decoded
+    }
+    fields.setdefault("id", record_id)
+    return {"record_type": record_type, "record_id": record_id, "fields": fields}
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -848,6 +988,39 @@ def make_api_handler(
             auth_context = self._authorize_request("GET", raw_path, path)
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
+                return
+            if path.startswith("/evidence/records/"):
+                if auth_context.get("auth_type") != "admin_token":
+                    self._write_json(
+                        {"error": "unauthorized", "reason": "admin_token_required"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                parts = path.split("/")
+                if len(parts) != 5 or not parts[3] or not parts[4]:
+                    self._write_json({"error": "invalid_evidence_record_path"}, HTTPStatus.BAD_REQUEST)
+                    return
+                record_type = unquote(parts[3])
+                record_id = unquote(parts[4])
+                try:
+                    evidence = authoritative_evidence_record(
+                        store_path, record_type, record_id
+                    )
+                except EvidenceRecordNotFound as error:
+                    self._write_json(
+                        {
+                            "error": "record_not_found",
+                            "record_type": error.record_type,
+                            "record_id": error.record_id,
+                        },
+                        HTTPStatus.NOT_FOUND,
+                    )
+                except ValueError as error:
+                    self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                except RuntimeError as error:
+                    self._write_json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                else:
+                    self._write_json(evidence)
                 return
             if path == "/psychlo/tick":
                 with self._psychlo_request() as request_bridge:

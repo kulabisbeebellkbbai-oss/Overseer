@@ -8,15 +8,19 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 
-DEFAULT_PROJECT_ROOT = Path("/home/god/.local/share/overseer/project")
-DEFAULT_SOURCE_ROOT = DEFAULT_PROJECT_ROOT / "src"
-DEFAULT_STORE = DEFAULT_PROJECT_ROOT / "state" / "overseer.sqlite3"
+DEFAULT_API_URL = "http://127.0.0.1:8766"
+DEFAULT_TOKEN_FILE = Path("/home/god/.local/share/overseer/project/state/api-token")
+MAX_TOKEN_BYTES = 4096
+MAX_API_RESPONSE_BYTES = 1024 * 1024
 HOOK_PROMPT_RE = re.compile(r"<hook_prompt\b[^>]*>.*?</hook_prompt>", re.IGNORECASE | re.DOTALL)
 EXPLICIT_REMOTE_TEST_RE = re.compile(
     r"("
@@ -136,41 +140,125 @@ def needs_quark_testing(user_text: str, assistant_text: str, cwd: str) -> bool:
     return has_explicit_remote_testing_request(user_text)
 
 
-def import_overseer(project_root: Path, source_root: Path) -> None:
-    for path in (str(source_root), str(project_root / "src")):
-        if path not in sys.path:
-            sys.path.insert(0, path)
+class OverseerApiError(RuntimeError):
+    """A redacted failure to use the local Overseer authority API."""
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _validate_token_metadata(metadata: os.stat_result) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OverseerApiError("API token is not a regular file")
+    if metadata.st_nlink != 1:
+        raise OverseerApiError("API token file must not be hard-linked")
+    if metadata.st_uid != os.geteuid():
+        raise OverseerApiError("API token file has an unexpected owner")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise OverseerApiError("API token file must have mode 0600")
+    if metadata.st_size > MAX_TOKEN_BYTES:
+        raise OverseerApiError("API token file is too large")
+
+
+def _read_api_token(path: Path) -> str:
+    try:
+        before = os.lstat(path)
+        if stat.S_ISLNK(before.st_mode):
+            raise OverseerApiError("API token file must not be a symlink")
+        _validate_token_metadata(before)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            _validate_token_metadata(opened)
+            if not _same_file(before, opened):
+                raise OverseerApiError("API token file changed while opening")
+            raw = os.read(descriptor, MAX_TOKEN_BYTES + 1)
+            if len(raw) > MAX_TOKEN_BYTES:
+                raise OverseerApiError("API token file is too large")
+            after = os.fstat(descriptor)
+            _validate_token_metadata(after)
+            if not _same_file(opened, after) or after.st_size != before.st_size:
+                raise OverseerApiError("API token file changed while reading")
+            lexical_after = os.lstat(path)
+            _validate_token_metadata(lexical_after)
+            if not _same_file(before, lexical_after):
+                raise OverseerApiError("API token file changed while reading")
+        finally:
+            os.close(descriptor)
+    except OverseerApiError:
+        raise
+    except OSError as error:
+        raise OverseerApiError("API token file could not be safely read") from error
+    try:
+        token = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as error:
+        raise OverseerApiError("API token file is not valid UTF-8") from error
+    if not token or any(character.isspace() or ord(character) < 0x20 for character in token):
+        raise OverseerApiError("API token is not canonical")
+    return token
+
+
+def _api_base_url() -> str:
+    selected = os.environ.get("OVERSEER_API_URL", DEFAULT_API_URL).rstrip("/")
+    parsed = urlparse(selected)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise OverseerApiError("Overseer API URL must be an uncredentialed loopback HTTP origin")
+    return selected
+
+
+def _api_request(path: str, payload: dict[str, object] | None = None) -> dict[str, Any]:
+    method = "POST" if payload is not None else "GET"
+    body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    token_path = Path(os.environ.get("OVERSEER_TOKEN_FILE", str(DEFAULT_TOKEN_FILE))).expanduser()
+    request = Request(f"{_api_base_url()}{path}", data=body, method=method)
+    request.add_header("Accept", "application/json")
+    request.add_header("Authorization", f"Bearer {_read_api_token(token_path)}")
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(request, timeout=5) as response:
+            raw = response.read(MAX_API_RESPONSE_BYTES + 1)
+    except HTTPError as error:
+        raise OverseerApiError(f"Overseer API rejected {method} {path} with HTTP {error.code}") from error
+    except (OSError, URLError) as error:
+        raise OverseerApiError(f"Overseer API request failed for {method} {path}") from error
+    if len(raw) > MAX_API_RESPONSE_BYTES:
+        raise OverseerApiError("Overseer API response is too large")
+    try:
+        decoded = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise OverseerApiError("Overseer API returned invalid JSON") from error
+    if not isinstance(decoded, dict):
+        raise OverseerApiError("Overseer API returned a non-object response")
+    return decoded
 
 
 def ensure_quark_job(
-    project_root: Path,
-    store_path: Path,
     session_id: str,
     cwd: str,
     trigger_text: str,
     dry_run: bool = False,
     allow_queue: bool = True,
 ) -> dict[str, object]:
-    import_overseer(project_root, Path(os.environ.get("OVERSEER_SOURCE_ROOT", str(DEFAULT_SOURCE_ROOT))))
-    from overseer.core import OwnerDomain, RiskLevel
-    from overseer.remote_testing import (
-        collect_remote_test_results_status,
-        enqueue_remote_test_job_status,
-        remote_testing_status,
-        request_remote_testing_lease_status,
-    )
-    from overseer.cli import record_crew_message_status
-    from overseer.store import SQLiteStore
-
     name = project_name(cwd)
     suffix = stable_suffix(session_id or "session", cwd)
     lease_id = f"lease.codex-stop.{name.lower()}.{suffix}"
     gateway_path = project_gateway_path(name)
     job_type = job_type_for(trigger_text, name)
-    status = remote_testing_status(project_root)
+    status = _api_request("/usage/remote-testing")
     existing_lease = next((item for item in status["leases"] if item.get("lease_id") == lease_id), None)
     if existing_lease and existing_lease.get("last_job_id"):
-        results = collect_remote_test_results_status(project_root, lease_id=lease_id)
+        results = _api_request("/usage/remote-testing/results", {"lease_id": lease_id})
         if results["result_count"]:
             return {"action": "collected", "lease_id": lease_id, "job_type": job_type, "results": results["results"]}
         pending = [job for job in status["pending_jobs"] + status["claimed_jobs"] if job.get("lease_id") == lease_id]
@@ -180,53 +268,51 @@ def ensure_quark_job(
         return {"action": "noop", "lease_id": lease_id, "job_type": job_type, "reason": "no existing requested test job"}
     if dry_run:
         return {"action": "would_queue", "lease_id": lease_id, "job_type": job_type, "gateway_path": gateway_path}
-    request_remote_testing_lease_status(
-        project_root,
-        lease_id,
-        name,
-        "Quark coordinated explicitly requested remote testing",
-        requested_by="quark",
-        job_types=(job_type,),
-        priority="normal",
+    _api_request(
+        "/usage/remote-testing/leases",
+        {
+            "lease_id": lease_id,
+            "project": name,
+            "purpose": "Quark coordinated explicitly requested remote testing",
+            "requested_by": "quark",
+            "job_types": [job_type],
+            "priority": "normal",
+        },
     )
     params: dict[str, object] = {"scheduled_by": "quark-stop-hook", "validation_stage": "requested-remote-testing"}
     if job_type == "protected_gateway.request_sequence":
         params["requests"] = [{"label": "health", "method": "GET", "path": "/health"}]
-    job = enqueue_remote_test_job_status(
-        project_root,
-        lease_id,
-        job_type,
-        requested_by="quark",
-        project=name,
-        params=params,
-        base_url=os.environ.get("OVERSEER_REMOTE_TEST_BASE_URL", "https://roadex.home.arpa:9443"),
-        ui_path=f"{gateway_path}/ui",
-        gateway_path=gateway_path,
-        token_source="state/api-token",
-        mutates=False,
+    job = _api_request(
+        "/usage/remote-testing/jobs",
+        {
+            "lease_id": lease_id,
+            "job_type": job_type,
+            "requested_by": "quark",
+            "project": name,
+            "params": params,
+            "base_url": os.environ.get("OVERSEER_REMOTE_TEST_BASE_URL", "https://roadex.home.arpa:9443"),
+            "ui_path": f"{gateway_path}/ui",
+            "gateway_path": gateway_path,
+            "token_source": "state/api-token",
+            "mutates": False,
+        },
     )
     crew_id = f"crew.quark.remote-testing-final.{name.lower()}.{suffix}"
-    if store_path.exists():
-        store = SQLiteStore(store_path)
-        try:
-            try:
-                store.load_crew_message(crew_id)
-                exists = True
-            except KeyError:
-                exists = False
-        finally:
-            store.close()
-        if not exists:
-            record_crew_message_status(
-                store_path,
-                OwnerDomain.QUARK.value,
-                "Coordinate requested remote testing",
-                f"Queued {job_type} for {name} after explicit thread request; collect redacted result and continue the thread.",
-                RiskLevel.MEDIUM.value,
-                requested_by=name,
-                message_id=crew_id,
-                related_resource_id="remote-testing.tank-msi",
-            )
+    _api_request(
+        "/crew/messages",
+        {
+            "message_id": crew_id,
+            "owner_domain": "quark",
+            "subject": "Coordinate requested remote testing",
+            "message": (
+                f"Queued {job_type} for {name} after explicit thread request; "
+                "collect redacted result and continue the thread."
+            ),
+            "priority": "medium",
+            "requested_by": name,
+            "related_resource_id": "remote-testing.tank-msi",
+        },
+    )
     return {"action": "queued", "lease_id": lease_id, "job_type": job_type, "job": job["job"], "crew_message_id": crew_id}
 
 
@@ -270,12 +356,8 @@ def stop_check(payload: dict[str, Any], dry_run: bool = False) -> int:
     hook_continuation = has_quark_hook_continuation(raw_user_text)
     if not explicit_request and not hook_continuation:
         return 0
-    project_root = Path(os.environ.get("OVERSEER_PROJECT_ROOT", str(DEFAULT_PROJECT_ROOT))).expanduser()
-    store_path = Path(os.environ.get("OVERSEER_STORE", str(DEFAULT_STORE))).expanduser()
     try:
         result = ensure_quark_job(
-            project_root,
-            store_path,
             str(payload.get("session_id") or ""),
             cwd,
             "\n".join([user_text, assistant_text]),
@@ -283,8 +365,12 @@ def stop_check(payload: dict[str, Any], dry_run: bool = False) -> int:
             allow_queue=explicit_request,
         )
     except Exception as error:
-        print(f"quark_remote_testing_stop_hook: unable to coordinate remote test: {error}", file=sys.stderr)
-        return 0
+        print(
+            "quark_remote_testing_stop_hook: unable to coordinate requested remote test through Overseer: "
+            f"{type(error).__name__}",
+            file=sys.stderr,
+        )
+        return 2
     if dry_run:
         print(json.dumps(result, sort_keys=True))
         return 0

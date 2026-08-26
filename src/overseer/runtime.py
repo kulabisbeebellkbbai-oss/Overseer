@@ -131,6 +131,30 @@ COLLECTION_FAMILIES = frozenset(
 UNSAFE_AUTONOMOUS_COLLECTION_FAMILIES = frozenset(
     {"crew_dispatch", "usage_continuation", "knowledge_capture", "station_audit"}
 )
+COLLECTION_KIND_FAMILIES = {
+    CollectionJobKind.HOST_INSPECTION: "host",
+    CollectionJobKind.PHYSICAL_DISCOVERY: "discovery",
+    CollectionJobKind.VIRTUAL_DISCOVERY: "discovery",
+    CollectionJobKind.CREW_DISPATCH: "crew_dispatch",
+    CollectionJobKind.USAGE_CONTINUATION: "usage_continuation",
+    CollectionJobKind.KNOWLEDGE_CAPTURE: "knowledge_capture",
+    CollectionJobKind.STATION_AUDIT: "station_audit",
+    CollectionJobKind.PACKAGE_INSPECTION: "package",
+    CollectionJobKind.FRESHNESS_PROJECTION: "freshness",
+    CollectionJobKind.GIT_INSPECTION: "git",
+    CollectionJobKind.STORAGE_INSPECTION: "storage",
+    CollectionJobKind.FIRMWARE_INSPECTION: "firmware",
+}
+DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES = frozenset(
+    {
+        "crew_dispatch",
+        "usage_continuation",
+        "knowledge_capture",
+        "station_audit",
+        "freshness",
+        "git",
+    }
+)
 
 
 def _store_path(value: str | Any) -> str:
@@ -371,20 +395,6 @@ def _default_jobs(
         ("collection.storage.capacity", CollectionJobKind.STORAGE_INSPECTION, OwnerDomain.KIRA, "storage.capacity"),
         ("collection.firmware.inspection", CollectionJobKind.FIRMWARE_INSPECTION, OwnerDomain.OBRIEN, "firmware.local"),
     )
-    family_by_kind = {
-        CollectionJobKind.HOST_INSPECTION: "host",
-        CollectionJobKind.PHYSICAL_DISCOVERY: "discovery",
-        CollectionJobKind.VIRTUAL_DISCOVERY: "discovery",
-        CollectionJobKind.CREW_DISPATCH: "crew_dispatch",
-        CollectionJobKind.USAGE_CONTINUATION: "usage_continuation",
-        CollectionJobKind.KNOWLEDGE_CAPTURE: "knowledge_capture",
-        CollectionJobKind.STATION_AUDIT: "station_audit",
-        CollectionJobKind.PACKAGE_INSPECTION: "package",
-        CollectionJobKind.FRESHNESS_PROJECTION: "freshness",
-        CollectionJobKind.GIT_INSPECTION: "git",
-        CollectionJobKind.STORAGE_INSPECTION: "storage",
-        CollectionJobKind.FIRMWARE_INSPECTION: "firmware",
-    }
     jobs.extend(
         CollectionJob(
             id=job_id,
@@ -396,7 +406,7 @@ def _default_jobs(
             priority=1 if kind is not CollectionJobKind.FRESHNESS_PROJECTION else 0,
         )
         for job_id, kind, owner, resource_id in fixed
-        if families is None or family_by_kind[kind] in families
+        if families is None or COLLECTION_KIND_FAMILIES[kind] in families
     )
     return tuple(jobs)
 
@@ -421,6 +431,7 @@ def seed_default_collection_jobs(
         seeded: list[str] = []
         skipped: list[dict[str, str]] = []
         existing_jobs = {job.id: job for job in store.list_collection_jobs()}
+        dedicated_principal = os.environ.get("OVERSEER_DEDICATED_PRINCIPAL") == "1"
         if "health" in seed_families:
             for existing in existing_jobs.values():
                 if (
@@ -443,7 +454,17 @@ def seed_default_collection_jobs(
                 # Configuration refreshes must never rewrite the operator's
                 # durable enabled/suspended policy or scheduler state.
                 job = replace(job, enabled=existing.enabled)
-            elif job.kind.value in UNSAFE_AUTONOMOUS_COLLECTION_FAMILIES:
+            family = COLLECTION_KIND_FAMILIES.get(job.kind, "health")
+            if dedicated_principal and family in DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES:
+                job = replace(job, enabled=False)
+                skipped.append(
+                    {
+                        "job_id": job.id,
+                        "status": "disabled",
+                        "reason": "user-session bridge is required in dedicated-principal mode",
+                    }
+                )
+            elif existing is None and job.kind.value in UNSAFE_AUTONOMOUS_COLLECTION_FAMILIES:
                 # Visibility is useful for a fresh install, but no external
                 # or mutating action is authorized by merely seeding it.
                 job = replace(job, enabled=False)

@@ -9,20 +9,20 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
+import stat
 import sys
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlparse
 
 
-OVERSEER_API = "http://127.0.0.1:8766"
-OVERSEER_HEALTH = f"{OVERSEER_API}/health"
-OVERSEER_PROJECT = "/home/god/.local/share/overseer/project"
-OVERSEER_STORE = f"{OVERSEER_PROJECT}/state/overseer.sqlite3"
-OVERSEER_TOKEN_FILE = f"{OVERSEER_PROJECT}/state/api-token"
+DEFAULT_OVERSEER_API = "http://127.0.0.1:8766"
+DEFAULT_OVERSEER_TOKEN_FILE = "/home/god/.local/share/overseer/project/state/api-token"
 DEFAULT_FINDINGS = Path.home() / ".codex/state/overseer-evidence-findings.json"
+MAX_TOKEN_BYTES = 4096
+MAX_API_RESPONSE_BYTES = 1024 * 1024
 
 RESOURCE_RE = re.compile(
     r"\b(overseer|protected\s+gateway|gateway|proxy|proxies|port|ports|listener|listeners|"
@@ -56,31 +56,13 @@ RECORD_REFERENCE_RE = re.compile(
 )
 HOOK_PROMPT_RE = re.compile(r"<hook_prompt\b[^>]*>.*?</hook_prompt>", re.IGNORECASE | re.DOTALL)
 
-RECORD_TYPES: dict[str, tuple[str, frozenset[str]]] = {
-    "crew_message": (
-        "crew_messages",
-        frozenset({"id", "owner_domain", "status", "review_status", "related_plan_id", "related_resource_id", "requested_by", "decided_by"}),
-    ),
-    "admin_plan": (
-        "admin_change_plans",
-        frozenset({"id", "kind", "owner_domain", "target", "risk_level", "approval_level", "approved", "approved_by", "canceled", "archived"}),
-    ),
-    "claim": (
-        "claims",
-        frozenset({"id", "resource_id", "claim_type", "owner_thread", "owner_role", "status", "risk_level"}),
-    ),
-    "usage_continuation": (
-        "usage_continuation_requests",
-        frozenset({"id", "limit_id", "resource_id", "owner_thread", "requested_units", "risk_level", "requested_by"}),
-    ),
-    "backup_provisioning_plan": (
-        "backup_provisioning_plans",
-        frozenset({"id", "plan_id", "kind", "status", "approved_by", "plan_digest", "evidence_digest", "root_authorization_refs"}),
-    ),
-    "storage_root_authorization": (
-        "storage_root_authorizations",
-        frozenset({"id", "authorization_ref", "project_id", "root_id", "status", "root_identity", "approval_id", "target_digest"}),
-    ),
+RECORD_TYPES: dict[str, frozenset[str]] = {
+    "crew_message": frozenset({"id", "owner_domain", "status", "review_status", "related_plan_id", "related_resource_id", "requested_by", "decided_by"}),
+    "admin_plan": frozenset({"id", "kind", "owner_domain", "target", "risk_level", "approval_level", "approved", "approved_by", "canceled", "archived"}),
+    "claim": frozenset({"id", "resource_id", "claim_type", "owner_thread", "owner_role", "status", "risk_level"}),
+    "usage_continuation": frozenset({"id", "limit_id", "resource_id", "owner_thread", "requested_units", "risk_level", "requested_by"}),
+    "backup_provisioning_plan": frozenset({"id", "plan_id", "kind", "status", "approved_by", "plan_digest", "evidence_digest", "root_authorization_refs"}),
+    "storage_root_authorization": frozenset({"id", "authorization_ref", "project_id", "root_id", "status", "root_identity", "approval_id", "target_digest"}),
 }
 
 REQUIRED_EXPECTED_FIELDS: dict[str, frozenset[str]] = {
@@ -175,11 +157,92 @@ def latest_turn(path: Path) -> list[tuple[str | None, str]]:
     return entries[last_user:] if last_user >= 0 else entries
 
 
-def overseer_ready() -> bool:
+class OverseerApiError(RuntimeError):
+    """A redacted failure to use the local Overseer authority API."""
+
+
+def overseer_api_url(api_url: str | None = None) -> str:
+    selected = (api_url or os.environ.get("OVERSEER_API_URL") or DEFAULT_OVERSEER_API).rstrip("/")
+    parsed = urlparse(selected)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise OverseerApiError("Overseer API URL must be an uncredentialed loopback HTTP origin")
+    return selected
+
+
+def overseer_token_file(token_file: str | None = None) -> Path:
+    return Path(token_file or os.environ.get("OVERSEER_TOKEN_FILE") or DEFAULT_OVERSEER_TOKEN_FILE).expanduser()
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _validate_token_metadata(metadata: os.stat_result) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OverseerApiError("ordinary API token is not a regular file")
+    if metadata.st_nlink != 1:
+        raise OverseerApiError("ordinary API token file must not be hard-linked")
+    if metadata.st_uid != os.geteuid():
+        raise OverseerApiError("ordinary API token file has an unexpected owner")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise OverseerApiError("ordinary API token file must have mode 0600")
+    if metadata.st_size > MAX_TOKEN_BYTES:
+        raise OverseerApiError("ordinary API token file is too large")
+
+
+def read_api_token(token_file: str | None = None) -> str:
+    path = overseer_token_file(token_file)
     try:
-        with urllib.request.urlopen(OVERSEER_HEALTH, timeout=2) as response:
+        before = os.lstat(path)
+        if stat.S_ISLNK(before.st_mode):
+            raise OverseerApiError("ordinary API token file must not be a symlink")
+        _validate_token_metadata(before)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            _validate_token_metadata(opened)
+            if not _same_file(before, opened):
+                raise OverseerApiError("ordinary API token file changed while opening")
+            raw = os.read(descriptor, MAX_TOKEN_BYTES + 1)
+            if len(raw) > MAX_TOKEN_BYTES:
+                raise OverseerApiError("ordinary API token file is too large")
+            after = os.fstat(descriptor)
+            _validate_token_metadata(after)
+            if not _same_file(opened, after) or after.st_size != before.st_size:
+                raise OverseerApiError("ordinary API token file changed while reading")
+            lexical_after = os.lstat(path)
+            _validate_token_metadata(lexical_after)
+            if not _same_file(before, lexical_after):
+                raise OverseerApiError("ordinary API token file changed while reading")
+        finally:
+            os.close(descriptor)
+    except OverseerApiError:
+        raise
+    except OSError as error:
+        raise OverseerApiError("ordinary API token file could not be safely read") from error
+    try:
+        token = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as error:
+        raise OverseerApiError("ordinary API token file is not valid UTF-8") from error
+    if not token or any(character.isspace() or ord(character) < 0x20 for character in token):
+        raise OverseerApiError("ordinary API token is not canonical")
+    return token
+
+
+def overseer_ready(api_url: str | None = None) -> bool:
+    try:
+        with urllib.request.urlopen(f"{overseer_api_url(api_url)}/health", timeout=2) as response:
             return 200 <= response.status < 300
-    except OSError:
+    except (OSError, OverseerApiError):
         return False
 
 
@@ -193,12 +256,16 @@ def needs_overseer(text: str, cwd: str = "") -> bool:
 
 def route_message(ready: bool) -> str:
     status = "reachable" if ready else "not reachable"
+    try:
+        health_endpoint = f"{overseer_api_url()}/health"
+    except OverseerApiError:
+        health_endpoint = "invalid loopback API configuration"
     example = '{"record_type":"crew_message","record_id":"crew.kira.example","expected":{"owner_domain":"kira","status":"acknowledged","review_status":"approved","requested_by":"Roadex"}}'
     return "\n".join([
         "Overseer local coordination required for shared-resource work on this computer.",
         "Use the `overseer-local-coordination` skill before changing or reserving shared resources.",
-        f"Overseer API health is {status} at {OVERSEER_HEALTH}.",
-        f"Use store `{OVERSEER_STORE}` and token file `{OVERSEER_TOKEN_FILE}`; never print the token.",
+        f"Overseer API health is {status} at {health_endpoint}.",
+        f"Use the authenticated API and token file `{overseer_token_file()}`; never print the token.",
         f"Record evidence must be authoritative and exact. Final format: `Overseer evidence: {example}`.",
     ])
 
@@ -223,34 +290,52 @@ def parse_claims(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     return claims, errors
 
 
-def _canonical_record(store_path: Path, record_type: str, record_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    spec = RECORD_TYPES.get(record_type)
-    if spec is None:
+def _fetch_authoritative_record(
+    record_type: str,
+    record_id: str,
+    *,
+    api_url: str | None = None,
+    token_file: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if record_type not in RECORD_TYPES:
         return None, f"unsupported record_type {record_type!r}"
-    table, _allowed = spec
     try:
-        connection = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True, timeout=2)
+        token = read_api_token(token_file)
+        request = urllib.request.Request(
+            f"{overseer_api_url(api_url)}/evidence/records/{quote(record_type, safe='')}/{quote(record_id, safe='')}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            raw = response.read(MAX_API_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_API_RESPONSE_BYTES:
+                raise OverseerApiError("authoritative API response is too large")
+            payload = json.loads(raw)
+    except urllib.error.HTTPError as exc:
         try:
-            row = connection.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
-            if row is None:
-                return None, None
-            columns = [item[0] for item in connection.execute(f"SELECT * FROM {table} LIMIT 0").description]
-        finally:
-            connection.close()
-    except (OSError, sqlite3.Error) as exc:
-        return None, f"authoritative store unavailable: {type(exc).__name__}"
-    raw = dict(zip(columns, row, strict=True))
-    payload = raw.pop("payload", "{}")
-    try:
-        decoded = json.loads(payload)
-    except (TypeError, json.JSONDecodeError):
-        return None, "authoritative record payload is invalid"
-    if not isinstance(decoded, dict):
-        return None, "authoritative record payload is invalid"
-    return {**raw, **decoded}, None
+            payload = json.loads(exc.read())
+        except (OSError, TypeError, json.JSONDecodeError):
+            payload = {}
+        if exc.code == 404 and payload.get("error") == "record_not_found":
+            return None, None
+        return None, f"authoritative API unavailable: HTTP {exc.code}"
+    except (OSError, TypeError, ValueError, OverseerApiError, json.JSONDecodeError) as exc:
+        return None, f"authoritative API unavailable: {type(exc).__name__}"
+    if not isinstance(payload, dict) or payload.get("record_type") != record_type or payload.get("record_id") != record_id:
+        return None, "authoritative API response is invalid"
+    fields = payload.get("fields")
+    if not isinstance(fields, dict):
+        return None, "authoritative API response is invalid"
+    if set(fields) - RECORD_TYPES[record_type]:
+        return None, "authoritative API response contains unsupported fields"
+    return fields, None
 
 
-def verify_claim(claim: dict[str, Any], store_path: Path) -> dict[str, Any]:
+def verify_claim(
+    claim: dict[str, Any],
+    *,
+    api_url: str | None = None,
+    token_file: str | None = None,
+) -> dict[str, Any]:
     record_type = claim.get("record_type")
     record_id = claim.get("record_id")
     expected = claim.get("expected")
@@ -259,13 +344,15 @@ def verify_claim(claim: dict[str, Any], store_path: Path) -> dict[str, Any]:
     spec = RECORD_TYPES.get(record_type)
     if spec is None:
         return {"accepted": False, "failure_class": "malformed", "record_type": record_type, "record_id": record_id, "reason": "unsupported record_type"}
-    unknown = sorted(set(expected) - spec[1])
+    unknown = sorted(set(expected) - spec)
     if unknown:
         return {"accepted": False, "failure_class": "malformed", "record_type": record_type, "record_id": record_id, "reason": f"unsupported expected fields: {', '.join(unknown)}"}
     missing = sorted(REQUIRED_EXPECTED_FIELDS[record_type] - set(expected))
     if missing:
         return {"accepted": False, "failure_class": "malformed", "record_type": record_type, "record_id": record_id, "reason": f"required exact fields missing: {', '.join(missing)}"}
-    actual, error = _canonical_record(store_path, record_type, record_id)
+    actual, error = _fetch_authoritative_record(
+        record_type, record_id, api_url=api_url, token_file=token_file
+    )
     if error:
         return {"accepted": False, "failure_class": "unavailable", "record_type": record_type, "record_id": record_id, "reason": error}
     if actual is None:
@@ -292,36 +379,59 @@ def _attempt_id(transcript: Path, assistant_text: str) -> str:
     return hashlib.sha256(material.encode()).hexdigest()
 
 
-def escalate_to_odo(fingerprint: str, result: dict[str, Any], count: int, store_path: Path) -> str:
+def escalate_to_odo(
+    fingerprint: str,
+    result: dict[str, Any],
+    count: int,
+    *,
+    api_url: str | None = None,
+    token_file: str | None = None,
+) -> str:
     message_id = f"crew.odo.hook-evidence.{fingerprint[:20]}"
-    connection = sqlite3.connect(store_path, timeout=3)
-    try:
-        if connection.execute("SELECT 1 FROM crew_messages WHERE id = ?", (message_id,)).fetchone():
-            return message_id
-    finally:
-        connection.close()
-    source_root = Path(os.environ.get("OVERSEER_SOURCE_ROOT", f"{OVERSEER_PROJECT}/src"))
-    sys.path.insert(0, str(source_root))
-    from overseer.cli import record_crew_message_status
-
-    record_crew_message_status(
-        store_path,
-        "odo",
-        "Repeated unverified Overseer hook evidence",
-        (
-            f"Risk assessment requested after {count} distinct hook attempts claimed the same unverified "
-            f"{result.get('record_type', 'record')} identifier. Failure class: {result.get('failure_class')}. "
-            "The hook denied completion. No transcript, credentials, or authoritative field values were retained."
-        ),
-        priority="high",
-        requested_by="overseer_project_guard",
-        message_id=message_id,
-        related_resource_id="security.codex-hooks",
+    token = read_api_token(token_file)
+    body = json.dumps(
+        {
+            "message_id": message_id,
+            "owner_domain": "odo",
+            "subject": "Repeated unverified Overseer hook evidence",
+            "message": (
+                f"Risk assessment requested after {count} distinct hook attempts claimed the same unverified "
+                f"{result.get('record_type', 'record')} identifier. Failure class: {result.get('failure_class')}. "
+                "The hook denied completion. No transcript, credentials, or authoritative field values were retained."
+            ),
+            "priority": "high",
+            "requested_by": "overseer_project_guard",
+            "related_resource_id": "security.codex-hooks",
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{overseer_api_url(api_url)}/crew/messages",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
     )
+    with urllib.request.urlopen(request, timeout=3) as response:
+        if not 200 <= response.status < 300:
+            raise OSError(f"crew escalation returned HTTP {response.status}")
+        if len(response.read(MAX_API_RESPONSE_BYTES + 1)) > MAX_API_RESPONSE_BYTES:
+            raise OverseerApiError("crew escalation API response is too large")
     return message_id
 
 
-def record_failure(result: dict[str, Any], claim: dict[str, Any], transcript: Path, assistant_text: str, store_path: Path, findings_path: Path) -> dict[str, Any]:
+def record_failure(
+    result: dict[str, Any],
+    claim: dict[str, Any],
+    transcript: Path,
+    assistant_text: str,
+    findings_path: Path,
+    *,
+    api_url: str | None = None,
+    token_file: str | None = None,
+) -> dict[str, Any]:
     fingerprint = _finding_fingerprint(result, claim)
     attempt = _attempt_id(transcript, assistant_text)
     findings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +463,13 @@ def record_failure(result: dict[str, Any], claim: dict[str, Any], transcript: Pa
             item["last_seen_at"] = datetime.now(UTC).isoformat()
         if item["occurrence_count"] >= 2 and not item.get("odo_message_id"):
             try:
-                item["odo_message_id"] = escalate_to_odo(fingerprint, result, item["occurrence_count"], store_path)
+                item["odo_message_id"] = escalate_to_odo(
+                    fingerprint,
+                    result,
+                    item["occurrence_count"],
+                    api_url=api_url,
+                    token_file=token_file,
+                )
             except Exception as exc:  # Keep the validation fail-closed even when escalation is unavailable.
                 item["escalation_error"] = type(exc).__name__
         handle.seek(0)
@@ -388,11 +504,12 @@ def stop_check(payload: dict[str, Any]) -> int:
         return 0
 
     claims, parse_errors = parse_claims(assistant_text)
-    store_path = Path(os.environ.get("OVERSEER_STORE", OVERSEER_STORE))
+    api_url = os.environ.get("OVERSEER_API_URL") or DEFAULT_OVERSEER_API
+    token_file = str(overseer_token_file())
     findings_path = Path(os.environ.get("OVERSEER_EVIDENCE_FINDINGS", str(DEFAULT_FINDINGS)))
     failures: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for claim in claims:
-        result = verify_claim(claim, store_path)
+        result = verify_claim(claim, api_url=api_url, token_file=token_file)
         if not result["accepted"]:
             failures.append((result, claim))
     if parse_errors:
@@ -400,7 +517,15 @@ def stop_check(payload: dict[str, Any]) -> int:
 
     if failures:
         result, claim = failures[0]
-        finding = record_failure(result, claim, transcript, assistant_text, store_path, findings_path)
+        finding = record_failure(
+            result,
+            claim,
+            transcript,
+            assistant_text,
+            findings_path,
+            api_url=api_url,
+            token_file=token_file,
+        )
         escalation = f" Odo risk record: {finding['odo_message_id']}." if finding.get("odo_message_id") else ""
         print(
             "overseer_project_guard: blocked final response; claimed Overseer evidence was denied: "
@@ -418,7 +543,15 @@ def stop_check(payload: dict[str, Any]) -> int:
         record_id = references[0] if references else None
         result = {"accepted": False, "failure_class": "malformed", "record_id": record_id, "reason": "record evidence was not supplied as a typed JSON claim"}
         claim = {"record_id": record_id}
-        finding = record_failure(result, claim, transcript, assistant_text, store_path, findings_path)
+        finding = record_failure(
+            result,
+            claim,
+            transcript,
+            assistant_text,
+            findings_path,
+            api_url=api_url,
+            token_file=token_file,
+        )
         escalation = f" Odo risk record: {finding['odo_message_id']}." if finding.get("odo_message_id") else ""
         print(
             "overseer_project_guard: blocked final response; record-like evidence cannot be accepted from prose or tool output. "

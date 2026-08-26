@@ -960,7 +960,9 @@ def rehearse_store_migration(
 ) -> dict[str, object]:
     """Create an online backup and migrate only a second copied canary."""
 
-    if type(pages_per_step) is not int or not 1 <= pages_per_step <= 4096:
+    if type(pages_per_step) is not int or not (
+        pages_per_step == -1 or 1 <= pages_per_step <= 4096
+    ):
         raise ActivationPackageError("backup pages_per_step is outside the bounded range")
     if (
         type(sleep_seconds) not in (int, float)
@@ -1066,6 +1068,7 @@ def rehearse_store_migration(
         "backupBounds": {
             "pagesPerStep": pages_per_step,
             "sleepSeconds": sleep_seconds,
+            "singleStep": pages_per_step == -1,
         },
         "sourceMutationPerformed": False,
         "finalQuiescedBackupRequired": True,
@@ -4335,7 +4338,7 @@ def _main(argv: list[str] | None = None) -> int:
         rehearse_store_migration(
             package_root,
             source_store=args.source_store,
-            pages_per_step=4096,
+            pages_per_step=-1,
             sleep_seconds=0,
         )
         render_activation_contract(

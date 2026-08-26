@@ -563,6 +563,23 @@ def test_rehearsal_backup_rejects_insecure_or_linked_store(tmp_path: Path) -> No
         rehearse_store_migration(tmp_path / "package-linked", source_store=linked)
 
 
+@pytest.mark.parametrize("pages_per_step", [-2, 0, 4097])
+def test_rehearsal_backup_rejects_unapproved_page_step_values(
+    tmp_path: Path,
+    pages_per_step: int,
+) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    _wal_store(source)
+
+    with pytest.raises(ActivationPackageError, match="pages_per_step"):
+        rehearse_store_migration(
+            tmp_path / f"package-{pages_per_step}",
+            source_store=source,
+            pages_per_step=pages_per_step,
+            sleep_seconds=0,
+        )
+
+
 def test_rehearsal_backup_fails_closed_on_integrity_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -820,8 +837,9 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
         (package / "private" / "migration" / "migration-report.json").read_text(encoding="utf-8")
     )
     assert migration_report["backupBounds"] == {
-        "pagesPerStep": 4096,
+        "pagesPerStep": -1,
         "sleepSeconds": 0,
+        "singleStep": True,
     }
 
 

@@ -126,6 +126,41 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
     assert first["rootPython"]["releasePath"] == "runtime/bin/python3.13"
 
 
+@pytest.mark.skipif(
+    not Path("/usr/bin/python3.13").is_file() or not Path("/usr/lib/python3.13").is_dir(),
+    reason="host Python 3.13 runtime is unavailable",
+)
+def test_copied_release_runtime_executes_with_release_local_pythonhome(tmp_path: Path) -> None:
+    checkout = _reviewed_checkout(tmp_path)
+    dependencies = _dependencies(tmp_path)
+    python = Path("/usr/bin/python3.13")
+    stdlib = Path("/usr/lib/python3.13")
+    manifest = build_release_manifest(checkout, dependencies, python, stdlib)
+    package = tmp_path / "activation-package"
+    release = stage_release_payload(
+        manifest,
+        checkout=checkout,
+        dependency_root=dependencies,
+        stdlib_root=stdlib,
+        package_root=package,
+    )
+    staged_python = release / "runtime" / "bin" / "python3.13"
+    result = subprocess.run(
+        [str(staged_python), "-c", "import json, sqlite3, ssl; print('runtime-ok')"],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONHOME": str(release / "runtime"),
+            "PYTHONPATH": f"{release / 'app' / 'src'}:{release / 'site-packages'}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "runtime-ok"
+
+
 def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Path) -> None:
     checkout = _reviewed_checkout(tmp_path)
     dependencies = _dependencies(tmp_path)
@@ -631,6 +666,7 @@ def test_final_migration_requires_quiescence_and_preserves_source(
     assert stat_mode(backup) == 0o600
     assert stat_mode(destination) == 0o600
     assert stat_mode(source) == 0o400
+    assert stat_mode(source.parent) == 0o555
     restored = restore_legacy_store_access(
         source_store=source,
         expected_source_uid=os.geteuid(),
@@ -685,15 +721,15 @@ def _prepared_package(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
 def _finalized_package(tmp_path: Path) -> tuple[Path, str]:
     package, manifest, source = _prepared_package(tmp_path)
     rollback = tmp_path / "rollback"
-    rollback.write_text("rollback input\n", encoding="utf-8")
-    rollback.chmod(0o600)
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
     render_activation_contract(
         package,
         manifest,
         source_store=source,
         overseer_uid=984,
         overseer_gid=984,
-        rollback_inputs={"rollback": rollback},
+        rollback_inputs={"v1.1.5-release": rollback},
     )
     create_human_verifiers(
         package,
@@ -718,6 +754,9 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     _wal_store(source)
     rollback = tmp_path / "rollback-unit"
     rollback.write_text("[Service]\nExecStart=/old/python\n", encoding="utf-8")
+    rollback_release = tmp_path / "rollback-release"
+    rollback_release.mkdir()
+    (rollback_release / "src.py").write_text("old release\n", encoding="utf-8")
     package_parent = tmp_path / "activation-packages"
     package_parent.mkdir(mode=0o700)
     monkeypatch.setattr(activation_package_module, "APPROVED_PACKAGE_PARENT", package_parent)
@@ -754,6 +793,8 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
             "984",
             "--rollback-input",
             f"v1.1.5-api-unit={rollback}",
+            "--rollback-input",
+            f"v1.1.5-release={rollback_release}",
         ]
     ) == 0
 
@@ -829,6 +870,12 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         for index, command in enumerate(commands)
         if command[-1] == "/home/god/.local/share/overseer/project/state/api-token"
     )
+    token_copy = commands[token_copy_index]
+    assert token_copy[token_copy.index("-o") + 1] == "root"
+    assert token_copy[token_copy.index("-g") + 1] == "god"
+    assert token_copy[token_copy.index("-m") + 1] == "0640"
+    assert token_copy[-2] == "/etc/overseer/api-token"
+    assert "verify-compatibility-token" in commands[token_copy_index + 1]
     canary_health_index = next(
         index for index, command in enumerate(commands) if command[-1] == "http://127.0.0.1:18766/health"
     )
@@ -864,21 +911,18 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         "crash-after-claim retry does not issue a second command",
     ]
     assert all("-r" not in command and "-R" not in command for command in commands)
-    assert contract["rollbackCommands"][-2:] == [
-        [
-            "/usr/sbin/runuser",
-            "--user",
-            "god",
-            "--",
-            "/usr/bin/env",
-            f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}",
-            "/usr/bin/systemctl",
-            "--user",
-            "start",
-            "overseer.service",
-            "overseer-api.service",
-        ],
-        ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8766/health"],
+    assert "verify-rollback-bundle" in contract["rollbackCommands"][0]
+    assert "v1.1.5-release" in contract["rollbackBundle"]["executionSourceLabel"]
+    assert any(
+        any("overseer-v1-1-5-rollback-runtime.service" in value for value in command)
+        for command in contract["rollbackCommands"]
+    )
+    assert contract["rollbackCommands"][-1] == [
+        "/usr/bin/curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "http://127.0.0.1:8766/health",
     ]
     rollback = json.loads((package / "public" / "rollback-manifest.json").read_text())
     assert {item["label"] for item in rollback["inputs"]} == {
@@ -897,15 +941,15 @@ def test_package_finalization_requires_human_gate_and_detects_drift(
 ) -> None:
     package, manifest, source = _prepared_package(tmp_path)
     rollback = tmp_path / "rollback"
-    rollback.write_text("rollback input\n", encoding="utf-8")
-    rollback.chmod(0o600)
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
     render_activation_contract(
         package,
         manifest,
         source_store=source,
         overseer_uid=984,
         overseer_gid=984,
-        rollback_inputs={"rollback": rollback},
+        rollback_inputs={"v1.1.5-release": rollback},
     )
 
     with pytest.raises(ActivationPackageError, match="human verifier"):
@@ -991,6 +1035,12 @@ def test_root_approval_record_binds_one_exact_sealed_package(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
     package, digest = _finalized_package(tmp_path)
     approval_path = tmp_path / "executor-state" / "approved-package.json"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
@@ -1011,9 +1061,14 @@ def test_root_approval_record_binds_one_exact_sealed_package(
     )
 
     assert recorded["packageDigest"] == digest
-    assert recorded["packageRoot"] == str(package.resolve())
+    assert recorded["packageRoot"] == str(execution_package.resolve())
+    assert recorded["sourcePackageRoot"] == str(package.resolve())
     assert stat_mode(approval_path) == 0o600
-    assert activation_package_module._load_activation_approval(package) == recorded
+    assert verify_activation_package(execution_package, digest)["verified"] is True
+    assert (
+        execution_package / "public" / "activation-contract.json"
+    ).stat().st_ino != (package / "public" / "activation-contract.json").stat().st_ino
+    assert activation_package_module._load_activation_approval(execution_package) == recorded
     with pytest.raises(ActivationPackageError, match="already exists"):
         record_activation_approval(package, expected_package_digest=digest)
 
@@ -1173,3 +1228,225 @@ def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls
         expected_package_digest=digest,
         attestation_path=attestation,
     )["verified"] is True
+
+
+def test_root_rollback_bundle_is_exact_and_drift_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, _digest = _finalized_package(tmp_path)
+    package_manifest = package / "public" / "rollback-manifest.json"
+    document = json.loads(package_manifest.read_text(encoding="utf-8"))
+    bundle_root = tmp_path / "root-bundle"
+    bundle_root.mkdir(mode=0o755)
+    for item in document["inputs"]:
+        bundle = item["bundle"]
+        for entry in bundle["files"]:
+            relative = Path(bundle["relativeRoot"]) / entry["relativePath"]
+            source = package / "private" / "rollback-inputs" / relative
+            target = bundle_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            target.chmod(int(entry["mode"], 8))
+    for directory in sorted(
+        (path for path in bundle_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        directory.chmod(0o555)
+    bundle_root.chmod(0o555)
+    root_manifest = tmp_path / "root-rollback-manifest.json"
+    root_manifest.write_bytes(package_manifest.read_bytes())
+    root_manifest.chmod(0o644)
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    verified = activation_package_module.verify_rollback_bundle(
+        bundle_root=bundle_root,
+        rollback_manifest=root_manifest,
+    )
+
+    assert verified["verified"] is True
+    first_file = next(path for path in bundle_root.rglob("*") if path.is_file())
+    first_file.chmod(0o600)
+    first_file.write_text("drift\n", encoding="utf-8")
+    first_file.chmod(0o400)
+    with pytest.raises(ActivationPackageError, match="bundle artifact drift"):
+        activation_package_module.verify_rollback_bundle(
+            bundle_root=bundle_root,
+            rollback_manifest=root_manifest,
+        )
+
+
+def test_compatibility_token_comes_from_installed_root_state_and_stays_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "installed-api-token"
+    source.write_bytes(b"approved-token")
+    source.chmod(0o600)
+    parent = tmp_path / "legacy-state"
+    parent.mkdir(mode=0o700)
+    target = parent / "api-token"
+    target.write_bytes(source.read_bytes())
+    target.chmod(0o640)
+    parent.chmod(0o555)
+    parent_metadata = parent.stat()
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    verified = activation_package_module.verify_compatibility_token(
+        source_token=source,
+        target_token=target,
+        expected_target_uid=os.geteuid(),
+        expected_target_gid=os.getegid(),
+        expected_parent_device=parent_metadata.st_dev,
+        expected_parent_inode=parent_metadata.st_ino,
+    )
+
+    assert verified["verified"] is True
+    target.chmod(0o600)
+    with pytest.raises(ActivationPackageError, match="compatibility API token"):
+        activation_package_module.verify_compatibility_token(
+            source_token=source,
+            target_token=target,
+            expected_target_uid=os.geteuid(),
+            expected_target_gid=os.getegid(),
+            expected_parent_device=parent_metadata.st_dev,
+            expected_parent_inode=parent_metadata.st_ino,
+        )
+
+
+def test_activation_runner_enforces_order_state_and_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "a" * 64
+    package = tmp_path / "package"
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_approved_cutover",
+        lambda _package: {"verified": True},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+
+    first = activation_package_module.execute_approved_activation(package)
+    second = activation_package_module.execute_approved_activation(package)
+
+    assert first == {"status": "complete", "packageDigest": digest, "replayed": False}
+    assert second == {"status": "complete", "packageDigest": digest, "replayed": True}
+    assert calls == [("/bin/true", "staging"), ("/bin/true", "cutover")]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "complete"
+    assert state["phase"] == "complete"
+    assert state["secretValuesRecorded"] is False
+
+
+def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "b" * 64
+    package = tmp_path / "package"
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/false", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_approved_cutover",
+        lambda _package: {"verified": True},
+    )
+
+    def execute(command: list[str]) -> int:
+        calls.append(tuple(command))
+        return 1 if command[1] == "cutover" else 0
+
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+
+    with pytest.raises(ActivationPackageError, match="sealed rollback completed"):
+        activation_package_module.execute_approved_activation(package)
+    assert calls == [
+        ("/bin/true", "staging"),
+        ("/bin/false", "cutover"),
+        ("/bin/true", "rollback"),
+    ]
+    assert activation_package_module.execute_approved_rollback(package) == {
+        "status": "rolled_back",
+        "packageDigest": digest,
+        "replayed": True,
+    }
+    with pytest.raises(ActivationPackageError, match="not safely resumable"):
+        activation_package_module.execute_approved_activation(package)

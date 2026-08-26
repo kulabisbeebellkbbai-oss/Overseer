@@ -46,6 +46,7 @@ MAX_STAGED_SECRET_BYTES = 512
 APPROVED_OVERSEER_UID = 984
 APPROVED_OVERSEER_GID = 984
 APPROVED_PACKAGE_PARENT = Path("/home/god/.local/share/overseer/activation-packages")
+APPROVED_EXECUTION_PACKAGE = Path("/var/lib/overseer-executor/approved-package")
 CANARY_REQUIRED_CONTROLS = (
     "apiHealth",
     "usageBridgeBounded",
@@ -133,6 +134,26 @@ def _validate_new_package_destination(package_root: str | os.PathLike[str]) -> P
 
 def _validate_existing_package_destination(package_root: str | os.PathLike[str]) -> Path:
     package = Path(package_root).absolute()
+    if package == APPROVED_EXECUTION_PACKAGE.absolute():
+        parent = package.parent
+        try:
+            parent_metadata = parent.lstat()
+            package_metadata = package.lstat()
+        except OSError as error:
+            raise ActivationPackageError("approved execution package is unavailable") from error
+        root_uid, root_gid = _activation_root_identity()
+        if (
+            parent.is_symlink()
+            or package.is_symlink()
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or not stat.S_ISDIR(package_metadata.st_mode)
+            or (parent_metadata.st_uid, parent_metadata.st_gid) != (root_uid, root_gid)
+            or (package_metadata.st_uid, package_metadata.st_gid) != (root_uid, root_gid)
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+            or stat.S_IMODE(package_metadata.st_mode) != 0o700
+        ):
+            raise ActivationPackageError("approved execution package ownership or mode is invalid")
+        return package
     parent = APPROVED_PACKAGE_PARENT.absolute()
     if package.parent != parent or re.fullmatch(r"v1\.1\.6-[0-9a-f]{7,40}", package.name) is None:
         raise ActivationPackageError("activation package is outside the approved Overseer package root")
@@ -1336,8 +1357,6 @@ def prepare_final_store_migration(
         if _processes_with_open_inode(source_metadata.st_dev, source_metadata.st_ino):
             raise ActivationPackageError("final migration source acquired another open process")
         sidecar_after = {str(path): _artifact_identity(path) for path in sidecars}
-        os.chown(parent, expected_source_uid, expected_source_gid)
-        os.chmod(parent, expected_parent_mode)
 
         backup_integrity = _integrity_check(backup)
         before_counts, schema_before = _migration_evidence(backup)
@@ -1401,12 +1420,20 @@ def prepare_final_store_migration(
             "schemaBefore": schema_before,
             "schemaAfter": schema_after,
             "quiescenceLock": "parent-and-store-write-access-revoked",
+            "retainedParentLock": {
+                "uid": root_uid,
+                "gid": expected_source_gid,
+                "mode": "0555",
+                "restoredOnlyByRollbackOrFailure": True,
+            },
             "openProcessPreflight": "clear",
             "sidecarsAtStart": sidecar_before,
             "sidecarsAfterBackup": sidecar_after,
         }
         report_path = backup.with_suffix(f"{backup.suffix}.report.json")
         _write_new(report_path, _canonical(report) + b"\n", 0o600)
+        os.chown(parent, root_uid, expected_source_gid)
+        os.chmod(parent, 0o555)
         return report
     except BaseException:
         if lock_acquired:
@@ -1678,6 +1705,205 @@ def _rollback_input(label: str, path: Path) -> dict[str, object]:
     raise ActivationPackageError(f"rollback input has an unsupported type: {label}")
 
 
+def _stage_rollback_inputs(
+    package: Path,
+    items: list[dict[str, object]],
+) -> None:
+    staging_root = package / "private" / "rollback-inputs"
+    _ensure_directory(staging_root)
+    for item in items:
+        label = str(item["label"])
+        source = Path(str(item["path"]))
+        relative_root = _safe_relative(label)
+        kind = item.get("kind")
+        if kind == "file":
+            raw, metadata = _stable_read(source)
+            if len(raw) != item.get("size") or _sha256(raw) != item.get("sha256"):
+                raise ActivationPackageError(f"rollback input drifted while staging: {label}")
+            mode = 0o500 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o400
+            staged_relative = f"{relative_root}/artifact"
+            _write_new(staging_root / staged_relative, raw, mode)
+            item["bundle"] = {
+                "relativeRoot": relative_root,
+                "files": [{"relativePath": "artifact", "mode": f"{mode:04o}"}],
+            }
+            continue
+        if kind != "directory" or not isinstance(item.get("entries"), list):
+            raise ActivationPackageError("rollback bundle input is invalid")
+        bundled_files: list[dict[str, object]] = []
+        for entry in item["entries"]:
+            if not isinstance(entry, dict) or not isinstance(entry.get("relativePath"), str):
+                raise ActivationPackageError("rollback bundle directory entry is invalid")
+            relative = _safe_relative(str(entry["relativePath"]))
+            raw, metadata = _stable_read(source / relative)
+            if len(raw) != entry.get("size") or _sha256(raw) != entry.get("sha256"):
+                raise ActivationPackageError(f"rollback input drifted while staging: {label}/{relative}")
+            mode = 0o500 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o400
+            _write_new(staging_root / relative_root / relative, raw, mode)
+            bundled_files.append({"relativePath": relative, "mode": f"{mode:04o}"})
+        item["bundle"] = {
+            "relativeRoot": relative_root,
+            "files": bundled_files,
+        }
+
+
+def _rollback_bundle_install_commands(
+    package: Path,
+    rollback_items: list[dict[str, object]],
+    bundle_root: Path,
+) -> list[list[str]]:
+    staging_root = package / "private" / "rollback-inputs"
+    directories = {bundle_root}
+    file_commands: list[list[str]] = []
+    for item in rollback_items:
+        bundle = item.get("bundle")
+        if not isinstance(bundle, Mapping) or not isinstance(bundle.get("relativeRoot"), str):
+            raise ActivationPackageError("rollback bundle manifest is invalid")
+        relative_root = Path(_safe_relative(str(bundle["relativeRoot"])))
+        files = bundle.get("files")
+        if not isinstance(files, list):
+            raise ActivationPackageError("rollback bundle file manifest is invalid")
+        for entry in files:
+            if not isinstance(entry, Mapping):
+                raise ActivationPackageError("rollback bundle file entry is invalid")
+            relative = Path(_safe_relative(str(entry.get("relativePath", ""))))
+            mode = str(entry.get("mode", ""))
+            if mode not in {"0400", "0500"}:
+                raise ActivationPackageError("rollback bundle file mode is invalid")
+            target = bundle_root / relative_root / relative
+            directories.update(target.parents)
+            file_commands.append(
+                [
+                    "/usr/bin/install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    mode,
+                    str(staging_root / relative_root / relative),
+                    str(target),
+                ]
+            )
+    selected = sorted(
+        (path for path in directories if str(path).startswith(str(bundle_root))),
+        key=lambda path: (len(path.parts), str(path)),
+    )
+    directory_commands = [
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", str(path)]
+        for path in selected
+    ]
+    freeze_commands = [["/usr/bin/chmod", "0555", str(path)] for path in reversed(selected)]
+    return [*directory_commands, *file_commands, *freeze_commands]
+
+
+def verify_rollback_bundle(
+    *,
+    bundle_root: str | os.PathLike[str],
+    rollback_manifest: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Verify the immutable root-owned rollback bundle used for execution."""
+
+    _require_root_activation()
+    root = Path(bundle_root)
+    manifest_path = Path(rollback_manifest)
+    root_uid, root_gid = _activation_root_identity()
+    root_metadata = root.lstat()
+    if (
+        root.is_symlink()
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != root_uid
+        or root_metadata.st_gid != root_gid
+        or stat.S_IMODE(root_metadata.st_mode) != 0o555
+    ):
+        raise ActivationPackageError("root rollback bundle directory is invalid")
+    manifest_raw, manifest_metadata = _stable_read(manifest_path)
+    if (
+        manifest_metadata.st_uid != root_uid
+        or manifest_metadata.st_gid != root_gid
+        or stat.S_IMODE(manifest_metadata.st_mode) != 0o644
+    ):
+        raise ActivationPackageError("root rollback manifest metadata is invalid")
+    try:
+        document = json.loads(manifest_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("root rollback manifest is invalid") from error
+    if not isinstance(document, dict):
+        raise ActivationPackageError("root rollback manifest schema is invalid")
+    items = document.get("inputs")
+    if (
+        document.get("schemaVersion") != ROLLBACK_MANIFEST_SCHEMA
+        or document.get("preserveInputs") is not True
+        or document.get("restoreMigratedDatabaseToLegacyAuthority") is not False
+        or not isinstance(items, list)
+    ):
+        raise ActivationPackageError("root rollback manifest schema is invalid")
+    expected_paths: set[str] = set()
+    verified_files = 0
+    for item in items:
+        bundle = item.get("bundle") if isinstance(item, dict) else None
+        if not isinstance(bundle, dict) or not isinstance(bundle.get("relativeRoot"), str):
+            raise ActivationPackageError("root rollback bundle binding is invalid")
+        relative_root = _safe_relative(bundle["relativeRoot"])
+        expected_by_relative: dict[str, Mapping[str, object]] = {}
+        if item.get("kind") == "file":
+            expected_by_relative["artifact"] = item
+        elif item.get("kind") == "directory" and isinstance(item.get("entries"), list):
+            expected_by_relative = {
+                str(entry["relativePath"]): entry
+                for entry in item["entries"]
+                if isinstance(entry, Mapping) and isinstance(entry.get("relativePath"), str)
+            }
+        else:
+            raise ActivationPackageError("root rollback bundle input kind is invalid")
+        files = bundle.get("files")
+        if not isinstance(files, list) or len(files) != len(expected_by_relative):
+            raise ActivationPackageError("root rollback bundle file count is invalid")
+        for bundled in files:
+            if not isinstance(bundled, Mapping) or not isinstance(bundled.get("relativePath"), str):
+                raise ActivationPackageError("root rollback bundle file binding is invalid")
+            relative = _safe_relative(str(bundled["relativePath"]))
+            expected = expected_by_relative.get(relative)
+            if expected is None:
+                raise ActivationPackageError("root rollback bundle has an unexpected file")
+            path = root / relative_root / relative
+            observed = _stream_hash_regular(path, label="root rollback bundle artifact")
+            if (
+                observed["sha256"] != expected.get("sha256")
+                or observed["size"] != expected.get("size")
+                or observed["uid"] != root_uid
+                or observed["gid"] != root_gid
+                or observed["mode"] != bundled.get("mode")
+                or observed["links"] != 1
+            ):
+                raise ActivationPackageError("root rollback bundle artifact drift detected")
+            expected_paths.add((Path(relative_root) / relative).as_posix())
+            verified_files += 1
+    observed_paths: set[str] = set()
+    for path in root.rglob("*"):
+        metadata = path.lstat()
+        if path.is_symlink():
+            raise ActivationPackageError("root rollback bundle contains a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            if (
+                metadata.st_uid != root_uid
+                or metadata.st_gid != root_gid
+                or stat.S_IMODE(metadata.st_mode) != 0o555
+            ):
+                raise ActivationPackageError("root rollback bundle directory metadata drifted")
+        elif stat.S_ISREG(metadata.st_mode):
+            observed_paths.add(path.relative_to(root).as_posix())
+        else:
+            raise ActivationPackageError("root rollback bundle contains an unsupported artifact")
+    if observed_paths != expected_paths:
+        raise ActivationPackageError("root rollback bundle contains unexpected or missing artifacts")
+    return {
+        "verified": True,
+        "fileCount": verified_files,
+        "rollbackManifestSha256": _sha256(manifest_raw),
+    }
+
+
 def verify_rollback_inputs(package_root: str | os.PathLike[str]) -> dict[str, object]:
     """Re-hash every captured rollback input and fail closed on any drift."""
 
@@ -1703,11 +1929,13 @@ def verify_rollback_inputs(package_root: str | os.PathLike[str]) -> dict[str, ob
     ):
         raise ActivationPackageError("rollback manifest schema is invalid")
     observed: list[dict[str, object]] = []
+    expected_inputs: list[dict[str, object]] = []
     for item in document["inputs"]:
         if not isinstance(item, dict) or not isinstance(item.get("label"), str) or not isinstance(item.get("path"), str):
             raise ActivationPackageError("rollback manifest input is invalid")
         observed.append(_rollback_input(item["label"], Path(item["path"])))
-    if observed != document["inputs"]:
+        expected_inputs.append({key: value for key, value in item.items() if key != "bundle"})
+    if observed != expected_inputs:
         raise ActivationPackageError("rollback input drift detected")
     return {
         "verified": True,
@@ -1738,7 +1966,16 @@ def _package_file_inventory(package: Path) -> list[dict[str, object]]:
                 raise ActivationPackageError("activation package artifact has an unexpected owner")
             if details["links"] != 1:
                 raise ActivationPackageError("activation package artifact must be single-link")
-            result.append({"path": relative, **details})
+            result.append(
+                {
+                    "path": relative,
+                    "sha256": details["sha256"],
+                    "size": details["size"],
+                    "mode": details["mode"],
+                    "links": details["links"],
+                    "ownerBinding": "package-root-owner",
+                }
+            )
     result.sort(key=lambda item: str(item["path"]))
     if not result:
         raise ActivationPackageError("activation package is empty")
@@ -1766,8 +2003,7 @@ def _package_directory_inventory(package: Path) -> list[dict[str, object]]:
             {
                 "path": relative,
                 "mode": "0700",
-                "uid": metadata.st_uid,
-                "gid": metadata.st_gid,
+                "ownerBinding": "package-root-owner",
             }
         )
     result.sort(key=lambda item: str(item["path"]))
@@ -1895,6 +2131,13 @@ def render_activation_contract(
     rollback_items = [
         _rollback_input(label, Path(path)) for label, path in sorted(rollback_inputs.items())
     ]
+    rollback_release = next(
+        (item for item in rollback_items if item.get("label") == "v1.1.5-release"),
+        None,
+    )
+    if rollback_release is None or rollback_release.get("kind") != "directory":
+        raise ActivationPackageError("root rollback execution requires the v1.1.5-release directory input")
+    _stage_rollback_inputs(package, rollback_items)
     rollback_manifest = {
         "schemaVersion": ROLLBACK_MANIFEST_SCHEMA,
         "preserveInputs": True,
@@ -1904,9 +2147,14 @@ def render_activation_contract(
     rollback_path = package / "public" / "rollback-manifest.json"
     _write_new(rollback_path, _canonical(rollback_manifest) + b"\n", 0o644)
 
-    public = package / "public"
-    private = package / "private"
+    execution_package = APPROVED_EXECUTION_PACKAGE.absolute()
+    public = execution_package / "public"
+    private = execution_package / "private"
     release_root = str(release_manifest["releaseRoot"])
+    manifest_digest = release_manifest.get("manifestDigest")
+    if not isinstance(manifest_digest, str) or len(manifest_digest) != 64 or set(manifest_digest) - _HEX:
+        raise ActivationPackageError("release manifest digest is invalid")
+    rollback_bundle_root = Path(f"/opt/overseer/rollback/{manifest_digest}")
     install_commands: list[list[str]] = [
         ["/usr/sbin/groupadd", "--system", "--gid", str(overseer_gid), "overseer"],
         [
@@ -1924,12 +2172,14 @@ def render_activation_contract(
         ],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer/releases"],
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer/rollback"],
         ["/usr/bin/install", "-d", "-o", "overseer", "-g", "overseer", "-m", "0700", "/var/lib/overseer"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor/activation-package"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor/activation-package/public"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "overseer", "-m", "0750", "/etc/overseer"],
-        *_release_install_commands(package, release_manifest),
+        *_release_install_commands(execution_package, release_manifest),
+        *_rollback_bundle_install_commands(execution_package, rollback_items, rollback_bundle_root),
         [
             "/usr/bin/install",
             "-o",
@@ -1938,7 +2188,7 @@ def render_activation_contract(
             "root",
             "-m",
             "0644",
-            str(package / "public" / "rollback-manifest.json"),
+            str(public / "rollback-manifest.json"),
             "/var/lib/overseer-executor/activation-package/public/rollback-manifest.json",
         ],
     ]
@@ -1989,9 +2239,6 @@ def render_activation_contract(
         or not isinstance(release_python.get("releasePath"), str)
     ):
         raise ActivationPackageError("release Python manifest is invalid")
-    manifest_digest = release_manifest.get("manifestDigest")
-    if not isinstance(manifest_digest, str) or len(manifest_digest) != 64 or set(manifest_digest) - _HEX:
-        raise ActivationPackageError("release manifest digest is invalid")
     final_backup = Path(
         f"/var/lib/overseer-executor/v1.1.6-source-{manifest_digest}.sqlite3"
     )
@@ -2043,6 +2290,16 @@ def render_activation_contract(
         "/usr/bin/systemctl",
         "--user",
     ]
+    user_systemd_run = [
+        "/usr/sbin/runuser",
+        "--user",
+        "god",
+        "--",
+        "/usr/bin/env",
+        f"XDG_RUNTIME_DIR=/run/user/{source_metadata.st_uid}",
+        "/usr/bin/systemd-run",
+        "--user",
+    ]
     activation_python = [
         "/usr/bin/env",
         f"PYTHONHOME={release_root}/runtime",
@@ -2063,7 +2320,7 @@ def render_activation_contract(
             str(private / "migration" / "rehearsal-migrated.sqlite3"),
             "/var/lib/overseer/overseer-canary.sqlite3",
         ],
-        [*activation_python, "verify-approved-staging", "--package-root", str(package)],
+        [*activation_python, "verify-approved-staging", "--package-root", str(execution_package)],
         ["/usr/bin/systemctl", "daemon-reload"],
         ["/usr/bin/systemd-tmpfiles", "--create", "/etc/tmpfiles.d/overseer.conf"],
         [
@@ -2074,11 +2331,11 @@ def render_activation_contract(
         ],
         ["/usr/bin/systemctl", "start", "overseer-api-canary.service"],
         ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18766/health"],
-        [*activation_python, "run-approved-canary", "--package-root", str(package)],
+        [*activation_python, "run-approved-canary", "--package-root", str(execution_package)],
         ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"],
     ]
     cutover_commands = [
-        [*activation_python, "verify-approved-cutover", "--package-root", str(package)],
+        [*activation_python, "verify-approved-cutover", "--package-root", str(execution_package)],
         [*user_systemctl, "stop", "overseer.service", "overseer-api.service"],
         migration_command,
         ["/usr/bin/systemctl", "daemon-reload"],
@@ -2088,27 +2345,40 @@ def render_activation_contract(
         [
             "/usr/bin/install",
             "-o",
-            "god",
+            "root",
             "-g",
             "god",
             "-m",
-            "0600",
-            str(private / "credentials" / "api-token"),
+            "0640",
+            "/etc/overseer/api-token",
             "/home/god/.local/share/overseer/project/state/api-token",
+        ],
+        [
+            *activation_python,
+            "verify-compatibility-token",
+            "--source-token",
+            "/etc/overseer/api-token",
+            "--target-token",
+            "/home/god/.local/share/overseer/project/state/api-token",
+            "--expected-target-uid",
+            str(god.pw_uid),
+            "--expected-target-gid",
+            str(god.pw_gid),
+            "--expected-parent-device",
+            str(parent_metadata.st_dev),
+            "--expected-parent-inode",
+            str(parent_metadata.st_ino),
         ],
         ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8766/health"],
     ]
     rollback_commands = [
         [
-            "/usr/bin/env",
-            f"PYTHONHOME={release_root}/runtime",
-            f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
-            str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
-            "-m",
-            "overseer.activation_package",
-            "verify-rollback",
-            "--package-root",
-            "/var/lib/overseer-executor/activation-package",
+            *activation_python,
+            "verify-rollback-bundle",
+            "--bundle-root",
+            str(rollback_bundle_root),
+            "--rollback-manifest",
+            "/var/lib/overseer-executor/activation-package/public/rollback-manifest.json",
         ],
         ["/usr/bin/systemctl", "stop", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
         ["/usr/bin/systemctl", "disable", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
@@ -2138,7 +2408,58 @@ def render_activation_contract(
             "--expected-parent-mode",
             str(parent_mode),
         ],
-        [*user_systemctl, "start", "overseer.service", "overseer-api.service"],
+        [
+            *user_systemd_run,
+            "--unit=overseer-v1-1-5-rollback-runtime.service",
+            "--service-type=simple",
+            "--property=Restart=on-failure",
+            "--property=RestartSec=5s",
+            f"--working-directory={rollback_bundle_root / 'v1.1.5-release'}",
+            f"--setenv=PYTHONHOME={release_root}/runtime",
+            f"--setenv=PYTHONPATH={rollback_bundle_root / 'v1.1.5-release' / 'src'}:{release_root}/site-packages",
+            "--",
+            str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+            "-m",
+            "overseer.cli",
+            "run",
+            "--store",
+            str(source.resolve()),
+        ],
+        [
+            *user_systemd_run,
+            "--unit=overseer-v1-1-5-rollback-api.service",
+            "--service-type=simple",
+            "--property=Restart=on-failure",
+            "--property=RestartSec=5s",
+            "--property=After=overseer-v1-1-5-rollback-runtime.service",
+            "--property=LoadCredential=psychlo-overseer-peer-secret:/home/god/.config/psychlo/overseer-peer-secret",
+            "--property=LoadCredential=roadex-project-human-thread-secret:/home/god/.config/overseer/project-human-thread-relay.secret",
+            f"--working-directory={rollback_bundle_root / 'v1.1.5-release'}",
+            f"--setenv=PYTHONHOME={release_root}/runtime",
+            f"--setenv=PYTHONPATH={rollback_bundle_root / 'v1.1.5-release' / 'src'}:{release_root}/site-packages",
+            "--setenv=PYTHONDONTWRITEBYTECODE=1",
+            "--setenv=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798",
+            "--setenv=OVERSEER_PSYCHLO_BRIDGE_DATABASE=/home/god/.local/share/overseer/psychlo/bridge.sqlite3",
+            "--setenv=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=/home/god/.config/overseer/psychlo-project-bindings.json",
+            "--setenv=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-overseer-peer-secret",
+            "--setenv=OVERSEER_PSYCHLO_POLICY_VERSION=2026-08-08",
+            "--setenv=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_SECRET_FILE=%d/roadex-project-human-thread-secret",
+            "--setenv=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/home/god/.local/share/overseer/project-human-thread/relay.sqlite3",
+            "--setenv=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780/api/internal/overseer/project-human-thread/questions",
+            "--",
+            str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+            "-m",
+            "overseer.cli",
+            "serve-api",
+            "--store",
+            str(source.resolve()),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8766",
+            "--auth-token-file",
+            "/home/god/.local/share/overseer/project/state/api-token",
+        ],
         ["/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8766/health"],
     ]
     contract: dict[str, object] = {
@@ -2146,7 +2467,7 @@ def render_activation_contract(
         "liveExecutionApproved": False,
         "requiresSeparateDigestBoundApproval": True,
         "requiresEuid": 0,
-        "packageRoot": str(package),
+        "packageRoot": str(execution_package),
         "releaseRoot": release_root,
         "releaseManifestDigest": release_manifest.get("manifestDigest"),
         "approvalRecord": {
@@ -2226,7 +2547,13 @@ def render_activation_contract(
             ],
         },
         "rollbackCommands": rollback_commands,
-        "rollbackManifest": str(rollback_path),
+        "rollbackManifest": str(public / "rollback-manifest.json"),
+        "rollbackBundle": {
+            "root": str(rollback_bundle_root),
+            "executionSourceLabel": "v1.1.5-release",
+            "rootOwnedReadOnly": True,
+            "usesTransientUserUnits": True,
+        },
         "stopConditions": [
             "package digest or artifact identity drift",
             "UID or GID 984 is no longer free or resolves to a different account",
@@ -2312,6 +2639,38 @@ def _installed_credential_root() -> Path:
     return Path("/etc/overseer")
 
 
+def _import_approved_execution_package(
+    source_package: Path,
+    *,
+    expected_package_digest: str,
+) -> Path:
+    destination = APPROVED_EXECUTION_PACKAGE.absolute()
+    if destination.exists() or destination.is_symlink():
+        raise ActivationPackageError("approved execution package destination already exists")
+    _ensure_directory(destination.parent)
+    _ensure_directory(destination)
+    for directory, directories, files in os.walk(source_package, followlinks=False):
+        source_directory = Path(directory)
+        relative_directory = source_directory.relative_to(source_package)
+        target_directory = destination / relative_directory
+        _ensure_directory(target_directory)
+        for name in directories:
+            source_child = source_directory / name
+            if source_child.is_symlink():
+                raise ActivationPackageError("source activation package contains a directory symlink")
+            _ensure_directory(target_directory / name)
+        for name in files:
+            source = source_directory / name
+            relative = _safe_relative(source.relative_to(source_package).as_posix())
+            raw, metadata = _stable_read(source)
+            mode = stat.S_IMODE(metadata.st_mode)
+            if mode not in {0o400, 0o444, 0o500, 0o555, 0o600, 0o644}:
+                raise ActivationPackageError("source activation package file mode is invalid")
+            _write_new(destination / relative, raw, mode)
+    verify_activation_package(destination, expected_package_digest)
+    return destination
+
+
 def record_activation_approval(
     package_root: str | os.PathLike[str],
     *,
@@ -2320,13 +2679,25 @@ def record_activation_approval(
     """Record one explicit, root-owned approval for an exact sealed package."""
 
     _require_root_activation()
-    package = Path(package_root).resolve()
-    verified = verify_activation_package(package, expected_package_digest)
+    source_package = Path(package_root).resolve()
+    verified = verify_activation_package(source_package, expected_package_digest)
+    package = _import_approved_execution_package(
+        source_package,
+        expected_package_digest=expected_package_digest,
+    )
+    contract = _sealed_package_json(
+        package,
+        expected_package_digest=expected_package_digest,
+        relative_path="public/activation-contract.json",
+    )
+    if contract.get("packageRoot") != str(package):
+        raise ActivationPackageError("sealed activation contract does not bind the execution package")
     target = _activation_approval_record_path()
     document = {
         "schemaVersion": ACTIVATION_APPROVAL_SCHEMA,
         "approved": True,
         "packageRoot": str(package),
+        "sourcePackageRoot": str(source_package),
         "packageDigest": expected_package_digest,
         "packageFileCount": verified["fileCount"],
         "liveExecutionScope": "staging-canary-and-cutover-for-this-package-only",
@@ -2438,6 +2809,39 @@ def _account_ids(owner: str, group: str) -> tuple[int, int]:
         raise ActivationPackageError("installed activation owner or group is unavailable") from error
 
 
+def _validate_contract_principal_binding(contract: Mapping[str, object]) -> None:
+    if (
+        contract.get("schemaVersion") != ACTIVATION_CONTRACT_SCHEMA
+        or contract.get("liveExecutionApproved") is not False
+        or contract.get("requiresSeparateDigestBoundApproval") is not True
+        or contract.get("requiresEuid") != 0
+    ):
+        raise ActivationPackageError("activation contract authority boundary is invalid")
+    account = contract.get("account")
+    source_store = contract.get("sourceStore")
+    if not isinstance(account, Mapping) or not isinstance(source_store, Mapping):
+        raise ActivationPackageError("activation principal contract is invalid")
+    if account != {
+        "user": "overseer",
+        "uid": APPROVED_OVERSEER_UID,
+        "group": "overseer",
+        "gid": APPROVED_OVERSEER_GID,
+    }:
+        raise ActivationPackageError("activation dedicated-principal binding drifted")
+    god_uid = source_store.get("uid")
+    god_gid = source_store.get("gid")
+    if type(god_uid) is not int or type(god_gid) is not int:
+        raise ActivationPackageError("activation god principal binding is invalid")
+    _validate_principal_binding(
+        god_uid=god_uid,
+        overseer_uid=APPROVED_OVERSEER_UID,
+        overseer_gid=APPROVED_OVERSEER_GID,
+    )
+    god = pwd.getpwnam("god")
+    if god.pw_gid != god_gid:
+        raise ActivationPackageError("god primary group does not match the sealed activation contract")
+
+
 def _verify_install_results(
     package: Path,
     *,
@@ -2540,11 +2944,56 @@ def verify_installed_staging(
     commands = contract.get("stagingAndCanaryCommands")
     if not isinstance(commands, list):
         raise ActivationPackageError("activation staging command contract is invalid")
+    _validate_contract_principal_binding(contract)
     return _verify_install_results(
         package,
         expected_package_digest=expected_package_digest,
         commands=commands,
     )
+
+
+def verify_compatibility_token(
+    *,
+    source_token: str | os.PathLike[str],
+    target_token: str | os.PathLike[str],
+    expected_target_uid: int,
+    expected_target_gid: int,
+    expected_parent_device: int,
+    expected_parent_inode: int,
+) -> dict[str, object]:
+    """Verify the post-start client token copy from protected installed state."""
+
+    _require_root_activation()
+    source = Path(source_token)
+    target = Path(target_token)
+    root_uid, root_gid = _activation_root_identity()
+    source_details = _stream_hash_regular(source, label="installed API token")
+    target_details = _stream_hash_regular(target, label="compatibility API token")
+    parent_metadata = target.parent.lstat()
+    if (
+        source_details["uid"] != root_uid
+        or source_details["gid"] != root_gid
+        or source_details["mode"] != "0600"
+        or target_details["uid"] != expected_target_uid
+        or target_details["gid"] != expected_target_gid
+        or target_details["mode"] != "0640"
+        or source_details["sha256"] != target_details["sha256"]
+        or source_details["size"] != target_details["size"]
+        or target.parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_dev != expected_parent_device
+        or parent_metadata.st_ino != expected_parent_inode
+        or parent_metadata.st_uid != root_uid
+        or parent_metadata.st_gid != expected_target_gid
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o555
+    ):
+        raise ActivationPackageError("compatibility API token copy or retained parent lock is invalid")
+    return {
+        "verified": True,
+        "sha256": source_details["sha256"],
+        "size": source_details["size"],
+        "target": str(target),
+    }
 
 
 def run_canary_acceptance(
@@ -2815,6 +3264,326 @@ def verify_approved_staging(
     }
 
 
+def _activation_state_path() -> Path:
+    return Path("/var/lib/overseer-executor/activation-state.json")
+
+
+def _load_activation_state() -> dict[str, object] | None:
+    target = _activation_state_path()
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ActivationPackageError("activation runner state could not be read") from error
+    raw, metadata = _stable_read(target)
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        metadata.st_uid != root_uid
+        or metadata.st_gid != root_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ActivationPackageError("activation runner state metadata is invalid")
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("activation runner state is invalid") from error
+    if not isinstance(document, dict) or document.get("schemaVersion") != "overseer.activation-runner-state.v1":
+        raise ActivationPackageError("activation runner state schema is invalid")
+    return document
+
+
+def _write_activation_state(document: Mapping[str, object]) -> None:
+    target = _activation_state_path()
+    _ensure_directory(target.parent)
+    root_uid, root_gid = _activation_root_identity()
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        payload = _canonical(dict(document)) + b"\n"
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("activation state write made no progress")
+            view = view[written:]
+        os.fchown(descriptor, root_uid, root_gid)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, target)
+        parent_descriptor = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _contract_commands(contract: Mapping[str, object], field: str) -> list[list[str]]:
+    raw = contract.get(field)
+    if not isinstance(raw, list) or not raw:
+        raise ActivationPackageError(f"activation contract {field} is empty or invalid")
+    result: list[list[str]] = []
+    for command in raw:
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(value, str) and value for value in command)
+            or not str(command[0]).startswith("/")
+        ):
+            raise ActivationPackageError(f"activation contract {field} contains an invalid argv")
+        result.append(list(command))
+    return result
+
+
+def _execute_contract_command(command: list[str]) -> int:
+    environment = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    try:
+        result = subprocess.run(
+            command,
+            stdin=None,
+            stdout=None,
+            stderr=None,
+            check=False,
+            env=environment,
+        )
+    except OSError as error:
+        raise ActivationPackageError(f"activation command could not start: {command[0]}") from error
+    return int(result.returncode)
+
+
+def _runner_state(
+    *,
+    package_digest: str,
+    status: str,
+    phase: str,
+    command_index: int | None = None,
+    command: list[str] | None = None,
+    failure: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schemaVersion": "overseer.activation-runner-state.v1",
+        "packageDigest": package_digest,
+        "status": status,
+        "phase": phase,
+        "commandIndex": command_index,
+        "commandDigest": _sha256(_canonical(command)) if command is not None else None,
+        "failure": failure,
+        "updatedAtNs": time.time_ns(),
+        "secretValuesRecorded": False,
+    }
+
+
+def execute_approved_activation(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Execute one sealed activation contract in order through a fail-closed state machine."""
+
+    _require_root_activation()
+    package = Path(package_root).resolve()
+    approval = _load_activation_approval(package)
+    digest = str(approval["packageDigest"])
+    contract = _sealed_package_json(
+        package,
+        expected_package_digest=digest,
+        relative_path="public/activation-contract.json",
+    )
+    if contract.get("packageRoot") != str(package):
+        raise ActivationPackageError("activation contract package root is not approval-bound")
+    _validate_contract_principal_binding(contract)
+    existing = _load_activation_state()
+    if existing is not None:
+        if (
+            existing.get("packageDigest") == digest
+            and existing.get("status") == "complete"
+            and existing.get("phase") == "complete"
+        ):
+            return {"status": "complete", "packageDigest": digest, "replayed": True}
+        raise ActivationPackageError(
+            "activation runner state is not safely resumable; use the sealed rollback path"
+        )
+    staging = _contract_commands(contract, "stagingAndCanaryCommands")
+    cutover = _contract_commands(contract, "cutoverCommands")
+    rollback = _contract_commands(contract, "rollbackCommands")
+    canary = contract.get("canary")
+    cleanup_raw = canary.get("failureCleanupCommands") if isinstance(canary, Mapping) else None
+    cleanup = []
+    if isinstance(cleanup_raw, list):
+        for command in cleanup_raw:
+            if isinstance(command, list) and command and all(isinstance(value, str) for value in command):
+                cleanup.append(list(command))
+
+    _write_activation_state(_runner_state(package_digest=digest, status="running", phase="staging"))
+    for index, command in enumerate(staging):
+        _validate_contract_principal_binding(contract)
+        _write_activation_state(
+            _runner_state(
+                package_digest=digest,
+                status="command_running",
+                phase="staging",
+                command_index=index,
+                command=command,
+            )
+        )
+        returncode = _execute_contract_command(command)
+        if returncode != 0:
+            for cleanup_command in cleanup:
+                _execute_contract_command(cleanup_command)
+            _write_activation_state(
+                _runner_state(
+                    package_digest=digest,
+                    status="failed_before_cutover",
+                    phase="staging",
+                    command_index=index,
+                    command=command,
+                    failure=f"exit-{returncode}",
+                )
+            )
+            raise ActivationPackageError("staged activation command failed before cutover")
+        _write_activation_state(
+            _runner_state(
+                package_digest=digest,
+                status="command_complete",
+                phase="staging",
+                command_index=index,
+                command=command,
+            )
+        )
+
+    verify_approved_cutover(package)
+    _write_activation_state(_runner_state(package_digest=digest, status="running", phase="cutover"))
+    for index, command in enumerate(cutover):
+        _validate_contract_principal_binding(contract)
+        _write_activation_state(
+            _runner_state(
+                package_digest=digest,
+                status="command_running",
+                phase="cutover",
+                command_index=index,
+                command=command,
+            )
+        )
+        returncode = _execute_contract_command(command)
+        if returncode != 0:
+            _write_activation_state(
+                _runner_state(
+                    package_digest=digest,
+                    status="rollback_running",
+                    phase="rollback",
+                    command_index=index,
+                    command=command,
+                    failure=f"cutover-exit-{returncode}",
+                )
+            )
+            for rollback_index, rollback_command in enumerate(rollback):
+                rollback_returncode = _execute_contract_command(rollback_command)
+                if rollback_returncode != 0:
+                    _write_activation_state(
+                        _runner_state(
+                            package_digest=digest,
+                            status="rollback_failed",
+                            phase="rollback",
+                            command_index=rollback_index,
+                            command=rollback_command,
+                            failure=f"exit-{rollback_returncode}",
+                        )
+                    )
+                    raise ActivationPackageError("cutover failed and sealed rollback did not complete")
+            _write_activation_state(
+                _runner_state(
+                    package_digest=digest,
+                    status="rolled_back",
+                    phase="rollback",
+                    failure=f"cutover-exit-{returncode}",
+                )
+            )
+            raise ActivationPackageError("cutover failed and the sealed rollback completed")
+        _write_activation_state(
+            _runner_state(
+                package_digest=digest,
+                status="command_complete",
+                phase="cutover",
+                command_index=index,
+                command=command,
+            )
+        )
+    _write_activation_state(_runner_state(package_digest=digest, status="complete", phase="complete"))
+    return {"status": "complete", "packageDigest": digest, "replayed": False}
+
+
+def execute_approved_rollback(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Recover an interrupted/failed cutover through only the sealed rollback commands."""
+
+    _require_root_activation()
+    package = Path(package_root).resolve()
+    approval = _load_activation_approval(package)
+    digest = str(approval["packageDigest"])
+    contract = _sealed_package_json(
+        package,
+        expected_package_digest=digest,
+        relative_path="public/activation-contract.json",
+    )
+    if contract.get("packageRoot") != str(package):
+        raise ActivationPackageError("activation contract package root is not approval-bound")
+    _validate_contract_principal_binding(contract)
+    state = _load_activation_state()
+    if state is None or state.get("packageDigest") != digest:
+        raise ActivationPackageError("no matching activation runner state exists for rollback")
+    if state.get("status") == "rolled_back":
+        return {"status": "rolled_back", "packageDigest": digest, "replayed": True}
+    if state.get("phase") == "staging":
+        raise ActivationPackageError("activation stopped before cutover; rollback execution is not required")
+    if state.get("phase") not in {"cutover", "rollback"}:
+        raise ActivationPackageError("activation runner state is not eligible for sealed rollback")
+    rollback = _contract_commands(contract, "rollbackCommands")
+    for index, command in enumerate(rollback):
+        _validate_contract_principal_binding(contract)
+        _write_activation_state(
+            _runner_state(
+                package_digest=digest,
+                status="rollback_command_running",
+                phase="rollback",
+                command_index=index,
+                command=command,
+            )
+        )
+        returncode = _execute_contract_command(command)
+        if returncode != 0:
+            _write_activation_state(
+                _runner_state(
+                    package_digest=digest,
+                    status="rollback_failed",
+                    phase="rollback",
+                    command_index=index,
+                    command=command,
+                    failure=f"exit-{returncode}",
+                )
+            )
+            raise ActivationPackageError("sealed rollback recovery command failed")
+    _write_activation_state(
+        _runner_state(package_digest=digest, status="rolled_back", phase="rollback")
+    )
+    return {"status": "rolled_back", "packageDigest": digest, "replayed": False}
+
+
 def _canary_attestation_path(package_digest: str) -> Path:
     return Path(f"/var/lib/overseer-executor/canary-{package_digest}.json")
 
@@ -2869,6 +3638,12 @@ def _main(argv: list[str] | None = None) -> int:
         help="verify every captured rollback input before restoration",
     )
     verify_rollback.add_argument("--package-root", required=True)
+    verify_root_rollback = commands.add_parser(
+        "verify-rollback-bundle",
+        help="verify the immutable root-owned rollback execution bundle",
+    )
+    verify_root_rollback.add_argument("--bundle-root", required=True)
+    verify_root_rollback.add_argument("--rollback-manifest", required=True)
     restore_legacy = commands.add_parser(
         "restore-legacy-store-access",
         help="restore the exact legacy store access needed for approved rollback",
@@ -2902,6 +3677,26 @@ def _main(argv: list[str] | None = None) -> int:
         help="verify package approval, installed artifacts, and canary attestation",
     )
     approved_cutover.add_argument("--package-root", required=True)
+    compatibility_token = commands.add_parser(
+        "verify-compatibility-token",
+        help="verify the protected post-start client token copy",
+    )
+    compatibility_token.add_argument("--source-token", required=True)
+    compatibility_token.add_argument("--target-token", required=True)
+    compatibility_token.add_argument("--expected-target-uid", required=True, type=int)
+    compatibility_token.add_argument("--expected-target-gid", required=True, type=int)
+    compatibility_token.add_argument("--expected-parent-device", required=True, type=int)
+    compatibility_token.add_argument("--expected-parent-inode", required=True, type=int)
+    execute_activation = commands.add_parser(
+        "execute-approved-activation",
+        help="execute the sealed activation and rollback state machine",
+    )
+    execute_activation.add_argument("--package-root", required=True)
+    execute_rollback = commands.add_parser(
+        "execute-approved-rollback",
+        help="recover an interrupted cutover through the sealed rollback contract",
+    )
+    execute_rollback.add_argument("--package-root", required=True)
     final_store = commands.add_parser(
         "prepare-final-store",
         help="create the final migrated authority store after legacy writers are stopped",
@@ -3017,6 +3812,13 @@ def _main(argv: list[str] | None = None) -> int:
         result = verify_rollback_inputs(args.package_root)
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "verify-rollback-bundle":
+        result = verify_rollback_bundle(
+            bundle_root=args.bundle_root,
+            rollback_manifest=args.rollback_manifest,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "restore-legacy-store-access":
         result = restore_legacy_store_access(
             source_store=args.source_store,
@@ -3064,6 +3866,29 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "verify-compatibility-token":
+        result = verify_compatibility_token(
+            source_token=args.source_token,
+            target_token=args.target_token,
+            expected_target_uid=args.expected_target_uid,
+            expected_target_gid=args.expected_target_gid,
+            expected_parent_device=args.expected_parent_device,
+            expected_parent_inode=args.expected_parent_inode,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "execute-approved-activation":
+        result = execute_approved_activation(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "execute-approved-rollback":
+        result = execute_approved_rollback(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "prepare-final-store":
         report = prepare_final_store_migration(
             source_store=args.source_store,
@@ -3095,6 +3920,8 @@ __all__ = [
     "activation_package_status",
     "build_release_manifest",
     "create_human_verifiers",
+    "execute_approved_activation",
+    "execute_approved_rollback",
     "finalize_activation_package",
     "prepare_final_store_migration",
     "record_activation_approval",
@@ -3109,8 +3936,10 @@ __all__ = [
     "verify_approved_cutover",
     "verify_approved_staging",
     "verify_canary_attestation",
+    "verify_compatibility_token",
     "verify_installed_staging",
     "verify_rollback_inputs",
+    "verify_rollback_bundle",
 ]
 
 

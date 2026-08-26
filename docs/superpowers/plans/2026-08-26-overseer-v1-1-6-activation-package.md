@@ -99,12 +99,12 @@
 
 **Interfaces:**
 - Consumes: release/config/unit/rollback/credential/backup manifests.
-- Produces: exact non-executing command JSON, a root-only final-migration primitive, and a closed package manifest. No preparation artifact is an executable activation script.
+- Produces: exact command JSON, a root-only state-machine runner, a root-only final-migration primitive, an immutable rollback bundle, and a closed package manifest. No preparation artifact grants activation without a separate digest-bound root approval record.
 
 - [x] Test exact account UID/GID, paths, units, allowlist, install modes, canary order, root-owned digest approval, installed-artifact verification, exact live controls, cutover order, and rollback order.
 - [x] Test no unresolved angle-bracket values, globs, recursive copies, token argv, or unapproved service names.
 - [x] Test finalization refuses missing interactive verifier documents and any artifact drift.
-- [x] Implement command rendering, package self-verification, and status reporting.
+- [x] Implement command rendering, package self-verification, state-machine execution, interrupted-cutover rollback recovery, and status reporting.
 - [x] Run focused tests, `systemd-analyze verify`, and `git diff --check`.
 
 ### Task 6: Build the real preparation package and stop at the human gate

@@ -1605,7 +1605,7 @@ LENOVO 80VR
             self.assertEqual(status["plans"], 0)
             self.assertEqual(status["inspection"]["status"], "failed")
 
-    def test_obrien_package_maintenance_cycle_refreshes_stages_and_executes_with_enabled_adapters(self):
+    def test_obrien_package_maintenance_cycle_never_self_enables_or_self_approves(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
             commands = []
@@ -1630,12 +1630,12 @@ LENOVO 80VR
             )
             summary = admin_executions_status(store_path)
 
-        self.assertEqual(status["completed_executions"], 2)
+        self.assertEqual(status["completed_executions"], 0)
         self.assertEqual(status["failed_executions"], 0)
-        self.assertTrue(status["host_mutation_performed"])
-        self.assertIn(("sudo", "apt-get", "update"), commands)
-        self.assertIn(("sudo", "apt-get", "install", "--only-upgrade", "-y", "openssl"), commands)
-        self.assertEqual({item["status"] for item in summary["executions"]}, {AdminExecutionStatus.COMPLETED.value})
+        self.assertFalse(status["host_mutation_performed"])
+        self.assertEqual(commands, [])
+        self.assertEqual({item["status"] for item in summary["executions"]}, {AdminExecutionStatus.BLOCKED.value})
+        self.assertTrue(all(item["mutation_performed"] is True for item in status["adapter_enablement"]))
 
     def test_obrien_package_maintenance_cycle_can_leave_live_execution_blocked_without_adapter_auto_enable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8999,7 +8999,7 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(result["rollback_results"][1]["command"], ["sudo", "apt-get", "-f", "install", "-y"])
         self.assertEqual(executions["executions"][0]["rollback_results"][1]["title"], "Attempt package recovery")
 
-    def test_obrien_advancement_uses_sisko_approval_for_package_upgrade(self):
+    def test_obrien_advancement_requests_sisko_approval_without_self_approval(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
             plan_admin_change_status(
@@ -9014,13 +9014,11 @@ class AdminChangePlanTests(unittest.TestCase):
             requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
             approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
 
-            with patch("overseer.cli.execute_admin_change_status") as execute:
-                execute.return_value = {"status": AdminExecutionStatus.COMPLETED.value}
-                status = overseer_cli._advance_obrien_package_plan(
-                    store_path,
-                    "admin.apt.upgrade.sisko-auto",
-                    "2026-07-20T20:30:00+00:00",
-                )
+            status = overseer_cli._advance_obrien_package_plan(
+                store_path,
+                "admin.apt.upgrade.sisko-auto",
+                "2026-07-20T20:30:00+00:00",
+            )
 
             store = SQLiteStore(store_path)
             try:
@@ -9028,11 +9026,10 @@ class AdminChangePlanTests(unittest.TestCase):
             finally:
                 store.close()
 
-        self.assertEqual(status["readiness_state"], "sisko_approved")
-        self.assertEqual(status["approval"]["approval_level"], ApprovalLevel.SISKO.value)
-        self.assertEqual(status["execution"]["status"], AdminExecutionStatus.COMPLETED.value)
-        self.assertTrue(plan.approved)
-        self.assertEqual(plan.approved_by, "sisko")
+        self.assertEqual(status["owner_domain"], OwnerDomain.SISKO.value)
+        self.assertEqual(status["related_plan_id"], "admin.apt.upgrade.sisko-auto")
+        self.assertFalse(plan.approved)
+        self.assertIsNone(plan.approved_by)
 
     def test_admin_policy_warning_approval_allows_residual_warning(self):
         with tempfile.TemporaryDirectory() as directory:

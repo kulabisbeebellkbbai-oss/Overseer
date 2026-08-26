@@ -1870,7 +1870,7 @@ def run_obrien_package_maintenance_cycle_status(
     actions.append({"stage_index_refresh": admin_change_plan_status(refresh_plan)})
 
     if auto_enable_adapters:
-        enabled_actions.append(_ensure_admin_adapter_enabled(store_path, AdminChangeKind.APT_UPDATE, "human", now))
+        enabled_actions.append(_ensure_admin_adapter_enablement_requested(store_path, AdminChangeKind.APT_UPDATE, now))
     refresh_execution = execute_admin_change_status(
         store_path,
         refresh_plan.id,
@@ -1891,7 +1891,7 @@ def run_obrien_package_maintenance_cycle_status(
     upgrade_advancements: list[dict[str, object]] = []
     if inspection_and_plans.get("plans"):
         if auto_enable_adapters:
-            enabled_actions.append(_ensure_admin_adapter_enabled(store_path, AdminChangeKind.APT_UPGRADE, "human", now))
+            enabled_actions.append(_ensure_admin_adapter_enablement_requested(store_path, AdminChangeKind.APT_UPGRADE, now))
         for item in inspection_and_plans.get("items", []):
             if isinstance(item, dict) and item.get("id"):
                 advancement = _advance_obrien_package_plan(
@@ -8408,15 +8408,6 @@ def _advance_obrien_package_plan(
     if readiness.get("readiness_state") == "ready_for_overseer_execution":
         return execute_admin_change_status(store_path, plan_id, runner=runner, policy_profile_path=policy_profile_path)
     if readiness.get("readiness_state") == "approval_required":
-        if readiness.get("approval_level") == ApprovalLevel.SISKO.value:
-            approval = approve_admin_change_status(store_path, plan_id, "sisko", advanced_at)
-            execution = _execute_obrien_package_plan_if_ready(store_path, plan_id, runner=runner, policy_profile_path=policy_profile_path)
-            return {
-                "plan_id": plan_id,
-                "readiness_state": "sisko_approved",
-                "approval": approval,
-                "execution": execution,
-            }
         return _ensure_sisko_plan_message(
             store_path,
             plan_id,
@@ -8448,10 +8439,9 @@ def _execute_obrien_package_plan_if_ready(
     return execute_admin_change_status(store_path, plan_id, runner=runner, policy_profile_path=policy_profile_path)
 
 
-def _ensure_admin_adapter_enabled(
+def _ensure_admin_adapter_enablement_requested(
     store_path: str | Path,
     kind: AdminChangeKind,
-    approved_by: str,
     approved_at: str,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
@@ -8467,20 +8457,17 @@ def _ensure_admin_adapter_enabled(
     if kind in enabled:
         return {"kind": kind.value, "already_enabled": True, "mutation_performed": False}
     if existing:
-        approval = approve_admin_adapter_enablement_status(
-            store_path,
-            f"approval.admin.adapter.enable.{kind.value}",
-            approved_by,
-            approved_at,
-        )
-        return {"kind": kind.value, "already_enabled": False, "approval": approval, "mutation_performed": True}
+        return {
+            "kind": kind.value,
+            "already_enabled": False,
+            "approval": approval_request_status(existing[0]),
+            "mutation_performed": False,
+        }
     requested = request_admin_adapter_enablement_status(store_path, kind.value, "obrien", approved_at)
-    approval = approve_admin_adapter_enablement_status(store_path, requested["approval_id"], approved_by, approved_at)
     return {
         "kind": kind.value,
         "already_enabled": False,
         "request": requested,
-        "approval": approval,
         "mutation_performed": True,
     }
 
@@ -11605,8 +11592,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     approve_admin_parser = subparsers.add_parser("approve-admin-change", help="record approval metadata for an admin change plan")
     approve_admin_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     approve_admin_parser.add_argument("--plan-id", required=True)
-    approve_admin_parser.add_argument("--approved-by", required=True)
-    approve_admin_parser.add_argument("--approved-at")
     cancel_admin_parser = subparsers.add_parser("cancel-admin-change", help="mark an admin change plan canceled without executing it")
     cancel_admin_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     cancel_admin_parser.add_argument("--plan-id", required=True)
@@ -13095,8 +13080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "approve-admin-change":
-        print(json.dumps(approve_admin_change_status(args.store, args.plan_id, args.approved_by, args.approved_at), sort_keys=True))
-        return 0
+        raise ValueError("direct CLI admin approval is disabled; use the independent human approval API")
 
     if args.command == "cancel-admin-change":
         print(

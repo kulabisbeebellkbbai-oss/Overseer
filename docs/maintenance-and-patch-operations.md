@@ -54,7 +54,7 @@ It summarizes persisted maintenance targets plus install, package index refresh,
 
 `plan-package-updates` uses the same read-only inspection result to stage O'Brien-owned admin plans for package metadata refresh and package upgrades. It writes only Overseer plan records; the normal approval, policy, rollback, and execution gates still decide whether package commands may run.
 
-`run-package-maintenance-cycle` is the approved live O'Brien package-maintenance path. It stages and executes an apt metadata refresh, inspects the refreshed package state, stages detected apt upgrades, auto-records the approved apt update/upgrade adapter enablement records for the store, lets Sisko approve Sisko-level package upgrades, executes only plans that pass policy, and persists command, verification, rollback, audit, and blocked/failed evidence. If adapter auto-enablement is disabled, the same command stops at the adapter gate and records blocked execution evidence instead of running apt commands.
+`run-package-maintenance-cycle` stages an apt metadata refresh, inspects available package state, stages detected apt upgrades, and requests any missing apt adapter enablement records. It never approves adapter enablement or Sisko-level package plans itself. Execution remains blocked until independently recorded approvals satisfy both gates; command, verification, rollback, audit, and blocked/failed evidence remain persisted.
 
 Advisory feed integration is available through the Admin page and local API:
 

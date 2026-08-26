@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -157,6 +159,38 @@ def test_admin_approval_api_rejects_client_supplied_identity(tmp_path: Path) -> 
 
     assert denied.value.code == 400
     assert payload["error"] == "admin approval payload contains unsupported fields"
+
+
+def test_direct_cli_admin_approval_is_retired(tmp_path: Path) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    plan_admin_change_status(
+        store_path,
+        "admin.approval.no-cli-bypass",
+        "user_service_restart",
+        "overseer-approval-smoke.service",
+        "prove direct CLI approval is unavailable",
+        "inactive",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "overseer.cli",
+            "approve-admin-change",
+            "--store",
+            str(store_path),
+            "--plan-id",
+            "admin.approval.no-cli-bypass",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+    )
+
+    assert result.returncode != 0
+    assert "direct CLI admin approval is disabled" in result.stderr
 
 
 def test_api_handler_rejects_shared_agent_and_approval_credentials(

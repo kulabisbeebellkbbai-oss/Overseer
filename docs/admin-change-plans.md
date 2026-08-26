@@ -39,7 +39,8 @@ PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.psychlo-recurring-cycle-activation.20260816 --kind psychlo_recurring_cycle_activation --target overseer-psychlo-usage.timer --psychlo-cycle-spec /home/god/.local/share/overseer/admin-manifests/psychlo-recurring-cycle-activation.20260816.json --reason "activate fresh signed accounting before every approved Psychlo scheduling cycle"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.firewall.8443 --kind firewall_allow_tcp --target tcp/8443 --port 8443 --reason "publish approved local service"
 PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3
-PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --approved-by sisko
+# Direct CLI approval is disabled. Approve the exact plan through POST /admin/approve
+# with the separately configured human approval credential.
 PYTHONPATH=src python3 -m overseer.cli cancel-admin-change --store state/overseer.sqlite3 --plan-id admin.block.example --canceled-by odo --reason "reserved documentation address; no observed hostile traffic"
 PYTHONPATH=src python3 -m overseer.cli execute-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api
 PYTHONPATH=src python3 -m overseer.cli admin-executions --store state/overseer.sqlite3
@@ -68,6 +69,17 @@ only one request can become the command-running winner. The stored result is
 bound to a digest of the plan's immutable command authority; replacing a plan
 under the same ID cannot inherit prior completion evidence. Legacy completed
 rows without that digest fail closed instead of running or replaying commands.
+
+Before any command runs, Overseer persists a durable execution claim bound to
+the immutable plan digest. Plan mutation and execution share one cross-process
+authority lock. A crash or process loss leaves the claim in `claimed` state;
+the same plan ID then fails closed with `reconciliation required` and never
+automatically repeats a command. A normal terminal result and its audit event
+are committed atomically with claim finalization.
+
+O'Brien may request package adapter enablement and route a plan to Sisko, but
+it cannot approve either record itself. The maintenance cycle remains blocked
+until independently recorded approvals satisfy both gates.
 
 ## Disposable Approval Smoke Test
 

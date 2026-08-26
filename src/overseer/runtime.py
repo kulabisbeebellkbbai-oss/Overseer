@@ -432,6 +432,23 @@ def seed_default_collection_jobs(
         skipped: list[dict[str, str]] = []
         existing_jobs = {job.id: job for job in store.list_collection_jobs()}
         dedicated_principal = os.environ.get("OVERSEER_DEDICATED_PRINCIPAL") == "1"
+        dedicated_disabled_ids: set[str] = set()
+        if dedicated_principal:
+            for existing_id, existing in tuple(existing_jobs.items()):
+                family = COLLECTION_KIND_FAMILIES.get(existing.kind, "health")
+                if family not in DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES:
+                    continue
+                disabled = replace(existing, enabled=False)
+                store.save_collection_job(disabled)
+                existing_jobs[existing_id] = disabled
+                dedicated_disabled_ids.add(existing_id)
+                skipped.append(
+                    {
+                        "job_id": existing_id,
+                        "status": "disabled",
+                        "reason": "user-session bridge is required in dedicated-principal mode",
+                    }
+                )
         if "health" in seed_families:
             for existing in existing_jobs.values():
                 if (
@@ -457,13 +474,15 @@ def seed_default_collection_jobs(
             family = COLLECTION_KIND_FAMILIES.get(job.kind, "health")
             if dedicated_principal and family in DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES:
                 job = replace(job, enabled=False)
-                skipped.append(
-                    {
-                        "job_id": job.id,
-                        "status": "disabled",
-                        "reason": "user-session bridge is required in dedicated-principal mode",
-                    }
-                )
+                if job.id not in dedicated_disabled_ids:
+                    dedicated_disabled_ids.add(job.id)
+                    skipped.append(
+                        {
+                            "job_id": job.id,
+                            "status": "disabled",
+                            "reason": "user-session bridge is required in dedicated-principal mode",
+                        }
+                    )
             elif existing is None and job.kind.value in UNSAFE_AUTONOMOUS_COLLECTION_FAMILIES:
                 # Visibility is useful for a fresh install, but no external
                 # or mutating action is authorized by merely seeding it.

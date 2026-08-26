@@ -10,6 +10,7 @@ import secrets
 import socket
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from json import JSONDecodeError
@@ -270,6 +271,193 @@ from .ui import OPERATOR_CONSOLE_HTML
 
 
 DEFAULT_CODEX_USAGE_DB = Path("/home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3")
+
+DEDICATED_DISABLED_GET_INTEGRATIONS = {
+    "/documents/status": "documents.status",
+    "/documents/evidence": "documents.evidence",
+    "/documents/notes": "documents.notes",
+    "/documents/knowledge-capture-plan": "documents.knowledge-capture",
+    "/git/status": "git.status",
+    "/virtual/operations": "virtual.operations",
+    "/identity/evidence": "identity.evidence",
+}
+DEDICATED_DISABLED_POST_PREFIXES = (
+    "/agent-dispatches",
+    "/agent-checkpoints",
+    "/agent-recovery",
+    "/agent-handoffs",
+    "/agent-failover",
+    "/documents",
+    "/virtual",
+    "/identity/rotation-requests",
+)
+
+
+def dedicated_principal_mode() -> bool:
+    return os.environ.get("OVERSEER_DEDICATED_PRINCIPAL") == "1"
+
+
+def user_bridge_client_from_environment() -> Any | None:
+    if not dedicated_principal_mode():
+        return None
+    socket_path = os.environ.get("OVERSEER_USER_BRIDGE_SOCKET")
+    if not socket_path:
+        return None
+    from .user_bridge import DEFAULT_USER_BRIDGE_SOCKET, UserBridgeClient
+
+    if Path(socket_path) != DEFAULT_USER_BRIDGE_SOCKET:
+        raise ValueError("user bridge socket must use the fixed runtime path")
+    raw_uid = os.environ.get("OVERSEER_USER_BRIDGE_SERVER_UID")
+    try:
+        expected_uid = int(raw_uid or "", 10)
+    except ValueError as error:
+        raise ValueError("user bridge server UID must be numeric") from error
+    if expected_uid < 0:
+        raise ValueError("user bridge server UID must be nonnegative")
+    return UserBridgeClient(
+        DEFAULT_USER_BRIDGE_SOCKET,
+        expected_server_uid=expected_uid,
+    )
+
+
+def dedicated_integration_disabled_status(integration: str) -> dict[str, object]:
+    return {
+        "integration": integration,
+        "status": "disabled",
+        "reason": "typed_user_bridge_method_not_available",
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def _call_user_bridge_projection(user_bridge_client: Any | None, method: str) -> dict[str, Any]:
+    if user_bridge_client is None:
+        return {"state": "unavailable", "reason": "provider_not_configured"}
+    try:
+        response = user_bridge_client.call(
+            method, f"api-{secrets.token_hex(16)}"
+        )
+    except Exception:
+        return {"state": "error", "error_code": "user_bridge_unavailable"}
+    projection = response.get("projection") if isinstance(response, dict) and response.get("status") == "ok" else None
+    if not isinstance(projection, dict):
+        return {"state": "error", "error_code": "user_bridge_response_invalid"}
+    return projection
+
+
+class UserBridgeProjectionReader:
+    """Coalesce UI reads so refresh traffic cannot flood user-owned sources."""
+
+    def __init__(
+        self,
+        user_bridge_client: Any | None,
+        *,
+        success_ttl_seconds: float = 30.0,
+        error_ttl_seconds: float = 2.0,
+    ) -> None:
+        self.user_bridge_client = user_bridge_client
+        self.success_ttl_seconds = success_ttl_seconds
+        self.error_ttl_seconds = error_ttl_seconds
+        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+
+    def read(self, method: str) -> dict[str, Any]:
+        with self._lock:
+            now = time.monotonic()
+            cached = self._cache.get(method)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            projection = _call_user_bridge_projection(self.user_bridge_client, method)
+            ttl = (
+                self.success_ttl_seconds
+                if projection.get("state") in {"available", "stale"}
+                else self.error_ttl_seconds
+            )
+            self._cache[method] = (now + ttl, projection)
+            return projection
+
+
+def _user_bridge_projection(source: Any | None, method: str) -> dict[str, Any]:
+    if isinstance(source, UserBridgeProjectionReader):
+        return source.read(method)
+    return _call_user_bridge_projection(source, method)
+
+
+def dedicated_codex_usage_health_status(user_bridge_client: Any | None) -> dict[str, Any]:
+    projection = _user_bridge_projection(user_bridge_client, "codex.usage.snapshot.v1")
+    state = projection.get("state")
+    windows = projection.get("windows") if state in {"available", "stale"} else []
+    if not isinstance(windows, list):
+        state = "error"
+        windows = []
+    safe_windows: list[dict[str, object]] = []
+    for item in windows[:8]:
+        if not isinstance(item, dict):
+            continue
+        safe_windows.append(
+            {
+                "limit_name": item.get("name"),
+                "windows": [
+                    {
+                        "name": item.get("name"),
+                        "used_percent": item.get("used"),
+                        "remaining_percent": item.get("remaining"),
+                        "resets_at": item.get("reset_at"),
+                    }
+                ],
+            }
+        )
+    available = state == "available"
+    return {
+        "available": available,
+        "observed_at": projection.get("observed_at"),
+        "posture": "unknown",
+        "minimum_remaining_percent": None,
+        "recommendation": (
+            "Codex usage is available through the read-only user bridge."
+            if available
+            else "Codex usage is unavailable until the read-only user bridge is healthy."
+        ),
+        "rate_limits": safe_windows,
+        "account_usage": {},
+        "source": "codex.usage.snapshot.v1",
+        "bridge_state": state if state in {"available", "stale", "unavailable", "error"} else "error",
+        "next_step": "Restore the bounded user bridge projection; do not open the user usage database from the authority service.",
+    }
+
+
+def dedicated_agent_session_discovery_status(
+    payload: dict[str, Any], user_bridge_client: Any | None
+) -> dict[str, object]:
+    allowed = {"provider_id", "instance_id"}
+    if set(payload) - allowed:
+        raise ValueError("unknown dedicated session discovery fields")
+    provider_id = str(payload.get("provider_id", "codex"))
+    instance_id = str(payload.get("instance_id", "overseer.default"))
+    if provider_id != "codex":
+        raise ValueError("dedicated session discovery supports only codex")
+    if not instance_id.strip():
+        raise ValueError("instance_id is required")
+    projection = _user_bridge_projection(user_bridge_client, "codex.sessions.list.v1")
+    state = projection.get("state")
+    sessions = projection.get("sessions") if state in {"available", "stale"} else []
+    if not isinstance(sessions, list):
+        state = "error"
+        sessions = []
+    safe_sessions = [item for item in sessions[:64] if isinstance(item, dict)]
+    return {
+        "provider_id": provider_id,
+        "instance_id": instance_id,
+        "bridge_state": state if state in {"available", "stale", "unavailable", "error"} else "error",
+        "observed_at": projection.get("observed_at"),
+        "sessions": safe_sessions,
+        "items": safe_sessions,
+        "threads": len(safe_sessions),
+        "resources": 0,
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+        "next_step": "Use redacted discovery evidence only; dispatch and resume remain disabled.",
+    }
 
 
 def codex_usage_health_status(db_path: str | Path | None = None) -> dict[str, Any]:
@@ -936,6 +1124,7 @@ def make_api_handler(
     admin_approval_verifier: ApprovalVerifier | None = None,
     roadex_fixture_approval_verifier: ApprovalVerifier | None = None,
     psychlo_bridge: PsychloBridge | None = None,
+    user_bridge_client: Any | None = None,
     psychlo_peer_authority: str = "127.0.0.1:8766",
     roadex_relay_authority: str = "127.0.0.1:8766",
 ):
@@ -944,6 +1133,7 @@ def make_api_handler(
         admin_approval_verifier,
         roadex_fixture_approval_verifier,
     )
+    user_bridge_reader = UserBridgeProjectionReader(user_bridge_client)
     if psychlo_bridge is not None:
         def load_bridge_approval(approval_id: str):
             with SQLiteStore(store_path) as primary:
@@ -988,6 +1178,16 @@ def make_api_handler(
             auth_context = self._authorize_request("GET", raw_path, path)
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
+                return
+            if dedicated_principal_mode() and path == "/health/codex-usage":
+                self._handle(lambda: dedicated_codex_usage_health_status(user_bridge_reader))
+                return
+            if dedicated_principal_mode() and path in DEDICATED_DISABLED_GET_INTEGRATIONS:
+                self._write_json(
+                    dedicated_integration_disabled_status(
+                        DEDICATED_DISABLED_GET_INTEGRATIONS[path]
+                    )
+                )
                 return
             if path.startswith("/evidence/records/"):
                 if auth_context.get("auth_type") != "admin_token":
@@ -1531,6 +1731,15 @@ def make_api_handler(
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
+            if dedicated_principal_mode() and any(
+                path == prefix or path.startswith(f"{prefix}/")
+                for prefix in DEDICATED_DISABLED_POST_PREFIXES
+            ):
+                self._write_json(
+                    dedicated_integration_disabled_status(path.lstrip("/").replace("/", ".")),
+                    HTTPStatus.CONFLICT,
+                )
+                return
             collection_control = path == "/health/probes/run" or path.startswith(
                 "/collections/jobs/"
             )
@@ -1675,6 +1884,13 @@ def make_api_handler(
                 self._write_json({"error": "control routes require admin authorization"}, HTTPStatus.FORBIDDEN)
                 return
             if path == "/agent-sessions/discover":
+                if dedicated_principal_mode():
+                    self._handle_json(
+                        lambda payload: dedicated_agent_session_discovery_status(
+                            payload, user_bridge_reader
+                        )
+                    )
+                    return
                 self._handle_json(
                     lambda payload: discover_agent_sessions_status(
                         store_path,
@@ -2080,6 +2296,22 @@ def make_api_handler(
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
             if path == "/codex-projects/discover-threads":
+                if dedicated_principal_mode():
+                    self._handle_json(
+                        lambda payload: dedicated_agent_session_discovery_status(
+                            (
+                                {"provider_id": "codex", "instance_id": "overseer.default"}
+                                if not payload
+                                else payload
+                            ),
+                            user_bridge_reader,
+                        ),
+                        response_headers={
+                            "Deprecation": "true",
+                            "Link": '</agent-sessions/discover>; rel="successor-version"',
+                        },
+                    )
+                    return
                 self._handle_json(
                     lambda payload: _legacy_codex_discovery_status(
                         store_path,
@@ -2551,6 +2783,7 @@ def run_api_server(
     auth_token: str | None = None,
     admin_approval_verifier: ApprovalVerifier | None = None,
     roadex_fixture_approval_verifier: ApprovalVerifier | None = None,
+    user_bridge_client: Any | None = None,
 ) -> None:
     if host not in LOOPBACK_HOSTS:
         raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
@@ -2561,6 +2794,11 @@ def run_api_server(
     )
     from .backup_host_operations import ConcreteHostProvisioningAdapter, PRIVILEGED_CONFIRMATION
     decision_factory = lambda plan: ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION)
+    selected_user_bridge_client = (
+        user_bridge_client
+        if user_bridge_client is not None
+        else user_bridge_client_from_environment()
+    )
     psychlo_bridge = None
     if os.environ.get("OVERSEER_PSYCHLO_PEER_SECRET_FILE"):
         bridge_environment = dict(os.environ)
@@ -2578,6 +2816,7 @@ def run_api_server(
             admin_approval_verifier=admin_approval_verifier,
             roadex_fixture_approval_verifier=roadex_fixture_approval_verifier,
             psychlo_bridge=psychlo_bridge,
+            user_bridge_client=selected_user_bridge_client,
         ),
     )
     try:

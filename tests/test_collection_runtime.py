@@ -151,6 +151,15 @@ def test_dedicated_principal_reseeding_disables_all_user_session_collectors(
         for job_id in user_session_ids:
             job = store.load_collection_job(job_id)
             store.save_collection_job(job.__class__(**{**job.__dict__, "enabled": True}))
+        store.save_collection_job(
+            CollectionJob(
+                id="collection.custom.user-git",
+                kind=CollectionJobKind.GIT_INSPECTION,
+                owner_domain=OwnerDomain.EZRI,
+                resource_id="git.custom",
+                enabled=True,
+            )
+        )
 
     monkeypatch.setenv("OVERSEER_DEDICATED_PRINCIPAL", "1")
     result = seed_default_collection_jobs(path)
@@ -158,11 +167,12 @@ def test_dedicated_principal_reseeding_disables_all_user_session_collectors(
     with SQLiteStore(path) as store:
         jobs = {job.id: job for job in store.list_collection_jobs()}
     assert all(not jobs[job_id].enabled for job_id in user_session_ids)
+    assert jobs["collection.custom.user-git"].enabled is False
     assert jobs["collection.health.health.api"].enabled is True
     disabled = {item["job_id"]: item["reason"] for item in result["disabled"]}
     assert all(
         disabled[job_id] == "user-session bridge is required in dedicated-principal mode"
-        for job_id in user_session_ids
+        for job_id in user_session_ids | {"collection.custom.user-git"}
     )
 
 

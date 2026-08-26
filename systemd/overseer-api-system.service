@@ -1,6 +1,7 @@
 [Unit]
 Description=Overseer system API
-After=local-fs.target
+Wants=overseer-codex-user-bridge.socket
+After=local-fs.target overseer-codex-user-bridge.socket
 
 [Service]
 Type=simple
@@ -12,6 +13,8 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=OVERSEER_DEDICATED_PRINCIPAL=1
 Environment=OVERSEER_ADMIN_TICKET_PRIVATE_KEY=/etc/overseer/admin-ticket-private-key
 Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock
+Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock
+Environment=OVERSEER_USER_BRIDGE_SERVER_UID=@GOD_UID@
 Environment=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798
 Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-bridge.sqlite3
 Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-peer-secret

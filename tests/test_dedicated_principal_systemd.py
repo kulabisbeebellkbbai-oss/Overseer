@@ -15,6 +15,7 @@ RUNTIME_UNIT = SYSTEMD / "overseer-runtime-system.service"
 SOCKET_UNIT = SYSTEMD / "overseer-admin-executor.socket"
 EXECUTOR_UNIT = SYSTEMD / "overseer-admin-executor@.service"
 ALLOWLIST = ROOT / "config" / "admin-executor-allowlist.json"
+TMPFILES = SYSTEMD / "overseer-tmpfiles.conf"
 
 
 COMMON_HARDENING = (
@@ -59,6 +60,7 @@ def _render_units(tmp_path: Path) -> list[Path]:
     replacements = {
         "@OVERSEER_RELEASE@": str(release),
         "@OVERSEER_PYTHON@": str(python_path),
+        "@GOD_UID@": "1000",
     }
     for source in (API_UNIT, RUNTIME_UNIT, SOCKET_UNIT, EXECUTOR_UNIT):
         target = tmp_path / source.name
@@ -128,6 +130,9 @@ def test_api_uses_independent_credentials_verifiers_and_loopback_peer_channels()
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780" in api
     assert "Environment=OVERSEER_ADMIN_TICKET_PRIVATE_KEY=/etc/overseer/admin-ticket-private-key" in api
     assert "Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock" in api
+    assert "Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock" in api
+    assert "Environment=OVERSEER_USER_BRIDGE_SERVER_UID=@GOD_UID@" in api
+    assert "Wants=overseer-codex-user-bridge.socket" in api
 
     command = _one(api, "ExecStart")
     assert "--admin-approval-verifier-file /etc/overseer/admin-approval-verifier.json" in command
@@ -173,6 +178,10 @@ def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> 
     assert "systemctl --user" not in executor
     assert "sudo" not in executor
     assert "/bin/sh" not in executor and "/bin/bash" not in executor
+
+
+def test_shared_runtime_socket_directory_is_root_created_for_only_overseer_group() -> None:
+    assert _read(TMPFILES).strip() == "d /run/overseer 0750 root overseer -"
 
 
 def test_sample_allowlist_contains_only_the_approval_smoke_restart_rule() -> None:

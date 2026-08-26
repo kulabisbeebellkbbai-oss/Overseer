@@ -1168,6 +1168,95 @@ def test_final_migration_rejects_source_replacement_during_parent_lock(
     assert not backup.with_suffix(f"{backup.suffix}.report.json").exists()
 
 
+def test_final_migration_rejects_closed_fd_shared_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "overseer.sqlite3"
+    _wal_store(source)
+    approved = source.stat()
+    parent = source.parent.stat()
+    parent_mode = stat_mode(source.parent)
+    backup_parent = tmp_path / "executor-state"
+    destination_parent = tmp_path / "authority-state"
+    backup_parent.mkdir(mode=0o700)
+    destination_parent.mkdir(mode=0o700)
+    backup = backup_parent / "final-source.sqlite3"
+    destination = destination_parent / "final-migrated.sqlite3"
+    mapper = subprocess.Popen(
+        [
+            "/usr/bin/python3.13",
+            "-c",
+            """
+import ctypes
+import os
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.restype = ctypes.c_void_p
+fd = os.open(sys.argv[1], os.O_RDWR)
+size = os.fstat(fd).st_size
+address = libc.mmap(None, size, 3, 1, fd, 0)
+if address == ctypes.c_void_p(-1).value:
+    raise OSError(ctypes.get_errno(), "mmap failed")
+os.close(fd)
+print("ready", flush=True)
+sys.stdin.readline()
+if libc.munmap(ctypes.c_void_p(address), size) != 0:
+    raise OSError(ctypes.get_errno(), "munmap failed")
+""",
+            str(source),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert mapper.stdout is not None
+    assert mapper.stdin is not None
+    assert mapper.stdout.readline().strip() == "ready"
+    assert mapper.pid not in activation_package_module._processes_with_open_inode(
+        approved.st_dev,
+        approved.st_ino,
+    )
+    assert mapper.pid in activation_package_module._processes_with_mapped_inode(
+        approved.st_dev,
+        approved.st_ino,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_parent_lock_mode", lambda: 0o700)
+    try:
+        with pytest.raises(ActivationPackageError, match="mapping"):
+            prepare_final_store_migration(
+                source_store=source,
+                backup_store=backup,
+                destination_store=destination,
+                expected_source_device=approved.st_dev,
+                expected_source_inode=approved.st_ino,
+                expected_source_uid=os.geteuid(),
+                expected_source_gid=os.getegid(),
+                expected_parent_device=parent.st_dev,
+                expected_parent_inode=parent.st_ino,
+                expected_parent_mode=parent_mode,
+                destination_uid=os.geteuid(),
+                destination_gid=os.getegid(),
+                sleep_seconds=0,
+            )
+    finally:
+        mapper.stdin.write("stop\n")
+        mapper.stdin.flush()
+        mapper.wait(timeout=5)
+
+    assert mapper.returncode == 0
+    assert not backup.exists()
+    assert not destination.exists()
+
+
 def _prepared_package(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
     checkout = _reviewed_checkout(tmp_path)
     dependencies = _dependencies(tmp_path)
@@ -1442,6 +1531,9 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         ]
     )
     assert canary_health_index < stop_index < migration_index < system_start_index < token_copy_index
+    canary_health = commands[canary_health_index]
+    assert "--retry-all-errors" in canary_health
+    assert canary_health[canary_health.index("--retry-max-time") + 1] == "15"
     assert all("overseer.service" not in command for command in staging_commands)
     assert contract["cutoverGate"] == {
         "requiredFunction": "overseer.activation_package.verify_approved_cutover",
@@ -1506,6 +1598,8 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         f"--setenv=LD_LIBRARY_PATH={manifest['releaseRoot']}/lib" in command
         for command in rollback_transients
     )
+
+
     assert all(
         any(value.startswith("--property=Description=overseer.rollback-transient.v1:") for value in command)
         and any(value.startswith("--setenv=OVERSEER_ROLLBACK_TRANSIENT_ID=") for value in command)
@@ -1558,6 +1652,69 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     rollback_unit.write_text("drift\n", encoding="utf-8")
     with pytest.raises(ActivationPackageError, match="rollback input drift"):
         verify_rollback_inputs(package)
+
+
+def test_canary_health_retry_handles_an_initially_missing_unix_socket(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "delayed-api.sock"
+    errors: list[BaseException] = []
+
+    def delayed_server() -> None:
+        try:
+            time.sleep(0.2)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            listener.listen()
+            listener.settimeout(3)
+            try:
+                peer, _address = listener.accept()
+                try:
+                    peer.recv(4096)
+                    peer.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n"
+                        b"Connection: close\r\n\r\n{\"ok\":true}"
+                    )
+                finally:
+                    peer.close()
+            finally:
+                listener.close()
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=delayed_server, daemon=True)
+    thread.start()
+    result = subprocess.run(
+        [
+            "/usr/bin/curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "1",
+            "--max-time",
+            "3",
+            "--retry",
+            "10",
+            "--retry-delay",
+            "1",
+            "--retry-max-time",
+            "15",
+            "--retry-all-errors",
+            "--unix-socket",
+            str(socket_path),
+            "http://localhost/health",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    thread.join(timeout=5)
+
+    assert result.returncode == 0, result.stderr
+    assert not errors
+    assert not thread.is_alive()
 
 
 @pytest.mark.parametrize(

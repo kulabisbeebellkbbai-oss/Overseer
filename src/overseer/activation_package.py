@@ -1440,7 +1440,12 @@ def rehearse_store_migration(
     return report
 
 
-def _processes_with_open_inode(device: int, inode: int) -> tuple[int, ...]:
+def _processes_with_open_inode(
+    device: int,
+    inode: int,
+    *,
+    excluded_pids: frozenset[int] = frozenset(),
+) -> tuple[int, ...]:
     """Return processes with the exact source inode open, without shell tools."""
 
     result: set[int] = set()
@@ -1451,6 +1456,9 @@ def _processes_with_open_inode(device: int, inode: int) -> tuple[int, ...]:
         raise ActivationPackageError("open-process preflight could not inspect /proc") from error
     for process in process_directories:
         if not process.name.isdecimal():
+            continue
+        process_id = int(process.name)
+        if process_id in excluded_pids:
             continue
         descriptors = process / "fd"
         try:
@@ -1463,8 +1471,69 @@ def _processes_with_open_inode(device: int, inode: int) -> tuple[int, ...]:
             except (FileNotFoundError, PermissionError, ProcessLookupError):
                 continue
             if (metadata.st_dev, metadata.st_ino) == (device, inode):
-                result.add(int(process.name))
+                result.add(process_id)
                 break
+    return tuple(sorted(result))
+
+
+def _processes_with_mapped_inode(
+    device: int,
+    inode: int,
+    *,
+    excluded_pids: frozenset[int] = frozenset(),
+) -> tuple[int, ...]:
+    """Return processes mapping the exact inode, including closed-fd mappings."""
+
+    result: set[int] = set()
+    try:
+        process_directories = tuple(Path("/proc").iterdir())
+    except OSError as error:
+        raise ActivationPackageError("mapped-process preflight could not inspect /proc") from error
+    for process in process_directories:
+        if not process.name.isdecimal():
+            continue
+        process_id = int(process.name)
+        if process_id in excluded_pids:
+            continue
+        try:
+            lines = (process / "maps").read_text(encoding="ascii").splitlines()
+        except (FileNotFoundError, PermissionError, ProcessLookupError, UnicodeDecodeError):
+            continue
+        for line in lines:
+            fields = line.split(maxsplit=5)
+            if len(fields) < 5 or not fields[4].isdecimal() or int(fields[4]) != inode:
+                continue
+            try:
+                major_text, minor_text = fields[3].split(":", 1)
+                mapped_device = os.makedev(int(major_text, 16), int(minor_text, 16))
+            except (ValueError, OSError):
+                continue
+            if mapped_device == device:
+                result.add(process_id)
+                break
+    return tuple(sorted(result))
+
+
+def _legacy_inode_activity(
+    identities: tuple[tuple[int, int], ...],
+    *,
+    include_open_files: bool,
+) -> tuple[int, ...]:
+    result: set[int] = set()
+    for device, inode in identities:
+        if include_open_files:
+            result.update(
+                _processes_with_open_inode(
+                    device,
+                    inode,
+                )
+            )
+        result.update(
+            _processes_with_mapped_inode(
+                device,
+                inode,
+            )
+        )
     return tuple(sorted(result))
 
 
@@ -1649,6 +1718,14 @@ def prepare_final_store_migration(
         raise ActivationPackageError("final migration source parent is not the approved private directory")
     sidecars = tuple(Path(f"{source}{suffix}") for suffix in ("-wal", "-shm"))
     sidecar_before = {str(path): _artifact_identity(path) for path in sidecars}
+    legacy_inode_identities = (
+        (source_metadata.st_dev, source_metadata.st_ino),
+        *(
+            (identity[0], identity[1])
+            for identity in sidecar_before.values()
+            if identity is not None
+        ),
+    )
     for path in sidecars:
         if path.exists() or path.is_symlink():
             _validate_store_artifact(
@@ -1715,8 +1792,10 @@ def prepare_final_store_migration(
             os.fchmod(parent_descriptor, expected_parent_mode)
             raise
         lock_acquired = True
-        if _processes_with_open_inode(source_metadata.st_dev, source_metadata.st_ino):
-            raise ActivationPackageError("final migration source still has an open process")
+        if _legacy_inode_activity(legacy_inode_identities, include_open_files=True):
+            raise ActivationPackageError(
+                "final migration SQLite artifacts still have an open process or mapping"
+            )
 
         bound_paths = tuple(bound_parent / path.name for path in _legacy_store_paths(source))
         for original_path, path in zip(_legacy_store_paths(source), bound_paths, strict=True):
@@ -1786,6 +1865,10 @@ def prepare_final_store_migration(
         for path in bound_paths:
             if path.exists():
                 os.chmod(path, 0o400)
+        if _legacy_inode_activity(legacy_inode_identities, include_open_files=False):
+            raise ActivationPackageError(
+                "final migration SQLite artifacts acquired a mapped process before hashing"
+            )
         locked_source = os.fstat(source_descriptor)
         source_digest_before = _stream_hash_open_regular(
             source_descriptor,
@@ -1827,8 +1910,10 @@ def prepare_final_store_migration(
         for descriptor in legacy_descriptors:
             os.close(descriptor)
         legacy_descriptors.clear()
-        if _processes_with_open_inode(source_metadata.st_dev, source_metadata.st_ino):
-            raise ActivationPackageError("final migration source acquired another open process")
+        if _legacy_inode_activity(legacy_inode_identities, include_open_files=True):
+            raise ActivationPackageError(
+                "final migration SQLite artifacts acquired another open process or mapping"
+            )
         sidecar_after = {
             str(original): _artifact_identity(bound)
             for original, bound in zip(sidecars, bound_paths[1:], strict=True)
@@ -2977,11 +3062,17 @@ def render_activation_contract(
             "--fail",
             "--silent",
             "--show-error",
+            "--connect-timeout",
+            "1",
+            "--max-time",
+            "3",
             "--retry",
             "10",
             "--retry-delay",
             "1",
-            "--retry-connrefused",
+            "--retry-max-time",
+            "15",
+            "--retry-all-errors",
             "--unix-socket",
             str(CANARY_API_SOCKET),
             "http://localhost/health",

@@ -1063,6 +1063,10 @@ def rehearse_store_migration(
         "schemaBefore": schema_before,
         "schemaAfter": schema_after,
         "rowCountPolicy": "fixed-key-tables-or-bounded-fallback",
+        "backupBounds": {
+            "pagesPerStep": pages_per_step,
+            "sleepSeconds": sleep_seconds,
+        },
         "sourceMutationPerformed": False,
         "finalQuiescedBackupRequired": True,
     }
@@ -4331,6 +4335,8 @@ def _main(argv: list[str] | None = None) -> int:
         rehearse_store_migration(
             package_root,
             source_store=args.source_store,
+            pages_per_step=4096,
+            sleep_seconds=0,
         )
         render_activation_contract(
             package_root,

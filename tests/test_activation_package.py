@@ -816,6 +816,13 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     assert result["readyForApproval"] is False
     assert result["packageRoot"] == str(package)
     assert not (package / "public" / "package-manifest.json").exists()
+    migration_report = json.loads(
+        (package / "private" / "migration" / "migration-report.json").read_text(encoding="utf-8")
+    )
+    assert migration_report["backupBounds"] == {
+        "pagesPerStep": 4096,
+        "sleepSeconds": 0,
+    }
 
 
 def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_path: Path) -> None:

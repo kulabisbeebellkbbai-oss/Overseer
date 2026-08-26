@@ -118,7 +118,7 @@
 
 - [ ] Commit source implementation before package generation.
 - [ ] Run the full clean test suite.
-- [ ] Generate the package without live service or database mutation.
+- [ ] Generate the package without live service or database mutation, using the recorded 4,096-page/no-sleep SQLite backup bound under nice-level-10 and idle-I/O process scheduling so continuous WAL commits cannot starve the rehearsal.
 - [ ] Run package self-verification and inspect the exact status.
 - [ ] Stop and request local interactive creation of the two human verifier documents.
 

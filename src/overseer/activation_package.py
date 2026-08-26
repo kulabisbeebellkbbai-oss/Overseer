@@ -3851,6 +3851,8 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         and migrated.get("size") == observed_migrated["size"]
         and migrated.get("integrityCheck") == observed_migrated["integrityCheck"]
         and reindexed == observed_backup["approvedExpressionIndexes"]
+        and observed_migrated["approvedExpressionIndexes"]
+        == sorted(COPIED_EXPRESSION_INDEX_SQL)
         and before_counts == observed_backup["rowCounts"]
         and after_counts == observed_migrated["rowCounts"]
         and report.get("schemaBefore") == observed_backup["schema"]

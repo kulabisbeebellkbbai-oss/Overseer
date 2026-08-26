@@ -2383,6 +2383,55 @@ def test_package_verification_rejects_omitted_reindex_evidence(
         verify_activation_package(package, replacement_digest)
 
 
+def test_package_verification_rejects_deleted_migrated_expression_index(
+    tmp_path: Path,
+) -> None:
+    package, _digest = _finalized_package(tmp_path)
+    migrated = package / "private" / "migration" / "rehearsal-migrated.sqlite3"
+    with sqlite3.connect(migrated) as connection:
+        connection.execute("DROP INDEX idx_host_snapshots_captured_at")
+        connection.commit()
+        assert connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "PRAGMA journal_mode=DELETE"
+        ).fetchone()[0].lower() == "delete"
+    migrated.chmod(0o600)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{migrated}{suffix}")
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+
+    observed = activation_package_module._sealed_migration_artifact_evidence(
+        migrated,
+        expected_uid=os.geteuid(),
+    )
+    assert observed["approvedExpressionIndexes"] == []
+    report_path = package / "private" / "migration" / "migration-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["migrated"].update(
+        {
+            "sha256": observed["sha256"],
+            "size": observed["size"],
+            "integrityCheck": observed["integrityCheck"],
+        }
+    )
+    report["rowCountsAfter"] = observed["rowCounts"]
+    report["schemaAfter"] = observed["schema"]
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    report_path.chmod(0o600)
+    replacement_digest = _reseal_package_manifest_for_test(package)
+
+    with pytest.raises(ActivationPackageError, match="artifact evidence"):
+        verify_activation_package(package, replacement_digest)
+
+
 def test_package_finalization_rejects_contract_rehearsal_source_mismatch(
     tmp_path: Path,
 ) -> None:

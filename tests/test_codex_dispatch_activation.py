@@ -156,8 +156,12 @@ def test_mutable_checkout_launcher_is_never_executed(tmp_path: Path):
 def test_bootstrap_rejects_unrelated_or_arbitrary_self_consistent_blob_before_exec():
     head = activation._git(("rev-parse", "HEAD"))
     tree = activation._git(("rev-parse", "HEAD^{tree}"))
+    binding = _fixture_bootstrap_binding(head, tree)
     spec = replace(_spec(), source_commit=head, source_tree_digest=tree,
-                   bootstrap_binding=_fixture_bootstrap_binding(head, tree))
+                   bootstrap_binding=binding,
+                   launcher_blob=str(binding["launcherBlob"]),
+                   launcher_sha256=str(binding["launcherSha256"]),
+                   launcher_size=int(binding["launcherSize"]))
     command = list(activation._isolated_launcher_command(spec, "probe", ()))
     config = json.loads(command[5])
     unrelated = subprocess.check_output(
@@ -187,8 +191,12 @@ def test_bootstrap_rejects_unrelated_or_arbitrary_self_consistent_blob_before_ex
 def test_service_bootstrap_rejects_approved_manager_drift_before_launcher_import():
     head = activation._git(("rev-parse", "HEAD"))
     tree = activation._git(("rev-parse", "HEAD^{tree}"))
+    binding = _fixture_bootstrap_binding(head, tree)
     spec = replace(_spec(), source_commit=head, source_tree_digest=tree,
-                   bootstrap_binding=_fixture_bootstrap_binding(head, tree))
+                   bootstrap_binding=binding,
+                   launcher_blob=str(binding["launcherBlob"]),
+                   launcher_sha256=str(binding["launcherSha256"]),
+                   launcher_size=int(binding["launcherSize"]))
     drifted = {**spec.bus_peer_binding, "startTicks": int(spec.bus_peer_binding["startTicks"]) + 1}
     spec = replace(spec, bus_peer_binding=drifted)
     payload = (

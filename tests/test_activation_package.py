@@ -1133,6 +1133,7 @@ def test_final_migration_requires_quiescence_and_preserves_source(
     destination = destination_parent / "final-migrated.sqlite3"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_rollback_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1191,6 +1192,7 @@ def test_final_migration_requires_quiescence_and_preserves_source(
     assert stat_mode(source) == 0o400
     assert stat_mode(source.parent) == 0o555
     restored = restore_legacy_store_access(
+        package_root=tmp_path / "package",
         source_store=source,
         expected_source_uid=os.geteuid(),
         expected_source_gid=os.getegid(),
@@ -1254,6 +1256,7 @@ os._exit(0)
     destination = destination_parent / "final-migrated.sqlite3"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_rollback_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1288,6 +1291,7 @@ os._exit(0)
             "SELECT value FROM retained_items ORDER BY id"
         ).fetchall() == [("one",), ("two",), ("three",)]
     restore_legacy_store_access(
+        package_root=tmp_path / "package",
         source_store=source,
         expected_source_uid=os.geteuid(),
         expected_source_gid=os.getegid(),
@@ -3304,6 +3308,7 @@ def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls
         lambda _digest: attestation,
     )
     canary_socket = tmp_path / "api-canary.sock"
+    monkeypatch.setattr(activation_package_module, "CANARY_API_SOCKET", canary_socket)
     monkeypatch.setattr(
         activation_package_module,
         "_validate_canary_socket",
@@ -3404,6 +3409,12 @@ def test_live_canary_rejects_prebound_socket_before_connecting_or_attesting(
     listener.listen()
     listener.setblocking(False)
     attestation = tmp_path / "canary-attestation.json"
+    monkeypatch.setattr(activation_package_module, "CANARY_API_SOCKET", canary_socket)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_canary_attestation_path",
+        lambda _digest: attestation,
+    )
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -3768,12 +3779,19 @@ def test_mutating_canary_primitive_requires_the_active_sealed_runner_command(
             "runnerStateStatus": "not-started",
         },
     )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_inherited_activation_lock",
+        lambda: None,
+    )
+    expected_options = {"--package-root": str(package.resolve())}
 
     with pytest.raises(ActivationPackageError, match="active staging-canary runner"):
         activation_package_module._require_active_phase_command(
             package,
             phase="staging-canary",
             command_name="run-approved-canary",
+            expected_options=expected_options,
         )
 
     activation_package_module._write_activation_state(
@@ -3790,7 +3808,16 @@ def test_mutating_canary_primitive_requires_the_active_sealed_runner_command(
         package,
         phase="staging-canary",
         command_name="run-approved-canary",
+        expected_options=expected_options,
     )
+
+    with pytest.raises(ActivationPackageError, match="sealed command arguments"):
+        activation_package_module._require_active_phase_command(
+            package,
+            phase="staging-canary",
+            command_name="run-approved-canary",
+            expected_options={"--package-root": str(tmp_path / "other-package")},
+        )
 
     drifted = activation_package_module._runner_state(
         package_digest=digest,
@@ -3805,6 +3832,7 @@ def test_mutating_canary_primitive_requires_the_active_sealed_runner_command(
             package,
             phase="staging-canary",
             command_name="run-approved-canary",
+            expected_options=expected_options,
         )
 
 
@@ -4351,7 +4379,13 @@ def test_canary_public_primitive_requires_active_sealed_staging_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     package = tmp_path / "package"
+    attestation = tmp_path / "attestation.json"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_canary_attestation_path",
+        lambda _digest: attestation,
+    )
 
     def reject(*_args, **_kwargs) -> None:
         raise ActivationPackageError("run-approved-canary requires the active staging-canary runner")
@@ -4364,7 +4398,7 @@ def test_canary_public_primitive_requires_active_sealed_staging_command(
             expected_package_digest="a" * 64,
             admin_secret="unused-admin-secret",
             roadex_secret="unused-roadex-secret",
-            attestation_path=tmp_path / "attestation.json",
+            attestation_path=attestation,
         )
 
 
@@ -4625,3 +4659,343 @@ def test_legacy_v1_state_and_package_approval_remain_rollback_readable(
     assert approval["schemaVersion"] == "overseer.activation-package-approval.v1"
     assert state is not None
     assert state["schemaVersion"] == "overseer.activation-runner-state.v1"
+
+
+def test_active_command_guard_requires_an_inherited_runner_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OVERSEER_ACTIVATION_LOCK_FD", raising=False)
+
+    with pytest.raises(ActivationPackageError, match="inherited activation execution lock"):
+        activation_package_module._require_inherited_activation_lock()
+
+
+def test_contract_child_exports_the_inherited_lock_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "executor" / "activation-state.json"
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    class Result:
+        returncode = 0
+
+    def run(*_args, **kwargs):
+        observed.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(activation_package_module.subprocess, "run", run)
+
+    with activation_package_module._activation_execution_lock():
+        activation_package_module._execute_contract_command(["/bin/true"])
+
+    pass_fds = observed["pass_fds"]
+    environment = observed["env"]
+    assert isinstance(pass_fds, tuple)
+    assert isinstance(environment, dict)
+    assert environment["OVERSEER_ACTIVATION_LOCK_FD"] == str(pass_fds[0])
+
+
+def test_cleanup_satisfaction_rejects_systemctl_query_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        activation_package_module,
+        "_command_outcome",
+        lambda _command: (4, None),
+    )
+
+    assert activation_package_module._cleanup_command_satisfied(
+        ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"]
+    ) is False
+
+
+def test_failed_staging_command_cleans_up_when_cleanup_checkpoint_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "a" * 64
+    package = tmp_path / "package"
+    staging = ["/bin/false", "staging"]
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [staging],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [cleanup]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "staging-canary"},
+    )
+
+    def execute(command: list[str]) -> int:
+        calls.append(tuple(command))
+        return 1 if command == staging else 0
+
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+    original_write = activation_package_module._write_activation_state
+    failed_once = False
+
+    def fail_cleanup_checkpoint(document: dict[str, object]) -> None:
+        nonlocal failed_once
+        if document.get("status") == "cleanup_command_running" and not failed_once:
+            failed_once = True
+            raise OSError("simulated cleanup checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_cleanup_checkpoint)
+
+    with pytest.raises(ActivationPackageError, match="failed before cutover"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    assert calls == [tuple(staging), tuple(cleanup)]
+
+
+def test_failed_cutover_command_rolls_back_when_rollback_checkpoint_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "b" * 64
+    package = tmp_path / "package"
+    cutover = ["/bin/false", "cutover"]
+    rollback = ["/bin/true", "rollback"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [cutover],
+        "rollbackCommands": [rollback],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "cutover"},
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="canary_passed_awaiting_cutover_approval",
+            phase="staging-canary",
+        )
+    )
+
+    def execute(command: list[str]) -> int:
+        calls.append(tuple(command))
+        return 1 if command == cutover else 0
+
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+    original_write = activation_package_module._write_activation_state
+    failed_once = False
+
+    def fail_rollback_checkpoint(document: dict[str, object]) -> None:
+        nonlocal failed_once
+        if document.get("status") == "rollback_command_running" and not failed_once:
+            failed_once = True
+            raise OSError("simulated rollback checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_rollback_checkpoint)
+
+    with pytest.raises(ActivationPackageError, match="sealed rollback completed"):
+        activation_package_module.execute_approved_cutover(package)
+
+    assert calls == [tuple(cutover), tuple(rollback)]
+
+
+def test_cutover_state_recovery_reconciles_existing_exact_rollback_transients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "c" * 64
+    command = ["/usr/bin/systemd-run", "sealed-rollback"]
+    contract = {"rollbackCommands": [command]}
+    observed: list[bool] = []
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", lambda _state: None)
+    monkeypatch.setattr(activation_package_module, "_validate_contract_principal_binding", lambda _contract: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_rollback_transient_spec",
+        lambda _command: {"unit": "sealed.service"},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_rollback_transient",
+        lambda _contract, _command, *, resume: observed.append(resume),
+    )
+
+    activation_package_module._execute_rollback_sequence(
+        contract,
+        package_digest=digest,
+        prior_state={
+            "schemaVersion": activation_package_module.ACTIVATION_RUNNER_STATE_SCHEMA,
+            "packageDigest": digest,
+            "status": "command_running",
+            "phase": "cutover",
+            "commandIndex": 0,
+            "commandDigest": "d" * 64,
+        },
+    )
+
+    assert observed == [True]
+
+
+def test_restore_legacy_store_public_primitive_requires_sealed_rollback_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.sqlite3"
+    source.touch()
+    metadata = source.stat()
+    parent = source.parent.stat()
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+
+    def reject(*_args, **_kwargs) -> None:
+        raise ActivationPackageError(
+            "restore-legacy-store-access requires the active sealed rollback command"
+        )
+
+    monkeypatch.setattr(activation_package_module, "_require_active_rollback_command", reject)
+
+    with pytest.raises(ActivationPackageError, match="active sealed rollback command"):
+        restore_legacy_store_access(
+            package_root=tmp_path / "package",
+            source_store=source,
+            expected_source_uid=metadata.st_uid,
+            expected_source_gid=metadata.st_gid,
+            expected_source_device=metadata.st_dev,
+            expected_source_inode=metadata.st_ino,
+            expected_parent_device=parent.st_dev,
+            expected_parent_inode=parent.st_ino,
+            expected_parent_mode=stat_mode(source.parent),
+        )
+
+
+def test_manual_rollback_checkpoint_failure_retries_and_records_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "e" * 64
+    package = tmp_path / "package"
+    rollback = ["/bin/true", "rollback"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [rollback],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="command_running",
+            phase="cutover",
+            command_index=0,
+            command=["/bin/true", "cutover"],
+        )
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+    original_write = activation_package_module._write_activation_state
+    failed_once = False
+
+    def fail_rollback_completion(document: dict[str, object]) -> None:
+        nonlocal failed_once
+        if document.get("status") == "rollback_command_complete" and not failed_once:
+            failed_once = True
+            raise OSError("simulated rollback completion checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_rollback_completion)
+
+    result = activation_package_module.execute_approved_rollback(package)
+
+    assert result["status"] == "rolled_back"
+    assert calls == [tuple(rollback), tuple(rollback)]
+    final_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert final_state["status"] == "rolled_back"

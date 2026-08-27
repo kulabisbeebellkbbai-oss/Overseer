@@ -193,6 +193,13 @@ immediately when a post-command checkpoint fails; and keep prior schemas
 readable only by the sealed rollback path. Re-run the exact-commit Daybreak
 review after all findings are corrected.
 
+The exact-commit review must also verify that persisted runner state cannot be
+replayed by a caller that did not inherit the active lock, every guarded
+primitive validates its complete sealed argument map, cleanup and rollback
+remain effective when either their entry or completion checkpoint fails, the
+legacy-store restoration primitive cannot be invoked directly, and cleanup
+treats only the exact inactive `systemctl is-active` result as satisfied.
+
 - [ ] **Step 4: Generate the replacement owner-scoped package**
 
 Reuse the reviewed package workflow and immutable local inputs. Do not use `sudo`, import into `/var/lib/overseer-executor`, write a phase approval, or execute a runner.

@@ -63,6 +63,7 @@ APPROVED_OVERSEER_GID = 984
 APPROVED_PACKAGE_PARENT = Path("/home/god/.local/share/overseer/activation-packages")
 APPROVED_EXECUTION_PACKAGE = Path("/var/lib/overseer-executor/approved-package")
 CANARY_API_SOCKET = Path("/run/overseer-canary/api.sock")
+ACTIVATION_LOCK_FD_ENV = "OVERSEER_ACTIVATION_LOCK_FD"
 _ACTIVE_EXECUTION_LOCK_DESCRIPTOR: int | None = None
 APPROVED_SQLITE_VERSION = "3.53.4"
 APPROVED_SQLITE_SOURCE_ID = (
@@ -1771,7 +1772,7 @@ def _legacy_store_paths(source: Path) -> tuple[Path, ...]:
     return (source, Path(f"{source}-wal"), Path(f"{source}-shm"))
 
 
-def restore_legacy_store_access(
+def _restore_legacy_store_access_unchecked(
     *,
     source_store: str | os.PathLike[str],
     expected_source_uid: int,
@@ -1837,6 +1838,47 @@ def restore_legacy_store_access(
     }
 
 
+def restore_legacy_store_access(
+    *,
+    package_root: str | os.PathLike[str],
+    source_store: str | os.PathLike[str],
+    expected_source_uid: int,
+    expected_source_gid: int,
+    expected_source_device: int,
+    expected_source_inode: int,
+    expected_parent_device: int,
+    expected_parent_inode: int,
+    expected_parent_mode: int,
+) -> dict[str, object]:
+    """Restore legacy access only as the exact active sealed rollback command."""
+
+    source = Path(source_store).resolve()
+    _require_active_rollback_command(
+        package_root,
+        command_name="restore-legacy-store-access",
+        expected_options={
+            "--source-store": str(source),
+            "--expected-source-uid": str(expected_source_uid),
+            "--expected-source-gid": str(expected_source_gid),
+            "--expected-source-device": str(expected_source_device),
+            "--expected-source-inode": str(expected_source_inode),
+            "--expected-parent-device": str(expected_parent_device),
+            "--expected-parent-inode": str(expected_parent_inode),
+            "--expected-parent-mode": str(expected_parent_mode),
+        },
+    )
+    return _restore_legacy_store_access_unchecked(
+        source_store=source,
+        expected_source_uid=expected_source_uid,
+        expected_source_gid=expected_source_gid,
+        expected_source_device=expected_source_device,
+        expected_source_inode=expected_source_inode,
+        expected_parent_device=expected_parent_device,
+        expected_parent_inode=expected_parent_inode,
+        expected_parent_mode=expected_parent_mode,
+    )
+
+
 def prepare_final_store_migration(
     *,
     package_root: str | os.PathLike[str],
@@ -1866,6 +1908,23 @@ def prepare_final_store_migration(
         package_root,
         phase="cutover",
         command_name="prepare-final-store",
+        expected_options={
+            "--package-root": str(Path(package_root).resolve()),
+            "--source-store": str(Path(source_store).resolve()),
+            "--backup-store": str(Path(backup_store).resolve()),
+            "--destination-store": str(Path(destination_store).resolve()),
+            "--expected-source-device": str(expected_source_device),
+            "--expected-source-inode": str(expected_source_inode),
+            "--expected-source-uid": str(expected_source_uid),
+            "--expected-source-gid": str(expected_source_gid),
+            "--expected-parent-device": str(expected_parent_device),
+            "--expected-parent-inode": str(expected_parent_inode),
+            "--expected-parent-mode": str(expected_parent_mode),
+            "--destination-uid": str(destination_uid),
+            "--destination-gid": str(destination_gid),
+            "--pages-per-step": str(pages_per_step),
+            "--sleep-seconds": str(sleep_seconds),
+        },
     )
 
     for value, label in (
@@ -2310,7 +2369,7 @@ def prepare_final_store_migration(
         restore_error: BaseException | None = None
         if lock_acquired:
             try:
-                restore_legacy_store_access(
+                _restore_legacy_store_access_unchecked(
                     source_store=source,
                     expected_source_uid=expected_source_uid,
                     expected_source_gid=expected_source_gid,
@@ -3579,6 +3638,8 @@ def render_activation_contract(
         [
             *activation_python,
             "restore-legacy-store-access",
+            "--package-root",
+            str(execution_package),
             "--source-store",
             str(source.resolve()),
             "--expected-source-uid",
@@ -4831,11 +4892,19 @@ def run_canary_acceptance(
     from .client import OverseerApiClient
 
     _require_root_activation()
-    package = Path(package_root)
+    package = Path(package_root).resolve()
+    if (
+        base_url != "http://localhost"
+        or Path(unix_socket_path) != CANARY_API_SOCKET
+        or Path(attestation_path) != _canary_attestation_path(expected_package_digest)
+    ):
+        raise ActivationPackageError("canary runtime arguments are not the sealed command arguments")
     _require_active_phase_command(
         package,
         phase="staging-canary",
         command_name="run-approved-canary",
+        expected_options={"--package-root": str(package)},
+        expected_package_digest=expected_package_digest,
     )
     verified = verify_activation_package(package, expected_package_digest)
     verify_installed_staging(package, expected_package_digest=expected_package_digest)
@@ -5105,6 +5174,41 @@ def _activation_lock_path() -> Path:
     return _activation_state_path().with_name("activation.lock")
 
 
+def _require_inherited_activation_lock() -> int:
+    """Prove this primitive inherited the runner's exact locked descriptor."""
+
+    raw_descriptor = os.environ.get(ACTIVATION_LOCK_FD_ENV, "")
+    if re.fullmatch(r"[0-9]+", raw_descriptor) is None:
+        raise ActivationPackageError("active command requires the inherited activation execution lock")
+    descriptor = int(raw_descriptor)
+    if descriptor < 3:
+        raise ActivationPackageError("inherited activation execution lock descriptor is invalid")
+    target = _activation_lock_path()
+    try:
+        inherited = os.fstat(descriptor)
+        lexical = target.lstat()
+    except OSError as error:
+        raise ActivationPackageError("inherited activation execution lock is unavailable") from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        target.is_symlink()
+        or not stat.S_ISREG(inherited.st_mode)
+        or not stat.S_ISREG(lexical.st_mode)
+        or inherited.st_nlink != 1
+        or lexical.st_nlink != 1
+        or inherited.st_uid != root_uid
+        or inherited.st_gid != root_gid
+        or stat.S_IMODE(inherited.st_mode) != 0o600
+        or (inherited.st_dev, inherited.st_ino) != (lexical.st_dev, lexical.st_ino)
+    ):
+        raise ActivationPackageError("inherited activation execution lock identity is invalid")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise ActivationPackageError("activation execution lock was not inherited by this command") from error
+    return descriptor
+
+
 @contextmanager
 def _activation_execution_lock():
     global _ACTIVE_EXECUTION_LOCK_DESCRIPTOR
@@ -5306,15 +5410,35 @@ def _load_activation_phase_approval(
     return document
 
 
+def _sealed_command_options(command: list[str], *, command_name: str) -> dict[str, str]:
+    if command.count(command_name) != 1:
+        raise ActivationPackageError("active runner command name is not uniquely sealed")
+    tail = command[command.index(command_name) + 1 :]
+    if len(tail) % 2:
+        raise ActivationPackageError("active runner command arguments are malformed")
+    options: dict[str, str] = {}
+    for index in range(0, len(tail), 2):
+        name, value = tail[index : index + 2]
+        if not name.startswith("--") or "=" in name or name in options or not value:
+            raise ActivationPackageError("active runner command arguments are malformed")
+        options[name] = value
+    return options
+
+
 def _require_active_phase_command(
     package_root: str | os.PathLike[str],
     *,
     phase: str,
     command_name: str,
+    expected_options: Mapping[str, str],
+    expected_package_digest: str | None = None,
 ) -> None:
+    _require_inherited_activation_lock()
     package = Path(package_root).resolve()
     package_approval = _load_activation_approval(package)
     package_digest = str(package_approval["packageDigest"])
+    if expected_package_digest is not None and package_digest != expected_package_digest:
+        raise ActivationPackageError("active runner package digest does not match the command")
     contract = _sealed_package_json(
         package,
         expected_package_digest=package_digest,
@@ -5336,11 +5460,53 @@ def _require_active_phase_command(
     if type(index) is not int or not 0 <= index < len(commands):
         raise ActivationPackageError("active runner state is not bound to a sealed command")
     command = commands[index]
-    if (
-        command_name not in command
-        or state.get("commandDigest") != _sha256(_canonical(command))
-    ):
+    if state.get("commandDigest") != _sha256(_canonical(command)):
         raise ActivationPackageError("active runner state is not bound to the sealed command")
+    if _sealed_command_options(command, command_name=command_name) != dict(expected_options):
+        raise ActivationPackageError("active runner call does not match the sealed command arguments")
+
+
+def _require_active_rollback_command(
+    package_root: str | os.PathLike[str],
+    *,
+    command_name: str,
+    expected_options: Mapping[str, str],
+) -> None:
+    _require_inherited_activation_lock()
+    package = Path(package_root).resolve()
+    package_approval = _load_activation_approval_for_rollback(package)
+    package_digest = str(package_approval["packageDigest"])
+    sealed_contract = _sealed_package_json(
+        package,
+        expected_package_digest=package_digest,
+        relative_path="public/activation-contract.json",
+    )
+    schema = sealed_contract.get("schemaVersion")
+    contract = _normalize_rollback_contract(sealed_contract)
+    state = _load_activation_state()
+    if (
+        state is None
+        or state.get("schemaVersion")
+        not in {ACTIVATION_RUNNER_STATE_SCHEMA, LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA}
+        or state.get("packageDigest") != package_digest
+        or state.get("phase") != "rollback"
+        or state.get("status") != "rollback_command_running"
+    ):
+        raise ActivationPackageError(
+            f"{command_name} requires the active sealed rollback command"
+        )
+    commands = _contract_commands(contract, "rollbackCommands")
+    index = state.get("commandIndex")
+    if type(index) is not int or not 0 <= index < len(commands):
+        raise ActivationPackageError("active rollback state is not bound to a sealed command")
+    command = commands[index]
+    if state.get("commandDigest") != _sha256(_canonical(command)):
+        raise ActivationPackageError("active rollback state is not bound to the sealed command")
+    expected = dict(expected_options)
+    if schema == ACTIVATION_CONTRACT_SCHEMA:
+        expected["--package-root"] = str(package)
+    if _sealed_command_options(command, command_name=command_name) != expected:
+        raise ActivationPackageError("active rollback call does not match the sealed command arguments")
 
 
 def _record_activation_phase_approval_locked(
@@ -5425,6 +5591,7 @@ def _execute_contract_command(command: list[str]) -> int:
         "HOME": "/root",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        ACTIVATION_LOCK_FD_ENV: str(lock_descriptor),
     }
     try:
         result = subprocess.run(
@@ -5484,7 +5651,7 @@ def _cleanup_command_satisfied(command: list[str]) -> bool:
         returncode, start_error = _command_outcome(
             ["/usr/bin/systemctl", "is-active", "--quiet", unit]
         )
-        if start_error is not None or returncode == 0:
+        if start_error is not None or returncode != 3:
             return False
     return True
 
@@ -5564,6 +5731,32 @@ def _execute_emergency_cleanup_sequence(contract: Mapping[str, object]) -> None:
             raise ActivationPackageError(
                 f"emergency staging cleanup command failed: {detail}"
             )
+
+
+def _write_recovery_state_best_effort(document: Mapping[str, object]) -> bool:
+    try:
+        _write_activation_state(document)
+    except Exception:
+        return False
+    return True
+
+
+def _execute_resilient_cleanup(
+    contract: Mapping[str, object],
+    *,
+    package_digest: str,
+) -> bool:
+    try:
+        _execute_cleanup_sequence(contract, package_digest=package_digest)
+    except Exception:
+        _execute_emergency_cleanup_sequence(contract)
+    return _write_recovery_state_best_effort(
+        _runner_state(
+            package_digest=package_digest,
+            status="aborted_before_cutover",
+            phase="staging_cleanup",
+        )
+    )
 
 
 def _rollback_transient_spec(command: list[str]) -> dict[str, object] | None:
@@ -5889,6 +6082,7 @@ def _execute_rollback_sequence(
         commands=commands,
         package_digest=package_digest,
     )
+    recover_from_cutover = prior_state is not None and prior_state.get("phase") == "cutover"
     for index, command in enumerate(commands):
         try:
             _validate_contract_principal_binding(contract)
@@ -5920,7 +6114,10 @@ def _execute_rollback_sequence(
                 _execute_rollback_transient(
                     contract,
                     command,
-                    resume=recovery_boundary is not None and index <= recovery_boundary,
+                    resume=(
+                        recover_from_cutover
+                        or (recovery_boundary is not None and index <= recovery_boundary)
+                    ),
                 )
             except Exception as error:
                 _write_activation_state(
@@ -5968,11 +6165,48 @@ def _execute_rollback_sequence(
     )
 
 
+def _sealed_restore_legacy_arguments(command: list[str]) -> dict[str, object] | None:
+    command_name = "restore-legacy-store-access"
+    if command_name not in command:
+        return None
+    options = _sealed_command_options(command, command_name=command_name)
+    options.pop("--package-root", None)
+    expected = {
+        "--source-store",
+        "--expected-source-uid",
+        "--expected-source-gid",
+        "--expected-source-device",
+        "--expected-source-inode",
+        "--expected-parent-device",
+        "--expected-parent-inode",
+        "--expected-parent-mode",
+    }
+    if set(options) != expected:
+        raise ActivationPackageError("sealed rollback store-restore command is invalid")
+    try:
+        return {
+            "source_store": options["--source-store"],
+            "expected_source_uid": int(options["--expected-source-uid"]),
+            "expected_source_gid": int(options["--expected-source-gid"]),
+            "expected_source_device": int(options["--expected-source-device"]),
+            "expected_source_inode": int(options["--expected-source-inode"]),
+            "expected_parent_device": int(options["--expected-parent-device"]),
+            "expected_parent_inode": int(options["--expected-parent-inode"]),
+            "expected_parent_mode": int(options["--expected-parent-mode"]),
+        }
+    except ValueError as error:
+        raise ActivationPackageError("sealed rollback store-restore values are invalid") from error
+
+
 def _execute_emergency_rollback_sequence(contract: Mapping[str, object]) -> None:
     """Run sealed rollback without checkpoints when state publication has failed."""
 
     for command in _contract_commands(contract, "rollbackCommands"):
         _validate_contract_principal_binding(contract)
+        restore_arguments = _sealed_restore_legacy_arguments(command)
+        if restore_arguments is not None:
+            _restore_legacy_store_access_unchecked(**restore_arguments)
+            continue
         if _rollback_transient_spec(command) is not None:
             _execute_rollback_transient(contract, command, resume=True)
             continue
@@ -5982,6 +6216,33 @@ def _execute_emergency_rollback_sequence(contract: Mapping[str, object]) -> None
             raise ActivationPackageError(
                 f"emergency sealed rollback command failed: {detail}"
             )
+
+
+def _execute_resilient_rollback(
+    contract: Mapping[str, object],
+    *,
+    package_digest: str,
+    prior_state: Mapping[str, object] | None,
+    originating_failure: str | None,
+) -> bool:
+    try:
+        _execute_rollback_sequence(
+            contract,
+            package_digest=package_digest,
+            prior_state=prior_state,
+            originating_failure=originating_failure,
+        )
+    except Exception:
+        _execute_emergency_rollback_sequence(contract)
+        return _write_recovery_state_best_effort(
+            _runner_state(
+                package_digest=package_digest,
+                status="rolled_back",
+                phase="rollback",
+                failure=originating_failure,
+            )
+        )
+    return True
 
 
 def _approved_activation_contract(
@@ -6059,17 +6320,16 @@ def _execute_approved_staging_canary_locked(
         returncode, start_error = _validated_command_outcome(contract, command)
         if returncode != 0:
             command_failure = start_error or f"exit-{returncode}"
-            _execute_cleanup_sequence(contract, package_digest=digest)
-            _write_activation_state(
-                _runner_state(
-                    package_digest=digest,
-                    status="failed_before_cutover",
-                    phase="staging-canary",
-                    command_index=index,
-                    command=command,
-                    failure=command_failure,
+            try:
+                cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
+            except Exception as cleanup_error:
+                raise ActivationPackageError(
+                    "staged activation command failed and sealed cleanup did not complete"
+                ) from cleanup_error
+            if not cleanup_durable:
+                raise ActivationPackageError(
+                    "staged activation command failed; cleanup completed but terminal recovery state is not durable"
                 )
-            )
             raise ActivationPackageError("staged activation command failed before cutover")
         try:
             _write_activation_state(
@@ -6083,11 +6343,15 @@ def _execute_approved_staging_canary_locked(
             )
         except Exception as checkpoint_error:
             try:
-                _execute_emergency_cleanup_sequence(contract)
+                cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
             except Exception as cleanup_error:
                 raise ActivationPackageError(
                     "checkpoint failed after staging command and immediate cleanup failed"
                 ) from cleanup_error
+            if not cleanup_durable:
+                raise ActivationPackageError(
+                    "checkpoint failed after staging command; cleanup completed but terminal recovery state is not durable"
+                ) from checkpoint_error
             raise ActivationPackageError(
                 "checkpoint failed after staging command; immediate cleanup completed"
             ) from checkpoint_error
@@ -6095,15 +6359,16 @@ def _execute_approved_staging_canary_locked(
     try:
         verify_approved_cutover(package)
     except Exception as error:
-        _execute_cleanup_sequence(contract, package_digest=digest)
-        _write_activation_state(
-            _runner_state(
-                package_digest=digest,
-                status="failed_before_cutover",
-                phase="staging_cleanup",
-                failure=type(error).__name__,
-            )
-        )
+        try:
+            cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
+        except Exception as cleanup_error:
+            raise ActivationPackageError(
+                "cutover gate failed and sealed staging cleanup did not complete"
+            ) from cleanup_error
+        if not cleanup_durable:
+            raise ActivationPackageError(
+                "cutover gate failed; cleanup completed but terminal recovery state is not durable"
+            ) from error
         raise ActivationPackageError("cutover gate failed after staging cleanup") from error
     try:
         _write_activation_state(
@@ -6115,11 +6380,15 @@ def _execute_approved_staging_canary_locked(
         )
     except Exception as checkpoint_error:
         try:
-            _execute_emergency_cleanup_sequence(contract)
+            cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
         except Exception as cleanup_error:
             raise ActivationPackageError(
                 "final staging checkpoint failed and immediate cleanup failed"
             ) from cleanup_error
+        if not cleanup_durable:
+            raise ActivationPackageError(
+                "final staging checkpoint failed; cleanup completed but terminal recovery state is not durable"
+            ) from checkpoint_error
         raise ActivationPackageError(
             "final staging checkpoint failed; immediate cleanup completed"
         ) from checkpoint_error
@@ -6153,57 +6422,73 @@ def _execute_approved_cutover_locked(
     cutover = _contract_commands(contract, "cutoverCommands")
     rollback = _contract_commands(contract, "rollbackCommands")
     _write_activation_state(_runner_state(package_digest=digest, status="running", phase="cutover"))
+    completed_state: dict[str, object] | None = None
     for index, command in enumerate(cutover):
-        _write_activation_state(
-            _runner_state(
-                package_digest=digest,
-                status="command_running",
-                phase="cutover",
-                command_index=index,
-                command=command,
-            )
+        command_state = _runner_state(
+            package_digest=digest,
+            status="command_running",
+            phase="cutover",
+            command_index=index,
+            command=command,
         )
+        _write_activation_state(command_state)
         returncode, start_error = _validated_command_outcome(contract, command)
         if returncode != 0:
             command_failure = start_error or f"cutover-exit-{returncode}"
-            _write_activation_state(
-                _runner_state(
-                    package_digest=digest,
-                    status="rollback_command_running",
-                    phase="rollback",
-                    command_index=0,
-                    command=rollback[0],
-                    failure=command_failure,
-                )
+            rollback_state = _runner_state(
+                package_digest=digest,
+                status="rollback_command_running",
+                phase="rollback",
+                command_index=0,
+                command=rollback[0],
+                failure=command_failure,
             )
             try:
-                _execute_rollback_sequence(
+                _write_activation_state(rollback_state)
+                recovery_state: Mapping[str, object] = rollback_state
+            except Exception:
+                recovery_state = command_state
+            try:
+                rollback_durable = _execute_resilient_rollback(
                     contract,
                     package_digest=digest,
+                    prior_state=recovery_state,
                     originating_failure=command_failure,
                 )
-            except ActivationPackageError as error:
+            except Exception as error:
                 raise ActivationPackageError(
                     "cutover failed and sealed rollback did not complete"
                 ) from error
-            raise ActivationPackageError("cutover failed and the sealed rollback completed")
-        try:
-            _write_activation_state(
-                _runner_state(
-                    package_digest=digest,
-                    status="command_complete",
-                    phase="cutover",
-                    command_index=index,
-                    command=command,
+            if not rollback_durable:
+                raise ActivationPackageError(
+                    "cutover failed; sealed rollback completed but terminal recovery state is not durable"
                 )
-            )
+            raise ActivationPackageError("cutover failed and the sealed rollback completed")
+        completed_state = _runner_state(
+            package_digest=digest,
+            status="command_complete",
+            phase="cutover",
+            command_index=index,
+            command=command,
+        )
+        try:
+            _write_activation_state(completed_state)
         except Exception as checkpoint_error:
             try:
-                _execute_emergency_rollback_sequence(contract)
+                rollback_durable = _execute_resilient_rollback(
+                    contract,
+                    package_digest=digest,
+                    prior_state=command_state,
+                    originating_failure=type(checkpoint_error).__name__,
+                )
             except Exception as rollback_error:
                 raise ActivationPackageError(
                     "checkpoint failed after cutover command and immediate sealed rollback failed"
                 ) from rollback_error
+            if not rollback_durable:
+                raise ActivationPackageError(
+                    "checkpoint failed after cutover command; rollback completed but terminal recovery state is not durable"
+                ) from checkpoint_error
             raise ActivationPackageError(
                 "checkpoint failed after cutover command; immediate sealed rollback completed"
             ) from checkpoint_error
@@ -6213,11 +6498,20 @@ def _execute_approved_cutover_locked(
         )
     except Exception as checkpoint_error:
         try:
-            _execute_emergency_rollback_sequence(contract)
+            rollback_durable = _execute_resilient_rollback(
+                contract,
+                package_digest=digest,
+                prior_state=completed_state,
+                originating_failure=type(checkpoint_error).__name__,
+            )
         except Exception as rollback_error:
             raise ActivationPackageError(
                 "final cutover checkpoint failed and immediate sealed rollback failed"
             ) from rollback_error
+        if not rollback_durable:
+            raise ActivationPackageError(
+                "final cutover checkpoint failed; rollback completed but terminal recovery state is not durable"
+            ) from checkpoint_error
         raise ActivationPackageError(
             "final cutover checkpoint failed; immediate sealed rollback completed"
         ) from checkpoint_error
@@ -6255,23 +6549,22 @@ def _execute_approved_rollback_locked(
             "replayed": True,
         }
     if state.get("phase") in {"staging", "staging-canary", "staging_cleanup"}:
-        _execute_cleanup_sequence(contract, package_digest=digest)
-        _write_activation_state(
-            _runner_state(
-                package_digest=digest,
-                status="aborted_before_cutover",
-                phase="staging_cleanup",
+        if not _execute_resilient_cleanup(contract, package_digest=digest):
+            raise ActivationPackageError(
+                "staging cleanup completed but terminal recovery state is not durable"
             )
-        )
         return {"status": "aborted_before_cutover", "packageDigest": digest, "replayed": False}
     if state.get("phase") not in {"cutover", "rollback"}:
         raise ActivationPackageError("activation runner state is not eligible for sealed rollback")
-    _execute_rollback_sequence(
+    if not _execute_resilient_rollback(
         contract,
         package_digest=digest,
         prior_state=state,
         originating_failure=str(state.get("failure")) if state.get("failure") else None,
-    )
+    ):
+        raise ActivationPackageError(
+            "sealed rollback completed but terminal recovery state is not durable"
+        )
     return {"status": "rolled_back", "packageDigest": digest, "replayed": False}
 
 
@@ -6378,6 +6671,7 @@ def _main(argv: list[str] | None = None) -> int:
         "restore-legacy-store-access",
         help="restore the exact legacy store access needed for approved rollback",
     )
+    restore_legacy.add_argument("--package-root")
     restore_legacy.add_argument("--source-store", required=True)
     restore_legacy.add_argument("--expected-source-uid", required=True, type=int)
     restore_legacy.add_argument("--expected-source-gid", required=True, type=int)
@@ -6596,6 +6890,11 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "restore-legacy-store-access":
         result = restore_legacy_store_access(
+            package_root=(
+                _validate_existing_package_destination(args.package_root)
+                if args.package_root
+                else APPROVED_EXECUTION_PACKAGE
+            ),
             source_store=args.source_store,
             expected_source_uid=args.expected_source_uid,
             expected_source_gid=args.expected_source_gid,

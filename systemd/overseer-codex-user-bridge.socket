@@ -4,10 +4,10 @@ Before=overseer-codex-user-bridge.service
 
 [Socket]
 ListenStream=/run/overseer/codex-user-bridge.sock
-SocketMode=0660
-SocketUser=god
-SocketGroup=overseer
-DirectoryMode=0750
+SocketMode=0600
+SocketUser=@OVERSEER_UID@
+SocketGroup=0
+DirectoryMode=0710
 RemoveOnStop=yes
 
 [Install]

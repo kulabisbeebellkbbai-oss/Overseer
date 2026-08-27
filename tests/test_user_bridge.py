@@ -331,10 +331,11 @@ def test_bridge_templates_are_root_socket_activated_and_network_denied() -> None
     service_unit = (root / "systemd/overseer-codex-user-bridge.service").read_text()
 
     assert "ListenStream=/run/overseer/codex-user-bridge.sock" in socket_unit
-    assert "SocketUser=god" in socket_unit
-    assert "SocketGroup=overseer" in socket_unit
-    assert "SocketMode=0660" in socket_unit
-    assert "User=god" in service_unit
+    assert "SocketUser=@OVERSEER_UID@" in socket_unit
+    assert "SocketGroup=0" in socket_unit
+    assert "SocketMode=0600" in socket_unit
+    assert "User=@GOD_UID@" in service_unit
+    assert "Group=@GOD_UID@" in service_unit
     assert (
         "Environment=PYTHONPATH=@OVERSEER_RELEASE@/app/src:"
         "@OVERSEER_RELEASE@/site-packages"

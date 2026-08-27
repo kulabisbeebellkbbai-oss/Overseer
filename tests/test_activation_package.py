@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -9,6 +10,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -2033,11 +2035,18 @@ def test_ensure_dedicated_principal_reuses_exact_existing_identity(
         pw_dir="/var/lib/overseer",
         pw_shell="/usr/sbin/nologin",
     )
-    group = SimpleNamespace(gr_name="overseer", gr_gid=984)
+    group = SimpleNamespace(gr_name="overseer", gr_gid=984, gr_mem=[])
     monkeypatch.setattr(activation_package_module.pwd, "getpwnam", lambda name: user)
     monkeypatch.setattr(activation_package_module.pwd, "getpwuid", lambda uid: user)
     monkeypatch.setattr(activation_package_module.grp, "getgrnam", lambda name: group)
     monkeypatch.setattr(activation_package_module.grp, "getgrgid", lambda gid: group)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwall", lambda: [user])
+    monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [group])
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_dedicated_principal_password_lock",
+        lambda **_kwargs: None,
+    )
 
     def unexpected_run(*args: object, **kwargs: object) -> object:
         raise AssertionError("exact existing principal must not invoke account creation")
@@ -2090,7 +2099,7 @@ def test_ensure_dedicated_principal_creates_only_missing_exact_entries(
         assert kwargs["pass_fds"] == (17,)
         assert kwargs["env"][activation_package_module.ACTIVATION_LOCK_FD_ENV] == "17"
         if command[0] == "/usr/sbin/groupadd":
-            state["group"] = SimpleNamespace(gr_name="overseer", gr_gid=984)
+            state["group"] = SimpleNamespace(gr_name="overseer", gr_gid=984, gr_mem=[])
         elif command[0] == "/usr/sbin/useradd":
             state["user"] = SimpleNamespace(
                 pw_name="overseer",
@@ -2107,7 +2116,22 @@ def test_ensure_dedicated_principal_creates_only_missing_exact_entries(
     monkeypatch.setattr(activation_package_module.pwd, "getpwuid", user_by_uid)
     monkeypatch.setattr(activation_package_module.grp, "getgrnam", group_by_name)
     monkeypatch.setattr(activation_package_module.grp, "getgrgid", group_by_gid)
+    monkeypatch.setattr(
+        activation_package_module.pwd,
+        "getpwall",
+        lambda: [] if state["user"] is None else [state["user"]],
+    )
+    monkeypatch.setattr(
+        activation_package_module.grp,
+        "getgrall",
+        lambda: [] if state["group"] is None else [state["group"]],
+    )
     monkeypatch.setattr(activation_package_module.subprocess, "run", create)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_dedicated_principal_password_lock",
+        lambda **_kwargs: None,
+    )
 
     result = activation_package_module._ensure_dedicated_principal_identity(
         uid=984,
@@ -2139,7 +2163,7 @@ def test_ensure_dedicated_principal_creates_only_missing_exact_entries(
 def test_ensure_dedicated_principal_completes_group_only_prior_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    group = SimpleNamespace(gr_name="overseer", gr_gid=984)
+    group = SimpleNamespace(gr_name="overseer", gr_gid=984, gr_mem=[])
     user: object | None = None
     calls: list[list[str]] = []
 
@@ -2169,7 +2193,18 @@ def test_ensure_dedicated_principal_completes_group_only_prior_attempt(
     monkeypatch.setattr(activation_package_module.pwd, "getpwuid", user_by_uid)
     monkeypatch.setattr(activation_package_module.grp, "getgrnam", lambda name: group)
     monkeypatch.setattr(activation_package_module.grp, "getgrgid", lambda gid: group)
+    monkeypatch.setattr(
+        activation_package_module.pwd,
+        "getpwall",
+        lambda: [] if user is None else [user],
+    )
+    monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [group])
     monkeypatch.setattr(activation_package_module.subprocess, "run", create)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_dedicated_principal_password_lock",
+        lambda **_kwargs: None,
+    )
 
     result = activation_package_module._ensure_dedicated_principal_identity(
         uid=984,
@@ -2204,13 +2239,19 @@ def test_ensure_dedicated_principal_rejects_nonzero_child_even_after_identity_ap
 
     def failed_create(command: list[str], **kwargs: object) -> object:
         nonlocal group
-        group = SimpleNamespace(gr_name="overseer", gr_gid=984)
+        group = SimpleNamespace(gr_name="overseer", gr_gid=984, gr_mem=[])
         return SimpleNamespace(returncode=9)
 
     monkeypatch.setattr(activation_package_module.pwd, "getpwnam", missing_user)
     monkeypatch.setattr(activation_package_module.pwd, "getpwuid", missing_user)
     monkeypatch.setattr(activation_package_module.grp, "getgrnam", group_by_name)
     monkeypatch.setattr(activation_package_module.grp, "getgrgid", group_by_gid)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwall", lambda: [])
+    monkeypatch.setattr(
+        activation_package_module.grp,
+        "getgrall",
+        lambda: [] if group is None else [group],
+    )
     monkeypatch.setattr(activation_package_module.subprocess, "run", failed_create)
 
     with pytest.raises(ActivationPackageError, match="group creation failed"):
@@ -2239,6 +2280,8 @@ def test_ensure_dedicated_principal_rejects_name_to_uid_drift_before_mutation(
         raise KeyError(uid)
 
     monkeypatch.setattr(activation_package_module.pwd, "getpwuid", missing_uid)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwall", lambda: [drifted])
+    monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [])
 
     def unexpected_run(*args: object, **kwargs: object) -> object:
         raise AssertionError("identity drift must be rejected before mutation")
@@ -2253,6 +2296,93 @@ def test_ensure_dedicated_principal_rejects_name_to_uid_drift_before_mutation(
             shell="/usr/sbin/nologin",
             lock_descriptor=17,
         )
+
+
+@pytest.mark.parametrize(
+    ("supplementary_members", "include_foreign_primary"),
+    [(["god"], False), ([], True)],
+)
+def test_dedicated_principal_rejects_supplementary_and_foreign_primary_members(
+    monkeypatch: pytest.MonkeyPatch,
+    supplementary_members: list[str],
+    include_foreign_primary: bool,
+) -> None:
+    overseer = SimpleNamespace(
+        pw_name="overseer",
+        pw_uid=984,
+        pw_gid=984,
+        pw_dir="/var/lib/overseer",
+        pw_shell="/usr/sbin/nologin",
+    )
+    foreign = SimpleNamespace(
+        pw_name="foreign",
+        pw_uid=985,
+        pw_gid=984,
+        pw_dir="/var/empty",
+        pw_shell="/usr/sbin/nologin",
+    )
+    group = SimpleNamespace(
+        gr_name="overseer",
+        gr_gid=984,
+        gr_mem=supplementary_members,
+    )
+    monkeypatch.setattr(activation_package_module.pwd, "getpwnam", lambda name: overseer)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwuid", lambda uid: overseer)
+    monkeypatch.setattr(activation_package_module.grp, "getgrnam", lambda name: group)
+    monkeypatch.setattr(activation_package_module.grp, "getgrgid", lambda gid: group)
+    monkeypatch.setattr(
+        activation_package_module.pwd,
+        "getpwall",
+        lambda: [overseer, foreign] if include_foreign_primary else [overseer],
+    )
+    monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [group])
+
+    with pytest.raises(ActivationPackageError, match="membership"):
+        activation_package_module._dedicated_principal_presence(
+            uid=984,
+            gid=984,
+            home_dir="/var/lib/overseer",
+            shell="/usr/sbin/nologin",
+        )
+
+
+def test_dedicated_principal_requires_locked_password_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def unlocked(command: list[str], **kwargs: object) -> object:
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="overseer P 2026-08-27 0 99999 7 -1\n")
+
+    monkeypatch.setattr(activation_package_module.subprocess, "run", unlocked)
+    with pytest.raises(ActivationPackageError, match="password.*locked"):
+        activation_package_module._validate_dedicated_principal_password_lock(
+            lock_descriptor=31
+        )
+    assert observed["command"] == ["/usr/bin/passwd", "--status", "overseer"]
+    kwargs = observed["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["pass_fds"] == (31,)
+    assert kwargs["env"][activation_package_module.ACTIVATION_LOCK_FD_ENV] == "31"
+
+
+def test_dedicated_principal_accepts_only_locked_password_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        activation_package_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="overseer L 2026-08-27 0 99999 7 -1\n",
+        ),
+    )
+
+    activation_package_module._validate_dedicated_principal_password_lock(
+        lock_descriptor=31
+    )
 
 
 def test_ensure_dedicated_principal_requires_active_sealed_staging_command(
@@ -2360,10 +2490,16 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         "--package-root",
         "/var/lib/overseer-executor/approved-package",
     ]
+    assert "PYTHONDONTWRITEBYTECODE=1" in principal_commands[0]
+    assert "-B" in principal_commands[0]
     assert all(
-        command[0] not in {"/usr/sbin/groupadd", "/usr/sbin/useradd"}
+        not any(Path(argument).name in {"groupadd", "useradd"} for argument in command)
         for command in commands
     )
+    for command in commands:
+        if command and command[0] == "/usr/bin/install":
+            assert command[command.index("-o") + 1] != "overseer"
+            assert command[command.index("-g") + 1] != "overseer"
     activation_package_module._validate_contract_principal_bootstrap(
         Path(str(contract["packageRoot"])),
         contract,
@@ -2376,6 +2512,33 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         activation_package_module._validate_contract_principal_bootstrap(
             Path(str(contract["packageRoot"])),
             misplaced,
+        )
+    wrapped_account_command = dict(contract)
+    wrapped_account_command["cutoverCommands"] = [
+        *cutover_commands,
+        ["/usr/bin/env", "/usr/sbin/groupadd", "unexpected"],
+    ]
+    with pytest.raises(ActivationPackageError, match="principal bootstrap"):
+        activation_package_module._validate_contract_principal_bootstrap(
+            Path(str(contract["packageRoot"])),
+            wrapped_account_command,
+        )
+    shell_wrapped_account_command = dict(contract)
+    shell_wrapped_account_command["cutoverCommands"] = [
+        *cutover_commands,
+        ["/bin/sh", "-c", "/usr/sbin/useradd unexpected"],
+    ]
+    with pytest.raises(ActivationPackageError, match="principal bootstrap"):
+        activation_package_module._validate_contract_principal_bootstrap(
+            Path(str(contract["packageRoot"])),
+            shell_wrapped_account_command,
+        )
+    traversing_release = dict(contract)
+    traversing_release["releaseRoot"] = "/opt/overseer/releases/../unexpected"
+    with pytest.raises(ActivationPackageError, match="release root"):
+        activation_package_module._validate_contract_principal_bootstrap(
+            Path(str(contract["packageRoot"])),
+            traversing_release,
         )
     stop_index = next(
         index
@@ -2569,6 +2732,36 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     rollback_unit.write_text("drift\n", encoding="utf-8")
     with pytest.raises(ActivationPackageError, match="rollback input drift"):
         verify_rollback_inputs(package)
+
+
+def test_sealed_principal_python_command_does_not_write_bytecode(tmp_path: Path) -> None:
+    package, manifest, source = _prepared_package(tmp_path)
+    rollback = tmp_path / "rollback"
+    rollback.mkdir()
+    (rollback / "artifact").write_text("rollback\n", encoding="utf-8")
+    contract = render_activation_contract(
+        package,
+        manifest,
+        source_store=source,
+        overseer_uid=984,
+        overseer_gid=984,
+        rollback_inputs={"v1.1.5-release": rollback},
+    )
+    command = list(contract["stagingAndCanaryCommands"][0])
+    module_root = tmp_path / "sealed-module"
+    module_root.mkdir()
+    (module_root / "sealed_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+    executable_index = command.index("-B") - 1
+    command[1] = "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu"
+    command[2] = "PYTHONHOME=/usr"
+    command[3] = f"PYTHONPATH={module_root}"
+    command[executable_index] = sys.executable
+    command[executable_index + 1 :] = ["-B", "-s", "-P", "-c", "import sealed_probe"]
+
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (module_root / "__pycache__").exists()
 
 
 def test_canary_health_retry_handles_an_initially_missing_unix_socket(
@@ -4863,6 +5056,38 @@ def test_contract_child_inherits_activation_lock_descriptor(
     pass_fds = observed.get("pass_fds")
     assert isinstance(pass_fds, tuple)
     assert len(pass_fds) == 1
+
+
+def test_inherited_lock_survives_parent_descriptor_close_until_child_exit(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "activation.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-c",
+            "import os,time; os.fstat(int(os.environ['LOCK_FD'])); time.sleep(0.5)",
+        ],
+        env={"LOCK_FD": str(descriptor)},
+        pass_fds=(descriptor,),
+    )
+    os.close(descriptor)
+    contender = os.open(lock_path, os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert child.wait(timeout=5) == 0
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=5)
+        os.close(contender)
 
 
 def test_staging_checkpoint_failure_runs_immediate_cleanup(

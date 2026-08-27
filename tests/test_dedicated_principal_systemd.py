@@ -62,6 +62,7 @@ def _render_units(tmp_path: Path) -> list[Path]:
         "@OVERSEER_RELEASE@": str(release),
         "@OVERSEER_PYTHON@": str(python_path),
         "@GOD_UID@": "1000",
+        "@OVERSEER_UID@": "984",
     }
     for source in (
         API_UNIT,
@@ -84,8 +85,8 @@ def test_api_and_runtime_use_the_dedicated_system_principal_and_immutable_releas
         unit = _read(path)
         assert "[Service]" in unit
         assert "[Install]" in unit
-        assert _one(unit, "User") == "overseer"
-        assert _one(unit, "Group") == "overseer"
+        assert _one(unit, "User") == "@OVERSEER_UID@"
+        assert _one(unit, "Group") == "@OVERSEER_UID@"
         assert _one(unit, "WorkingDirectory") == "@OVERSEER_RELEASE@"
         assert (
             "Environment=PYTHONPATH=@OVERSEER_RELEASE@/app/src:"
@@ -166,8 +167,8 @@ def test_api_uses_independent_credentials_verifiers_and_loopback_peer_channels()
 def test_disposable_api_canary_is_separate_bounded_and_principal_owned() -> None:
     canary = _read(CANARY_UNIT)
     command = _one(canary, "ExecStart")
-    assert _one(canary, "User") == "overseer"
-    assert _one(canary, "Group") == "overseer"
+    assert _one(canary, "User") == "@OVERSEER_UID@"
+    assert _one(canary, "Group") == "@OVERSEER_UID@"
     assert "--store /var/lib/overseer/overseer-canary.sqlite3" in command
     assert "--socket-fd" not in command
     assert "--socket-path /run/overseer-canary/api.sock" in command
@@ -195,8 +196,8 @@ def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> 
     assert "Accept=yes" in socket
     assert _one(socket, "ListenStream") == "/run/overseer/admin-executor.sock"
     assert _one(socket, "SocketMode") == "0600"
-    assert _one(socket, "SocketUser") == "overseer"
-    assert _one(socket, "SocketGroup") == "overseer"
+    assert _one(socket, "SocketUser") == "@OVERSEER_UID@"
+    assert _one(socket, "SocketGroup") == "0"
     assert "WantedBy=sockets.target" in socket
 
     executor = _read(EXECUTOR_UNIT)
@@ -238,7 +239,7 @@ def test_executor_socket_and_root_instance_have_narrow_privileged_boundary() -> 
 
 
 def test_shared_runtime_socket_directory_is_root_created_for_only_overseer_group() -> None:
-    assert _read(TMPFILES).strip() == "d /run/overseer 0750 root overseer -"
+    assert _read(TMPFILES).strip() == "d /run/overseer 0710 0 @OVERSEER_UID@ -"
 
 
 def test_sample_allowlist_contains_only_the_approval_smoke_restart_rule() -> None:

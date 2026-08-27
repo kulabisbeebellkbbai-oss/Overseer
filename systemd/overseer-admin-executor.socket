@@ -4,8 +4,8 @@ Description=Overseer approved system-unit executor socket
 [Socket]
 ListenStream=/run/overseer/admin-executor.sock
 SocketMode=0600
-SocketUser=overseer
-SocketGroup=overseer
+SocketUser=@OVERSEER_UID@
+SocketGroup=0
 Accept=yes
 
 [Install]

@@ -266,15 +266,52 @@ def _dedicated_principal_presence(
     group_by_gid = _optional_group_by_gid(gid)
     if (group_by_name is None) != (group_by_gid is None):
         raise ActivationPackageError("dedicated principal group name or GID is assigned differently")
-    if group_by_name is not None and (
-        group_by_name.gr_name != "overseer"
-        or group_by_name.gr_gid != gid
-        or group_by_gid is None
-        or group_by_gid.gr_name != group_by_name.gr_name
-        or group_by_gid.gr_gid != group_by_name.gr_gid
-    ):
-        raise ActivationPackageError("dedicated principal group identity drifted")
+    if group_by_name is not None:
+        if (
+            group_by_name.gr_name != "overseer"
+            or group_by_name.gr_gid != gid
+            or group_by_gid is None
+            or group_by_gid.gr_name != group_by_name.gr_name
+            or group_by_gid.gr_gid != group_by_name.gr_gid
+        ):
+            raise ActivationPackageError("dedicated principal group identity drifted")
+        if tuple(group_by_name.gr_mem) or tuple(group_by_gid.gr_mem):
+            raise ActivationPackageError(
+                "dedicated principal group membership is not empty"
+            )
+    enumerated_users = tuple(pwd.getpwall())
+    enumerated_groups = tuple(grp.getgrall())
+    name_users = tuple(item for item in enumerated_users if item.pw_name == "overseer")
+    uid_users = tuple(item for item in enumerated_users if item.pw_uid == uid)
+    name_groups = tuple(item for item in enumerated_groups if item.gr_name == "overseer")
+    gid_groups = tuple(item for item in enumerated_groups if item.gr_gid == gid)
+    if user_by_name is None:
+        if name_users or uid_users:
+            raise ActivationPackageError("dedicated principal user enumeration drifted")
+    elif len(name_users) != 1 or len(uid_users) != 1 or name_users[0] != uid_users[0]:
+        raise ActivationPackageError("dedicated principal user enumeration drifted")
+    if group_by_name is None:
+        if name_groups or gid_groups:
+            raise ActivationPackageError("dedicated principal group enumeration drifted")
+    elif len(name_groups) != 1 or len(gid_groups) != 1 or name_groups[0] != gid_groups[0]:
+        raise ActivationPackageError("dedicated principal group enumeration drifted")
+    primary_members = tuple(item.pw_name for item in enumerated_users if item.pw_gid == gid)
+    expected_primary_members = ("overseer",) if user_by_name is not None else ()
+    if primary_members != expected_primary_members:
+        raise ActivationPackageError(
+            "dedicated principal primary group membership is not exclusive"
+        )
     return user_by_name is not None, group_by_name is not None
+
+
+def _principal_command_environment(lock_descriptor: int) -> dict[str, str]:
+    return {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        ACTIVATION_LOCK_FD_ENV: str(lock_descriptor),
+    }
 
 
 def _run_principal_creation_command(command: list[str], *, lock_descriptor: int) -> int:
@@ -284,18 +321,38 @@ def _run_principal_creation_command(command: list[str], *, lock_descriptor: int)
             capture_output=True,
             text=True,
             check=False,
-            env={
-                "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-                "HOME": "/root",
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-                ACTIVATION_LOCK_FD_ENV: str(lock_descriptor),
-            },
+            env=_principal_command_environment(lock_descriptor),
             pass_fds=(lock_descriptor,),
+            timeout=30,
         )
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise ActivationPackageError("dedicated principal creation command could not start") from error
     return result.returncode
+
+
+def _validate_dedicated_principal_password_lock(*, lock_descriptor: int) -> None:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/passwd", "--status", "overseer"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_principal_command_environment(lock_descriptor),
+            pass_fds=(lock_descriptor,),
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ActivationPackageError(
+            "dedicated principal password lock status could not be read"
+        ) from error
+    fields = result.stdout.strip().split()
+    if (
+        result.returncode != 0
+        or len(fields) < 2
+        or fields[0] != "overseer"
+        or fields[1] not in {"L", "LK"}
+    ):
+        raise ActivationPackageError("dedicated principal password is not locked")
 
 
 def _ensure_dedicated_principal_identity(
@@ -359,6 +416,7 @@ def _ensure_dedicated_principal_identity(
         )
     if not user_exists or not group_exists:
         raise ActivationPackageError("dedicated principal creation did not produce the approved identity")
+    _validate_dedicated_principal_password_lock(lock_descriptor=lock_descriptor)
     return {
         "status": "existing" if initially_complete else "created",
         "user": "overseer",
@@ -3509,9 +3567,11 @@ def render_activation_contract(
         f"LD_LIBRARY_PATH={package_release_root}/lib",
         f"PYTHONHOME={package_release_root}/runtime",
         f"PYTHONPATH={package_release_root}/app/src:{package_release_root}/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
         "PYTHONNOUSERSITE=1",
         "PYTHONSAFEPATH=1",
         str(package_release_root / _safe_relative(str(release_python["releasePath"]))),
+        "-B",
         "-s",
         "-P",
         "-m",
@@ -3537,11 +3597,31 @@ def render_activation_contract(
         ],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer/releases"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer/rollback"],
-        ["/usr/bin/install", "-d", "-o", "overseer", "-g", "overseer", "-m", "0700", "/var/lib/overseer"],
+        [
+            "/usr/bin/install",
+            "-d",
+            "-o",
+            str(overseer_uid),
+            "-g",
+            str(overseer_gid),
+            "-m",
+            "0700",
+            "/var/lib/overseer",
+        ],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor/activation-package"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "/var/lib/overseer-executor/activation-package/public"],
-        ["/usr/bin/install", "-d", "-o", "root", "-g", "overseer", "-m", "0750", "/etc/overseer"],
+        [
+            "/usr/bin/install",
+            "-d",
+            "-o",
+            "0",
+            "-g",
+            str(overseer_gid),
+            "-m",
+            "0710",
+            "/etc/overseer",
+        ],
         *_release_install_commands(execution_package, release_manifest),
         *_rollback_bundle_install_commands(execution_package, rollback_items, rollback_bundle_root),
         [
@@ -3557,15 +3637,15 @@ def render_activation_contract(
         ],
     ]
     config_installs = (
-        (private / "credentials" / "admin-approval-verifier.json", "/etc/overseer/admin-approval-verifier.json", "overseer", "overseer", "0600"),
-        (private / "credentials" / "roadex-fixture-approval-verifier.json", "/etc/overseer/roadex-fixture-approval-verifier.json", "overseer", "overseer", "0600"),
+        (private / "credentials" / "admin-approval-verifier.json", "/etc/overseer/admin-approval-verifier.json", str(overseer_uid), str(overseer_gid), "0600"),
+        (private / "credentials" / "roadex-fixture-approval-verifier.json", "/etc/overseer/roadex-fixture-approval-verifier.json", str(overseer_uid), str(overseer_gid), "0600"),
         (private / "credentials" / "api-token", "/etc/overseer/api-token", "root", "root", "0600"),
         (private / "credentials" / "psychlo-peer-secret", "/etc/overseer/psychlo-peer-secret", "root", "root", "0600"),
         (private / "credentials" / "roadex-project-human-thread-secret", "/etc/overseer/roadex-project-human-thread-secret", "root", "root", "0600"),
         (public / "config" / "psychlo-project-bindings.json", "/etc/overseer/psychlo-project-bindings.json", "root", "root", "0644"),
         (public / "config" / "admin-executor-public-key", "/etc/overseer/admin-executor-public-key", "root", "root", "0644"),
         (public / "config" / "admin-executor-allowlist.json", "/etc/overseer/admin-executor-allowlist.json", "root", "root", "0644"),
-        (private / "credentials" / "admin-ticket-private-key", "/etc/overseer/admin-ticket-private-key", "overseer", "overseer", "0600"),
+        (private / "credentials" / "admin-ticket-private-key", "/etc/overseer/admin-ticket-private-key", str(overseer_uid), str(overseer_gid), "0600"),
     )
     install_commands.extend(
         ["/usr/bin/install", "-o", owner, "-g", group, "-m", mode, str(source_path), target]
@@ -3605,9 +3685,11 @@ def render_activation_contract(
         f"LD_LIBRARY_PATH={release_root}/lib",
         f"PYTHONHOME={release_root}/runtime",
         f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
         "PYTHONNOUSERSITE=1",
         "PYTHONSAFEPATH=1",
         str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+        "-B",
         "-s",
         "-P",
         "-m",
@@ -3665,9 +3747,11 @@ def render_activation_contract(
         f"LD_LIBRARY_PATH={release_root}/lib",
         f"PYTHONHOME={release_root}/runtime",
         f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
         "PYTHONNOUSERSITE=1",
         "PYTHONSAFEPATH=1",
         str(PurePosixPath(release_root) / _safe_relative(str(release_python["releasePath"]))),
+        "-B",
         "-s",
         "-P",
         "-m",
@@ -3680,9 +3764,9 @@ def render_activation_contract(
         [
             "/usr/bin/install",
             "-o",
-            "overseer",
+            str(overseer_uid),
             "-g",
-            "overseer",
+            str(overseer_gid),
             "-m",
             "0600",
             str(private / "migration" / "rehearsal-migrated.sqlite3"),
@@ -4857,8 +4941,10 @@ def _read_bound_package_manifest(
 
 def _account_ids(owner: str, group: str) -> tuple[int, int]:
     try:
-        return pwd.getpwnam(owner).pw_uid, grp.getgrnam(group).gr_gid
-    except KeyError as error:
+        owner_id = int(owner) if owner.isdecimal() else pwd.getpwnam(owner).pw_uid
+        group_id = int(group) if group.isdecimal() else grp.getgrnam(group).gr_gid
+        return owner_id, group_id
+    except (KeyError, ValueError) as error:
         raise ActivationPackageError("installed activation owner or group is unavailable") from error
 
 
@@ -6585,17 +6671,25 @@ def _validate_contract_principal_bootstrap(
     contract: Mapping[str, object],
 ) -> None:
     release_root = contract.get("releaseRoot")
-    if not isinstance(release_root, str) or not release_root.startswith("/opt/overseer/releases/"):
+    if not isinstance(release_root, str):
         raise ActivationPackageError("activation principal bootstrap release root is invalid")
-    package_release_root = package / "public" / "release" / PurePosixPath(release_root).name
+    release_path = PurePosixPath(release_root)
+    if (
+        release_path.parent != PurePosixPath("/opt/overseer/releases")
+        or release_path.name in {"", ".", ".."}
+    ):
+        raise ActivationPackageError("activation principal bootstrap release root is invalid")
+    package_release_root = package / "public" / "release" / release_path.name
     expected = [
         "/usr/bin/env",
         f"LD_LIBRARY_PATH={package_release_root}/lib",
         f"PYTHONHOME={package_release_root}/runtime",
         f"PYTHONPATH={package_release_root}/app/src:{package_release_root}/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
         "PYTHONNOUSERSITE=1",
         "PYTHONSAFEPATH=1",
         str(package_release_root / "runtime/bin/python3.13"),
+        "-B",
         "-s",
         "-P",
         "-m",
@@ -6613,7 +6707,11 @@ def _validate_contract_principal_bootstrap(
     if (
         staging[0] != expected
         or sum(command.count("ensure-dedicated-principal") for command in all_commands) != 1
-        or any(command[0] in {"/usr/sbin/groupadd", "/usr/sbin/useradd"} for command in all_commands)
+        or any(
+            re.search(r"(?:^|[/\s])(?:groupadd|useradd)(?:$|\s)", argument) is not None
+            for command in all_commands
+            for argument in command
+        )
     ):
         raise ActivationPackageError("activation principal bootstrap command is invalid")
 

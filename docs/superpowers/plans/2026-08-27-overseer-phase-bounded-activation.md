@@ -185,6 +185,14 @@ Expected: all tests pass, with only documented skips.
 
 Review the exact commit with `gpt-daybreak-blue-latest`, falling back only to `gpt-5.6-terra`. Require explicit findings by severity and a pass/fail release decision.
 
+If review identifies a direct primitive bypass, lock-lifetime race, checkpoint
+recovery gap, or prior-schema recovery break, add a failing regression first.
+Require mutating primitives to validate the active sealed runner command inside
+their public functions; inherit the runner lock into command children; recover
+immediately when a post-command checkpoint fails; and keep prior schemas
+readable only by the sealed rollback path. Re-run the exact-commit Daybreak
+review after all findings are corrected.
+
 - [ ] **Step 4: Generate the replacement owner-scoped package**
 
 Reuse the reviewed package workflow and immutable local inputs. Do not use `sudo`, import into `/var/lib/overseer-executor`, write a phase approval, or execute a runner.

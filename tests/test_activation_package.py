@@ -1132,6 +1132,7 @@ def test_final_migration_requires_quiescence_and_preserves_source(
     backup = backup_parent / "final-source.sqlite3"
     destination = destination_parent / "final-migrated.sqlite3"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1143,6 +1144,7 @@ def test_final_migration_requires_quiescence_and_preserves_source(
     try:
         with pytest.raises(ActivationPackageError, match="open process"):
             prepare_final_store_migration(
+                package_root=tmp_path / "package",
                 source_store=source,
                 backup_store=backup,
                 destination_store=destination,
@@ -1161,6 +1163,7 @@ def test_final_migration_requires_quiescence_and_preserves_source(
         held_open.close()
 
     report = prepare_final_store_migration(
+        package_root=tmp_path / "package",
         source_store=source,
         backup_store=backup,
         destination_store=destination,
@@ -1250,6 +1253,7 @@ os._exit(0)
     backup = backup_parent / "final-source.sqlite3"
     destination = destination_parent / "final-migrated.sqlite3"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1258,6 +1262,7 @@ os._exit(0)
     monkeypatch.setattr(activation_package_module, "_activation_parent_lock_mode", lambda: 0o700)
 
     report = prepare_final_store_migration(
+        package_root=tmp_path / "package",
         source_store=source,
         backup_store=backup,
         destination_store=destination,
@@ -1311,6 +1316,7 @@ def test_final_migration_rejects_source_replacement_during_parent_lock(
     destination = destination_parent / "final-migrated.sqlite3"
     displaced = tmp_path / "approved-displaced.sqlite3"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1344,6 +1350,7 @@ def test_final_migration_rejects_source_replacement_during_parent_lock(
 
     with pytest.raises(ActivationPackageError, match="identity drifted"):
         prepare_final_store_migration(
+            package_root=tmp_path / "package",
             source_store=source,
             backup_store=backup,
             destination_store=destination,
@@ -1434,6 +1441,7 @@ if libc.munmap(ctypes.c_void_p(other_address), other_size) != 0:
         approved.st_ino,
     )
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1443,6 +1451,7 @@ if libc.munmap(ctypes.c_void_p(other_address), other_size) != 0:
     try:
         with pytest.raises(ActivationPackageError, match="mapping"):
             prepare_final_store_migration(
+                package_root=tmp_path / "package",
                 source_store=source,
                 backup_store=backup,
                 destination_store=destination,
@@ -1549,6 +1558,7 @@ def test_final_migration_rejects_scm_rights_queued_writable_reference(
         approved.st_ino,
     )
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1558,6 +1568,7 @@ def test_final_migration_rejects_scm_rights_queued_writable_reference(
     try:
         with pytest.raises(ActivationPackageError, match="lease barrier rejected"):
             prepare_final_store_migration(
+                package_root=tmp_path / "package",
                 source_store=source,
                 backup_store=backup,
                 destination_store=destination,
@@ -1646,6 +1657,7 @@ def test_final_migration_rejects_dequeued_write_closed_before_lease(
         return real_fcntl(descriptor, command, *args)
 
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1656,6 +1668,7 @@ def test_final_migration_rejects_dequeued_write_closed_before_lease(
     try:
         with pytest.raises(ActivationPackageError, match="descriptor changed before"):
             prepare_final_store_migration(
+                package_root=tmp_path / "package",
                 source_store=source,
                 backup_store=backup,
                 destination_store=destination,
@@ -1726,6 +1739,7 @@ def test_final_migration_pre_hash_checkpoint_rescans_open_descriptors(
     backup = backup_parent / "final-source.sqlite3"
     destination = destination_parent / "final-migrated.sqlite3"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -1774,6 +1788,7 @@ def test_final_migration_pre_hash_checkpoint_rescans_open_descriptors(
     try:
         with pytest.raises(ActivationPackageError, match="open process or mapping"):
             prepare_final_store_migration(
+                package_root=tmp_path / "package",
                 source_store=source,
                 backup_store=backup,
                 destination_store=destination,
@@ -3270,6 +3285,7 @@ def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls
         target.chmod(0o600)
     attestation = tmp_path / "canary-attestation.json"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -3389,6 +3405,7 @@ def test_live_canary_rejects_prebound_socket_before_connecting_or_attesting(
     listener.setblocking(False)
     attestation = tmp_path / "canary-attestation.json"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         activation_package_module,
         "verify_installed_staging",
@@ -3844,6 +3861,11 @@ def test_interrupted_staging_recovery_runs_and_records_cleanup(
     )
     monkeypatch.setattr(
         activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_sealed_package_json",
         lambda *_args, **_kwargs: contract,
     )
@@ -4153,6 +4175,11 @@ def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
     )
     monkeypatch.setattr(
         activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_sealed_package_json",
         lambda *_args, **_kwargs: contract,
     )
@@ -4283,3 +4310,318 @@ def test_cutover_failure_records_recoverable_first_rollback_command_before_execu
     assert state["commandDigest"] == hashlib.sha256(
         json.dumps(rollback, sort_keys=True, separators=(",", ":")).encode("ascii")
     ).hexdigest()
+
+
+def test_final_migration_public_primitive_requires_active_sealed_cutover_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    source = tmp_path / "source.sqlite3"
+    source.touch()
+    metadata = source.stat()
+    parent_metadata = source.parent.stat()
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+
+    def reject(*_args, **_kwargs) -> None:
+        raise ActivationPackageError("prepare-final-store requires the active cutover runner")
+
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", reject)
+
+    with pytest.raises(ActivationPackageError, match="active cutover runner"):
+        prepare_final_store_migration(
+            package_root=package,
+            source_store=source,
+            backup_store=tmp_path / "backup.sqlite3",
+            destination_store=tmp_path / "destination.sqlite3",
+            expected_source_device=metadata.st_dev,
+            expected_source_inode=metadata.st_ino,
+            expected_source_uid=metadata.st_uid,
+            expected_source_gid=metadata.st_gid,
+            expected_parent_device=parent_metadata.st_dev,
+            expected_parent_inode=parent_metadata.st_ino,
+            expected_parent_mode=stat_mode(source.parent),
+            destination_uid=os.geteuid(),
+            destination_gid=os.getegid(),
+        )
+
+
+def test_canary_public_primitive_requires_active_sealed_staging_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+
+    def reject(*_args, **_kwargs) -> None:
+        raise ActivationPackageError("run-approved-canary requires the active staging-canary runner")
+
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", reject)
+
+    with pytest.raises(ActivationPackageError, match="active staging-canary runner"):
+        run_canary_acceptance(
+            package,
+            expected_package_digest="a" * 64,
+            admin_secret="unused-admin-secret",
+            roadex_secret="unused-roadex-secret",
+            attestation_path=tmp_path / "attestation.json",
+        )
+
+
+def test_cleanup_satisfaction_checks_every_sealed_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def outcome(command: list[str]) -> tuple[int, str | None]:
+        unit = command[-1]
+        calls.append(unit)
+        return (0, None) if unit == "still-active.socket" else (3, None)
+
+    monkeypatch.setattr(activation_package_module, "_command_outcome", outcome)
+
+    assert activation_package_module._cleanup_command_satisfied(
+        [
+            "/usr/bin/systemctl",
+            "stop",
+            "inactive.service",
+            "still-active.socket",
+            "unchecked.socket",
+        ]
+    ) is False
+    assert calls == ["inactive.service", "still-active.socket"]
+
+
+def test_contract_child_inherits_activation_lock_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "executor" / "activation-state.json"
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    class Result:
+        returncode = 0
+
+    def run(*_args, **kwargs):
+        observed.update(kwargs)
+        for descriptor in kwargs.get("pass_fds", ()):
+            os.fstat(descriptor)
+        return Result()
+
+    monkeypatch.setattr(activation_package_module.subprocess, "run", run)
+
+    with activation_package_module._activation_execution_lock():
+        assert activation_package_module._execute_contract_command(["/bin/true"]) == 0
+
+    pass_fds = observed.get("pass_fds")
+    assert isinstance(pass_fds, tuple)
+    assert len(pass_fds) == 1
+
+
+def test_staging_checkpoint_failure_runs_immediate_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "7" * 64
+    package = tmp_path / "package"
+    staging = ["/bin/true", "staging"]
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [staging],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [cleanup]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "staging-canary"},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+    original_write = activation_package_module._write_activation_state
+
+    def fail_completed_state(document: dict[str, object]) -> None:
+        if document.get("status") == "command_complete":
+            raise OSError("simulated checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_completed_state)
+
+    with pytest.raises(ActivationPackageError, match="checkpoint failed after staging command"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    assert calls == [tuple(staging), tuple(cleanup)]
+
+
+def test_cutover_checkpoint_failure_runs_immediate_sealed_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "8" * 64
+    package = tmp_path / "package"
+    cutover = ["/bin/true", "cutover"]
+    rollback = ["/bin/true", "rollback"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [cutover],
+        "rollbackCommands": [rollback],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "cutover"},
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="canary_passed_awaiting_cutover_approval",
+            phase="staging-canary",
+        )
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+    original_write = activation_package_module._write_activation_state
+
+    def fail_completed_state(document: dict[str, object]) -> None:
+        if document.get("status") == "command_complete":
+            raise OSError("simulated checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_completed_state)
+
+    with pytest.raises(ActivationPackageError, match="checkpoint failed after cutover command"):
+        activation_package_module.execute_approved_cutover(package)
+
+    assert calls == [tuple(cutover), tuple(rollback)]
+
+
+def test_legacy_v1_state_and_package_approval_remain_rollback_readable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "9" * 64
+    package = tmp_path / "package"
+    package.mkdir()
+    approval_path = tmp_path / "approved-activation-package.json"
+    approval_path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "overseer.activation-package-approval.v1",
+                "approved": True,
+                "packageRoot": str(package.resolve()),
+                "sourcePackageRoot": str(tmp_path / "source-package"),
+                "packageDigest": digest,
+                "packageFileCount": 42,
+                "liveExecutionScope": "staging-canary-and-cutover-for-this-package-only",
+            }
+        ),
+        encoding="utf-8",
+    )
+    approval_path.chmod(0o600)
+    state_path = tmp_path / "activation-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "overseer.activation-runner-state.v1",
+                "packageDigest": digest,
+                "status": "command_running",
+                "phase": "cutover",
+                "commandIndex": 0,
+                "commandDigest": "a" * 64,
+                "failure": None,
+                "updatedAtNs": 1,
+                "secretValuesRecorded": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_activation_package",
+        lambda *_args, **_kwargs: {"fileCount": 42},
+    )
+
+    approval = activation_package_module._load_activation_approval_for_rollback(package)
+    state = activation_package_module._load_activation_state()
+
+    assert approval["schemaVersion"] == "overseer.activation-package-approval.v1"
+    assert state is not None
+    assert state["schemaVersion"] == "overseer.activation-runner-state.v1"

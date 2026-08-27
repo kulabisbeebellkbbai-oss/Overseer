@@ -109,7 +109,9 @@ def test_factory_constructs_distinct_relay_secret_and_database(tmp_path: Path):
     roadex_secret_file = tmp_path / "roadex.secret"
     bindings_file = tmp_path / "bindings.json"
     psychlo_secret_file.write_bytes(PSYCHLO_SECRET); roadex_secret_file.write_bytes(ROADEX_SECRET); bindings_file.write_text("{}")
-    for path in (psychlo_secret_file, roadex_secret_file, bindings_file): path.chmod(0o600)
+    for path in (psychlo_secret_file, roadex_secret_file):
+        path.chmod(0o600)
+    bindings_file.chmod(0o644)
     bridge = create_bridge_from_environment({
         "OVERSEER_PSYCHLO_BRIDGE_DATABASE": str(tmp_path / "psychlo.sqlite"),
         "OVERSEER_STORE_DATABASE": str(tmp_path / "primary.sqlite"),

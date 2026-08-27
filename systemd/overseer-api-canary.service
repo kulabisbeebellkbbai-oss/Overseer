@@ -25,7 +25,7 @@ Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=/etc/overseer/psychlo-project
 Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-peer-secret
 Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-canary-relay.sqlite3
 Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_SECRET_FILE=%d/roadex-peer-secret
-Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780
+Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780/api/internal/overseer/project-human-thread/questions
 LoadCredential=api-token:/etc/overseer/api-token
 LoadCredential=psychlo-peer-secret:/etc/overseer/psychlo-peer-secret
 LoadCredential=roadex-peer-secret:/etc/overseer/roadex-project-human-thread-secret

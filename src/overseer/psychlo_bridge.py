@@ -2773,7 +2773,9 @@ class CodexProjectDispatcher:
     """Dispatch one prompt to the explicitly bound existing Codex conversation."""
 
     def __init__(self, bindings_file: str | Path):
-        bindings = json.loads(_read_private_file(Path(bindings_file)).decode("utf-8"))
+        bindings = json.loads(
+            _read_configuration_file(Path(bindings_file)).decode("utf-8")
+        )
         if not isinstance(bindings, dict): raise ValueError("Psychlo project bindings must be an object")
         self.bindings = bindings
 
@@ -3366,6 +3368,40 @@ def _read_secret(path: Path) -> bytes:
     if len(value) < 32 or len(value) > 4096 or any(byte < 0x20 or byte == 0x7F for byte in value):
         raise ValueError("Psychlo peer secret is unavailable")
     return value
+
+
+def _read_configuration_file(
+    path: Path,
+    *,
+    maximum_bytes: int = MAX_BODY_BYTES,
+) -> bytes:
+    if not path.is_absolute():
+        raise ValueError("configuration file path must be absolute")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid not in {0, os.getuid()}
+            or metadata.st_mode & 0o022
+            or metadata.st_size > maximum_bytes
+        ):
+            raise ValueError("configuration file is unsafe")
+        chunks = []
+        remaining = maximum_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        if len(value) > maximum_bytes:
+            raise ValueError("configuration file is too large")
+        return value
+    finally:
+        os.close(descriptor)
 
 
 def _read_private_file(path: Path, *, maximum_bytes: int = MAX_BODY_BYTES) -> bytes:

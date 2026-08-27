@@ -2240,6 +2240,7 @@ def test_private_peer_secret_accepts_root_managed_credential_file(
         metadata = real_fstat(descriptor)
         return SimpleNamespace(
             st_mode=metadata.st_mode,
+            st_nlink=metadata.st_nlink,
             st_uid=0,
             st_size=metadata.st_size,
         )
@@ -2272,6 +2273,41 @@ def test_private_peer_secret_rejects_foreign_non_root_owner(
 
     with pytest.raises(ValueError, match="Psychlo peer secret is unavailable"):
         _read_secret(secret)
+
+
+def test_project_dispatcher_accepts_root_managed_read_only_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text('{"lead-arcade":{"conversationId":"conversation-1"}}')
+    bindings.chmod(0o644)
+    real_fstat = psychlo_bridge_module.os.fstat
+
+    def root_owned_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_nlink=metadata.st_nlink,
+            st_uid=0,
+            st_size=metadata.st_size,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", root_owned_fstat)
+    monkeypatch.setattr(psychlo_bridge_module.os, "getuid", lambda: 984)
+
+    assert CodexProjectDispatcher(bindings).bindings == {
+        "lead-arcade": {"conversationId": "conversation-1"}
+    }
+
+
+def test_project_dispatcher_rejects_group_writable_bindings(tmp_path: Path):
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text("{}")
+    bindings.chmod(0o664)
+
+    with pytest.raises(ValueError, match="configuration file is unsafe"):
+        CodexProjectDispatcher(bindings)
 
 
 def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):

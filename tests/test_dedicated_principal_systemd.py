@@ -144,7 +144,11 @@ def test_api_uses_independent_credentials_verifiers_and_loopback_peer_channels()
     assert "OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=/etc/overseer/psychlo-project-bindings.json" in api
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-relay.sqlite3" in api
     assert "OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798" in api
-    assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780" in api
+    assert (
+        "Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT="
+        "http://127.0.0.1:8780/api/internal/overseer/project-human-thread/questions"
+        in api
+    )
     assert "Environment=OVERSEER_ADMIN_TICKET_PRIVATE_KEY=/etc/overseer/admin-ticket-private-key" in api
     assert "Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock" in api
     assert "Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock" in api
@@ -173,6 +177,11 @@ def test_disposable_api_canary_is_separate_bounded_and_principal_owned() -> None
     assert "overseer-api-canary.socket" not in canary
     assert "OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-canary-bridge.sqlite3" in canary
     assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-canary-relay.sqlite3" in canary
+    assert (
+        "Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT="
+        "http://127.0.0.1:8780/api/internal/overseer/project-human-thread/questions"
+        in canary
+    )
     assert _one(canary, "RuntimeMaxSec") == "10min"
     assert _one(canary, "TimeoutStopSec") == "10s"
     assert _one(canary, "RuntimeDirectory") == "overseer-canary"

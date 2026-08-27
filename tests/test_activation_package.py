@@ -550,6 +550,12 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
             f"Environment=LD_LIBRARY_PATH={manifest['releaseRoot']}/lib"
             in rendered[name].read_text(encoding="utf-8")
         )
+    for name in ("overseer-api-canary.service", "overseer-api.service"):
+        assert (
+            "Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT="
+            "http://127.0.0.1:8780/api/internal/overseer/project-human-thread/questions"
+            in rendered[name].read_text(encoding="utf-8")
+        )
     allowlist = json.loads(
         (package / "public" / "config" / "admin-executor-allowlist.json").read_text(
             encoding="utf-8"

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import errno
 import fcntl
 import getpass
 import grp
@@ -47,6 +49,8 @@ PACKAGE_MANIFEST_SCHEMA = "overseer.dedicated-principal-package.v1"
 ACTIVATION_APPROVAL_SCHEMA = "overseer.activation-package-approval.v1"
 RELEASES_ROOT = PurePosixPath("/opt/overseer/releases")
 MAX_RELEASE_FILE_BYTES = 128 * 1024 * 1024
+MAX_APPROVED_PACKAGE_IMPORT_BYTES = 16 * 1024 * 1024 * 1024
+MIN_APPROVED_PACKAGE_IMPORT_HEADROOM_BYTES = 1024 * 1024 * 1024
 MAX_STAGED_SECRET_BYTES = 512
 APPROVED_OVERSEER_UID = 984
 APPROVED_OVERSEER_GID = 984
@@ -4082,6 +4086,84 @@ def _remove_failed_package_import(stage: Path, *, destination: Path) -> None:
     shutil.rmtree(stage)
 
 
+def _validate_package_import_capacity(source_package: Path, destination_parent: Path) -> int:
+    """Reject sparse or oversized imports and preserve operational disk headroom."""
+
+    package_owner = source_package.lstat().st_uid
+    total_size = 0
+    for directory, directories, files in os.walk(source_package, followlinks=False):
+        base = Path(directory)
+        for name in directories:
+            if (base / name).is_symlink():
+                raise ActivationPackageError("source activation package contains a directory symlink")
+        for name in files:
+            path = base / name
+            metadata = path.lstat()
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != package_owner
+                or metadata.st_nlink != 1
+            ):
+                raise ActivationPackageError("source activation package file metadata is invalid")
+            allocated_size = metadata.st_blocks * 512
+            if allocated_size < metadata.st_size:
+                raise ActivationPackageError("sparse activation package files are not allowed")
+            total_size += metadata.st_size
+            if total_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES:
+                raise ActivationPackageError("activation package exceeds the approved import size bound")
+    filesystem = os.statvfs(destination_parent)
+    available_size = filesystem.f_bavail * filesystem.f_frsize
+    required_size = total_size + max(
+        total_size,
+        MIN_APPROVED_PACKAGE_IMPORT_HEADROOM_BYTES,
+    )
+    if available_size < required_size:
+        raise ActivationPackageError("insufficient free space for bounded activation package import")
+    return total_size
+
+
+def _fsync_package_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ActivationPackageError("activation package directory changed before fsync")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _rename_package_no_replace(source: Path, destination: Path) -> None:
+    """Publish a staged package atomically without replacing any destination."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise ActivationPackageError("atomic no-replace package publication is unavailable") from error
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, "approved execution package destination already exists", destination)
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def _import_approved_execution_package(
     source_package: Path,
     *,
@@ -4091,12 +4173,14 @@ def _import_approved_execution_package(
     if destination.exists() or destination.is_symlink():
         raise ActivationPackageError("approved execution package destination already exists")
     _ensure_directory(destination.parent)
+    _validate_package_import_capacity(source_package, destination.parent)
     stage = destination.with_name(
         f".{destination.name}.import-{os.getpid()}-{secrets.token_hex(8)}"
     )
     _ensure_directory(stage)
     package_owner = source_package.lstat().st_uid
     directory_modes: list[tuple[Path, int]] = []
+    published = False
     try:
         for directory, directories, files in os.walk(source_package, followlinks=False):
             source_directory = Path(directory)
@@ -4135,20 +4219,19 @@ def _import_approved_execution_package(
             reverse=True,
         ):
             os.chmod(target_directory, mode)
+            _fsync_package_directory(target_directory)
         verify_activation_package(stage, expected_package_digest)
-        if destination.exists() or destination.is_symlink():
-            raise ActivationPackageError("approved execution package destination appeared during import")
-        os.rename(stage, destination)
-        parent_descriptor = os.open(
-            destination.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
+        _rename_package_no_replace(stage, destination)
+        published = True
         try:
-            os.fsync(parent_descriptor)
-        finally:
-            os.close(parent_descriptor)
+            _fsync_package_directory(destination.parent)
+        except BaseException as error:
+            raise ActivationPackageError(
+                "approved execution package was published but parent durability is indeterminate"
+            ) from error
     except BaseException:
-        _remove_failed_package_import(stage, destination=destination)
+        if not published:
+            _remove_failed_package_import(stage, destination=destination)
         raise
     return destination
 

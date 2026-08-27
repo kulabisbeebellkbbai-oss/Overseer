@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import errno
 import hashlib
 import io
 import json
@@ -2691,7 +2692,7 @@ def test_root_approval_import_streams_files_that_exceed_stable_read_bound(
     assert imported_store.read_bytes() == migration_store.read_bytes()
 
 
-def test_root_approval_import_failure_does_not_publish_partial_destination(
+def test_root_approval_import_enospc_does_not_publish_partial_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2721,7 +2722,7 @@ def test_root_approval_import_failure_does_not_publish_partial_destination(
         nonlocal attempts
         attempts += 1
         if attempts == 2:
-            raise ActivationPackageError("injected package import failure")
+            raise OSError(errno.ENOSPC, "injected package import ENOSPC")
         return copy_regular(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -2730,12 +2731,184 @@ def test_root_approval_import_failure_does_not_publish_partial_destination(
         fail_during_import,
     )
 
-    with pytest.raises(ActivationPackageError, match="injected package import failure"):
+    with pytest.raises(OSError, match="injected package import ENOSPC"):
         record_activation_approval(package, expected_package_digest=digest)
 
     assert not execution_package.exists()
     assert not approval_path.exists()
     assert not tuple(execution_package.parent.glob(".approved-package.import-*"))
+
+
+def test_root_approval_import_rejects_sparse_package_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    package, _digest = _finalized_package(tmp_path)
+    sparse = package / "public" / "sparse-import-test.bin"
+    with sparse.open("wb") as stream:
+        stream.seek(2 * 1024 * 1024)
+        stream.write(b"x")
+    digest = _reseal_package_manifest_for_test(package)
+
+    with pytest.raises(ActivationPackageError, match="sparse"):
+        record_activation_approval(package, expected_package_digest=digest)
+
+    assert not execution_package.exists()
+    assert not approval_path.exists()
+
+
+def test_root_approval_import_enforces_package_size_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    monkeypatch.setattr(activation_package_module, "MAX_APPROVED_PACKAGE_IMPORT_BYTES", 1)
+    package, digest = _finalized_package(tmp_path)
+
+    with pytest.raises(ActivationPackageError, match="size bound"):
+        record_activation_approval(package, expected_package_digest=digest)
+
+    assert not execution_package.exists()
+    assert not approval_path.exists()
+
+
+def test_root_approval_import_enforces_free_space_headroom(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    package, digest = _finalized_package(tmp_path)
+    filesystem = os.statvfs(tmp_path)
+    unavailable = os.statvfs_result(
+        (
+            filesystem.f_bsize,
+            filesystem.f_frsize,
+            filesystem.f_blocks,
+            filesystem.f_bfree,
+            0,
+            filesystem.f_files,
+            filesystem.f_ffree,
+            filesystem.f_favail,
+            filesystem.f_flag,
+            filesystem.f_namemax,
+        )
+    )
+    monkeypatch.setattr(activation_package_module.os, "statvfs", lambda _path: unavailable)
+
+    with pytest.raises(ActivationPackageError, match="insufficient free space"):
+        record_activation_approval(package, expected_package_digest=digest)
+
+    assert not execution_package.exists()
+    assert not approval_path.exists()
+
+
+def test_root_approval_import_reports_post_publish_durability_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    package, digest = _finalized_package(tmp_path)
+    fsync_directory = activation_package_module._fsync_package_directory
+
+    def fail_published_parent_fsync(path: Path) -> None:
+        if path == execution_package.parent and execution_package.exists():
+            raise OSError("injected parent fsync failure")
+        fsync_directory(path)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_fsync_package_directory",
+        fail_published_parent_fsync,
+    )
+
+    with pytest.raises(ActivationPackageError, match="durability is indeterminate"):
+        record_activation_approval(package, expected_package_digest=digest)
+
+    assert execution_package.is_dir()
+    assert not approval_path.exists()
+    assert not tuple(execution_package.parent.glob(".approved-package.import-*"))
+
+
+def test_root_approval_import_uses_atomic_no_replace_publication(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+
+    with pytest.raises(FileExistsError):
+        activation_package_module._rename_package_no_replace(source, destination)
+
+    assert source.is_dir()
+    assert destination.is_dir()
 
 
 def test_installed_artifact_verifier_compares_targets_to_sealed_hashes(

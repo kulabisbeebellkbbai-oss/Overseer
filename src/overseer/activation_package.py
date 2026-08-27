@@ -43,10 +43,13 @@ from .store import SQLiteStore
 
 
 RELEASE_SCHEMA = "overseer.dedicated-principal-release.v1"
-ACTIVATION_CONTRACT_SCHEMA = "overseer.dedicated-principal-activation-contract.v1"
+ACTIVATION_CONTRACT_SCHEMA = "overseer.dedicated-principal-activation-contract.v2"
 ROLLBACK_MANIFEST_SCHEMA = "overseer.dedicated-principal-rollback.v1"
 PACKAGE_MANIFEST_SCHEMA = "overseer.dedicated-principal-package.v1"
-ACTIVATION_APPROVAL_SCHEMA = "overseer.activation-package-approval.v1"
+ACTIVATION_APPROVAL_SCHEMA = "overseer.activation-package-approval.v2"
+ACTIVATION_PHASE_APPROVAL_SCHEMA = "overseer.activation-phase-approval.v1"
+ACTIVATION_RUNNER_STATE_SCHEMA = "overseer.activation-runner-state.v2"
+ACTIVATION_PHASES = frozenset({"staging-canary", "cutover"})
 RELEASES_ROOT = PurePosixPath("/opt/overseer/releases")
 MAX_RELEASE_FILE_BYTES = 128 * 1024 * 1024
 MAX_APPROVED_PACKAGE_IMPORT_BYTES = 16 * 1024 * 1024 * 1024
@@ -3436,7 +3439,13 @@ def render_activation_contract(
             "http://localhost/health",
         ],
         [*activation_python, "run-approved-canary", "--package-root", str(execution_package)],
-        ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"],
+        [
+            "/usr/bin/systemctl",
+            "stop",
+            "overseer-api-canary.service",
+            "overseer-admin-executor.socket",
+            "overseer-codex-user-bridge.socket",
+        ],
     ]
     cutover_commands = [
         [*activation_python, "verify-approved-cutover", "--package-root", str(execution_package)],
@@ -3590,6 +3599,22 @@ def render_activation_contract(
             "schemaVersion": ACTIVATION_APPROVAL_SCHEMA,
             "mustBeRootOwnedMode": "0600",
             "mustBindFinalPackageDigest": True,
+            "executionScope": "sealed-package-import-and-verification-only",
+        },
+        "phaseApprovalRecords": {
+            "schemaVersion": ACTIVATION_PHASE_APPROVAL_SCHEMA,
+            "stagingCanary": {
+                "phase": "staging-canary",
+                "path": str(_activation_phase_approval_record_path("staging-canary")),
+                "runner": "execute-approved-staging-canary",
+                "requiresRunnerState": "not-started",
+            },
+            "cutover": {
+                "phase": "cutover",
+                "path": str(_activation_phase_approval_record_path("cutover")),
+                "runner": "execute-approved-cutover",
+                "requiresRunnerState": "canary_passed_awaiting_cutover_approval",
+            },
         },
         "account": {
             "user": "overseer",
@@ -3628,8 +3653,10 @@ def render_activation_contract(
             "requiredFunction": "overseer.activation_package.verify_approved_cutover",
             "requiresApprovedPackageDigest": True,
             "requiresRootOwnedApprovalRecord": True,
+            "requiresRootOwnedPhaseApprovalRecord": True,
             "requiresRootOwnedDigestBoundAttestation": True,
             "manualCommandExtractionForbidden": True,
+            "automaticCutoverForbidden": True,
         },
         "canary": {
             "store": "/var/lib/overseer/overseer-canary.sqlite3",
@@ -3976,6 +4003,12 @@ def verify_activation_package(
 
 def _activation_approval_record_path() -> Path:
     return Path("/var/lib/overseer-executor/approved-activation-package.json")
+
+
+def _activation_phase_approval_record_path(phase: str) -> Path:
+    if phase not in ACTIVATION_PHASES:
+        raise ActivationPackageError("unsupported activation phase")
+    return Path(f"/var/lib/overseer-executor/approved-activation-phase-{phase}.json")
 
 
 def _installed_credential_root() -> Path:
@@ -4359,7 +4392,7 @@ def _write_activation_approval_for_imported_package(
         "sourcePackageRoot": str(source_package),
         "packageDigest": expected_package_digest,
         "packageFileCount": verified["fileCount"],
-        "liveExecutionScope": "staging-canary-and-cutover-for-this-package-only",
+        "liveExecutionScope": "sealed-package-import-and-verification-only",
     }
     _write_new(target, _canonical(document) + b"\n", 0o600)
     return document
@@ -4424,7 +4457,7 @@ def _load_activation_approval(
         or document.get("approved") is not True
         or document.get("packageRoot") != str(package)
         or document.get("liveExecutionScope")
-        != "staging-canary-and-cutover-for-this-package-only"
+        != "sealed-package-import-and-verification-only"
     ):
         raise ActivationPackageError("activation approval record metadata or scope is invalid")
     digest = document.get("packageDigest")
@@ -5061,7 +5094,7 @@ def _load_activation_state() -> dict[str, object] | None:
         document = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ActivationPackageError("activation runner state is invalid") from error
-    if not isinstance(document, dict) or document.get("schemaVersion") != "overseer.activation-runner-state.v1":
+    if not isinstance(document, dict) or document.get("schemaVersion") != ACTIVATION_RUNNER_STATE_SCHEMA:
         raise ActivationPackageError("activation runner state schema is invalid")
     return document
 
@@ -5101,6 +5134,193 @@ def _write_activation_state(document: Mapping[str, object]) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _phase_runner_state_digest(state: Mapping[str, object] | None) -> str | None:
+    return None if state is None else _sha256(_canonical(dict(state)))
+
+
+def _validate_phase_prerequisite(
+    phase: str,
+    state: Mapping[str, object] | None,
+    *,
+    package_digest: str,
+) -> None:
+    if phase == "staging-canary":
+        if state is not None:
+            raise ActivationPackageError("staging-canary phase requires an unstarted runner state")
+        return
+    if phase != "cutover":
+        raise ActivationPackageError("unsupported activation phase")
+    if (
+        state is None
+        or state.get("schemaVersion") != ACTIVATION_RUNNER_STATE_SCHEMA
+        or state.get("packageDigest") != package_digest
+        or state.get("phase") != "staging-canary"
+        or state.get("status") != "canary_passed_awaiting_cutover_approval"
+    ):
+        raise ActivationPackageError("cutover phase requires a successful canary runner state")
+
+
+def _read_activation_phase_approval(
+    package_root: str | os.PathLike[str],
+    *,
+    phase: str,
+) -> dict[str, object]:
+    if phase not in ACTIVATION_PHASES:
+        raise ActivationPackageError("unsupported activation phase")
+    package = Path(package_root).resolve()
+    package_approval = _load_activation_approval(package)
+    package_digest = str(package_approval["packageDigest"])
+    target = _activation_phase_approval_record_path(phase)
+    try:
+        raw, metadata = _stable_read(target)
+        document = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError(f"{phase} phase approval is unavailable or invalid") from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        metadata.st_uid != root_uid
+        or metadata.st_gid != root_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not isinstance(document, dict)
+        or document.get("schemaVersion") != ACTIVATION_PHASE_APPROVAL_SCHEMA
+        or document.get("approved") is not True
+        or document.get("packageRoot") != str(package)
+        or document.get("packageDigest") != package_digest
+        or document.get("phase") != phase
+        or document.get("executionScope") != f"{phase}-for-this-package-only"
+    ):
+        raise ActivationPackageError(f"{phase} phase approval metadata is invalid")
+    state_digest = document.get("runnerStateDigest")
+    state_status = document.get("runnerStateStatus")
+    if phase == "staging-canary":
+        if state_digest is not None or state_status != "not-started":
+            raise ActivationPackageError("staging-canary phase approval prerequisite is invalid")
+    elif (
+        not isinstance(state_digest, str)
+        or len(state_digest) != 64
+        or set(state_digest) - _HEX
+        or state_status != "canary_passed_awaiting_cutover_approval"
+    ):
+        raise ActivationPackageError("cutover phase approval prerequisite is invalid")
+    return document
+
+
+def _load_activation_phase_approval(
+    package_root: str | os.PathLike[str],
+    *,
+    phase: str,
+    expected_runner_state: Mapping[str, object] | None,
+) -> dict[str, object]:
+    package = Path(package_root).resolve()
+    package_approval = _load_activation_approval(package)
+    package_digest = str(package_approval["packageDigest"])
+    observed_state = _load_activation_state()
+    if observed_state != expected_runner_state:
+        raise ActivationPackageError("activation phase approval runner state changed")
+    _validate_phase_prerequisite(
+        phase,
+        observed_state,
+        package_digest=package_digest,
+    )
+    document = _read_activation_phase_approval(package, phase=phase)
+    if (
+        document.get("runnerStateDigest") != _phase_runner_state_digest(observed_state)
+        or document.get("runnerStateStatus")
+        != ("not-started" if observed_state is None else str(observed_state.get("status")))
+    ):
+        raise ActivationPackageError(f"{phase} phase approval runner state is invalid")
+    return document
+
+
+def _require_active_phase_command(
+    package_root: str | os.PathLike[str],
+    *,
+    phase: str,
+    command_name: str,
+) -> None:
+    package = Path(package_root).resolve()
+    package_approval = _load_activation_approval(package)
+    package_digest = str(package_approval["packageDigest"])
+    contract = _sealed_package_json(
+        package,
+        expected_package_digest=package_digest,
+        relative_path="public/activation-contract.json",
+    )
+    state = _load_activation_state()
+    if (
+        state is None
+        or state.get("schemaVersion") != ACTIVATION_RUNNER_STATE_SCHEMA
+        or state.get("packageDigest") != package_digest
+        or state.get("phase") != phase
+        or state.get("status") != "command_running"
+    ):
+        raise ActivationPackageError(f"{command_name} requires the active {phase} runner")
+    _read_activation_phase_approval(package, phase=phase)
+    field = "stagingAndCanaryCommands" if phase == "staging-canary" else "cutoverCommands"
+    commands = _contract_commands(contract, field)
+    index = state.get("commandIndex")
+    if type(index) is not int or not 0 <= index < len(commands):
+        raise ActivationPackageError("active runner state is not bound to a sealed command")
+    command = commands[index]
+    if (
+        command_name not in command
+        or state.get("commandDigest") != _sha256(_canonical(command))
+    ):
+        raise ActivationPackageError("active runner state is not bound to the sealed command")
+
+
+def _record_activation_phase_approval_locked(
+    package_root: str | os.PathLike[str],
+    *,
+    expected_package_digest: str,
+    phase: str,
+) -> dict[str, object]:
+    _require_root_activation()
+    if phase not in ACTIVATION_PHASES:
+        raise ActivationPackageError("unsupported activation phase")
+    package = Path(package_root).resolve()
+    package_approval = _load_activation_approval(package)
+    package_digest = str(package_approval["packageDigest"])
+    if package_digest != expected_package_digest:
+        raise ActivationPackageError("activation phase approval package digest does not match")
+    state = _load_activation_state()
+    _validate_phase_prerequisite(phase, state, package_digest=package_digest)
+    target = _activation_phase_approval_record_path(phase)
+    if target.exists() or target.is_symlink():
+        raise ActivationPackageError(f"{phase} phase approval record already exists")
+    document = {
+        "schemaVersion": ACTIVATION_PHASE_APPROVAL_SCHEMA,
+        "approved": True,
+        "packageRoot": str(package),
+        "packageDigest": package_digest,
+        "phase": phase,
+        "executionScope": f"{phase}-for-this-package-only",
+        "runnerStateDigest": _phase_runner_state_digest(state),
+        "runnerStateStatus": "not-started" if state is None else str(state.get("status")),
+    }
+    _write_new(target, _canonical(document) + b"\n", 0o600)
+    return document
+
+
+def record_activation_phase_approval(
+    package_root: str | os.PathLike[str],
+    *,
+    expected_package_digest: str,
+    phase: str,
+) -> dict[str, object]:
+    """Record one root-owned approval for one exact activation phase and state."""
+
+    if phase not in ACTIVATION_PHASES:
+        _require_root_activation()
+        raise ActivationPackageError("unsupported activation phase")
+    with _activation_execution_lock():
+        return _record_activation_phase_approval_locked(
+            package_root,
+            expected_package_digest=expected_package_digest,
+            phase=phase,
+        )
 
 
 def _contract_commands(contract: Mapping[str, object], field: str) -> list[list[str]]:
@@ -5199,7 +5419,7 @@ def _runner_state(
     failure: str | None = None,
 ) -> dict[str, object]:
     return {
-        "schemaVersion": "overseer.activation-runner-state.v1",
+        "schemaVersion": ACTIVATION_RUNNER_STATE_SCHEMA,
         "packageDigest": package_digest,
         "status": status,
         "phase": phase,
@@ -5509,7 +5729,7 @@ def _rollback_recovery_boundary(
     if prior_state is None or prior_state.get("phase") != "rollback":
         return None
     if (
-        prior_state.get("schemaVersion") != "overseer.activation-runner-state.v1"
+        prior_state.get("schemaVersion") != ACTIVATION_RUNNER_STATE_SCHEMA
         or prior_state.get("packageDigest") != package_digest
         or prior_state.get("status")
         not in {"rollback_command_running", "rollback_command_complete", "rollback_failed"}
@@ -5653,11 +5873,9 @@ def _execute_rollback_sequence(
     )
 
 
-def _execute_approved_activation_locked(
+def _approved_activation_contract(
     package_root: str | os.PathLike[str],
-) -> dict[str, object]:
-    """Execute one sealed activation contract in order through a fail-closed state machine."""
-
+) -> tuple[Path, str, dict[str, object]]:
     _require_root_activation()
     package = Path(package_root).resolve()
     approval = _load_activation_approval(package)
@@ -5670,29 +5888,47 @@ def _execute_approved_activation_locked(
     if contract.get("packageRoot") != str(package):
         raise ActivationPackageError("activation contract package root is not approval-bound")
     _validate_contract_principal_binding(contract)
+    return package, digest, contract
+
+
+def _execute_approved_staging_canary_locked(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Execute only the separately approved staging and live-canary phase."""
+
+    package, digest, contract = _approved_activation_contract(package_root)
     existing = _load_activation_state()
     if existing is not None:
         if (
             existing.get("packageDigest") == digest
-            and existing.get("status") == "complete"
-            and existing.get("phase") == "complete"
+            and existing.get("status") == "canary_passed_awaiting_cutover_approval"
+            and existing.get("phase") == "staging-canary"
         ):
-            return {"status": "complete", "packageDigest": digest, "replayed": True}
+            return {
+                "status": "canary_passed_awaiting_cutover_approval",
+                "packageDigest": digest,
+                "replayed": True,
+            }
         raise ActivationPackageError(
-            "activation runner state is not safely resumable; use the sealed rollback path"
+            "staging-canary runner state is not safely resumable; use the sealed rollback path"
         )
+    _load_activation_phase_approval(
+        package,
+        phase="staging-canary",
+        expected_runner_state=None,
+    )
     staging = _contract_commands(contract, "stagingAndCanaryCommands")
-    cutover = _contract_commands(contract, "cutoverCommands")
-    rollback = _contract_commands(contract, "rollbackCommands")
     _cleanup_commands(contract)
 
-    _write_activation_state(_runner_state(package_digest=digest, status="running", phase="staging"))
+    _write_activation_state(
+        _runner_state(package_digest=digest, status="running", phase="staging-canary")
+    )
     for index, command in enumerate(staging):
         _write_activation_state(
             _runner_state(
                 package_digest=digest,
                 status="command_running",
-                phase="staging",
+                phase="staging-canary",
                 command_index=index,
                 command=command,
             )
@@ -5705,7 +5941,7 @@ def _execute_approved_activation_locked(
                 _runner_state(
                     package_digest=digest,
                     status="failed_before_cutover",
-                    phase="staging",
+                    phase="staging-canary",
                     command_index=index,
                     command=command,
                     failure=command_failure,
@@ -5716,7 +5952,7 @@ def _execute_approved_activation_locked(
             _runner_state(
                 package_digest=digest,
                 status="command_complete",
-                phase="staging",
+                phase="staging-canary",
                 command_index=index,
                 command=command,
             )
@@ -5735,6 +5971,42 @@ def _execute_approved_activation_locked(
             )
         )
         raise ActivationPackageError("cutover gate failed after staging cleanup") from error
+    _write_activation_state(
+        _runner_state(
+            package_digest=digest,
+            status="canary_passed_awaiting_cutover_approval",
+            phase="staging-canary",
+        )
+    )
+    return {
+        "status": "canary_passed_awaiting_cutover_approval",
+        "packageDigest": digest,
+        "replayed": False,
+    }
+
+
+def _execute_approved_cutover_locked(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Resume one successful canary only after a separate state-bound approval."""
+
+    package, digest, contract = _approved_activation_contract(package_root)
+    existing = _load_activation_state()
+    if (
+        existing is not None
+        and existing.get("packageDigest") == digest
+        and existing.get("status") == "complete"
+        and existing.get("phase") == "complete"
+    ):
+        return {"status": "complete", "packageDigest": digest, "replayed": True}
+    _validate_phase_prerequisite("cutover", existing, package_digest=digest)
+    _load_activation_phase_approval(
+        package,
+        phase="cutover",
+        expected_runner_state=existing,
+    )
+    cutover = _contract_commands(contract, "cutoverCommands")
+    rollback = _contract_commands(contract, "rollbackCommands")
     _write_activation_state(_runner_state(package_digest=digest, status="running", phase="cutover"))
     for index, command in enumerate(cutover):
         _write_activation_state(
@@ -5811,7 +6083,7 @@ def _execute_approved_rollback_locked(
             "packageDigest": digest,
             "replayed": True,
         }
-    if state.get("phase") in {"staging", "staging_cleanup"}:
+    if state.get("phase") in {"staging-canary", "staging_cleanup"}:
         _execute_cleanup_sequence(contract, package_digest=digest)
         _write_activation_state(
             _runner_state(
@@ -5835,8 +6107,26 @@ def _execute_approved_rollback_locked(
 def execute_approved_activation(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
+    """Fail closed so legacy callers cannot cross the separate approval boundary."""
+
+    _require_root_activation()
+    raise ActivationPackageError(
+        "activation requires separate phase runners: execute-approved-staging-canary then execute-approved-cutover"
+    )
+
+
+def execute_approved_staging_canary(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
     with _activation_execution_lock():
-        return _execute_approved_activation_locked(package_root)
+        return _execute_approved_staging_canary_locked(package_root)
+
+
+def execute_approved_cutover(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    with _activation_execution_lock():
+        return _execute_approved_cutover_locked(package_root)
 
 
 def execute_approved_rollback(
@@ -5931,6 +6221,17 @@ def _main(argv: list[str] | None = None) -> int:
     )
     record_approval.add_argument("--package-root", required=True)
     record_approval.add_argument("--expected-package-digest", required=True)
+    record_phase_approval = commands.add_parser(
+        "record-activation-phase-approval",
+        help="record a root-owned approval for one exact package phase and runner state",
+    )
+    record_phase_approval.add_argument("--package-root", required=True)
+    record_phase_approval.add_argument("--expected-package-digest", required=True)
+    record_phase_approval.add_argument(
+        "--phase",
+        required=True,
+        choices=tuple(sorted(ACTIVATION_PHASES)),
+    )
     recover_approval_import = commands.add_parser(
         "recover-activation-approval-import",
         help="adopt or remove an unapproved package left by interrupted root import",
@@ -5969,9 +6270,19 @@ def _main(argv: list[str] | None = None) -> int:
     compatibility_token.add_argument("--expected-parent-inode", required=True, type=int)
     execute_activation = commands.add_parser(
         "execute-approved-activation",
-        help="execute the sealed activation and rollback state machine",
+        help="fail closed; activation now requires separately approved phase runners",
     )
     execute_activation.add_argument("--package-root", required=True)
+    execute_staging_canary = commands.add_parser(
+        "execute-approved-staging-canary",
+        help="execute only the separately approved staging and live-canary phase",
+    )
+    execute_staging_canary.add_argument("--package-root", required=True)
+    execute_cutover = commands.add_parser(
+        "execute-approved-cutover",
+        help="resume cutover only after a separately approved successful canary state",
+    )
+    execute_cutover.add_argument("--package-root", required=True)
     execute_rollback = commands.add_parser(
         "execute-approved-rollback",
         help="recover an interrupted cutover through the sealed rollback contract",
@@ -6131,6 +6442,14 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "record-activation-phase-approval":
+        result = record_activation_phase_approval(
+            _validate_existing_package_destination(args.package_root),
+            expected_package_digest=args.expected_package_digest,
+            phase=args.phase,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "recover-activation-approval-import":
         result = recover_activation_approval_import(
             args.source_package_root,
@@ -6141,6 +6460,11 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "run-approved-canary":
         package = _validate_existing_package_destination(args.package_root)
+        _require_active_phase_command(
+            package,
+            phase="staging-canary",
+            command_name="run-approved-canary",
+        )
         approval = _load_activation_approval(package)
         digest = str(approval["packageDigest"])
         admin_secret = getpass.getpass("Admin approval secret for canary: ")
@@ -6183,6 +6507,18 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "execute-approved-staging-canary":
+        result = execute_approved_staging_canary(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "execute-approved-cutover":
+        result = execute_approved_cutover(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "execute-approved-rollback":
         result = execute_approved_rollback(
             _validate_existing_package_destination(args.package_root),
@@ -6213,6 +6549,7 @@ def _main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "ACTIVATION_CONTRACT_SCHEMA",
+    "ACTIVATION_PHASE_APPROVAL_SCHEMA",
     "ActivationPackageError",
     "PACKAGE_MANIFEST_SCHEMA",
     "RELEASE_SCHEMA",
@@ -6221,11 +6558,14 @@ __all__ = [
     "build_release_manifest",
     "create_human_verifiers",
     "execute_approved_activation",
+    "execute_approved_cutover",
     "execute_approved_rollback",
+    "execute_approved_staging_canary",
     "finalize_activation_package",
     "prepare_final_store_migration",
     "recover_activation_approval_import",
     "record_activation_approval",
+    "record_activation_phase_approval",
     "rehearse_store_migration",
     "render_activation_contract",
     "render_systemd_units",

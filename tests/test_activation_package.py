@@ -2019,7 +2019,7 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     )
 
     encoded = json.dumps(contract, sort_keys=True)
-    assert contract["schemaVersion"] == "overseer.dedicated-principal-activation-contract.v1"
+    assert contract["schemaVersion"] == activation_package_module.ACTIVATION_CONTRACT_SCHEMA
     assert contract["liveExecutionApproved"] is False
     assert contract["account"] == {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984}
     assert contract["releaseRoot"] == manifest["releaseRoot"]
@@ -2090,10 +2090,34 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         "requiredFunction": "overseer.activation_package.verify_approved_cutover",
         "requiresApprovedPackageDigest": True,
         "requiresRootOwnedApprovalRecord": True,
+        "requiresRootOwnedPhaseApprovalRecord": True,
         "requiresRootOwnedDigestBoundAttestation": True,
         "manualCommandExtractionForbidden": True,
+        "automaticCutoverForbidden": True,
+    }
+    assert contract["phaseApprovalRecords"] == {
+        "schemaVersion": activation_package_module.ACTIVATION_PHASE_APPROVAL_SCHEMA,
+        "stagingCanary": {
+            "phase": "staging-canary",
+            "path": "/var/lib/overseer-executor/approved-activation-phase-staging-canary.json",
+            "runner": "execute-approved-staging-canary",
+            "requiresRunnerState": "not-started",
+        },
+        "cutover": {
+            "phase": "cutover",
+            "path": "/var/lib/overseer-executor/approved-activation-phase-cutover.json",
+            "runner": "execute-approved-cutover",
+            "requiresRunnerState": "canary_passed_awaiting_cutover_approval",
+        },
     }
     assert "run-approved-canary" in staging_commands[-2]
+    assert staging_commands[-1] == [
+        "/usr/bin/systemctl",
+        "stop",
+        "overseer-api-canary.service",
+        "overseer-admin-executor.socket",
+        "overseer-codex-user-bridge.socket",
+    ]
     assert "verify-approved-cutover" in cutover_commands[0]
     staging_verify_index = next(
         index for index, command in enumerate(staging_commands) if "verify-approved-staging" in command
@@ -2642,6 +2666,7 @@ def test_root_approval_record_binds_one_exact_sealed_package(
     assert recorded["packageDigest"] == digest
     assert recorded["packageRoot"] == str(execution_package.resolve())
     assert recorded["sourcePackageRoot"] == str(package.resolve())
+    assert recorded["liveExecutionScope"] == "sealed-package-import-and-verification-only"
     assert stat_mode(approval_path) == 0o600
     assert verify_activation_package(execution_package, digest)["verified"] is True
     assert (
@@ -2650,6 +2675,102 @@ def test_root_approval_record_binds_one_exact_sealed_package(
     assert activation_package_module._load_activation_approval(execution_package) == recorded
     with pytest.raises(ActivationPackageError, match="already exists"):
         record_activation_approval(package, expected_package_digest=digest)
+
+
+def test_phase_approvals_bind_package_and_exact_runner_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "9" * 64
+    package = tmp_path / "approved-package"
+    package.mkdir()
+    state_path = tmp_path / "executor" / "activation-state.json"
+    phase_paths = {
+        phase: tmp_path / "executor" / f"approved-{phase}.json"
+        for phase in ("staging-canary", "cutover")
+    }
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_phase_approval_record_path",
+        lambda phase: phase_paths[phase],
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+
+    staging = activation_package_module.record_activation_phase_approval(
+        package,
+        expected_package_digest=digest,
+        phase="staging-canary",
+    )
+
+    assert staging["runnerStateDigest"] is None
+    assert staging["runnerStateStatus"] == "not-started"
+    assert stat_mode(phase_paths["staging-canary"]) == 0o600
+    assert activation_package_module._load_activation_phase_approval(
+        package,
+        phase="staging-canary",
+        expected_runner_state=None,
+    ) == staging
+    with pytest.raises(ActivationPackageError, match="successful canary"):
+        activation_package_module.record_activation_phase_approval(
+            package,
+            expected_package_digest=digest,
+            phase="cutover",
+        )
+
+    canary_state = activation_package_module._runner_state(
+        package_digest=digest,
+        status="canary_passed_awaiting_cutover_approval",
+        phase="staging-canary",
+    )
+    activation_package_module._write_activation_state(canary_state)
+    cutover = activation_package_module.record_activation_phase_approval(
+        package,
+        expected_package_digest=digest,
+        phase="cutover",
+    )
+
+    assert cutover["runnerStateStatus"] == "canary_passed_awaiting_cutover_approval"
+    assert cutover["runnerStateDigest"] == hashlib.sha256(
+        json.dumps(canary_state, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    assert activation_package_module._load_activation_phase_approval(
+        package,
+        phase="cutover",
+        expected_runner_state=canary_state,
+    ) == cutover
+
+    drifted_state = dict(canary_state, status="running")
+    with pytest.raises(ActivationPackageError, match="runner state"):
+        activation_package_module._load_activation_phase_approval(
+            package,
+            phase="cutover",
+            expected_runner_state=drifted_state,
+        )
+
+
+def test_phase_approval_rejects_unknown_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+
+    with pytest.raises(ActivationPackageError, match="activation phase"):
+        activation_package_module.record_activation_phase_approval(
+            tmp_path,
+            expected_package_digest="8" * 64,
+            phase="everything",
+        )
 
 
 def test_root_approval_import_streams_files_that_exceed_stable_read_bound(
@@ -3401,7 +3522,7 @@ def test_compatibility_token_comes_from_installed_root_state_and_stays_read_only
         )
 
 
-def test_activation_runner_enforces_order_state_and_replay(
+def test_phase_bounded_activation_runner_stops_for_cutover_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3439,6 +3560,27 @@ def test_activation_runner_enforces_order_state_and_replay(
         "_sealed_package_json",
         lambda *_args, **_kwargs: contract,
     )
+    phase_loads: list[tuple[str, str | None]] = []
+
+    def load_phase_approval(
+        _package: Path,
+        *,
+        phase: str,
+        expected_runner_state: dict[str, object] | None,
+    ) -> dict[str, object]:
+        phase_loads.append(
+            (
+                phase,
+                None if expected_runner_state is None else str(expected_runner_state["status"]),
+            )
+        )
+        return {"packageDigest": digest, "phase": phase}
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        load_phase_approval,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "verify_approved_cutover",
@@ -3450,16 +3592,203 @@ def test_activation_runner_enforces_order_state_and_replay(
         lambda command: calls.append(tuple(command)) or 0,
     )
 
-    first = activation_package_module.execute_approved_activation(package)
-    second = activation_package_module.execute_approved_activation(package)
+    staged = activation_package_module.execute_approved_staging_canary(package)
+    replayed = activation_package_module.execute_approved_staging_canary(package)
 
-    assert first == {"status": "complete", "packageDigest": digest, "replayed": False}
-    assert second == {"status": "complete", "packageDigest": digest, "replayed": True}
+    assert staged == {
+        "status": "canary_passed_awaiting_cutover_approval",
+        "packageDigest": digest,
+        "replayed": False,
+    }
+    assert replayed == {
+        "status": "canary_passed_awaiting_cutover_approval",
+        "packageDigest": digest,
+        "replayed": True,
+    }
+    assert calls == [("/bin/true", "staging")]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "canary_passed_awaiting_cutover_approval"
+    assert state["phase"] == "staging-canary"
+    assert state["secretValuesRecorded"] is False
+    assert phase_loads == [("staging-canary", None)]
+
+    completed = activation_package_module.execute_approved_cutover(package)
+
+    assert completed == {"status": "complete", "packageDigest": digest, "replayed": False}
     assert calls == [("/bin/true", "staging"), ("/bin/true", "cutover")]
+    assert phase_loads == [
+        ("staging-canary", None),
+        ("cutover", "canary_passed_awaiting_cutover_approval"),
+    ]
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["status"] == "complete"
     assert state["phase"] == "complete"
-    assert state["secretValuesRecorded"] is False
+
+
+def test_legacy_all_in_one_activation_runner_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "executor" / "activation-state.json"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+
+    with pytest.raises(ActivationPackageError, match="separate phase runners"):
+        activation_package_module.execute_approved_activation(tmp_path / "package")
+
+    assert not state_path.exists()
+
+
+def test_cutover_runner_requires_separate_state_bound_phase_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "7" * 64
+    package = tmp_path / "package"
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="canary_passed_awaiting_cutover_approval",
+            phase="staging-canary",
+        )
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ActivationPackageError("cutover phase approval is unavailable")
+        ),
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(command) or 0,
+    )
+
+    with pytest.raises(ActivationPackageError, match="cutover phase approval"):
+        activation_package_module.execute_approved_cutover(package)
+
+    assert calls == []
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "canary_passed_awaiting_cutover_approval"
+
+
+def test_mutating_canary_primitive_requires_the_active_sealed_runner_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "6" * 64
+    package = tmp_path / "package"
+    command = [
+        "/opt/overseer/python",
+        "-m",
+        "overseer.activation_package",
+        "run-approved-canary",
+        "--package-root",
+        str(package.resolve()),
+    ]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "packageRoot": str(package.resolve()),
+        "stagingAndCanaryCommands": [command],
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_read_activation_phase_approval",
+        lambda _package, *, phase: {
+            "phase": phase,
+            "packageDigest": digest,
+            "runnerStateDigest": None,
+            "runnerStateStatus": "not-started",
+        },
+    )
+
+    with pytest.raises(ActivationPackageError, match="active staging-canary runner"):
+        activation_package_module._require_active_phase_command(
+            package,
+            phase="staging-canary",
+            command_name="run-approved-canary",
+        )
+
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="command_running",
+            phase="staging-canary",
+            command_index=0,
+            command=command,
+        )
+    )
+
+    activation_package_module._require_active_phase_command(
+        package,
+        phase="staging-canary",
+        command_name="run-approved-canary",
+    )
+
+    drifted = activation_package_module._runner_state(
+        package_digest=digest,
+        status="command_running",
+        phase="staging-canary",
+        command_index=0,
+        command=[*command, "--drift"],
+    )
+    activation_package_module._write_activation_state(drifted)
+    with pytest.raises(ActivationPackageError, match="sealed command"):
+        activation_package_module._require_active_phase_command(
+            package,
+            phase="staging-canary",
+            command_name="run-approved-canary",
+        )
 
 
 def test_activation_runner_lock_rejects_concurrent_entry(
@@ -3527,7 +3856,7 @@ def test_interrupted_staging_recovery_runs_and_records_cleanup(
         activation_package_module._runner_state(
             package_digest=digest,
             status="command_running",
-            phase="staging",
+            phase="staging-canary",
             command_index=0,
             command=["/bin/true", "staging"],
         )
@@ -3773,7 +4102,7 @@ def test_rollback_transient_retries_sealed_start_after_loaded_unit_is_collected(
 def test_rollback_recovery_rejects_saved_command_digest_mismatch() -> None:
     commands = [["/bin/true", "verify"], ["/bin/true", "restore"]]
     prior_state = {
-        "schemaVersion": "overseer.activation-runner-state.v1",
+        "schemaVersion": activation_package_module.ACTIVATION_RUNNER_STATE_SCHEMA,
         "packageDigest": "d" * 64,
         "phase": "rollback",
         "status": "rollback_command_running",
@@ -3832,6 +4161,21 @@ def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
         "verify_approved_cutover",
         lambda _package: {"verified": True},
     )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda _package, *, phase, expected_runner_state: {
+            "packageDigest": digest,
+            "phase": phase,
+        },
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="canary_passed_awaiting_cutover_approval",
+            phase="staging-canary",
+        )
+    )
 
     def execute(command: list[str]) -> int:
         calls.append(tuple(command))
@@ -3842,9 +4186,8 @@ def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
     monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
 
     with pytest.raises(ActivationPackageError, match="sealed rollback completed"):
-        activation_package_module.execute_approved_activation(package)
+        activation_package_module.execute_approved_cutover(package)
     assert calls == [
-        ("/bin/true", "staging"),
         ("/bin/false", "cutover"),
         ("/bin/true", "rollback"),
     ]
@@ -3853,8 +4196,8 @@ def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
         "packageDigest": digest,
         "replayed": True,
     }
-    with pytest.raises(ActivationPackageError, match="not safely resumable"):
-        activation_package_module.execute_approved_activation(package)
+    with pytest.raises(ActivationPackageError, match="successful canary"):
+        activation_package_module.execute_approved_cutover(package)
 
 
 def test_cutover_failure_records_recoverable_first_rollback_command_before_execution(
@@ -3902,6 +4245,21 @@ def test_cutover_failure_records_recoverable_first_rollback_command_before_execu
     )
     monkeypatch.setattr(
         activation_package_module,
+        "_load_activation_phase_approval",
+        lambda _package, *, phase, expected_runner_state: {
+            "packageDigest": digest,
+            "phase": phase,
+        },
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="canary_passed_awaiting_cutover_approval",
+            phase="staging-canary",
+        )
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_execute_contract_command",
         lambda command: 1 if command[1] == "cutover" else 0,
     )
@@ -3916,7 +4274,7 @@ def test_cutover_failure_records_recoverable_first_rollback_command_before_execu
     )
 
     with pytest.raises(KeyboardInterrupt, match="process loss"):
-        activation_package_module.execute_approved_activation(package)
+        activation_package_module.execute_approved_cutover(package)
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["phase"] == "rollback"

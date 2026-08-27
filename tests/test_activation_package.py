@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
@@ -2022,6 +2023,300 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     )
 
 
+def test_ensure_dedicated_principal_reuses_exact_existing_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = SimpleNamespace(
+        pw_name="overseer",
+        pw_uid=984,
+        pw_gid=984,
+        pw_dir="/var/lib/overseer",
+        pw_shell="/usr/sbin/nologin",
+    )
+    group = SimpleNamespace(gr_name="overseer", gr_gid=984)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwnam", lambda name: user)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwuid", lambda uid: user)
+    monkeypatch.setattr(activation_package_module.grp, "getgrnam", lambda name: group)
+    monkeypatch.setattr(activation_package_module.grp, "getgrgid", lambda gid: group)
+
+    def unexpected_run(*args: object, **kwargs: object) -> object:
+        raise AssertionError("exact existing principal must not invoke account creation")
+
+    monkeypatch.setattr(activation_package_module.subprocess, "run", unexpected_run)
+
+    assert activation_package_module._ensure_dedicated_principal_identity(
+        uid=984,
+        gid=984,
+        home_dir="/var/lib/overseer",
+        shell="/usr/sbin/nologin",
+        lock_descriptor=17,
+    ) == {
+        "status": "existing",
+        "user": "overseer",
+        "uid": 984,
+        "group": "overseer",
+        "gid": 984,
+    }
+
+
+def test_ensure_dedicated_principal_creates_only_missing_exact_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state: dict[str, object | None] = {"user": None, "group": None}
+    calls: list[list[str]] = []
+
+    def user_by_name(name: str) -> object:
+        if name != "overseer" or state["user"] is None:
+            raise KeyError(name)
+        return state["user"]
+
+    def user_by_uid(uid: int) -> object:
+        if uid != 984 or state["user"] is None:
+            raise KeyError(uid)
+        return state["user"]
+
+    def group_by_name(name: str) -> object:
+        if name != "overseer" or state["group"] is None:
+            raise KeyError(name)
+        return state["group"]
+
+    def group_by_gid(gid: int) -> object:
+        if gid != 984 or state["group"] is None:
+            raise KeyError(gid)
+        return state["group"]
+
+    def create(command: list[str], **kwargs: object) -> object:
+        calls.append(command)
+        assert kwargs["pass_fds"] == (17,)
+        assert kwargs["env"][activation_package_module.ACTIVATION_LOCK_FD_ENV] == "17"
+        if command[0] == "/usr/sbin/groupadd":
+            state["group"] = SimpleNamespace(gr_name="overseer", gr_gid=984)
+        elif command[0] == "/usr/sbin/useradd":
+            state["user"] = SimpleNamespace(
+                pw_name="overseer",
+                pw_uid=984,
+                pw_gid=984,
+                pw_dir="/var/lib/overseer",
+                pw_shell="/usr/sbin/nologin",
+            )
+        else:
+            raise AssertionError(f"unexpected principal command: {command}")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(activation_package_module.pwd, "getpwnam", user_by_name)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwuid", user_by_uid)
+    monkeypatch.setattr(activation_package_module.grp, "getgrnam", group_by_name)
+    monkeypatch.setattr(activation_package_module.grp, "getgrgid", group_by_gid)
+    monkeypatch.setattr(activation_package_module.subprocess, "run", create)
+
+    result = activation_package_module._ensure_dedicated_principal_identity(
+        uid=984,
+        gid=984,
+        home_dir="/var/lib/overseer",
+        shell="/usr/sbin/nologin",
+        lock_descriptor=17,
+    )
+
+    assert result["status"] == "created"
+    assert calls == [
+        ["/usr/sbin/groupadd", "--system", "--gid", "984", "overseer"],
+        [
+            "/usr/sbin/useradd",
+            "--system",
+            "--uid",
+            "984",
+            "--gid",
+            "984",
+            "--home-dir",
+            "/var/lib/overseer",
+            "--shell",
+            "/usr/sbin/nologin",
+            "overseer",
+        ],
+    ]
+
+
+def test_ensure_dedicated_principal_completes_group_only_prior_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = SimpleNamespace(gr_name="overseer", gr_gid=984)
+    user: object | None = None
+    calls: list[list[str]] = []
+
+    def user_by_name(name: str) -> object:
+        if user is None:
+            raise KeyError(name)
+        return user
+
+    def user_by_uid(uid: int) -> object:
+        if user is None:
+            raise KeyError(uid)
+        return user
+
+    def create(command: list[str], **kwargs: object) -> object:
+        nonlocal user
+        calls.append(command)
+        user = SimpleNamespace(
+            pw_name="overseer",
+            pw_uid=984,
+            pw_gid=984,
+            pw_dir="/var/lib/overseer",
+            pw_shell="/usr/sbin/nologin",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(activation_package_module.pwd, "getpwnam", user_by_name)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwuid", user_by_uid)
+    monkeypatch.setattr(activation_package_module.grp, "getgrnam", lambda name: group)
+    monkeypatch.setattr(activation_package_module.grp, "getgrgid", lambda gid: group)
+    monkeypatch.setattr(activation_package_module.subprocess, "run", create)
+
+    result = activation_package_module._ensure_dedicated_principal_identity(
+        uid=984,
+        gid=984,
+        home_dir="/var/lib/overseer",
+        shell="/usr/sbin/nologin",
+        lock_descriptor=19,
+    )
+
+    assert result["status"] == "created"
+    assert len(calls) == 1
+    assert calls[0][0] == "/usr/sbin/useradd"
+
+
+def test_ensure_dedicated_principal_rejects_nonzero_child_even_after_identity_appears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group: object | None = None
+
+    def missing_user(value: object) -> object:
+        raise KeyError(value)
+
+    def group_by_name(name: str) -> object:
+        if group is None:
+            raise KeyError(name)
+        return group
+
+    def group_by_gid(gid: int) -> object:
+        if group is None:
+            raise KeyError(gid)
+        return group
+
+    def failed_create(command: list[str], **kwargs: object) -> object:
+        nonlocal group
+        group = SimpleNamespace(gr_name="overseer", gr_gid=984)
+        return SimpleNamespace(returncode=9)
+
+    monkeypatch.setattr(activation_package_module.pwd, "getpwnam", missing_user)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwuid", missing_user)
+    monkeypatch.setattr(activation_package_module.grp, "getgrnam", group_by_name)
+    monkeypatch.setattr(activation_package_module.grp, "getgrgid", group_by_gid)
+    monkeypatch.setattr(activation_package_module.subprocess, "run", failed_create)
+
+    with pytest.raises(ActivationPackageError, match="group creation failed"):
+        activation_package_module._ensure_dedicated_principal_identity(
+            uid=984,
+            gid=984,
+            home_dir="/var/lib/overseer",
+            shell="/usr/sbin/nologin",
+            lock_descriptor=23,
+        )
+
+
+def test_ensure_dedicated_principal_rejects_name_to_uid_drift_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drifted = SimpleNamespace(
+        pw_name="overseer",
+        pw_uid=985,
+        pw_gid=984,
+        pw_dir="/var/lib/overseer",
+        pw_shell="/usr/sbin/nologin",
+    )
+    monkeypatch.setattr(activation_package_module.pwd, "getpwnam", lambda name: drifted)
+
+    def missing_uid(uid: int) -> object:
+        raise KeyError(uid)
+
+    monkeypatch.setattr(activation_package_module.pwd, "getpwuid", missing_uid)
+
+    def unexpected_run(*args: object, **kwargs: object) -> object:
+        raise AssertionError("identity drift must be rejected before mutation")
+
+    monkeypatch.setattr(activation_package_module.subprocess, "run", unexpected_run)
+
+    with pytest.raises(ActivationPackageError, match="name or UID"):
+        activation_package_module._ensure_dedicated_principal_identity(
+            uid=984,
+            gid=984,
+            home_dir="/var/lib/overseer",
+            shell="/usr/sbin/nologin",
+            lock_descriptor=17,
+        )
+
+
+def test_ensure_dedicated_principal_requires_active_sealed_staging_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "approved-package"
+
+    def reject(*args: object, **kwargs: object) -> object:
+        raise ActivationPackageError("active staging command required")
+
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", reject)
+    with pytest.raises(ActivationPackageError, match="active staging command required"):
+        activation_package_module.ensure_dedicated_principal(package_root=package)
+
+
+def test_ensure_dedicated_principal_derives_identity_from_active_sealed_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = (tmp_path / "approved-package").resolve()
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": 1000, "gid": 1000},
+    }
+    observed: dict[str, object] = {}
+
+    def active(*args: object, **kwargs: object) -> object:
+        observed["activeArgs"] = args
+        observed["activeKwargs"] = kwargs
+        return contract, 29
+
+    def ensure_identity(**kwargs: object) -> dict[str, object]:
+        observed["identity"] = kwargs
+        return {"status": "existing"}
+
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", active)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_ensure_dedicated_principal_identity",
+        ensure_identity,
+    )
+
+    assert activation_package_module.ensure_dedicated_principal(package_root=package) == {
+        "status": "existing"
+    }
+    assert observed["activeKwargs"] == {
+        "phase": "staging-canary",
+        "command_name": "ensure-dedicated-principal",
+        "expected_options": {"--package-root": str(package)},
+    }
+    assert observed["identity"] == {
+        "uid": 984,
+        "gid": 984,
+        "home_dir": "/var/lib/overseer",
+        "shell": "/usr/sbin/nologin",
+        "lock_descriptor": 29,
+    }
+
+
 def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_path: Path) -> None:
     package, manifest, source = _prepared_package(tmp_path)
     rollback_release = tmp_path / "v1.1.5-release"
@@ -2055,20 +2350,33 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     staging_commands = contract["stagingAndCanaryCommands"]
     cutover_commands = contract["cutoverCommands"]
     commands = [*staging_commands, *cutover_commands]
-    assert ["/usr/sbin/groupadd", "--system", "--gid", "984", "overseer"] in commands
-    assert [
-        "/usr/sbin/useradd",
-        "--system",
-        "--uid",
-        "984",
-        "--gid",
-        "984",
-        "--home-dir",
-        "/var/lib/overseer",
-        "--shell",
-        "/usr/sbin/nologin",
-        "overseer",
-    ] in commands
+    principal_commands = [
+        command for command in staging_commands if "ensure-dedicated-principal" in command
+    ]
+    assert len(principal_commands) == 1
+    assert staging_commands[0] == principal_commands[0]
+    assert principal_commands[0][-3:] == [
+        "ensure-dedicated-principal",
+        "--package-root",
+        "/var/lib/overseer-executor/approved-package",
+    ]
+    assert all(
+        command[0] not in {"/usr/sbin/groupadd", "/usr/sbin/useradd"}
+        for command in commands
+    )
+    activation_package_module._validate_contract_principal_bootstrap(
+        Path(str(contract["packageRoot"])),
+        contract,
+    )
+    misplaced = dict(contract)
+    misplaced_commands = [list(command) for command in staging_commands[1:]]
+    misplaced_commands.append(list(staging_commands[0]))
+    misplaced["stagingAndCanaryCommands"] = misplaced_commands
+    with pytest.raises(ActivationPackageError, match="principal bootstrap"):
+        activation_package_module._validate_contract_principal_bootstrap(
+            Path(str(contract["packageRoot"])),
+            misplaced,
+        )
     stop_index = next(
         index
         for index, command in enumerate(commands)
@@ -2232,9 +2540,18 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         if command and command[0] == "/usr/bin/env" and "overseer.activation_package" in command
     ]
     assert release_python_commands
+    package_release_root = (
+        Path("/var/lib/overseer-executor/approved-package/public/release")
+        / Path(str(manifest["releaseRoot"])).name
+    )
+    assert f"LD_LIBRARY_PATH={package_release_root}/lib" in principal_commands[0]
+    installed_release_python_commands = [
+        command for command in release_python_commands if command != principal_commands[0]
+    ]
+    assert installed_release_python_commands
     assert all(
         f"LD_LIBRARY_PATH={manifest['releaseRoot']}/lib" in command
-        for command in release_python_commands
+        for command in installed_release_python_commands
     )
     assert contract["rollbackCommands"][-1] == [
         "/usr/bin/curl",
@@ -3580,6 +3897,11 @@ def test_phase_bounded_activation_runner_stops_for_cutover_approval(
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(
         activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_activation_root_identity",
         lambda: (os.geteuid(), os.getegid()),
     )
@@ -3694,6 +4016,11 @@ def test_cutover_runner_requires_separate_state_bound_phase_approval(
     }
     state_path = tmp_path / "executor" / "activation-state.json"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -3882,6 +4209,11 @@ def test_interrupted_staging_recovery_runs_and_records_cleanup(
     state_path = tmp_path / "executor" / "activation-state.json"
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -4259,6 +4591,11 @@ def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(
         activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_activation_root_identity",
         lambda: (os.geteuid(), os.getegid()),
     )
@@ -4344,6 +4681,11 @@ def test_cutover_interrupt_before_first_rollback_command_runs_emergency_rollback
     }
     state_path = tmp_path / "executor" / "activation-state.json"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -4549,6 +4891,11 @@ def test_staging_checkpoint_failure_runs_immediate_cleanup(
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(
         activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_activation_root_identity",
         lambda: (os.geteuid(), os.getegid()),
     )
@@ -4612,6 +4959,11 @@ def test_cutover_checkpoint_failure_runs_immediate_sealed_rollback(
     state_path = tmp_path / "executor" / "activation-state.json"
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -4807,6 +5159,11 @@ def test_failed_staging_command_cleans_up_when_cleanup_checkpoint_fails(
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(
         activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_activation_root_identity",
         lambda: (os.geteuid(), os.getegid()),
     )
@@ -4874,6 +5231,11 @@ def test_failed_cutover_command_rolls_back_when_rollback_checkpoint_fails(
     state_path = tmp_path / "executor" / "activation-state.json"
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -5018,6 +5380,11 @@ def test_manual_rollback_checkpoint_failure_retries_and_records_recovery(
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(
         activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_activation_root_identity",
         lambda: (os.geteuid(), os.getegid()),
     )
@@ -5093,6 +5460,11 @@ def test_staging_later_command_entry_checkpoint_failure_runs_cleanup(
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(
         activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_activation_root_identity",
         lambda: (os.geteuid(), os.getegid()),
     )
@@ -5157,6 +5529,11 @@ def test_cutover_later_command_entry_checkpoint_failure_runs_rollback(
     state_path = tmp_path / "executor" / "activation-state.json"
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",

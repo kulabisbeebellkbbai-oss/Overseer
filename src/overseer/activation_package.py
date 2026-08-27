@@ -202,6 +202,195 @@ def _validate_principal_binding(*, god_uid: int, overseer_uid: int, overseer_gid
         raise ActivationPackageError("approved Overseer GID is assigned to another group")
 
 
+def _optional_user_by_name(name: str) -> pwd.struct_passwd | None:
+    try:
+        return pwd.getpwnam(name)
+    except KeyError:
+        return None
+
+
+def _optional_user_by_uid(uid: int) -> pwd.struct_passwd | None:
+    try:
+        return pwd.getpwuid(uid)
+    except KeyError:
+        return None
+
+
+def _optional_group_by_name(name: str) -> grp.struct_group | None:
+    try:
+        return grp.getgrnam(name)
+    except KeyError:
+        return None
+
+
+def _optional_group_by_gid(gid: int) -> grp.struct_group | None:
+    try:
+        return grp.getgrgid(gid)
+    except KeyError:
+        return None
+
+
+def _dedicated_principal_presence(
+    *,
+    uid: int,
+    gid: int,
+    home_dir: str,
+    shell: str,
+) -> tuple[bool, bool]:
+    if (
+        uid != APPROVED_OVERSEER_UID
+        or gid != APPROVED_OVERSEER_GID
+        or home_dir != "/var/lib/overseer"
+        or shell != "/usr/sbin/nologin"
+    ):
+        raise ActivationPackageError("dedicated principal request is not approved")
+    user_by_name = _optional_user_by_name("overseer")
+    user_by_uid = _optional_user_by_uid(uid)
+    if (user_by_name is None) != (user_by_uid is None):
+        raise ActivationPackageError("dedicated principal user name or UID is assigned differently")
+    if user_by_name is not None and (
+        user_by_name.pw_name != "overseer"
+        or user_by_name.pw_uid != uid
+        or user_by_name.pw_gid != gid
+        or user_by_name.pw_dir != home_dir
+        or user_by_name.pw_shell != shell
+        or user_by_uid is None
+        or user_by_uid.pw_name != user_by_name.pw_name
+        or user_by_uid.pw_uid != user_by_name.pw_uid
+        or user_by_uid.pw_gid != user_by_name.pw_gid
+        or user_by_uid.pw_dir != user_by_name.pw_dir
+        or user_by_uid.pw_shell != user_by_name.pw_shell
+    ):
+        raise ActivationPackageError("dedicated principal user identity drifted")
+    group_by_name = _optional_group_by_name("overseer")
+    group_by_gid = _optional_group_by_gid(gid)
+    if (group_by_name is None) != (group_by_gid is None):
+        raise ActivationPackageError("dedicated principal group name or GID is assigned differently")
+    if group_by_name is not None and (
+        group_by_name.gr_name != "overseer"
+        or group_by_name.gr_gid != gid
+        or group_by_gid is None
+        or group_by_gid.gr_name != group_by_name.gr_name
+        or group_by_gid.gr_gid != group_by_name.gr_gid
+    ):
+        raise ActivationPackageError("dedicated principal group identity drifted")
+    return user_by_name is not None, group_by_name is not None
+
+
+def _run_principal_creation_command(command: list[str], *, lock_descriptor: int) -> int:
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME": "/root",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                ACTIVATION_LOCK_FD_ENV: str(lock_descriptor),
+            },
+            pass_fds=(lock_descriptor,),
+        )
+    except OSError as error:
+        raise ActivationPackageError("dedicated principal creation command could not start") from error
+    return result.returncode
+
+
+def _ensure_dedicated_principal_identity(
+    *,
+    uid: int,
+    gid: int,
+    home_dir: str,
+    shell: str,
+    lock_descriptor: int,
+) -> dict[str, object]:
+    """Create missing dedicated-principal entries or reuse only their exact identity."""
+
+    user_exists, group_exists = _dedicated_principal_presence(
+        uid=uid,
+        gid=gid,
+        home_dir=home_dir,
+        shell=shell,
+    )
+    if user_exists and not group_exists:
+        raise ActivationPackageError("dedicated principal user exists without its approved group")
+    initially_complete = user_exists and group_exists
+    if not group_exists:
+        returncode = _run_principal_creation_command(
+            ["/usr/sbin/groupadd", "--system", "--gid", str(gid), "overseer"],
+            lock_descriptor=lock_descriptor,
+        )
+        if returncode != 0:
+            raise ActivationPackageError("dedicated principal group creation failed")
+        user_exists, group_exists = _dedicated_principal_presence(
+            uid=uid,
+            gid=gid,
+            home_dir=home_dir,
+            shell=shell,
+        )
+        if not group_exists:
+            raise ActivationPackageError("dedicated principal group creation did not persist")
+    if not user_exists:
+        returncode = _run_principal_creation_command(
+            [
+                "/usr/sbin/useradd",
+                "--system",
+                "--uid",
+                str(uid),
+                "--gid",
+                str(gid),
+                "--home-dir",
+                home_dir,
+                "--shell",
+                shell,
+                "overseer",
+            ],
+            lock_descriptor=lock_descriptor,
+        )
+        if returncode != 0:
+            raise ActivationPackageError("dedicated principal user creation failed")
+        user_exists, group_exists = _dedicated_principal_presence(
+            uid=uid,
+            gid=gid,
+            home_dir=home_dir,
+            shell=shell,
+        )
+    if not user_exists or not group_exists:
+        raise ActivationPackageError("dedicated principal creation did not produce the approved identity")
+    return {
+        "status": "existing" if initially_complete else "created",
+        "user": "overseer",
+        "uid": uid,
+        "group": "overseer",
+        "gid": gid,
+    }
+
+
+def ensure_dedicated_principal(
+    *,
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Run principal provisioning only as the exact active sealed staging command."""
+
+    package = Path(package_root).resolve()
+    contract, lock_descriptor = _require_active_phase_command(
+        package,
+        phase="staging-canary",
+        command_name="ensure-dedicated-principal",
+        expected_options={"--package-root": str(package)},
+    )
+    _validate_contract_principal_schema(contract)
+    return _ensure_dedicated_principal_identity(
+        uid=APPROVED_OVERSEER_UID,
+        gid=APPROVED_OVERSEER_GID,
+        home_dir="/var/lib/overseer",
+        shell="/usr/sbin/nologin",
+        lock_descriptor=lock_descriptor,
+    )
+
+
 def _validate_new_package_destination(package_root: str | os.PathLike[str]) -> Path:
     package = Path(package_root).absolute()
     parent = APPROVED_PACKAGE_PARENT.absolute()
@@ -3305,22 +3494,47 @@ def render_activation_contract(
     if not isinstance(manifest_digest, str) or len(manifest_digest) != 64 or set(manifest_digest) - _HEX:
         raise ActivationPackageError("release manifest digest is invalid")
     rollback_bundle_root = Path(f"/opt/overseer/rollback/{manifest_digest}")
+    release_python = release_manifest.get("rootPython")
+    if (
+        not isinstance(release_python, Mapping)
+        or not isinstance(release_python.get("path"), str)
+        or not isinstance(release_python.get("releasePath"), str)
+    ):
+        raise ActivationPackageError("release Python manifest is invalid")
+    package_release_root = (
+        execution_package / "public" / "release" / PurePosixPath(release_root).name
+    )
+    package_activation_python = [
+        "/usr/bin/env",
+        f"LD_LIBRARY_PATH={package_release_root}/lib",
+        f"PYTHONHOME={package_release_root}/runtime",
+        f"PYTHONPATH={package_release_root}/app/src:{package_release_root}/site-packages",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
+        str(package_release_root / _safe_relative(str(release_python["releasePath"]))),
+        "-s",
+        "-P",
+        "-m",
+        "overseer.activation_package",
+    ]
     install_commands: list[list[str]] = [
-        ["/usr/sbin/groupadd", "--system", "--gid", str(overseer_gid), "overseer"],
         [
-            "/usr/sbin/useradd",
-            "--system",
-            "--uid",
-            str(overseer_uid),
-            "--gid",
-            str(overseer_gid),
-            "--home-dir",
-            "/var/lib/overseer",
-            "--shell",
-            "/usr/sbin/nologin",
-            "overseer",
+            *package_activation_python,
+            "ensure-dedicated-principal",
+            "--package-root",
+            str(execution_package),
         ],
-        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer"],
+        [
+            "/usr/bin/install",
+            "-d",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0755",
+            "/opt/overseer",
+        ],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer/releases"],
         ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer/rollback"],
         ["/usr/bin/install", "-d", "-o", "overseer", "-g", "overseer", "-m", "0700", "/var/lib/overseer"],
@@ -3382,13 +3596,6 @@ def render_activation_contract(
         ]
         for name, target in unit_targets.items()
     )
-    release_python = release_manifest.get("rootPython")
-    if (
-        not isinstance(release_python, Mapping)
-        or not isinstance(release_python.get("path"), str)
-        or not isinstance(release_python.get("releasePath"), str)
-    ):
-        raise ActivationPackageError("release Python manifest is invalid")
     final_backup = Path(
         f"/var/lib/overseer-executor/v1.1.6-source-{manifest_digest}.sqlite3"
     )
@@ -5452,8 +5659,8 @@ def _require_active_phase_command(
     command_name: str,
     expected_options: Mapping[str, str],
     expected_package_digest: str | None = None,
-) -> None:
-    _require_inherited_activation_lock()
+) -> tuple[dict[str, object], int]:
+    lock_descriptor = _require_inherited_activation_lock()
     package = Path(package_root).resolve()
     package_approval = _load_activation_approval(package)
     package_digest = str(package_approval["packageDigest"])
@@ -5484,6 +5691,7 @@ def _require_active_phase_command(
         raise ActivationPackageError("active runner state is not bound to the sealed command")
     if _sealed_command_options(command, command_name=command_name) != dict(expected_options):
         raise ActivationPackageError("active runner call does not match the sealed command arguments")
+    return contract, lock_descriptor
 
 
 def _require_active_rollback_command(
@@ -6372,6 +6580,44 @@ def _execute_resilient_rollback(
     return True
 
 
+def _validate_contract_principal_bootstrap(
+    package: Path,
+    contract: Mapping[str, object],
+) -> None:
+    release_root = contract.get("releaseRoot")
+    if not isinstance(release_root, str) or not release_root.startswith("/opt/overseer/releases/"):
+        raise ActivationPackageError("activation principal bootstrap release root is invalid")
+    package_release_root = package / "public" / "release" / PurePosixPath(release_root).name
+    expected = [
+        "/usr/bin/env",
+        f"LD_LIBRARY_PATH={package_release_root}/lib",
+        f"PYTHONHOME={package_release_root}/runtime",
+        f"PYTHONPATH={package_release_root}/app/src:{package_release_root}/site-packages",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
+        str(package_release_root / "runtime/bin/python3.13"),
+        "-s",
+        "-P",
+        "-m",
+        "overseer.activation_package",
+        "ensure-dedicated-principal",
+        "--package-root",
+        str(package),
+    ]
+    staging = _contract_commands(contract, "stagingAndCanaryCommands")
+    all_commands = [
+        *staging,
+        *_contract_commands(contract, "cutoverCommands"),
+        *_contract_commands(contract, "rollbackCommands"),
+    ]
+    if (
+        staging[0] != expected
+        or sum(command.count("ensure-dedicated-principal") for command in all_commands) != 1
+        or any(command[0] in {"/usr/sbin/groupadd", "/usr/sbin/useradd"} for command in all_commands)
+    ):
+        raise ActivationPackageError("activation principal bootstrap command is invalid")
+
+
 def _approved_activation_contract(
     package_root: str | os.PathLike[str],
 ) -> tuple[Path, str, dict[str, object]]:
@@ -6387,6 +6633,7 @@ def _approved_activation_contract(
     if contract.get("packageRoot") != str(package):
         raise ActivationPackageError("activation contract package root is not approval-bound")
     _validate_contract_principal_binding(contract)
+    _validate_contract_principal_bootstrap(package, contract)
     return package, digest, contract
 
 
@@ -6845,6 +7092,11 @@ def _main(argv: list[str] | None = None) -> int:
     restore_legacy.add_argument("--expected-parent-device", required=True, type=int)
     restore_legacy.add_argument("--expected-parent-inode", required=True, type=int)
     restore_legacy.add_argument("--expected-parent-mode", required=True, type=int)
+    ensure_principal = commands.add_parser(
+        "ensure-dedicated-principal",
+        help="create or reuse only the exact approved dedicated principal",
+    )
+    ensure_principal.add_argument("--package-root", required=True)
     record_approval = commands.add_parser(
         "record-activation-approval",
         help="record a root-owned approval for one exact sealed package digest",
@@ -7071,6 +7323,12 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "ensure-dedicated-principal":
+        result = ensure_dedicated_principal(
+            package_root=_validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "record-activation-approval":
         result = record_activation_approval(
             _validate_existing_package_destination(args.package_root),
@@ -7193,6 +7451,7 @@ __all__ = [
     "execute_approved_cutover",
     "execute_approved_rollback",
     "execute_approved_staging_canary",
+    "ensure_dedicated_principal",
     "finalize_activation_package",
     "prepare_final_store_migration",
     "recover_activation_approval_import",

@@ -3373,7 +3373,12 @@ def _read_private_file(path: Path, *, maximum_bytes: int = MAX_BODY_BYTES) -> by
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077 or metadata.st_size > maximum_bytes:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid not in {0, os.getuid()}
+            or metadata.st_mode & 0o077
+            or metadata.st_size > maximum_bytes
+        ):
             raise ValueError("private file is unsafe")
         chunks = []
         remaining = maximum_bytes + 1

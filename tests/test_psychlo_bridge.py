@@ -2227,6 +2227,53 @@ def test_private_peer_secret_rejects_symlink_and_group_readable_file(tmp_path: P
         raise AssertionError("symlink secret was accepted")
 
 
+def test_private_peer_secret_accepts_root_managed_credential_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    secret = tmp_path / "secret"
+    secret.write_bytes(SECRET)
+    secret.chmod(0o400)
+    real_fstat = psychlo_bridge_module.os.fstat
+
+    def root_owned_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_uid=0,
+            st_size=metadata.st_size,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", root_owned_fstat)
+    monkeypatch.setattr(psychlo_bridge_module.os, "getuid", lambda: 984)
+
+    assert _read_secret(secret) == SECRET
+
+
+def test_private_peer_secret_rejects_foreign_non_root_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    secret = tmp_path / "secret"
+    secret.write_bytes(SECRET)
+    secret.chmod(0o400)
+    real_fstat = psychlo_bridge_module.os.fstat
+
+    def foreign_owned_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_uid=1001,
+            st_size=metadata.st_size,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", foreign_owned_fstat)
+    monkeypatch.setattr(psychlo_bridge_module.os, "getuid", lambda: 984)
+
+    with pytest.raises(ValueError, match="Psychlo peer secret is unavailable"):
+        _read_secret(secret)
+
+
 def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
     dispatched = []
     forwarded = []

@@ -203,6 +203,10 @@ Also exercise failure of a later command-entry checkpoint, interruption during
 command and recovery execution, containment under principal drift, and exact
 stale-transient rejection for added lifecycle actions, drop-ins, or credential
 source changes.
+Rollback normalization must remain available under NSS drift so emergency
+containment can run, while named-principal starts still fail closed. Raw
+transient review also covers systemd credential setters, environment unsetting,
+mount/image directives, privileged executable prefixes, and lock-path swaps.
 
 - [ ] **Step 4: Generate the replacement owner-scoped package**
 

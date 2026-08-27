@@ -4655,7 +4655,7 @@ def _account_ids(owner: str, group: str) -> tuple[int, int]:
         raise ActivationPackageError("installed activation owner or group is unavailable") from error
 
 
-def _validate_contract_principal_binding(contract: Mapping[str, object]) -> None:
+def _validate_contract_principal_schema(contract: Mapping[str, object]) -> tuple[int, int]:
     if (
         contract.get("schemaVersion") != ACTIVATION_CONTRACT_SCHEMA
         or contract.get("liveExecutionApproved") is not False
@@ -4678,6 +4678,11 @@ def _validate_contract_principal_binding(contract: Mapping[str, object]) -> None
     god_gid = source_store.get("gid")
     if type(god_uid) is not int or type(god_gid) is not int:
         raise ActivationPackageError("activation god principal binding is invalid")
+    return god_uid, god_gid
+
+
+def _validate_contract_principal_binding(contract: Mapping[str, object]) -> None:
+    god_uid, god_gid = _validate_contract_principal_schema(contract)
     _validate_principal_binding(
         god_uid=god_uid,
         overseer_uid=APPROVED_OVERSEER_UID,
@@ -5232,6 +5237,21 @@ def _activation_execution_lock():
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ActivationPackageError("another activation or rollback runner holds the execution lock") from error
+        locked = os.fstat(descriptor)
+        try:
+            lexical = target.lstat()
+        except OSError as error:
+            raise ActivationPackageError("activation execution lock path changed after locking") from error
+        if (
+            target.is_symlink()
+            or not stat.S_ISREG(lexical.st_mode)
+            or lexical.st_nlink != 1
+            or lexical.st_uid != root_uid
+            or lexical.st_gid != root_gid
+            or stat.S_IMODE(lexical.st_mode) != 0o600
+            or (locked.st_dev, locked.st_ino) != (lexical.st_dev, lexical.st_ino)
+        ):
+            raise ActivationPackageError("activation execution lock path changed after locking")
         if _ACTIVE_EXECUTION_LOCK_DESCRIPTOR is not None:
             raise ActivationPackageError("activation execution lock registration is already active")
         _ACTIVE_EXECUTION_LOCK_DESCRIPTOR = descriptor
@@ -5871,10 +5891,18 @@ _ROLLBACK_TRANSIENT_ACTION_PROPERTIES = (
     "ExecStopPost",
     "EnvironmentFiles",
     "PassEnvironment",
+    "UnsetEnvironment",
     "RootDirectory",
     "RootImage",
+    "TemporaryFileSystem",
+    "MountImages",
+    "ExtensionImages",
     "BindPaths",
     "BindReadOnlyPaths",
+    "SetCredential",
+    "SetCredentialEncrypted",
+    "LoadCredentialEncrypted",
+    "ImportCredential",
 )
 
 
@@ -5952,7 +5980,7 @@ def _validate_rollback_transient_fragment_contents(
     except UnicodeDecodeError as error:
         raise ActivationPackageError("rollback transient unit file encoding drifted") from error
     credentials: list[str] = []
-    executable_entries = 0
+    executable_entries: list[list[str]] = []
     forbidden = {
         "ExecCondition",
         "ExecStartPre",
@@ -5962,11 +5990,16 @@ def _validate_rollback_transient_fragment_contents(
         "ExecStopPost",
         "EnvironmentFile",
         "PassEnvironment",
+        "UnsetEnvironment",
         "RootDirectory",
         "RootImage",
+        "TemporaryFileSystem",
+        "MountImages",
         "ExtensionImages",
         "BindPaths",
         "BindReadOnlyPaths",
+        "SetCredential",
+        "SetCredentialEncrypted",
     }
     for line in text.splitlines():
         stripped = line.strip()
@@ -5982,7 +6015,7 @@ def _validate_rollback_transient_fragment_contents(
         if name == "LoadCredential":
             credentials.append(value)
         if name == "ExecStart" and value:
-            executable_entries += 1
+            executable_entries.append(_show_words(value, label="unit-file command"))
     properties = spec.get("properties")
     if not isinstance(properties, Mapping):
         raise ActivationPackageError("rollback transient sealed properties are invalid")
@@ -5993,7 +6026,12 @@ def _validate_rollback_transient_fragment_contents(
         or sorted(credentials) != sorted(expected_credentials)
     ):
         raise ActivationPackageError("rollback transient credential source drifted")
-    if executable_entries != 1:
+    argv = spec.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not all(isinstance(value, str) and value for value in argv)
+        or executable_entries != [argv]
+    ):
         raise ActivationPackageError("rollback transient executable drifted")
 
 
@@ -6360,7 +6398,7 @@ def _normalize_rollback_contract(contract: Mapping[str, object]) -> dict[str, ob
         raise ActivationPackageError("sealed rollback contract schema is invalid")
     normalized = dict(contract)
     normalized["schemaVersion"] = ACTIVATION_CONTRACT_SCHEMA
-    _validate_contract_principal_binding(normalized)
+    _validate_contract_principal_schema(normalized)
     return normalized
 
 
@@ -6664,7 +6702,6 @@ def _execute_approved_rollback_locked(
     )
     if contract.get("packageRoot") != str(package):
         raise ActivationPackageError("activation contract package root is not approval-bound")
-    _validate_contract_principal_binding(contract)
     state = _load_activation_state()
     if state is None or state.get("packageDigest") != digest:
         raise ActivationPackageError("no matching activation runner state exists for rollback")

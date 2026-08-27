@@ -4117,6 +4117,7 @@ def test_rollback_transient_snapshot_is_bound_to_all_sealed_properties(
 
 def test_rollback_transient_fragment_binds_exact_credential_sources() -> None:
     spec = {
+        "argv": ["/bin/true"],
         "properties": {
             "LoadCredential": ["sealed-secret:/root/sealed-secret"],
         }
@@ -4140,6 +4141,33 @@ def test_rollback_transient_fragment_binds_exact_credential_sources() -> None:
             valid + b"ExecStart=/bin/false\n",
             spec,
         )
+    for prefix in (b"+", b"!", b"!!"):
+        with pytest.raises(ActivationPackageError, match="executable drifted"):
+            activation_package_module._validate_rollback_transient_fragment_contents(
+                valid.replace(b"ExecStart=/bin/true", b"ExecStart=" + prefix + b"/bin/true"),
+                spec,
+            )
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "SetCredential",
+        "SetCredentialEncrypted",
+        "UnsetEnvironment",
+        "TemporaryFileSystem",
+        "MountImages",
+        "ExtensionImages",
+    ],
+)
+def test_rollback_transient_fragment_rejects_unsealed_injection_directives(
+    directive: str,
+) -> None:
+    spec = {"argv": ["/bin/true"], "properties": {"LoadCredential": []}}
+    raw = f"[Service]\nExecStart=/bin/true\n{directive}=unsealed\n".encode("ascii")
+
+    with pytest.raises(ActivationPackageError, match="drifted"):
+        activation_package_module._validate_rollback_transient_fragment_contents(raw, spec)
 
 
 def test_rollback_transient_identity_rejects_sealed_argv_drift() -> None:
@@ -5229,3 +5257,100 @@ def test_emergency_rollback_contains_new_services_before_principal_drift_blocks_
         activation_package_module._execute_emergency_rollback_sequence(contract)
 
     assert calls == [tuple(stop)]
+
+
+def test_manual_rollback_reaches_emergency_containment_under_principal_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "3" * 64
+    package = tmp_path / "package"
+    stop = ["/usr/bin/systemctl", "stop", "overseer-api.service"]
+    transient = _rollback_transient_command()
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "rollbackCommands": [stop, transient],
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="command_running",
+            phase="cutover",
+            command_index=0,
+            command=["/bin/true", "cutover"],
+        )
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_principal_binding",
+        lambda **_kwargs: (_ for _ in ()).throw(ActivationPackageError("principal drift")),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+
+    with pytest.raises(ActivationPackageError, match="principal drift"):
+        activation_package_module._execute_approved_rollback_locked(package)
+
+    assert calls == [tuple(stop)]
+
+
+def test_activation_lock_revalidates_path_after_flock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "executor" / "activation-state.json"
+    lock_path = state_path.with_name("activation.lock")
+    replacement = state_path.with_name("replacement.lock")
+    replacement.parent.mkdir(parents=True)
+    replacement.parent.chmod(0o700)
+    replacement.write_bytes(b"")
+    replacement.chmod(0o600)
+    original_flock = activation_package_module.fcntl.flock
+    replaced = False
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    def replace_after_lock(descriptor: int, operation: int) -> None:
+        nonlocal replaced
+        original_flock(descriptor, operation)
+        if operation & activation_package_module.fcntl.LOCK_EX and not replaced:
+            replaced = True
+            os.replace(replacement, lock_path)
+
+    monkeypatch.setattr(activation_package_module.fcntl, "flock", replace_after_lock)
+
+    with pytest.raises(ActivationPackageError, match="lock path changed"):
+        with activation_package_module._activation_execution_lock():
+            pytest.fail("replaced activation lock path was accepted")

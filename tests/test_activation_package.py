@@ -2766,6 +2766,7 @@ def test_root_approval_import_rejects_sparse_package_files(
     with sparse.open("wb") as stream:
         stream.seek(2 * 1024 * 1024)
         stream.write(b"x")
+    sparse.chmod(0o644)
     digest = _reseal_package_manifest_for_test(package)
 
     with pytest.raises(ActivationPackageError, match="sparse"):
@@ -2773,6 +2774,59 @@ def test_root_approval_import_rejects_sparse_package_files(
 
     assert not execution_package.exists()
     assert not approval_path.exists()
+
+
+def test_root_approval_import_rejects_same_owner_sparse_swap_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    package, digest = _finalized_package(tmp_path)
+    migration_store = package / "private" / "migration" / "rehearsal-source.sqlite3"
+    copy_regular = activation_package_module._copy_package_regular_to_new_path
+    swapped = False
+
+    def swap_before_descriptor_copy(source: Path, target: Path, **kwargs):
+        nonlocal swapped
+        if source == migration_store and not swapped:
+            swapped = True
+            source.unlink()
+            with source.open("wb") as stream:
+                stream.seek(kwargs["expected_size"] - 1)
+                stream.write(b"x")
+            source.chmod(kwargs["source_mode"])
+        return copy_regular(source, target, **kwargs)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_copy_package_regular_to_new_path",
+        swap_before_descriptor_copy,
+    )
+
+    with pytest.raises(ActivationPackageError, match="sparse"):
+        record_activation_approval(package, expected_package_digest=digest)
+
+    assert swapped is True
+    assert not execution_package.exists()
+    assert not approval_path.exists()
+    assert not tuple(execution_package.parent.glob(".approved-package.import-*"))
 
 
 def test_root_approval_import_enforces_package_size_bound(
@@ -2854,6 +2908,54 @@ def test_root_approval_import_enforces_free_space_headroom(
     assert not approval_path.exists()
 
 
+def test_root_approval_import_rechecks_headroom_after_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    package, digest = _finalized_package(tmp_path)
+    validate_free_space = activation_package_module._validate_package_import_free_space
+    checks = 0
+
+    def consume_reserved_headroom(path: Path, required_size: int) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise ActivationPackageError("insufficient free space after staging")
+        validate_free_space(path, required_size)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_package_import_free_space",
+        consume_reserved_headroom,
+    )
+
+    with pytest.raises(ActivationPackageError, match="after staging"):
+        record_activation_approval(package, expected_package_digest=digest)
+
+    assert checks == 2
+    assert not execution_package.exists()
+    assert not approval_path.exists()
+    assert not tuple(execution_package.parent.glob(".approved-package.import-*"))
+
+
 def test_root_approval_import_reports_post_publish_durability_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2896,6 +2998,73 @@ def test_root_approval_import_reports_post_publish_durability_failure(
     assert execution_package.is_dir()
     assert not approval_path.exists()
     assert not tuple(execution_package.parent.glob(".approved-package.import-*"))
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_fsync_package_directory",
+        fsync_directory,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_existing_package_destination",
+        lambda selected: Path(selected).resolve(),
+    )
+    recovered = activation_package_module.recover_activation_approval_import(
+        package,
+        expected_package_digest=digest,
+        action="adopt",
+    )
+
+    assert recovered["status"] == "adopted"
+    assert recovered["packageDigest"] == digest
+    assert approval_path.is_file()
+
+
+def test_root_approval_import_recovery_removes_invalid_unapproved_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    package, digest = _finalized_package(tmp_path)
+    execution_package.mkdir(parents=True, mode=0o700)
+    (execution_package / "partial-copy").write_text("incomplete\n", encoding="utf-8")
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_existing_package_destination",
+        lambda selected: Path(selected).resolve(),
+    )
+
+    recovered = activation_package_module.recover_activation_approval_import(
+        package,
+        expected_package_digest=digest,
+        action="remove",
+    )
+
+    assert recovered == {
+        "status": "removed",
+        "packageRoot": str(execution_package.resolve()),
+        "packageDigest": digest,
+        "approvalRecorded": False,
+    }
+    assert not execution_package.exists()
+    assert not approval_path.exists()
 
 
 def test_root_approval_import_uses_atomic_no_replace_publication(tmp_path: Path) -> None:

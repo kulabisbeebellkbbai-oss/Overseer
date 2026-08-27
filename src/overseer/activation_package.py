@@ -3988,7 +3988,8 @@ def _copy_package_regular_to_new_path(
     *,
     package_owner: int,
     source_mode: int,
-) -> None:
+    expected_size: int,
+) -> int:
     """Stream one descriptor-bound package file into a new destination path."""
 
     try:
@@ -4001,6 +4002,7 @@ def _copy_package_regular_to_new_path(
         or before.st_uid != package_owner
         or before.st_nlink != 1
         or stat.S_IMODE(before.st_mode) != source_mode
+        or before.st_size != expected_size
     ):
         raise ActivationPackageError("source activation package file metadata is invalid")
     source_descriptor = os.open(
@@ -4023,6 +4025,8 @@ def _copy_package_regular_to_new_path(
         opened = os.fstat(source_descriptor)
         if identity(opened) != identity(before):
             raise ActivationPackageError("source activation package file changed while opening")
+        if opened.st_blocks * 512 < expected_size:
+            raise ActivationPackageError("sparse activation package files are not allowed")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         target_descriptor = os.open(target, flags, 0o600)
@@ -4055,7 +4059,7 @@ def _copy_package_regular_to_new_path(
         if (
             not stat.S_ISREG(target_metadata.st_mode)
             or target_metadata.st_nlink != 1
-            or target_metadata.st_size != before.st_size
+            or target_metadata.st_size != expected_size
             or stat.S_IMODE(target_metadata.st_mode) != source_mode
         ):
             raise ActivationPackageError("imported activation package file metadata is invalid")
@@ -4069,6 +4073,7 @@ def _copy_package_regular_to_new_path(
         os.close(source_descriptor)
         if target_descriptor is not None:
             os.close(target_descriptor)
+    return copied
 
 
 def _remove_failed_package_import(stage: Path, *, destination: Path) -> None:
@@ -4081,46 +4086,91 @@ def _remove_failed_package_import(stage: Path, *, destination: Path) -> None:
         metadata = stage.lstat()
     except FileNotFoundError:
         return
-    if stage.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+    import_owner = os.geteuid()
+    if (
+        stage.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != import_owner
+    ):
         raise ActivationPackageError("package import cleanup target is unsafe")
+    for directory, directories, _files in os.walk(stage, topdown=True, followlinks=False):
+        path = Path(directory)
+        directory_metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != import_owner
+        ):
+            raise ActivationPackageError("package import cleanup tree is unsafe")
+        os.chmod(path, 0o700)
+        for name in directories:
+            child = path / name
+            child_metadata = child.lstat()
+            if (
+                child.is_symlink()
+                or not stat.S_ISDIR(child_metadata.st_mode)
+                or child_metadata.st_uid != import_owner
+            ):
+                raise ActivationPackageError("package import cleanup tree is unsafe")
+            os.chmod(child, 0o700)
     shutil.rmtree(stage)
 
 
-def _validate_package_import_capacity(source_package: Path, destination_parent: Path) -> int:
-    """Reject sparse or oversized imports and preserve operational disk headroom."""
+def _package_import_expectations(
+    source_package: Path,
+    expected_package_digest: str,
+) -> tuple[dict[str, tuple[int, int]], int]:
+    """Derive the exact import path, mode, and byte budget from the sealed manifest."""
 
-    package_owner = source_package.lstat().st_uid
+    manifest = _read_bound_package_manifest(source_package, expected_package_digest)
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise ActivationPackageError("package manifest file inventory is invalid")
+    expectations: dict[str, tuple[int, int]] = {}
     total_size = 0
-    for directory, directories, files in os.walk(source_package, followlinks=False):
-        base = Path(directory)
-        for name in directories:
-            if (base / name).is_symlink():
-                raise ActivationPackageError("source activation package contains a directory symlink")
-        for name in files:
-            path = base / name
-            metadata = path.lstat()
-            if (
-                path.is_symlink()
-                or not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != package_owner
-                or metadata.st_nlink != 1
-            ):
-                raise ActivationPackageError("source activation package file metadata is invalid")
-            allocated_size = metadata.st_blocks * 512
-            if allocated_size < metadata.st_size:
-                raise ActivationPackageError("sparse activation package files are not allowed")
-            total_size += metadata.st_size
-            if total_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES:
-                raise ActivationPackageError("activation package exceeds the approved import size bound")
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise ActivationPackageError("package manifest file inventory is invalid")
+        path = item.get("path")
+        size = item.get("size")
+        mode = item.get("mode")
+        if (
+            not isinstance(path, str)
+            or _safe_relative(path) != path
+            or path == "public/package-manifest.json"
+            or type(size) is not int
+            or size < 0
+            or not isinstance(mode, str)
+            or mode not in {"0400", "0444", "0500", "0555", "0600", "0644"}
+            or item.get("links") != 1
+            or item.get("ownerBinding") != "package-root-owner"
+            or path in expectations
+        ):
+            raise ActivationPackageError("package manifest file inventory is invalid")
+        expectations[path] = (size, int(mode, 8))
+        total_size += size
+    manifest_path = source_package / "public" / "package-manifest.json"
+    _manifest_raw, manifest_metadata = _stable_read(manifest_path)
+    if (
+        manifest_metadata.st_uid != source_package.lstat().st_uid
+        or stat.S_IMODE(manifest_metadata.st_mode) != 0o644
+        or manifest_metadata.st_nlink != 1
+    ):
+        raise ActivationPackageError("package manifest metadata is invalid")
+    expectations["public/package-manifest.json"] = (manifest_metadata.st_size, 0o644)
+    total_size += manifest_metadata.st_size
+    if total_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES:
+        raise ActivationPackageError("activation package exceeds the approved import size bound")
+    return expectations, total_size
+
+
+def _validate_package_import_free_space(destination_parent: Path, required_size: int) -> None:
+    """Require an exact free-space budget at the current import checkpoint."""
+
     filesystem = os.statvfs(destination_parent)
     available_size = filesystem.f_bavail * filesystem.f_frsize
-    required_size = total_size + max(
-        total_size,
-        MIN_APPROVED_PACKAGE_IMPORT_HEADROOM_BYTES,
-    )
     if available_size < required_size:
         raise ActivationPackageError("insufficient free space for bounded activation package import")
-    return total_size
 
 
 def _fsync_package_directory(path: Path) -> None:
@@ -4173,13 +4223,26 @@ def _import_approved_execution_package(
     if destination.exists() or destination.is_symlink():
         raise ActivationPackageError("approved execution package destination already exists")
     _ensure_directory(destination.parent)
-    _validate_package_import_capacity(source_package, destination.parent)
+    expectations, expected_total_size = _package_import_expectations(
+        source_package,
+        expected_package_digest,
+    )
+    import_headroom = max(
+        expected_total_size,
+        MIN_APPROVED_PACKAGE_IMPORT_HEADROOM_BYTES,
+    )
+    _validate_package_import_free_space(
+        destination.parent,
+        expected_total_size + import_headroom,
+    )
     stage = destination.with_name(
         f".{destination.name}.import-{os.getpid()}-{secrets.token_hex(8)}"
     )
     _ensure_directory(stage)
     package_owner = source_package.lstat().st_uid
     directory_modes: list[tuple[Path, int]] = []
+    copied_paths: set[str] = set()
+    copied_total_size = 0
     published = False
     try:
         for directory, directories, files in os.walk(source_package, followlinks=False):
@@ -4204,15 +4267,23 @@ def _import_approved_execution_package(
             for name in files:
                 source = source_directory / name
                 relative = _safe_relative(source.relative_to(source_package).as_posix())
-                mode = stat.S_IMODE(source.lstat().st_mode)
-                if mode not in {0o400, 0o444, 0o500, 0o555, 0o600, 0o644}:
-                    raise ActivationPackageError("source activation package file mode is invalid")
-                _copy_package_regular_to_new_path(
+                expected = expectations.get(relative)
+                if expected is None or relative in copied_paths:
+                    raise ActivationPackageError("source activation package file inventory drifted")
+                expected_size, mode = expected
+                copied_size = _copy_package_regular_to_new_path(
                     source,
                     stage / relative,
                     package_owner=package_owner,
                     source_mode=mode,
+                    expected_size=expected_size,
                 )
+                copied_paths.add(relative)
+                copied_total_size += copied_size
+                if copied_total_size > expected_total_size:
+                    raise ActivationPackageError("activation package import exceeded its sealed byte budget")
+        if copied_paths != set(expectations) or copied_total_size != expected_total_size:
+            raise ActivationPackageError("activation package import did not consume its sealed byte budget")
         for target_directory, mode in sorted(
             directory_modes,
             key=lambda item: len(item[0].parts),
@@ -4221,6 +4292,7 @@ def _import_approved_execution_package(
             os.chmod(target_directory, mode)
             _fsync_package_directory(target_directory)
         verify_activation_package(stage, expected_package_digest)
+        _validate_package_import_free_space(destination.parent, import_headroom)
         _rename_package_no_replace(stage, destination)
         published = True
         try:
@@ -4246,10 +4318,30 @@ def record_activation_approval(
     _require_root_activation()
     source_package = Path(package_root).resolve()
     verified = verify_activation_package(source_package, expected_package_digest)
+    target = _activation_approval_record_path()
+    if target.exists() or target.is_symlink():
+        raise ActivationPackageError("activation approval record already exists")
     package = _import_approved_execution_package(
         source_package,
         expected_package_digest=expected_package_digest,
     )
+    return _write_activation_approval_for_imported_package(
+        package,
+        source_package=source_package,
+        expected_package_digest=expected_package_digest,
+        verified=verified,
+    )
+
+
+def _write_activation_approval_for_imported_package(
+    package: Path,
+    *,
+    source_package: Path,
+    expected_package_digest: str,
+    verified: Mapping[str, object],
+) -> dict[str, object]:
+    """Write approval only after an exact root-owned execution copy is verified."""
+
     contract = _sealed_package_json(
         package,
         expected_package_digest=expected_package_digest,
@@ -4258,6 +4350,8 @@ def record_activation_approval(
     if contract.get("packageRoot") != str(package):
         raise ActivationPackageError("sealed activation contract does not bind the execution package")
     target = _activation_approval_record_path()
+    if target.exists() or target.is_symlink():
+        raise ActivationPackageError("activation approval record already exists")
     document = {
         "schemaVersion": ACTIVATION_APPROVAL_SCHEMA,
         "approved": True,
@@ -4269,6 +4363,45 @@ def record_activation_approval(
     }
     _write_new(target, _canonical(document) + b"\n", 0o600)
     return document
+
+
+def recover_activation_approval_import(
+    source_package_root: str | os.PathLike[str],
+    *,
+    expected_package_digest: str,
+    action: str,
+) -> dict[str, object]:
+    """Adopt or remove an unapproved root-owned package left by interrupted publication."""
+
+    _require_root_activation()
+    if action not in {"adopt", "remove"}:
+        raise ActivationPackageError("unsupported activation approval import recovery action")
+    source_package = _validate_existing_package_destination(source_package_root)
+    source_verified = verify_activation_package(source_package, expected_package_digest)
+    target = _activation_approval_record_path()
+    if target.exists() or target.is_symlink():
+        raise ActivationPackageError("activation approval record already exists")
+    package = _validate_existing_package_destination(APPROVED_EXECUTION_PACKAGE)
+    if action == "adopt":
+        imported_verified = verify_activation_package(package, expected_package_digest)
+        if imported_verified != source_verified:
+            raise ActivationPackageError("published execution package verification differs from source")
+        _fsync_package_directory(package.parent)
+        document = _write_activation_approval_for_imported_package(
+            package,
+            source_package=source_package,
+            expected_package_digest=expected_package_digest,
+            verified=source_verified,
+        )
+        return {"status": "adopted", **document}
+    shutil.rmtree(package)
+    _fsync_package_directory(package.parent)
+    return {
+        "status": "removed",
+        "packageRoot": str(package),
+        "packageDigest": expected_package_digest,
+        "approvalRecorded": False,
+    }
 
 
 def _load_activation_approval(
@@ -5798,6 +5931,17 @@ def _main(argv: list[str] | None = None) -> int:
     )
     record_approval.add_argument("--package-root", required=True)
     record_approval.add_argument("--expected-package-digest", required=True)
+    recover_approval_import = commands.add_parser(
+        "recover-activation-approval-import",
+        help="adopt or remove an unapproved package left by interrupted root import",
+    )
+    recover_approval_import.add_argument("--source-package-root", required=True)
+    recover_approval_import.add_argument("--expected-package-digest", required=True)
+    recover_approval_import.add_argument(
+        "--action",
+        required=True,
+        choices=("adopt", "remove"),
+    )
     approved_canary = commands.add_parser(
         "run-approved-canary",
         help="run mandatory live canary controls for the root-approved package",
@@ -5987,6 +6131,14 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "recover-activation-approval-import":
+        result = recover_activation_approval_import(
+            args.source_package_root,
+            expected_package_digest=args.expected_package_digest,
+            action=args.action,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "run-approved-canary":
         package = _validate_existing_package_destination(args.package_root)
         approval = _load_activation_approval(package)
@@ -6072,6 +6224,7 @@ __all__ = [
     "execute_approved_rollback",
     "finalize_activation_package",
     "prepare_final_store_migration",
+    "recover_activation_approval_import",
     "record_activation_approval",
     "rehearse_store_migration",
     "render_activation_contract",

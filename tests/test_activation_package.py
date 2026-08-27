@@ -2651,6 +2651,93 @@ def test_root_approval_record_binds_one_exact_sealed_package(
         record_activation_approval(package, expected_package_digest=digest)
 
 
+def test_root_approval_import_streams_files_that_exceed_stable_read_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    package, digest = _finalized_package(tmp_path)
+    migration_store = package / "private" / "migration" / "rehearsal-source.sqlite3"
+    stable_read = activation_package_module._stable_read
+
+    def reject_bounded_read(path: Path):
+        if Path(path) == migration_store:
+            raise ActivationPackageError("release input exceeds the per-file bound")
+        return stable_read(path)
+
+    monkeypatch.setattr(activation_package_module, "_stable_read", reject_bounded_read)
+
+    recorded = record_activation_approval(package, expected_package_digest=digest)
+
+    assert recorded["packageDigest"] == digest
+    imported_store = execution_package / migration_store.relative_to(package)
+    assert imported_store.read_bytes() == migration_store.read_bytes()
+
+
+def test_root_approval_import_failure_does_not_publish_partial_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_package = tmp_path / "executor-state" / "approved-package"
+    approval_path = tmp_path / "executor-state" / "approved-package.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_EXECUTION_PACKAGE",
+        execution_package,
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_approval_record_path",
+        lambda: approval_path,
+    )
+    package, digest = _finalized_package(tmp_path)
+    copy_regular = activation_package_module._copy_package_regular_to_new_path
+    attempts = 0
+
+    def fail_during_import(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise ActivationPackageError("injected package import failure")
+        return copy_regular(*args, **kwargs)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_copy_package_regular_to_new_path",
+        fail_during_import,
+    )
+
+    with pytest.raises(ActivationPackageError, match="injected package import failure"):
+        record_activation_approval(package, expected_package_digest=digest)
+
+    assert not execution_package.exists()
+    assert not approval_path.exists()
+    assert not tuple(execution_package.parent.glob(".approved-package.import-*"))
+
+
 def test_installed_artifact_verifier_compares_targets_to_sealed_hashes(
     tmp_path: Path,
 ) -> None:

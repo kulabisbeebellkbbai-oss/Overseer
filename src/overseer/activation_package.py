@@ -19,6 +19,7 @@ import pwd
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import sqlite3
 import stat
@@ -3977,6 +3978,110 @@ def _installed_credential_root() -> Path:
     return Path("/etc/overseer")
 
 
+def _copy_package_regular_to_new_path(
+    source: Path,
+    target: Path,
+    *,
+    package_owner: int,
+    source_mode: int,
+) -> None:
+    """Stream one descriptor-bound package file into a new destination path."""
+
+    try:
+        before = source.lstat()
+    except OSError as error:
+        raise ActivationPackageError("source activation package file could not be inspected") from error
+    if (
+        source.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != package_owner
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != source_mode
+    ):
+        raise ActivationPackageError("source activation package file metadata is invalid")
+    source_descriptor = os.open(
+        source,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    target_descriptor: int | None = None
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    try:
+        opened = os.fstat(source_descriptor)
+        if identity(opened) != identity(before):
+            raise ActivationPackageError("source activation package file changed while opening")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        target_descriptor = os.open(target, flags, 0o600)
+        copied = 0
+        while copied < before.st_size:
+            chunk = os.read(source_descriptor, min(1024 * 1024, before.st_size - copied))
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_descriptor, view)
+                if written <= 0:
+                    raise OSError("activation package copy made no progress")
+                copied += written
+                view = view[written:]
+        after = os.fstat(source_descriptor)
+        try:
+            lexical_after = source.lstat()
+        except OSError as error:
+            raise ActivationPackageError("source activation package file changed during copy") from error
+        if (
+            identity(after) != identity(before)
+            or identity(lexical_after) != identity(before)
+            or copied != before.st_size
+        ):
+            raise ActivationPackageError("source activation package file changed during copy")
+        os.fchmod(target_descriptor, source_mode)
+        os.fsync(target_descriptor)
+        target_metadata = os.fstat(target_descriptor)
+        if (
+            not stat.S_ISREG(target_metadata.st_mode)
+            or target_metadata.st_nlink != 1
+            or target_metadata.st_size != before.st_size
+            or stat.S_IMODE(target_metadata.st_mode) != source_mode
+        ):
+            raise ActivationPackageError("imported activation package file metadata is invalid")
+    except BaseException:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(source_descriptor)
+        if target_descriptor is not None:
+            os.close(target_descriptor)
+
+
+def _remove_failed_package_import(stage: Path, *, destination: Path) -> None:
+    """Remove only a private temporary sibling created by the package importer."""
+
+    expected_prefix = f".{destination.name}.import-"
+    if stage.parent != destination.parent or not stage.name.startswith(expected_prefix):
+        raise ActivationPackageError("refusing unsafe package import cleanup target")
+    try:
+        metadata = stage.lstat()
+    except FileNotFoundError:
+        return
+    if stage.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise ActivationPackageError("package import cleanup target is unsafe")
+    shutil.rmtree(stage)
+
+
 def _import_approved_execution_package(
     source_package: Path,
     *,
@@ -3986,42 +4091,65 @@ def _import_approved_execution_package(
     if destination.exists() or destination.is_symlink():
         raise ActivationPackageError("approved execution package destination already exists")
     _ensure_directory(destination.parent)
-    _ensure_directory(destination)
+    stage = destination.with_name(
+        f".{destination.name}.import-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    _ensure_directory(stage)
+    package_owner = source_package.lstat().st_uid
     directory_modes: list[tuple[Path, int]] = []
-    for directory, directories, files in os.walk(source_package, followlinks=False):
-        source_directory = Path(directory)
-        relative_directory = source_directory.relative_to(source_package)
-        target_directory = destination / relative_directory
-        source_directory_metadata = source_directory.lstat()
-        source_directory_mode = stat.S_IMODE(source_directory_metadata.st_mode)
-        if (
-            source_directory.is_symlink()
-            or source_directory_metadata.st_uid != source_package.lstat().st_uid
-            or source_directory_mode not in {0o500, 0o700}
+    try:
+        for directory, directories, files in os.walk(source_package, followlinks=False):
+            source_directory = Path(directory)
+            relative_directory = source_directory.relative_to(source_package)
+            target_directory = stage / relative_directory
+            source_directory_metadata = source_directory.lstat()
+            source_directory_mode = stat.S_IMODE(source_directory_metadata.st_mode)
+            if (
+                source_directory.is_symlink()
+                or source_directory_metadata.st_uid != package_owner
+                or source_directory_mode not in {0o500, 0o700}
+            ):
+                raise ActivationPackageError("source activation package directory mode is invalid")
+            _ensure_directory(target_directory)
+            directory_modes.append((target_directory, source_directory_mode))
+            for name in directories:
+                source_child = source_directory / name
+                if source_child.is_symlink():
+                    raise ActivationPackageError("source activation package contains a directory symlink")
+                _ensure_directory(target_directory / name)
+            for name in files:
+                source = source_directory / name
+                relative = _safe_relative(source.relative_to(source_package).as_posix())
+                mode = stat.S_IMODE(source.lstat().st_mode)
+                if mode not in {0o400, 0o444, 0o500, 0o555, 0o600, 0o644}:
+                    raise ActivationPackageError("source activation package file mode is invalid")
+                _copy_package_regular_to_new_path(
+                    source,
+                    stage / relative,
+                    package_owner=package_owner,
+                    source_mode=mode,
+                )
+        for target_directory, mode in sorted(
+            directory_modes,
+            key=lambda item: len(item[0].parts),
+            reverse=True,
         ):
-            raise ActivationPackageError("source activation package directory mode is invalid")
-        _ensure_directory(target_directory)
-        directory_modes.append((target_directory, source_directory_mode))
-        for name in directories:
-            source_child = source_directory / name
-            if source_child.is_symlink():
-                raise ActivationPackageError("source activation package contains a directory symlink")
-            _ensure_directory(target_directory / name)
-        for name in files:
-            source = source_directory / name
-            relative = _safe_relative(source.relative_to(source_package).as_posix())
-            raw, metadata = _stable_read(source)
-            mode = stat.S_IMODE(metadata.st_mode)
-            if mode not in {0o400, 0o444, 0o500, 0o555, 0o600, 0o644}:
-                raise ActivationPackageError("source activation package file mode is invalid")
-            _write_new(destination / relative, raw, mode)
-    for target_directory, mode in sorted(
-        directory_modes,
-        key=lambda item: len(item[0].parts),
-        reverse=True,
-    ):
-        os.chmod(target_directory, mode)
-    verify_activation_package(destination, expected_package_digest)
+            os.chmod(target_directory, mode)
+        verify_activation_package(stage, expected_package_digest)
+        if destination.exists() or destination.is_symlink():
+            raise ActivationPackageError("approved execution package destination appeared during import")
+        os.rename(stage, destination)
+        parent_descriptor = os.open(
+            destination.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except BaseException:
+        _remove_failed_package_import(stage, destination=destination)
+        raise
     return destination
 
 

@@ -4089,7 +4089,7 @@ def test_rollback_transient_snapshot_is_bound_to_all_sealed_properties(
         "Environment": environment,
         "ExecStart": "{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; start_time=[n/a] }",
         "After": "basic.target",
-        "LoadCredential": "",
+        "LoadCredential": "[unprintable]",
         "InvocationID": "1" * 32,
     }
     monkeypatch.setattr(
@@ -4100,13 +4100,46 @@ def test_rollback_transient_snapshot_is_bound_to_all_sealed_properties(
     monkeypatch.setattr(
         activation_package_module,
         "_verify_rollback_transient_fragment",
-        lambda fragment, *, unit: None,
+        lambda fragment, *, unit, spec: None,
     )
 
     assert activation_package_module._inspect_rollback_transient_unit(spec) == "active"
     snapshot["Description"] = "unsealed"
     with pytest.raises(ActivationPackageError, match="identity drifted"):
         activation_package_module._inspect_rollback_transient_unit(spec)
+    snapshot["Description"] = str(spec["description"])
+    snapshot["ExecStartPre"] = (
+        "{ path=/bin/false ; argv[]=/bin/false ; ignore_errors=no ; start_time=[n/a] }"
+    )
+    with pytest.raises(ActivationPackageError, match="additional actions drifted"):
+        activation_package_module._inspect_rollback_transient_unit(spec)
+
+
+def test_rollback_transient_fragment_binds_exact_credential_sources() -> None:
+    spec = {
+        "properties": {
+            "LoadCredential": ["sealed-secret:/root/sealed-secret"],
+        }
+    }
+    valid = b"""# transient\n[Service]\nLoadCredential=sealed-secret:/root/sealed-secret\nExecStart=/bin/true\n"""
+
+    activation_package_module._validate_rollback_transient_fragment_contents(valid, spec)
+
+    with pytest.raises(ActivationPackageError, match="credential source drifted"):
+        activation_package_module._validate_rollback_transient_fragment_contents(
+            valid.replace(b"/root/sealed-secret", b"/root/other-secret"),
+            spec,
+        )
+    with pytest.raises(ActivationPackageError, match="additional actions drifted"):
+        activation_package_module._validate_rollback_transient_fragment_contents(
+            valid + b"ExecStartPre=/bin/false\n",
+            spec,
+        )
+    with pytest.raises(ActivationPackageError, match="executable drifted"):
+        activation_package_module._validate_rollback_transient_fragment_contents(
+            valid + b"ExecStart=/bin/false\n",
+            spec,
+        )
 
 
 def test_rollback_transient_identity_rejects_sealed_argv_drift() -> None:
@@ -4255,7 +4288,7 @@ def test_activation_runner_rolls_back_cutover_failure_and_refuses_resume(
         activation_package_module.execute_approved_cutover(package)
 
 
-def test_cutover_failure_records_recoverable_first_rollback_command_before_execution(
+def test_cutover_interrupt_before_first_rollback_command_runs_emergency_rollback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4328,16 +4361,14 @@ def test_cutover_failure_records_recoverable_first_rollback_command_before_execu
         crash_before_first_rollback_command,
     )
 
-    with pytest.raises(KeyboardInterrupt, match="process loss"):
+    with pytest.raises(ActivationPackageError, match="sealed rollback completed"):
         activation_package_module.execute_approved_cutover(package)
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["phase"] == "rollback"
-    assert state["status"] == "rollback_command_running"
-    assert state["commandIndex"] == 0
-    assert state["commandDigest"] == hashlib.sha256(
-        json.dumps(rollback, sort_keys=True, separators=(",", ":")).encode("ascii")
-    ).hexdigest()
+    assert state["status"] == "rolled_back"
+    assert state["commandIndex"] is None
+    assert state["commandDigest"] is None
 
 
 def test_final_migration_public_primitive_requires_active_sealed_cutover_command(
@@ -4999,3 +5030,202 @@ def test_manual_rollback_checkpoint_failure_retries_and_records_recovery(
     assert calls == [tuple(rollback), tuple(rollback)]
     final_state = json.loads(state_path.read_text(encoding="utf-8"))
     assert final_state["status"] == "rolled_back"
+
+
+def test_staging_later_command_entry_checkpoint_failure_runs_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "1" * 64
+    package = tmp_path / "package"
+    first = ["/bin/true", "first-staging"]
+    second = ["/bin/true", "second-staging"]
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [first, second],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [cleanup]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "staging-canary"},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+    original_write = activation_package_module._write_activation_state
+
+    def fail_second_entry(document: dict[str, object]) -> None:
+        if document.get("status") == "command_running" and document.get("commandIndex") == 1:
+            raise OSError("simulated later command-entry checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_second_entry)
+
+    with pytest.raises(ActivationPackageError, match="entry checkpoint failed"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    assert calls == [tuple(first), tuple(cleanup)]
+
+
+def test_cutover_later_command_entry_checkpoint_failure_runs_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "2" * 64
+    package = tmp_path / "package"
+    first = ["/bin/true", "first-cutover"]
+    second = ["/bin/true", "second-cutover"]
+    rollback = ["/bin/true", "rollback"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [first, second],
+        "rollbackCommands": [rollback],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "cutover"},
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="canary_passed_awaiting_cutover_approval",
+            phase="staging-canary",
+        )
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+    original_write = activation_package_module._write_activation_state
+
+    def fail_second_entry(document: dict[str, object]) -> None:
+        if document.get("status") == "command_running" and document.get("commandIndex") == 1:
+            raise OSError("simulated later command-entry checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_second_entry)
+
+    with pytest.raises(ActivationPackageError, match="entry checkpoint failed"):
+        activation_package_module.execute_approved_cutover(package)
+
+    assert calls == [tuple(first), tuple(rollback)]
+
+
+def test_command_interrupt_is_classified_for_runner_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt(_command: list[str]) -> int:
+        raise KeyboardInterrupt("simulated interrupt")
+
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", interrupt)
+
+    assert activation_package_module._command_outcome(["/bin/true"]) == (
+        127,
+        "KeyboardInterrupt",
+    )
+
+
+def test_emergency_cleanup_executes_sealed_stop_during_principal_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup = ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"]
+    calls: list[tuple[str, ...]] = []
+    contract = {"canary": {"failureCleanupCommands": [cleanup]}}
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_binding",
+        lambda _contract: (_ for _ in ()).throw(ActivationPackageError("principal drift")),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+
+    activation_package_module._execute_emergency_cleanup_sequence(contract)
+
+    assert calls == [tuple(cleanup)]
+
+
+def test_emergency_rollback_contains_new_services_before_principal_drift_blocks_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop = ["/usr/bin/systemctl", "stop", "overseer-api.service"]
+    transient = _rollback_transient_command()
+    calls: list[tuple[str, ...]] = []
+    contract = {"rollbackCommands": [stop, transient]}
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_binding",
+        lambda _contract: (_ for _ in ()).throw(ActivationPackageError("principal drift")),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(tuple(command)) or 0,
+    )
+
+    with pytest.raises(ActivationPackageError, match="principal drift"):
+        activation_package_module._execute_emergency_rollback_sequence(contract)
+
+    assert calls == [tuple(stop)]

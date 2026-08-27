@@ -199,6 +199,10 @@ primitive validates its complete sealed argument map, cleanup and rollback
 remain effective when either their entry or completion checkpoint fails, the
 legacy-store restoration primitive cannot be invoked directly, and cleanup
 treats only the exact inactive `systemctl is-active` result as satisfied.
+Also exercise failure of a later command-entry checkpoint, interruption during
+command and recovery execution, containment under principal drift, and exact
+stale-transient rejection for added lifecycle actions, drop-ins, or credential
+source changes.
 
 - [ ] **Step 4: Generate the replacement owner-scoped package**
 

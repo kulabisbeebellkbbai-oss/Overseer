@@ -5611,7 +5611,7 @@ def _execute_contract_command(command: list[str]) -> int:
 def _command_outcome(command: list[str]) -> tuple[int, str | None]:
     try:
         return _execute_contract_command(command), None
-    except Exception as error:
+    except BaseException as error:
         return 127, type(error).__name__
 
 
@@ -5621,7 +5621,7 @@ def _validated_command_outcome(
 ) -> tuple[int, str | None]:
     try:
         _validate_contract_principal_binding(contract)
-    except Exception as error:
+    except BaseException as error:
         return 126, type(error).__name__
     return _command_outcome(command)
 
@@ -5723,7 +5723,9 @@ def _execute_emergency_cleanup_sequence(contract: Mapping[str, object]) -> None:
     """Stop every sealed staging unit when runner-state persistence is unavailable."""
 
     for command in _cleanup_commands(contract):
-        returncode, start_error = _validated_command_outcome(contract, command)
+        # Containment must not be suppressed by NSS/account drift. These are
+        # already sealed stop-only commands and do not start a principal.
+        returncode, start_error = _command_outcome(command)
         if returncode != 0 and not (
             start_error is None and _cleanup_command_satisfied(command)
         ):
@@ -5736,7 +5738,7 @@ def _execute_emergency_cleanup_sequence(contract: Mapping[str, object]) -> None:
 def _write_recovery_state_best_effort(document: Mapping[str, object]) -> bool:
     try:
         _write_activation_state(document)
-    except Exception:
+    except BaseException:
         return False
     return True
 
@@ -5748,7 +5750,7 @@ def _execute_resilient_cleanup(
 ) -> bool:
     try:
         _execute_cleanup_sequence(contract, package_digest=package_digest)
-    except Exception:
+    except BaseException:
         _execute_emergency_cleanup_sequence(contract)
     return _write_recovery_state_best_effort(
         _runner_state(
@@ -5860,6 +5862,22 @@ def _rollback_transient_spec(command: list[str]) -> dict[str, object] | None:
     }
 
 
+_ROLLBACK_TRANSIENT_ACTION_PROPERTIES = (
+    "ExecCondition",
+    "ExecStartPre",
+    "ExecStartPost",
+    "ExecReload",
+    "ExecStop",
+    "ExecStopPost",
+    "EnvironmentFiles",
+    "PassEnvironment",
+    "RootDirectory",
+    "RootImage",
+    "BindPaths",
+    "BindReadOnlyPaths",
+)
+
+
 def _systemctl_show_rollback_unit(unit: str) -> dict[str, str]:
     names = (
         "LoadState",
@@ -5879,6 +5897,8 @@ def _systemctl_show_rollback_unit(unit: str) -> dict[str, str]:
         "ExecStart",
         "After",
         "LoadCredential",
+        "DropInPaths",
+        *_ROLLBACK_TRANSIENT_ACTION_PROPERTIES,
         "InvocationID",
     )
     command = [
@@ -5923,7 +5943,66 @@ def _show_words(value: str, *, label: str) -> list[str]:
         raise ActivationPackageError(f"rollback transient {label} is invalid") from error
 
 
-def _verify_rollback_transient_fragment(fragment: Path, *, unit: str) -> None:
+def _validate_rollback_transient_fragment_contents(
+    raw: bytes,
+    spec: Mapping[str, object],
+) -> None:
+    try:
+        text = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ActivationPackageError("rollback transient unit file encoding drifted") from error
+    credentials: list[str] = []
+    executable_entries = 0
+    forbidden = {
+        "ExecCondition",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecReload",
+        "ExecStop",
+        "ExecStopPost",
+        "EnvironmentFile",
+        "PassEnvironment",
+        "RootDirectory",
+        "RootImage",
+        "ExtensionImages",
+        "BindPaths",
+        "BindReadOnlyPaths",
+    }
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")) or stripped.startswith("["):
+            continue
+        name, separator, value = stripped.partition("=")
+        if not separator or not name:
+            raise ActivationPackageError("rollback transient unit file syntax drifted")
+        if name in forbidden and value:
+            raise ActivationPackageError("rollback transient additional actions drifted")
+        if name in {"LoadCredentialEncrypted", "ImportCredential"} and value:
+            raise ActivationPackageError("rollback transient credential source drifted")
+        if name == "LoadCredential":
+            credentials.append(value)
+        if name == "ExecStart" and value:
+            executable_entries += 1
+    properties = spec.get("properties")
+    if not isinstance(properties, Mapping):
+        raise ActivationPackageError("rollback transient sealed properties are invalid")
+    expected_credentials = properties.get("LoadCredential", [])
+    if (
+        not isinstance(expected_credentials, list)
+        or not all(isinstance(value, str) and value for value in expected_credentials)
+        or sorted(credentials) != sorted(expected_credentials)
+    ):
+        raise ActivationPackageError("rollback transient credential source drifted")
+    if executable_entries != 1:
+        raise ActivationPackageError("rollback transient executable drifted")
+
+
+def _verify_rollback_transient_fragment(
+    fragment: Path,
+    *,
+    unit: str,
+    spec: Mapping[str, object],
+) -> None:
     expected_fragment = Path("/run/systemd/transient") / unit
     try:
         fragment_metadata = fragment.lstat()
@@ -5940,6 +6019,14 @@ def _verify_rollback_transient_fragment(fragment: Path, *, unit: str) -> None:
         or stat.S_IMODE(fragment_metadata.st_mode) & 0o022
     ):
         raise ActivationPackageError("rollback transient unit file identity drifted")
+    raw, opened = _stable_read(fragment)
+    if (
+        opened.st_uid != root_uid
+        or opened.st_gid != root_gid
+        or stat.S_IMODE(opened.st_mode) & 0o022
+    ):
+        raise ActivationPackageError("rollback transient unit file identity drifted")
+    _validate_rollback_transient_fragment_contents(raw, spec)
 
 
 def _inspect_rollback_transient_unit(spec: Mapping[str, object]) -> str:
@@ -5952,7 +6039,7 @@ def _inspect_rollback_transient_unit(spec: Mapping[str, object]) -> str:
     if load_state != "loaded" or not active_state:
         raise ActivationPackageError("rollback transient unit load state is invalid")
     fragment = Path(observed.get("FragmentPath", ""))
-    _verify_rollback_transient_fragment(fragment, unit=unit)
+    _verify_rollback_transient_fragment(fragment, unit=unit, spec=spec)
     invocation_id = observed.get("InvocationID", "")
     allowed_substates = {
         "active": {"running"},
@@ -5975,10 +6062,14 @@ def _inspect_rollback_transient_unit(spec: Mapping[str, object]) -> str:
         or observed.get("WorkingDirectory") != spec["workingDirectory"]
         or observed.get("Type") != "simple"
         or observed.get("CollectMode") != "inactive-or-failed"
+        or observed.get("DropInPaths")
+        or any(observed.get(name) for name in _ROLLBACK_TRANSIENT_ACTION_PROPERTIES)
         or observed.get("SubState") not in allowed_substates.get(active_state, set())
         or (invocation_id and re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None)
         or (active_state != "inactive" and not invocation_id)
     ):
+        if any(observed.get(name) for name in _ROLLBACK_TRANSIENT_ACTION_PROPERTIES):
+            raise ActivationPackageError("rollback transient additional actions drifted")
         raise ActivationPackageError("rollback transient unit identity drifted")
     properties = spec.get("properties")
     if not isinstance(properties, Mapping):
@@ -5990,11 +6081,6 @@ def _inspect_rollback_transient_unit(spec: Mapping[str, object]) -> str:
     expected_after = set(properties.get("After", []))
     if not expected_after.issubset(set(_show_words(observed.get("After", ""), label="ordering"))):
         raise ActivationPackageError("rollback transient ordering drifted")
-    expected_credentials = set(properties.get("LoadCredential", []))
-    if expected_credentials and observed.get("LoadCredential") != "[unprintable]":
-        raise ActivationPackageError("rollback transient credential binding drifted")
-    if not expected_credentials and observed.get("LoadCredential"):
-        raise ActivationPackageError("rollback transient unexpected credential binding")
     credential_directory = f"/run/credentials/{unit}"
     expected_environment = {
         str(value).replace("%d", credential_directory) for value in spec["environment"]
@@ -6202,12 +6288,15 @@ def _execute_emergency_rollback_sequence(contract: Mapping[str, object]) -> None
     """Run sealed rollback without checkpoints when state publication has failed."""
 
     for command in _contract_commands(contract, "rollbackCommands"):
-        _validate_contract_principal_binding(contract)
         restore_arguments = _sealed_restore_legacy_arguments(command)
         if restore_arguments is not None:
             _restore_legacy_store_access_unchecked(**restore_arguments)
             continue
         if _rollback_transient_spec(command) is not None:
+            # Stopping the successor and restoring numeric ownership are safe
+            # containment under principal drift. Starting a named-principal
+            # legacy transient is not, so revalidate immediately before it.
+            _validate_contract_principal_binding(contract)
             _execute_rollback_transient(contract, command, resume=True)
             continue
         returncode, start_error = _command_outcome(command)
@@ -6232,7 +6321,7 @@ def _execute_resilient_rollback(
             prior_state=prior_state,
             originating_failure=originating_failure,
         )
-    except Exception:
+    except BaseException:
         _execute_emergency_rollback_sequence(contract)
         return _write_recovery_state_best_effort(
             _runner_state(
@@ -6308,21 +6397,35 @@ def _execute_approved_staging_canary_locked(
         _runner_state(package_digest=digest, status="running", phase="staging-canary")
     )
     for index, command in enumerate(staging):
-        _write_activation_state(
-            _runner_state(
-                package_digest=digest,
-                status="command_running",
-                phase="staging-canary",
-                command_index=index,
-                command=command,
-            )
+        command_state = _runner_state(
+            package_digest=digest,
+            status="command_running",
+            phase="staging-canary",
+            command_index=index,
+            command=command,
         )
+        try:
+            _write_activation_state(command_state)
+        except BaseException as checkpoint_error:
+            try:
+                cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
+            except BaseException as cleanup_error:
+                raise ActivationPackageError(
+                    "staging command entry checkpoint failed and sealed cleanup did not complete"
+                ) from cleanup_error
+            if not cleanup_durable:
+                raise ActivationPackageError(
+                    "staging command entry checkpoint failed; cleanup completed but terminal recovery state is not durable"
+                ) from checkpoint_error
+            raise ActivationPackageError(
+                "staging command entry checkpoint failed; immediate cleanup completed"
+            ) from checkpoint_error
         returncode, start_error = _validated_command_outcome(contract, command)
         if returncode != 0:
             command_failure = start_error or f"exit-{returncode}"
             try:
                 cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
-            except Exception as cleanup_error:
+            except BaseException as cleanup_error:
                 raise ActivationPackageError(
                     "staged activation command failed and sealed cleanup did not complete"
                 ) from cleanup_error
@@ -6341,10 +6444,10 @@ def _execute_approved_staging_canary_locked(
                     command=command,
                 )
             )
-        except Exception as checkpoint_error:
+        except BaseException as checkpoint_error:
             try:
                 cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
-            except Exception as cleanup_error:
+            except BaseException as cleanup_error:
                 raise ActivationPackageError(
                     "checkpoint failed after staging command and immediate cleanup failed"
                 ) from cleanup_error
@@ -6358,10 +6461,10 @@ def _execute_approved_staging_canary_locked(
 
     try:
         verify_approved_cutover(package)
-    except Exception as error:
+    except BaseException as error:
         try:
             cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
-        except Exception as cleanup_error:
+        except BaseException as cleanup_error:
             raise ActivationPackageError(
                 "cutover gate failed and sealed staging cleanup did not complete"
             ) from cleanup_error
@@ -6378,10 +6481,10 @@ def _execute_approved_staging_canary_locked(
                 phase="staging-canary",
             )
         )
-    except Exception as checkpoint_error:
+    except BaseException as checkpoint_error:
         try:
             cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
-        except Exception as cleanup_error:
+        except BaseException as cleanup_error:
             raise ActivationPackageError(
                 "final staging checkpoint failed and immediate cleanup failed"
             ) from cleanup_error
@@ -6421,7 +6524,12 @@ def _execute_approved_cutover_locked(
     )
     cutover = _contract_commands(contract, "cutoverCommands")
     rollback = _contract_commands(contract, "rollbackCommands")
-    _write_activation_state(_runner_state(package_digest=digest, status="running", phase="cutover"))
+    cutover_running_state = _runner_state(
+        package_digest=digest,
+        status="running",
+        phase="cutover",
+    )
+    _write_activation_state(cutover_running_state)
     completed_state: dict[str, object] | None = None
     for index, command in enumerate(cutover):
         command_state = _runner_state(
@@ -6431,7 +6539,27 @@ def _execute_approved_cutover_locked(
             command_index=index,
             command=command,
         )
-        _write_activation_state(command_state)
+        try:
+            _write_activation_state(command_state)
+        except BaseException as checkpoint_error:
+            try:
+                rollback_durable = _execute_resilient_rollback(
+                    contract,
+                    package_digest=digest,
+                    prior_state=completed_state or cutover_running_state,
+                    originating_failure=type(checkpoint_error).__name__,
+                )
+            except BaseException as rollback_error:
+                raise ActivationPackageError(
+                    "cutover command entry checkpoint failed and sealed rollback did not complete"
+                ) from rollback_error
+            if not rollback_durable:
+                raise ActivationPackageError(
+                    "cutover command entry checkpoint failed; rollback completed but terminal recovery state is not durable"
+                ) from checkpoint_error
+            raise ActivationPackageError(
+                "cutover command entry checkpoint failed; immediate sealed rollback completed"
+            ) from checkpoint_error
         returncode, start_error = _validated_command_outcome(contract, command)
         if returncode != 0:
             command_failure = start_error or f"cutover-exit-{returncode}"
@@ -6446,7 +6574,7 @@ def _execute_approved_cutover_locked(
             try:
                 _write_activation_state(rollback_state)
                 recovery_state: Mapping[str, object] = rollback_state
-            except Exception:
+            except BaseException:
                 recovery_state = command_state
             try:
                 rollback_durable = _execute_resilient_rollback(
@@ -6455,7 +6583,7 @@ def _execute_approved_cutover_locked(
                     prior_state=recovery_state,
                     originating_failure=command_failure,
                 )
-            except Exception as error:
+            except BaseException as error:
                 raise ActivationPackageError(
                     "cutover failed and sealed rollback did not complete"
                 ) from error
@@ -6473,7 +6601,7 @@ def _execute_approved_cutover_locked(
         )
         try:
             _write_activation_state(completed_state)
-        except Exception as checkpoint_error:
+        except BaseException as checkpoint_error:
             try:
                 rollback_durable = _execute_resilient_rollback(
                     contract,
@@ -6481,7 +6609,7 @@ def _execute_approved_cutover_locked(
                     prior_state=command_state,
                     originating_failure=type(checkpoint_error).__name__,
                 )
-            except Exception as rollback_error:
+            except BaseException as rollback_error:
                 raise ActivationPackageError(
                     "checkpoint failed after cutover command and immediate sealed rollback failed"
                 ) from rollback_error
@@ -6496,7 +6624,7 @@ def _execute_approved_cutover_locked(
         _write_activation_state(
             _runner_state(package_digest=digest, status="complete", phase="complete")
         )
-    except Exception as checkpoint_error:
+    except BaseException as checkpoint_error:
         try:
             rollback_durable = _execute_resilient_rollback(
                 contract,
@@ -6504,7 +6632,7 @@ def _execute_approved_cutover_locked(
                 prior_state=completed_state,
                 originating_failure=type(checkpoint_error).__name__,
             )
-        except Exception as rollback_error:
+        except BaseException as rollback_error:
             raise ActivationPackageError(
                 "final cutover checkpoint failed and immediate sealed rollback failed"
             ) from rollback_error

@@ -1,7 +1,9 @@
-"""Prepare a closed dedicated-principal activation package without activation.
+"""Prepare and execute a closed, separately approved activation package.
 
-This module performs only owner-scoped staging.  It never invokes sudo,
-systemctl, useradd, groupadd, a shell, or a gateway operation.
+Preparation commands perform only owner-scoped staging. Privileged phase
+runners execute only sealed package commands after their independent approval;
+the guarded principal bootstrap may invoke exact ``groupadd`` or ``useradd``
+commands. The module never invokes sudo, a shell, or a gateway operation.
 """
 
 from __future__ import annotations
@@ -184,15 +186,21 @@ class ActivationPackageError(ValueError):
     """Raised when a package input or staged artifact is unsafe or unstable."""
 
 
-def _validate_principal_binding(*, god_uid: int, overseer_uid: int, overseer_gid: int) -> None:
+def _validate_principal_binding(
+    *,
+    god_uid: int,
+    god_gid: int,
+    overseer_uid: int,
+    overseer_gid: int,
+) -> None:
     if (overseer_uid, overseer_gid) != (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID):
         raise ActivationPackageError("dedicated principal must use the approved UID/GID 984")
     try:
         god = pwd.getpwnam("god")
     except KeyError as error:
         raise ActivationPackageError("approved god account is unavailable") from error
-    if god.pw_uid != god_uid:
-        raise ActivationPackageError("god UID does not match the approved local account")
+    if (god.pw_uid, god.pw_gid) != (god_uid, god_gid):
+        raise ActivationPackageError("god UID/GID does not match the approved local account")
     try:
         existing_user = pwd.getpwuid(overseer_uid)
     except KeyError:
@@ -308,6 +316,22 @@ def _dedicated_principal_presence(
         raise ActivationPackageError(
             "dedicated principal primary group membership is not exclusive"
         )
+    if user_by_name is not None:
+        foreign_explicit_memberships = tuple(
+            item.gr_gid
+            for item in enumerated_groups
+            if item.gr_gid != gid and "overseer" in tuple(item.gr_mem)
+        )
+        try:
+            effective_groups = tuple(sorted(os.getgrouplist("overseer", gid)))
+        except OSError as error:
+            raise ActivationPackageError(
+                "dedicated principal supplementary groups could not be resolved"
+            ) from error
+        if foreign_explicit_memberships or effective_groups != (gid,):
+            raise ActivationPackageError(
+                "dedicated principal foreign supplementary group membership exists"
+            )
     return user_by_name is not None, group_by_name is not None
 
 
@@ -1030,6 +1054,9 @@ def build_release_manifest(
     root_python: str | os.PathLike[str],
     stdlib_root: str | os.PathLike[str],
     sqlite_library: str | os.PathLike[str],
+    *,
+    expected_commit: str,
+    expected_tree: str,
 ) -> dict[str, object]:
     """Build a deterministic manifest from a clean reviewed checkout."""
 
@@ -1043,12 +1070,21 @@ def build_release_manifest(
     selected_stdlib = lexical_stdlib.resolve()
     selected_python = Path(root_python)
     selected_sqlite = Path(sqlite_library)
+    if (
+        len(expected_commit) != 40
+        or set(expected_commit) - _HEX
+        or len(expected_tree) != 40
+        or set(expected_tree) - _HEX
+    ):
+        raise ActivationPackageError("approved Git identity is invalid")
     if _git(selected_checkout, "status", "--porcelain=v1", "--untracked-files=all").strip():
         raise ActivationPackageError("reviewed Git checkout must be clean")
     commit = _git(selected_checkout, "rev-parse", "HEAD^{commit}").strip().decode("ascii").lower()
-    tree = _git(selected_checkout, "rev-parse", "HEAD^{tree}").strip().decode("ascii").lower()
-    if len(commit) != 40 or set(commit) - _HEX or len(tree) != 40 or set(tree) - _HEX:
-        raise ActivationPackageError("reviewed Git identity is invalid")
+    if commit != expected_commit:
+        raise ActivationPackageError("reviewed Git commit does not match approval")
+    tree = _git(selected_checkout, "rev-parse", f"{commit}^{{tree}}").strip().decode("ascii").lower()
+    if tree != expected_tree:
+        raise ActivationPackageError("reviewed Git tree does not match the approved commit")
 
     files = [
         _git_file_entry(
@@ -1131,7 +1167,7 @@ def build_release_manifest(
     }
     if (
         _git(selected_checkout, "rev-parse", "HEAD^{commit}").strip().decode("ascii").lower() != commit
-        or _git(selected_checkout, "rev-parse", "HEAD^{tree}").strip().decode("ascii").lower() != tree
+        or _git(selected_checkout, "rev-parse", f"{commit}^{{tree}}").strip().decode("ascii").lower() != tree
         or _git(selected_checkout, "status", "--porcelain=v1", "--untracked-files=all").strip()
     ):
         raise ActivationPackageError("reviewed Git checkout changed while building the manifest")
@@ -2901,11 +2937,10 @@ def render_systemd_units(
             raise ActivationPackageError(f"{label} is invalid")
     _validate_principal_binding(
         god_uid=god_uid,
+        god_gid=god_gid,
         overseer_uid=overseer_uid,
         overseer_gid=overseer_uid,
     )
-    if pwd.getpwnam("god").pw_gid != god_gid:
-        raise ActivationPackageError("god GID does not match the approved local account")
     templates = Path(templates_root)
     if templates.is_symlink() or templates.name != "systemd":
         raise ActivationPackageError("systemd template root is invalid")
@@ -3701,6 +3736,7 @@ def render_activation_contract(
         raise ActivationPackageError("approved god account is unavailable") from error
     _validate_principal_binding(
         god_uid=god.pw_uid,
+        god_gid=god.pw_gid,
         overseer_uid=overseer_uid,
         overseer_gid=overseer_gid,
     )
@@ -5171,12 +5207,10 @@ def _validate_contract_principal_binding(contract: Mapping[str, object]) -> None
     god_uid, god_gid = _validate_contract_principal_schema(contract)
     _validate_principal_binding(
         god_uid=god_uid,
+        god_gid=god_gid,
         overseer_uid=APPROVED_OVERSEER_UID,
         overseer_gid=APPROVED_OVERSEER_GID,
     )
-    god = pwd.getpwnam("god")
-    if god.pw_gid != god_gid:
-        raise ActivationPackageError("god primary group does not match the sealed activation contract")
 
 
 def _verify_install_results(
@@ -7375,6 +7409,8 @@ def _main(argv: list[str] | None = None) -> int:
         help="stage a closed owner-only package without activating it",
     )
     prepare.add_argument("--checkout", required=True)
+    prepare.add_argument("--expected-commit", required=True)
+    prepare.add_argument("--expected-tree", required=True)
     prepare.add_argument("--dependency-root", required=True)
     prepare.add_argument("--root-python", required=True)
     prepare.add_argument("--stdlib-root", required=True)
@@ -7545,6 +7581,7 @@ def _main(argv: list[str] | None = None) -> int:
         package_root = _validate_sqlite_staged_package_destination(args.package_root)
         _validate_principal_binding(
             god_uid=args.god_uid,
+            god_gid=args.god_gid,
             overseer_uid=args.overseer_uid,
             overseer_gid=args.overseer_gid,
         )
@@ -7560,6 +7597,8 @@ def _main(argv: list[str] | None = None) -> int:
             args.root_python,
             args.stdlib_root,
             args.sqlite_library,
+            expected_commit=args.expected_commit,
+            expected_tree=args.expected_tree,
         )
         _assert_current_sqlite_runtime(manifest)
         stage_release_payload(

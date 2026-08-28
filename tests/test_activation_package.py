@@ -94,6 +94,14 @@ def _reviewed_checkout(tmp_path: Path) -> Path:
     return checkout
 
 
+def _reviewed_identity(checkout: Path) -> dict[str, str]:
+    commit = _git(checkout, "rev-parse", "HEAD^{commit}")
+    return {
+        "expected_commit": commit,
+        "expected_tree": _git(checkout, "rev-parse", f"{commit}^{{tree}}"),
+    }
+
+
 def _dependencies(tmp_path: Path) -> Path:
     root = tmp_path / "site-packages"
     package = root / "dependency"
@@ -225,6 +233,7 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
         python,
         stdlib,
         sqlite_library,
+        **_reviewed_identity(checkout),
     )
     second = build_release_manifest(
         checkout,
@@ -232,6 +241,7 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
         python,
         stdlib,
         sqlite_library,
+        **_reviewed_identity(checkout),
     )
 
     assert first == second
@@ -305,6 +315,113 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
     }
 
 
+def test_release_manifest_requires_exact_approved_commit_and_tree(tmp_path: Path) -> None:
+    checkout = _reviewed_checkout(tmp_path)
+    dependencies = _dependencies(tmp_path)
+    python = _python(tmp_path)
+    stdlib = _stdlib(tmp_path)
+    sqlite_library, _sqlite_evidence = _sqlite_runtime(tmp_path)
+    identity = _reviewed_identity(checkout)
+
+    with pytest.raises(ActivationPackageError, match="commit does not match"):
+        build_release_manifest(
+            checkout,
+            dependencies,
+            python,
+            stdlib,
+            sqlite_library,
+            expected_commit="0" * 40,
+            expected_tree=identity["expected_tree"],
+        )
+    with pytest.raises(ActivationPackageError, match="tree does not match"):
+        build_release_manifest(
+            checkout,
+            dependencies,
+            python,
+            stdlib,
+            sqlite_library,
+            expected_commit=identity["expected_commit"],
+            expected_tree="0" * 40,
+        )
+
+
+def test_release_manifest_derives_tree_from_captured_commit_across_head_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = _reviewed_checkout(tmp_path)
+    dependencies = _dependencies(tmp_path)
+    python = _python(tmp_path)
+    stdlib = _stdlib(tmp_path)
+    sqlite_library, _sqlite_evidence = _sqlite_runtime(tmp_path)
+    identity = _reviewed_identity(checkout)
+    real_git = activation_package_module._git
+    head_tree_requests: list[tuple[str, ...]] = []
+    head_commit_requests = 0
+
+    def aba_git(selected: Path, *args: str) -> bytes:
+        nonlocal head_commit_requests
+        if args == ("rev-parse", "HEAD^{commit}"):
+            head_commit_requests += 1
+            return identity["expected_commit"].encode("ascii") + b"\n"
+        if args == ("rev-parse", "HEAD^{tree}"):
+            head_tree_requests.append(args)
+            return b"f" * 40 + b"\n"
+        return real_git(selected, *args)
+
+    monkeypatch.setattr(activation_package_module, "_git", aba_git)
+    manifest = build_release_manifest(
+        checkout,
+        dependencies,
+        python,
+        stdlib,
+        sqlite_library,
+        **identity,
+    )
+
+    assert manifest["sourceCommit"] == identity["expected_commit"]
+    assert manifest["sourceTree"] == identity["expected_tree"]
+    assert head_commit_requests == 2
+    assert head_tree_requests == []
+
+
+def test_release_manifest_ignores_git_replace_refs_for_approved_commit(
+    tmp_path: Path,
+) -> None:
+    checkout = _reviewed_checkout(tmp_path)
+    dependencies = _dependencies(tmp_path)
+    python = _python(tmp_path)
+    stdlib = _stdlib(tmp_path)
+    sqlite_library, _sqlite_evidence = _sqlite_runtime(tmp_path)
+    identity = _reviewed_identity(checkout)
+    original_cli = (checkout / "src/overseer/cli.py").read_bytes()
+    (checkout / "src/overseer/cli.py").write_text("MALICIOUS = True\n", encoding="utf-8")
+    _git(checkout, "add", "src/overseer/cli.py")
+    _git(checkout, "commit", "-q", "-m", "replacement")
+    replacement_commit = _git(checkout, "rev-parse", "HEAD^{commit}")
+    _git(checkout, "reset", "--hard", "-q", identity["expected_commit"])
+    _git(checkout, "replace", identity["expected_commit"], replacement_commit)
+
+    manifest = build_release_manifest(
+        checkout,
+        dependencies,
+        python,
+        stdlib,
+        sqlite_library,
+        **identity,
+    )
+    package = tmp_path / "activation-package"
+    staged = stage_release_payload(
+        manifest,
+        checkout=checkout,
+        dependency_root=dependencies,
+        stdlib_root=stdlib,
+        package_root=package,
+    )
+
+    assert (staged / "app/src/overseer/cli.py").read_bytes() == original_cli
+
+
 def test_release_source_and_controls_are_read_from_the_recorded_git_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -347,6 +464,7 @@ def test_release_source_and_controls_are_read_from_the_recorded_git_tree(
         python,
         stdlib,
         sqlite_library,
+        **_reviewed_identity(checkout),
     )
     package = tmp_path / "activation-package"
     staged = stage_release_payload(
@@ -422,6 +540,7 @@ def test_release_manifest_rejects_unapproved_sqlite_runtime_identity(
             _python(tmp_path),
             _stdlib(tmp_path),
             sqlite_library,
+            **_reviewed_identity(checkout),
         )
 
 
@@ -440,6 +559,7 @@ def test_release_manifest_rejects_mutable_or_linked_sqlite_runtime(tmp_path: Pat
             python,
             stdlib,
             sqlite_library,
+            **_reviewed_identity(checkout),
         )
 
     sqlite_library.chmod(0o555)
@@ -452,6 +572,7 @@ def test_release_manifest_rejects_mutable_or_linked_sqlite_runtime(tmp_path: Pat
             python,
             stdlib,
             linked_library,
+            **_reviewed_identity(checkout),
         )
 
 
@@ -487,6 +608,7 @@ def test_release_manifest_rejects_sqlite_inode_replacement_during_probe(
             _python(tmp_path),
             _stdlib(tmp_path),
             sqlite_library,
+            **_reviewed_identity(checkout),
         )
 
 @pytest.mark.skipif(
@@ -510,6 +632,7 @@ def test_copied_release_runtime_executes_with_release_local_pythonhome(tmp_path:
         python,
         stdlib,
         sqlite_library,
+        **_reviewed_identity(checkout),
     )
     package = tmp_path / "activation-package"
     release = stage_release_payload(
@@ -565,6 +688,7 @@ def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Pa
             python,
             stdlib,
             sqlite_library,
+            **_reviewed_identity(checkout),
         )
 
     _git(checkout, "checkout", "--", "src/overseer/cli.py")
@@ -576,6 +700,7 @@ def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Pa
             python,
             stdlib,
             sqlite_library,
+            **_reviewed_identity(checkout),
         )
 
     (dependencies / "unsafe").unlink()
@@ -588,6 +713,7 @@ def test_release_manifest_rejects_dirty_tree_and_dependency_symlink(tmp_path: Pa
             python,
             stdlib,
             sqlite_library,
+            **_reviewed_identity(checkout),
         )
 
 
@@ -603,6 +729,7 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
         python,
         stdlib,
         sqlite_library,
+        **_reviewed_identity(checkout),
     )
     package = tmp_path / "activation-package"
 
@@ -1948,6 +2075,7 @@ def _prepared_package(
         python,
         stdlib,
         sqlite_library,
+        **_reviewed_identity(checkout),
     )
     package = tmp_path / "activation-package"
     stage_release_payload(
@@ -2079,6 +2207,10 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
             "prepare-package",
             "--checkout",
             str(checkout),
+            "--expected-commit",
+            _reviewed_identity(checkout)["expected_commit"],
+            "--expected-tree",
+            _reviewed_identity(checkout)["expected_tree"],
             "--dependency-root",
             str(dependencies),
             "--root-python",
@@ -2131,6 +2263,72 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     )
 
 
+def test_prepare_package_cli_rejects_god_gid_before_release_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_parent = tmp_path / "activation-packages"
+    package_parent.mkdir(mode=0o700)
+    monkeypatch.setattr(activation_package_module, "APPROVED_PACKAGE_PARENT", package_parent)
+    package = package_parent / "v1.1.6-abcdef0"
+    sqlite_library, _sqlite_evidence = _sqlite_runtime(
+        tmp_path,
+        package_root=package,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "build_release_manifest",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid god GID must be rejected before manifest construction"
+        ),
+    )
+
+    with pytest.raises(ActivationPackageError, match="UID/GID"):
+        activation_package_module._main(
+            [
+                "prepare-package",
+                "--checkout",
+                str(tmp_path / "checkout"),
+                "--expected-commit",
+                "0" * 40,
+                "--expected-tree",
+                "0" * 40,
+                "--dependency-root",
+                str(tmp_path / "dependencies"),
+                "--root-python",
+                str(tmp_path / "python"),
+                "--stdlib-root",
+                str(tmp_path / "stdlib"),
+                "--sqlite-library",
+                str(sqlite_library),
+                "--templates-root",
+                str(tmp_path / "systemd"),
+                "--package-root",
+                str(package),
+                "--psychlo-secret-file",
+                str(tmp_path / "psychlo-secret"),
+                "--roadex-secret-file",
+                str(tmp_path / "roadex-secret"),
+                "--psychlo-bindings-file",
+                str(tmp_path / "bindings.json"),
+                "--source-store",
+                str(tmp_path / "overseer.sqlite3"),
+                "--god-uid",
+                str(os.getuid()),
+                "--god-gid",
+                str(os.getgid() + 1),
+                "--overseer-uid",
+                "984",
+                "--overseer-gid",
+                "984",
+                "--rollback-input",
+                f"v1.1.5-release={tmp_path / 'rollback-release'}",
+            ]
+        )
+
+    assert not (package / "public" / "release").exists()
+
+
 def test_ensure_dedicated_principal_reuses_exact_existing_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2148,6 +2346,7 @@ def test_ensure_dedicated_principal_reuses_exact_existing_identity(
     monkeypatch.setattr(activation_package_module.grp, "getgrgid", lambda gid: group)
     monkeypatch.setattr(activation_package_module.pwd, "getpwall", lambda: [user])
     monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [group])
+    monkeypatch.setattr(activation_package_module.os, "getgrouplist", lambda _name, _gid: [984])
     monkeypatch.setattr(
         activation_package_module,
         "_validate_dedicated_principal_password_lock",
@@ -2232,6 +2431,7 @@ def test_ensure_dedicated_principal_creates_only_missing_exact_entries(
         "getgrall",
         lambda: [] if state["group"] is None else [state["group"]],
     )
+    monkeypatch.setattr(activation_package_module.os, "getgrouplist", lambda _name, _gid: [984])
     monkeypatch.setattr(activation_package_module.subprocess, "run", create)
     monkeypatch.setattr(
         activation_package_module,
@@ -2305,6 +2505,7 @@ def test_ensure_dedicated_principal_completes_group_only_prior_attempt(
         lambda: [] if user is None else [user],
     )
     monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [group])
+    monkeypatch.setattr(activation_package_module.os, "getgrouplist", lambda _name, _gid: [984])
     monkeypatch.setattr(activation_package_module.subprocess, "run", create)
     monkeypatch.setattr(
         activation_package_module,
@@ -2444,6 +2645,67 @@ def test_dedicated_principal_rejects_supplementary_and_foreign_primary_members(
     monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [group])
 
     with pytest.raises(ActivationPackageError, match="membership"):
+        activation_package_module._dedicated_principal_presence(
+            uid=984,
+            gid=984,
+            home_dir="/var/lib/overseer",
+            shell="/usr/sbin/nologin",
+        )
+
+
+def test_dedicated_principal_rejects_enumerated_foreign_supplementary_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overseer = SimpleNamespace(
+        pw_name="overseer",
+        pw_uid=984,
+        pw_gid=984,
+        pw_dir="/var/lib/overseer",
+        pw_shell="/usr/sbin/nologin",
+    )
+    primary = SimpleNamespace(gr_name="overseer", gr_gid=984, gr_mem=[])
+    foreign = SimpleNamespace(gr_name="docker", gr_gid=999, gr_mem=["overseer"])
+    monkeypatch.setattr(activation_package_module.pwd, "getpwnam", lambda _name: overseer)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwuid", lambda _uid: overseer)
+    monkeypatch.setattr(activation_package_module.grp, "getgrnam", lambda _name: primary)
+    monkeypatch.setattr(activation_package_module.grp, "getgrgid", lambda _gid: primary)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwall", lambda: [overseer])
+    monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [primary, foreign])
+    monkeypatch.setattr(activation_package_module.os, "getgrouplist", lambda _name, _gid: [984])
+
+    with pytest.raises(ActivationPackageError, match="foreign supplementary"):
+        activation_package_module._dedicated_principal_presence(
+            uid=984,
+            gid=984,
+            home_dir="/var/lib/overseer",
+            shell="/usr/sbin/nologin",
+        )
+
+
+def test_dedicated_principal_rejects_initgroups_only_foreign_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overseer = SimpleNamespace(
+        pw_name="overseer",
+        pw_uid=984,
+        pw_gid=984,
+        pw_dir="/var/lib/overseer",
+        pw_shell="/usr/sbin/nologin",
+    )
+    primary = SimpleNamespace(gr_name="overseer", gr_gid=984, gr_mem=[])
+    monkeypatch.setattr(activation_package_module.pwd, "getpwnam", lambda _name: overseer)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwuid", lambda _uid: overseer)
+    monkeypatch.setattr(activation_package_module.grp, "getgrnam", lambda _name: primary)
+    monkeypatch.setattr(activation_package_module.grp, "getgrgid", lambda _gid: primary)
+    monkeypatch.setattr(activation_package_module.pwd, "getpwall", lambda: [overseer])
+    monkeypatch.setattr(activation_package_module.grp, "getgrall", lambda: [primary])
+    monkeypatch.setattr(
+        activation_package_module.os,
+        "getgrouplist",
+        lambda _name, _gid: [984, 999],
+    )
+
+    with pytest.raises(ActivationPackageError, match="foreign supplementary"):
         activation_package_module._dedicated_principal_presence(
             uid=984,
             gid=984,

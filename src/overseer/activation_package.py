@@ -178,6 +178,7 @@ _CONTROL_SOURCE_PATHS = (
 _FORBIDDEN_COMMAND_INTERPRETERS = frozenset(
     {"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish", "csh", "tcsh"}
 )
+_FORBIDDEN_ENV_SPLIT_OPTIONS = ("-S", "--split-string")
 
 
 class ActivationPackageError(ValueError):
@@ -6322,6 +6323,23 @@ def _rollback_transient_spec(command: list[str]) -> dict[str, object] | None:
     if _sha256(_canonical(unbound)) != marker_digest:
         raise ActivationPackageError("rollback transient identity digest drifted")
     separator = command.index("--")
+    expected_preamble = [
+        "/usr/bin/systemd-run",
+        "--collect",
+        f"--uid={uid_values[0]}",
+        f"--gid={gid_values[0]}",
+    ]
+    allowed_option = lambda value: (
+        value.startswith("--unit=")
+        or value == "--service-type=simple"
+        or value.startswith("--property=")
+        or value.startswith("--working-directory=")
+        or value.startswith("--setenv=")
+    )
+    if command[:4] != expected_preamble or any(
+        not allowed_option(value) for value in command[4:separator]
+    ):
+        raise ActivationPackageError("sealed rollback transient option grammar is invalid")
     argv = command[separator + 1 :]
     if not argv or not argv[0].startswith("/"):
         raise ActivationPackageError("rollback transient executable is invalid")
@@ -6906,6 +6924,24 @@ def _validate_contract_principal_bootstrap(
         *_contract_commands(contract, "cutoverCommands"),
         *_contract_commands(contract, "rollbackCommands"),
     ]
+
+    def uses_forbidden_interpreter(command: list[str]) -> bool:
+        for argument in command:
+            if PurePosixPath(argument).name in _FORBIDDEN_COMMAND_INTERPRETERS:
+                return True
+            if any(
+                argument == option or argument.startswith(f"{option}=")
+                for option in _FORBIDDEN_ENV_SPLIT_OPTIONS
+            ):
+                return True
+            if argument.startswith("--spl") or (
+                argument.startswith("-")
+                and not argument.startswith("--")
+                and "S" in argument[1:]
+            ):
+                return True
+        return False
+
     if (
         staging[0] != expected
         or sum(command.count("ensure-dedicated-principal") for command in all_commands) != 1
@@ -6914,11 +6950,7 @@ def _validate_contract_principal_bootstrap(
             for command in all_commands
             for argument in command
         )
-        or any(
-            PurePosixPath(argument).name in _FORBIDDEN_COMMAND_INTERPRETERS
-            for command in all_commands
-            for argument in command
-        )
+        or any(uses_forbidden_interpreter(command) for command in all_commands)
     ):
         raise ActivationPackageError("activation principal bootstrap command is invalid")
 

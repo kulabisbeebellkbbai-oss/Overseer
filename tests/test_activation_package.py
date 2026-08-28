@@ -329,6 +329,18 @@ def test_release_source_and_controls_are_read_from_the_recorded_git_tree(
         return real_git(selected, *args)
 
     monkeypatch.setattr(activation_package_module, "_git", hide_worktree_status)
+    distinct_god_uid = 1234
+    distinct_god_gid = 2345
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_principal_binding",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module.pwd,
+        "getpwnam",
+        lambda _name: type("GodAccount", (), {"pw_gid": distinct_god_gid})(),
+    )
     manifest = build_release_manifest(
         checkout,
         dependencies,
@@ -348,8 +360,8 @@ def test_release_source_and_controls_are_read_from_the_recorded_git_tree(
         manifest,
         templates_root=checkout / "systemd",
         output_root=package / "public/systemd",
-        god_uid=os.getuid(),
-        god_gid=os.getgid(),
+        god_uid=distinct_god_uid,
+        god_gid=distinct_god_gid,
         overseer_uid=984,
         python_path=python,
     )
@@ -361,13 +373,16 @@ def test_release_source_and_controls_are_read_from_the_recorded_git_tree(
         b"@OVERSEER_PYTHON@": (
             f"{manifest['releaseRoot']}/runtime/bin/python3.13"
         ).encode(),
-        b"@GOD_UID@": str(os.getuid()).encode(),
-        b"@GOD_GID@": str(os.getgid()).encode(),
+        b"@GOD_UID@": str(distinct_god_uid).encode(),
+        b"@GOD_GID@": str(distinct_god_gid).encode(),
         b"@OVERSEER_UID@": b"984",
     }.items():
         expected_api = expected_api.replace(placeholder, replacement)
     assert rendered["overseer-api.service"].read_bytes() == expected_api
     assert b"/bin/false" not in rendered["overseer-api.service"].read_bytes()
+    bridge = rendered["overseer-codex-user-bridge.service"].read_text(encoding="utf-8")
+    assert f"User={distinct_god_uid}" in bridge
+    assert f"Group={distinct_god_gid}" in bridge
 
 
 @pytest.mark.parametrize(
@@ -2629,6 +2644,23 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
                 Path(str(contract["packageRoot"])),
                 shell_wrapped_account_command,
             )
+    for split_command in (
+        ["/usr/bin/env", "-S", "bash -c '/usr/sbin/useradd unexpected'"],
+        ["/usr/bin/env", "-Sbash -c '/usr/sbin/useradd unexpected'"],
+        ["/usr/bin/env", "-iSbash -c '/usr/sbin/useradd unexpected'"],
+        ["/usr/bin/env", "--split-string=sh -c '/usr/sbin/groupadd unexpected'"],
+        ["/usr/bin/env", "--spl=sh -c '/usr/sbin/groupadd unexpected'"],
+    ):
+        split_wrapped_account_command = dict(contract)
+        split_wrapped_account_command["cutoverCommands"] = [
+            *cutover_commands,
+            split_command,
+        ]
+        with pytest.raises(ActivationPackageError, match="principal bootstrap"):
+            activation_package_module._validate_contract_principal_bootstrap(
+                Path(str(contract["packageRoot"])),
+                split_wrapped_account_command,
+            )
     traversing_release = dict(contract)
     traversing_release["releaseRoot"] = "/opt/overseer/releases/../unexpected"
     with pytest.raises(ActivationPackageError, match="release root"):
@@ -4806,6 +4838,33 @@ def test_rollback_transient_identity_rejects_sealed_argv_drift() -> None:
 
     with pytest.raises(ActivationPackageError, match="identity digest drifted"):
         activation_package_module._rollback_transient_spec(command)
+
+
+@pytest.mark.parametrize(
+    "extra_options",
+    (
+        ["--uid", "0"],
+        ["--gid", "0"],
+        ["--ui=0"],
+        ["-p", "User=0"],
+    ),
+)
+def test_rollback_transient_rejects_resealed_alternate_identity_option_grammar(
+    extra_options: list[str],
+) -> None:
+    command = _rollback_transient_command()
+    unbound = [
+        value
+        for value in command
+        if not value.startswith("--property=Description=overseer.rollback-transient.v1:")
+        and not value.startswith("--setenv=OVERSEER_ROLLBACK_TRANSIENT_ID=")
+    ]
+    separator = unbound.index("--")
+    unbound[separator:separator] = extra_options
+    resealed = activation_package_module._bind_rollback_transient_identity(unbound)
+
+    with pytest.raises(ActivationPackageError, match="option grammar"):
+        activation_package_module._rollback_transient_spec(resealed)
 
 
 def test_rollback_transient_retries_sealed_start_after_loaded_unit_is_collected(

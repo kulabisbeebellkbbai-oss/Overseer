@@ -365,6 +365,8 @@ def test_bridge_templates_pass_disposable_systemd_verify(tmp_path: Path) -> None
     replacements = {
         "@OVERSEER_RELEASE@": str(release),
         "@OVERSEER_PYTHON@": sys.executable,
+        "@GOD_UID@": "4243",
+        "@GOD_GID@": "4244",
         "@OVERSEER_UID@": "4242",
     }
     rendered: list[Path] = []

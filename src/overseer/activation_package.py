@@ -178,7 +178,6 @@ _CONTROL_SOURCE_PATHS = (
 _FORBIDDEN_COMMAND_INTERPRETERS = frozenset(
     {"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish", "csh", "tcsh"}
 )
-_FORBIDDEN_ENV_SPLIT_OPTIONS = ("-S", "--split-string")
 
 
 class ActivationPackageError(ValueError):
@@ -6929,17 +6928,23 @@ def _validate_contract_principal_bootstrap(
         for argument in command:
             if PurePosixPath(argument).name in _FORBIDDEN_COMMAND_INTERPRETERS:
                 return True
-            if any(
-                argument == option or argument.startswith(f"{option}=")
-                for option in _FORBIDDEN_ENV_SPLIT_OPTIONS
-            ):
-                return True
-            if argument.startswith("--spl") or (
-                argument.startswith("-")
-                and not argument.startswith("--")
-                and "S" in argument[1:]
-            ):
-                return True
+        for env_index, executable in enumerate(command):
+            if PurePosixPath(executable).name != "env":
+                continue
+            for argument in command[env_index + 1 :]:
+                if argument.startswith("/") and "=" not in argument:
+                    break
+                option = argument.partition("=")[0]
+                if (
+                    len(option) > 2
+                    and option.startswith("--")
+                    and "--split-string".startswith(option)
+                ) or (
+                    option.startswith("-")
+                    and not option.startswith("--")
+                    and "S" in option[1:]
+                ):
+                    return True
         return False
 
     if (

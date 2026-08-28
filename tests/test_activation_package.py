@@ -2644,13 +2644,19 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
                 Path(str(contract["packageRoot"])),
                 shell_wrapped_account_command,
             )
-    for split_command in (
+    split_commands = [
         ["/usr/bin/env", "-S", "bash -c '/usr/sbin/useradd unexpected'"],
         ["/usr/bin/env", "-Sbash -c '/usr/sbin/useradd unexpected'"],
         ["/usr/bin/env", "-iSbash -c '/usr/sbin/useradd unexpected'"],
-        ["/usr/bin/env", "--split-string=sh -c '/usr/sbin/groupadd unexpected'"],
-        ["/usr/bin/env", "--spl=sh -c '/usr/sbin/groupadd unexpected'"],
-    ):
+    ]
+    split_commands.extend(
+        [
+            "/usr/bin/env",
+            f"{'--split-string'[:prefix_length]}=sh -c '/usr/sbin/groupadd unexpected'",
+        ]
+        for prefix_length in range(3, len("--split-string") + 1)
+    )
+    for split_command in split_commands:
         split_wrapped_account_command = dict(contract)
         split_wrapped_account_command["cutoverCommands"] = [
             *cutover_commands,

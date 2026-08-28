@@ -335,7 +335,7 @@ def test_bridge_templates_are_root_socket_activated_and_network_denied() -> None
     assert "SocketGroup=0" in socket_unit
     assert "SocketMode=0600" in socket_unit
     assert "User=@GOD_UID@" in service_unit
-    assert "Group=@GOD_UID@" in service_unit
+    assert "Group=@GOD_GID@" in service_unit
     assert (
         "Environment=PYTHONPATH=@OVERSEER_RELEASE@/app/src:"
         "@OVERSEER_RELEASE@/site-packages"

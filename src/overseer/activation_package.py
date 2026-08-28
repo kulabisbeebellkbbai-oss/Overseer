@@ -171,6 +171,13 @@ _SYSTEMD_TEMPLATES = {
     "overseer-runtime-system.service": "overseer-runtime.service",
     "overseer-tmpfiles.conf": "overseer-tmpfiles.conf",
 }
+_CONTROL_SOURCE_PATHS = (
+    *(f"systemd/{name}" for name in _SYSTEMD_TEMPLATES),
+    "config/admin-executor-allowlist.json",
+)
+_FORBIDDEN_COMMAND_INTERPRETERS = frozenset(
+    {"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish", "csh", "tcsh"}
+)
 
 
 class ActivationPackageError(ValueError):
@@ -549,10 +556,19 @@ def _sha256(value: bytes) -> str:
 
 def _git(checkout: Path, *args: str) -> bytes:
     result = subprocess.run(
-        ("git", "-C", str(checkout), *args),
+        ("/usr/bin/git", "-C", str(checkout), *args),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         check=False,
+        env={
+            "HOME": "/nonexistent",
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        },
     )
     if result.returncode != 0:
         raise ActivationPackageError("reviewed Git checkout could not be inspected")
@@ -620,11 +636,103 @@ def _safe_relative(value: str) -> str:
     return path.as_posix()
 
 
-def _source_inventory(checkout: Path) -> tuple[str, ...]:
-    raw = _git(checkout, "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", "src/overseer")
-    result = tuple(sorted(item.decode("utf-8", "strict") for item in raw.split(b"\0") if item))
+def _git_tree_inventory(
+    checkout: Path,
+    *,
+    tree: str,
+    pathspec: str,
+) -> tuple[dict[str, str], ...]:
+    if len(tree) != 40 or set(tree) - _HEX:
+        raise ActivationPackageError("reviewed Git tree identity is invalid")
+    safe_pathspec = _safe_relative(pathspec)
+    raw = _git(checkout, "ls-tree", "-r", "-z", tree, "--", safe_pathspec)
+    result: list[dict[str, str]] = []
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, encoded_path = record.split(b"\t", 1)
+            encoded_mode, encoded_type, encoded_object = metadata.split(b" ", 2)
+            mode = encoded_mode.decode("ascii")
+            object_type = encoded_type.decode("ascii")
+            object_id = encoded_object.decode("ascii").lower()
+            path = _safe_relative(encoded_path.decode("utf-8", "strict"))
+        except (ValueError, UnicodeError) as error:
+            raise ActivationPackageError("reviewed Git tree entry is invalid") from error
+        if (
+            object_type != "blob"
+            or mode not in {"100644", "100755"}
+            or len(object_id) != 40
+            or set(object_id) - _HEX
+            or not (path == safe_pathspec or path.startswith(f"{safe_pathspec}/"))
+        ):
+            raise ActivationPackageError("reviewed Git tree entry is not an approved file")
+        result.append(
+            {
+                "sourcePath": path,
+                "sourceObject": object_id,
+                "sourceGitMode": mode,
+            }
+        )
+    return tuple(sorted(result, key=lambda item: item["sourcePath"]))
+
+
+def _git_blob(checkout: Path, object_id: str) -> bytes:
+    if len(object_id) != 40 or set(object_id) - _HEX:
+        raise ActivationPackageError("reviewed Git blob identity is invalid")
+    try:
+        size = int(_git(checkout, "cat-file", "-s", object_id).strip().decode("ascii"))
+    except (ValueError, UnicodeError) as error:
+        raise ActivationPackageError("reviewed Git blob size is invalid") from error
+    if size < 0 or size > MAX_RELEASE_FILE_BYTES:
+        raise ActivationPackageError("reviewed Git blob exceeds the per-file bound")
+    content = _git(checkout, "cat-file", "blob", object_id)
+    git_digest = hashlib.sha1(
+        f"blob {len(content)}\0".encode("ascii") + content
+    ).hexdigest()
+    if len(content) != size or git_digest != object_id:
+        raise ActivationPackageError("reviewed Git blob content does not match its identity")
+    return content
+
+
+def _source_inventory(checkout: Path, *, tree: str) -> tuple[dict[str, str], ...]:
+    result = _git_tree_inventory(
+        checkout,
+        tree=tree,
+        pathspec="src/overseer",
+    )
     if not result:
         raise ActivationPackageError("reviewed runtime source inventory is empty")
+    return result
+
+
+def _git_file_entry(
+    checkout: Path,
+    tree_entry: Mapping[str, str],
+    *,
+    release_path: str | None,
+) -> dict[str, object]:
+    source_path = _safe_relative(str(tree_entry.get("sourcePath", "")))
+    source_object = str(tree_entry.get("sourceObject", ""))
+    source_mode = str(tree_entry.get("sourceGitMode", ""))
+    if source_mode not in {"100644", "100755"}:
+        raise ActivationPackageError("reviewed Git file mode is invalid")
+    content = _git_blob(checkout, source_object)
+    result: dict[str, object] = {
+        "sourcePath": source_path,
+        "sourceObject": source_object,
+        "sourceGitMode": source_mode,
+        "sha256": _sha256(content),
+        "size": len(content),
+        "mode": 0o555 if source_mode == "100755" else 0o444,
+    }
+    if release_path is not None:
+        result.update(
+            {
+                "releasePath": _safe_relative(release_path),
+                "sourceKind": "checkout",
+            }
+        )
     return result
 
 
@@ -943,13 +1051,12 @@ def build_release_manifest(
         raise ActivationPackageError("reviewed Git identity is invalid")
 
     files = [
-        _file_entry(
-            source_kind="checkout",
-            source_root=selected_checkout,
-            source_path=path,
-            release_path=f"app/{path}",
+        _git_file_entry(
+            selected_checkout,
+            item,
+            release_path=f"app/{item['sourcePath']}",
         )
-        for path in _source_inventory(selected_checkout)
+        for item in _source_inventory(selected_checkout, tree=tree)
     ]
     files.extend(
         _file_entry(
@@ -983,11 +1090,28 @@ def build_release_manifest(
         root_python=selected_python,
         sqlite_library=selected_sqlite,
     )
+    control_files: list[dict[str, object]] = []
+    for path in _CONTROL_SOURCE_PATHS:
+        entries = _git_tree_inventory(
+            selected_checkout,
+            tree=tree,
+            pathspec=path,
+        )
+        if len(entries) != 1 or entries[0]["sourcePath"] != path:
+            raise ActivationPackageError("reviewed activation control inventory is incomplete")
+        control_files.append(
+            _git_file_entry(
+                selected_checkout,
+                entries[0],
+                release_path=None,
+            )
+        )
     unsigned: dict[str, object] = {
         "schemaVersion": RELEASE_SCHEMA,
         "sourceCommit": commit,
         "sourceTree": tree,
         "files": files,
+        "controlFiles": control_files,
         "rootPython": {
             "path": str(selected_python),
             "releasePath": "runtime/bin/python3.13",
@@ -2662,7 +2786,13 @@ def stage_release_payload(
 
     files = manifest.get("files")
     release_root = manifest.get("releaseRoot")
-    if manifest.get("schemaVersion") != RELEASE_SCHEMA or not isinstance(files, list) or not isinstance(release_root, str):
+    source_tree = manifest.get("sourceTree")
+    if (
+        manifest.get("schemaVersion") != RELEASE_SCHEMA
+        or not isinstance(files, list)
+        or not isinstance(release_root, str)
+        or not isinstance(source_tree, str)
+    ):
         raise ActivationPackageError("release manifest is invalid")
     package = Path(package_root)
     _ensure_directory(package)
@@ -2675,17 +2805,34 @@ def stage_release_payload(
         "dependency": Path(dependency_root).resolve(),
         "stdlib": Path(stdlib_root).resolve(),
     }
+    checkout_inventory = {
+        item["sourcePath"]: item
+        for item in _source_inventory(roots["checkout"], tree=source_tree)
+    }
     for item in files:
         if not isinstance(item, Mapping) or item.get("sourceKind") not in roots:
             raise ActivationPackageError("release file manifest is invalid")
         source_path = str(item.get("sourcePath", ""))
         release_path = str(item.get("releasePath", ""))
-        if item["sourceKind"] == "stdlib":
+        if item["sourceKind"] == "checkout":
+            git_entry = checkout_inventory.get(source_path)
+            if (
+                git_entry is None
+                or git_entry["sourceObject"] != item.get("sourceObject")
+                or git_entry["sourceGitMode"] != item.get("sourceGitMode")
+            ):
+                raise ActivationPackageError(
+                    f"release Git source drifted after manifest: {source_path}"
+                )
+            content = _git_blob(roots["checkout"], git_entry["sourceObject"])
+        elif item["sourceKind"] == "stdlib":
             content, _metadata, resolved = _runtime_read(roots["stdlib"], source_path)
             if resolved != item.get("sourceResolvedPath"):
                 raise ActivationPackageError(f"standard-library source drifted after manifest: {source_path}")
         else:
-            content, _metadata = _stable_read(roots[str(item["sourceKind"])] / _safe_relative(source_path))
+            content, _metadata = _stable_read(
+                roots[str(item["sourceKind"])] / _safe_relative(source_path)
+            )
         if (
             len(content) != item.get("size")
             or _sha256(content) != item.get("sha256")
@@ -2736,6 +2883,7 @@ def render_systemd_units(
     templates_root: str | os.PathLike[str],
     output_root: str | os.PathLike[str],
     god_uid: int,
+    god_gid: int,
     overseer_uid: int,
     python_path: str | os.PathLike[str],
 ) -> dict[str, Path]:
@@ -2744,7 +2892,11 @@ def render_systemd_units(
     release_root = manifest.get("releaseRoot")
     if not isinstance(release_root, str) or not release_root.startswith("/opt/overseer/releases/"):
         raise ActivationPackageError("release root is invalid")
-    for value, label in ((god_uid, "god UID"), (overseer_uid, "overseer UID")):
+    for value, label in (
+        (god_uid, "god UID"),
+        (god_gid, "god GID"),
+        (overseer_uid, "overseer UID"),
+    ):
         if type(value) is not int or value < 1:
             raise ActivationPackageError(f"{label} is invalid")
     _validate_principal_binding(
@@ -2752,7 +2904,48 @@ def render_systemd_units(
         overseer_uid=overseer_uid,
         overseer_gid=overseer_uid,
     )
+    if pwd.getpwnam("god").pw_gid != god_gid:
+        raise ActivationPackageError("god GID does not match the approved local account")
     templates = Path(templates_root)
+    if templates.is_symlink() or templates.name != "systemd":
+        raise ActivationPackageError("systemd template root is invalid")
+    checkout = templates.resolve().parent
+    source_tree = manifest.get("sourceTree")
+    control_files = manifest.get("controlFiles")
+    if not isinstance(source_tree, str) or not isinstance(control_files, list):
+        raise ActivationPackageError("activation control manifest is invalid")
+    control_by_path = {
+        str(item.get("sourcePath")): item
+        for item in control_files
+        if isinstance(item, Mapping) and isinstance(item.get("sourcePath"), str)
+    }
+    if len(control_by_path) != len(_CONTROL_SOURCE_PATHS) or set(control_by_path) != set(
+        _CONTROL_SOURCE_PATHS
+    ):
+        raise ActivationPackageError("activation control manifest is incomplete")
+
+    def control_content(source_path: str) -> bytes:
+        entries = _git_tree_inventory(
+            checkout,
+            tree=source_tree,
+            pathspec=source_path,
+        )
+        expected = control_by_path[source_path]
+        if (
+            len(entries) != 1
+            or entries[0]["sourcePath"] != source_path
+            or entries[0]["sourceObject"] != expected.get("sourceObject")
+            or entries[0]["sourceGitMode"] != expected.get("sourceGitMode")
+        ):
+            raise ActivationPackageError("activation control Git binding drifted")
+        content = _git_blob(checkout, entries[0]["sourceObject"])
+        if (
+            _sha256(content) != expected.get("sha256")
+            or len(content) != expected.get("size")
+        ):
+            raise ActivationPackageError("activation control content drifted")
+        return content
+
     output = Path(output_root)
     if output.exists() or output.is_symlink():
         raise ActivationPackageError("rendered unit destination already exists")
@@ -2768,21 +2961,21 @@ def render_systemd_units(
         "@OVERSEER_RELEASE@": release_root,
         "@OVERSEER_PYTHON@": str(PurePosixPath(release_root) / _safe_relative(release_python)),
         "@GOD_UID@": str(god_uid),
+        "@GOD_GID@": str(god_gid),
         "@OVERSEER_UID@": str(overseer_uid),
     }
     result: dict[str, Path] = {}
     for source_name, target_name in _SYSTEMD_TEMPLATES.items():
-        content, _metadata = _stable_read(templates / source_name)
+        content = control_content(f"systemd/{source_name}")
         text = content.decode("utf-8", "strict")
         for placeholder, value in replacements.items():
             text = text.replace(placeholder, value)
-        if "@OVERSEER_" in text or "@GOD_UID@" in text:
+        if "@OVERSEER_" in text or "@GOD_UID@" in text or "@GOD_GID@" in text:
             raise ActivationPackageError(f"rendered unit has an unresolved placeholder: {source_name}")
         target = output / target_name
         _write_new(target, text.encode("utf-8"), 0o644)
         result[target_name] = target
-    allowlist_source = templates.parent / "config" / "admin-executor-allowlist.json"
-    allowlist, _metadata = _stable_read(allowlist_source)
+    allowlist = control_content("config/admin-executor-allowlist.json")
     try:
         parsed_allowlist = json.loads(allowlist)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -3739,8 +3932,8 @@ def render_activation_contract(
     rollback_systemd_run = [
         "/usr/bin/systemd-run",
         "--collect",
-        "--uid=god",
-        "--gid=god",
+        f"--uid={source_metadata.st_uid}",
+        f"--gid={source_metadata.st_gid}",
     ]
     activation_python = [
         "/usr/bin/env",
@@ -6078,14 +6271,16 @@ def _execute_resilient_cleanup(
 def _rollback_transient_spec(command: list[str]) -> dict[str, object] | None:
     if not command or command[0] != "/usr/bin/systemd-run":
         return None
+    uid_values = [value.removeprefix("--uid=") for value in command if value.startswith("--uid=")]
+    gid_values = [value.removeprefix("--gid=") for value in command if value.startswith("--gid=")]
     if (
         command.count("--") != 1
         or command.count("--collect") != 1
-        or command.count("--uid=god") != 1
-        or command.count("--gid=god") != 1
+        or len(uid_values) != 1
+        or len(gid_values) != 1
+        or re.fullmatch(r"[1-9][0-9]*", uid_values[0]) is None
+        or re.fullmatch(r"[1-9][0-9]*", gid_values[0]) is None
         or command.count("--service-type=simple") != 1
-        or any(value.startswith("--uid=") and value != "--uid=god" for value in command)
-        or any(value.startswith("--gid=") and value != "--gid=god" for value in command)
         or any(value.startswith("--service-type=") and value != "--service-type=simple" for value in command)
         or "--user" in command
     ):
@@ -6168,6 +6363,8 @@ def _rollback_transient_spec(command: list[str]) -> dict[str, object] | None:
         raise ActivationPackageError("rollback transient sealed properties are invalid")
     return {
         "unit": unit_values[0],
+        "user": uid_values[0],
+        "group": gid_values[0],
         "workingDirectory": working_values[0],
         "description": description_values[0],
         "environment": environment,
@@ -6389,8 +6586,8 @@ def _inspect_rollback_transient_unit(spec: Mapping[str, object]) -> str:
     if (
         observed.get("Transient") != "yes"
         or observed.get("Description") != spec["description"]
-        or observed.get("User") != "god"
-        or observed.get("Group") != "god"
+        or observed.get("User") != spec["user"]
+        or observed.get("Group") != spec["group"]
         or observed.get("WorkingDirectory") != spec["workingDirectory"]
         or observed.get("Type") != "simple"
         or observed.get("CollectMode") != "inactive-or-failed"
@@ -6458,6 +6655,11 @@ def _execute_rollback_transient(
     spec = _rollback_transient_spec(command)
     if spec is None:
         raise ActivationPackageError("rollback transient command is unavailable")
+    god_uid, god_gid = _validate_contract_principal_schema(contract)
+    if spec.get("user") != str(god_uid) or spec.get("group") != str(god_gid):
+        raise ActivationPackageError(
+            "rollback transient principal does not match the sealed activation contract"
+        )
 
     def inspect() -> str:
         _validate_contract_principal_binding(contract)
@@ -6709,6 +6911,11 @@ def _validate_contract_principal_bootstrap(
         or sum(command.count("ensure-dedicated-principal") for command in all_commands) != 1
         or any(
             re.search(r"(?:^|[/\s])(?:groupadd|useradd)(?:$|\s)", argument) is not None
+            for command in all_commands
+            for argument in command
+        )
+        or any(
+            PurePosixPath(argument).name in _FORBIDDEN_COMMAND_INTERPRETERS
             for command in all_commands
             for argument in command
         )
@@ -7142,6 +7349,7 @@ def _main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--psychlo-bindings-file", required=True)
     prepare.add_argument("--source-store", required=True)
     prepare.add_argument("--god-uid", required=True, type=int)
+    prepare.add_argument("--god-gid", required=True, type=int)
     prepare.add_argument("--overseer-uid", required=True, type=int)
     prepare.add_argument("--overseer-gid", required=True, type=int)
     prepare.add_argument("--rollback-input", required=True, action="append")
@@ -7329,6 +7537,7 @@ def _main(argv: list[str] | None = None) -> int:
             templates_root=args.templates_root,
             output_root=package_root / "public" / "systemd",
             god_uid=args.god_uid,
+            god_gid=args.god_gid,
             overseer_uid=args.overseer_uid,
             python_path=args.root_python,
         )

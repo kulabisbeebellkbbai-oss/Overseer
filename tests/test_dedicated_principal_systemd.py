@@ -62,6 +62,7 @@ def _render_units(tmp_path: Path) -> list[Path]:
         "@OVERSEER_RELEASE@": str(release),
         "@OVERSEER_PYTHON@": str(python_path),
         "@GOD_UID@": "1000",
+        "@GOD_GID@": "1000",
         "@OVERSEER_UID@": "984",
     }
     for source in (

@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -75,10 +76,20 @@ def _reviewed_checkout(tmp_path: Path) -> Path:
     package.mkdir(parents=True)
     (package / "__init__.py").write_text('__version__ = "1.1.6"\n', encoding="utf-8")
     (package / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    templates = checkout / "systemd"
+    templates.mkdir()
+    for source_name in activation_package_module._SYSTEMD_TEMPLATES:
+        shutil.copy2(ROOT / "systemd" / source_name, templates / source_name)
+    config = checkout / "config"
+    config.mkdir()
+    shutil.copy2(
+        ROOT / "config" / "admin-executor-allowlist.json",
+        config / "admin-executor-allowlist.json",
+    )
     _git(checkout, "init", "-q")
     _git(checkout, "config", "user.email", "overseer-test@localhost")
     _git(checkout, "config", "user.name", "Overseer Test")
-    _git(checkout, "add", "src")
+    _git(checkout, "add", "src", "systemd", "config")
     _git(checkout, "commit", "-q", "-m", "fixture")
     return checkout
 
@@ -244,6 +255,16 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
         "site-packages/_dependency.so",
         "site-packages/dependency/__init__.py",
     ]
+    checkout_files = [item for item in first["files"] if item["sourceKind"] == "checkout"]
+    assert all(
+        len(item["sourceObject"]) == 40
+        and item["sourceGitMode"] in {"100644", "100755"}
+        for item in checkout_files
+    )
+    assert {item["sourcePath"] for item in first["controlFiles"]} == {
+        *(f"systemd/{name}" for name in activation_package_module._SYSTEMD_TEMPLATES),
+        "config/admin-executor-allowlist.json",
+    }
     assert first["rootPython"]["path"] == str(python)
     assert first["rootPython"]["sha256"] == hashlib.sha256(b"python-runtime").hexdigest()
     assert first["rootPython"]["releasePath"] == "runtime/bin/python3.13"
@@ -282,6 +303,71 @@ def test_release_manifest_is_stable_closed_and_hashes_exact_inputs(tmp_path: Pat
         ),
         "walResetFixAttested": True,
     }
+
+
+def test_release_source_and_controls_are_read_from_the_recorded_git_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = _reviewed_checkout(tmp_path)
+    dependencies = _dependencies(tmp_path)
+    python = _python(tmp_path)
+    stdlib = _stdlib(tmp_path)
+    sqlite_library, _sqlite_evidence = _sqlite_runtime(tmp_path)
+    original_cli = (checkout / "src/overseer/cli.py").read_bytes()
+    original_api = (checkout / "systemd/overseer-api-system.service").read_bytes()
+    (checkout / "src/overseer/cli.py").write_text("MALICIOUS = True\n", encoding="utf-8")
+    (checkout / "systemd/overseer-api-system.service").write_text(
+        "[Service]\nExecStart=/bin/false\n",
+        encoding="utf-8",
+    )
+    real_git = activation_package_module._git
+
+    def hide_worktree_status(selected: Path, *args: str) -> bytes:
+        if args[:2] == ("status", "--porcelain=v1"):
+            return b""
+        return real_git(selected, *args)
+
+    monkeypatch.setattr(activation_package_module, "_git", hide_worktree_status)
+    manifest = build_release_manifest(
+        checkout,
+        dependencies,
+        python,
+        stdlib,
+        sqlite_library,
+    )
+    package = tmp_path / "activation-package"
+    staged = stage_release_payload(
+        manifest,
+        checkout=checkout,
+        dependency_root=dependencies,
+        stdlib_root=stdlib,
+        package_root=package,
+    )
+    rendered = render_systemd_units(
+        manifest,
+        templates_root=checkout / "systemd",
+        output_root=package / "public/systemd",
+        god_uid=os.getuid(),
+        god_gid=os.getgid(),
+        overseer_uid=984,
+        python_path=python,
+    )
+
+    assert (staged / "app/src/overseer/cli.py").read_bytes() == original_cli
+    expected_api = original_api
+    for placeholder, replacement in {
+        b"@OVERSEER_RELEASE@": str(manifest["releaseRoot"]).encode(),
+        b"@OVERSEER_PYTHON@": (
+            f"{manifest['releaseRoot']}/runtime/bin/python3.13"
+        ).encode(),
+        b"@GOD_UID@": str(os.getuid()).encode(),
+        b"@GOD_GID@": str(os.getgid()).encode(),
+        b"@OVERSEER_UID@": b"984",
+    }.items():
+        expected_api = expected_api.replace(placeholder, replacement)
+    assert rendered["overseer-api.service"].read_bytes() == expected_api
+    assert b"/bin/false" not in rendered["overseer-api.service"].read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -514,9 +600,10 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
     )
     rendered = render_systemd_units(
         manifest,
-        templates_root=ROOT / "systemd",
+        templates_root=checkout / "systemd",
         output_root=package / "public" / "systemd",
         god_uid=os.getuid(),
+        god_gid=os.getgid(),
         overseer_uid=984,
         python_path=python,
     )
@@ -577,6 +664,7 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
         content = path.read_text(encoding="utf-8")
         assert "@OVERSEER_" not in content
         assert "@GOD_UID@" not in content
+        assert "@GOD_GID@" not in content
     api = rendered["overseer-api.service"].read_text(encoding="utf-8")
     assert f"WorkingDirectory={manifest['releaseRoot']}" in api
     assert (
@@ -1856,9 +1944,10 @@ def _prepared_package(
     )
     render_systemd_units(
         manifest,
-        templates_root=ROOT / "systemd",
+        templates_root=checkout / "systemd",
         output_root=package / "public" / "systemd",
         god_uid=os.getuid(),
+        god_gid=os.getgid(),
         overseer_uid=984,
         python_path=python,
     )
@@ -1984,7 +2073,7 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
             "--sqlite-library",
             str(sqlite_library),
             "--templates-root",
-            str(ROOT / "systemd"),
+            str(checkout / "systemd"),
             "--package-root",
             str(package),
             "--psychlo-secret-file",
@@ -1997,6 +2086,8 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
             str(source),
             "--god-uid",
             str(os.getuid()),
+            "--god-gid",
+            str(os.getgid()),
             "--overseer-uid",
             "984",
             "--overseer-gid",
@@ -2523,16 +2614,21 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
             Path(str(contract["packageRoot"])),
             wrapped_account_command,
         )
-    shell_wrapped_account_command = dict(contract)
-    shell_wrapped_account_command["cutoverCommands"] = [
-        *cutover_commands,
-        ["/bin/sh", "-c", "/usr/sbin/useradd unexpected"],
-    ]
-    with pytest.raises(ActivationPackageError, match="principal bootstrap"):
-        activation_package_module._validate_contract_principal_bootstrap(
-            Path(str(contract["packageRoot"])),
-            shell_wrapped_account_command,
-        )
+    for script in (
+        "/usr/sbin/'useradd' unexpected",
+        "user''add unexpected",
+        "x=/usr/sbin/user; ${x}add unexpected",
+    ):
+        shell_wrapped_account_command = dict(contract)
+        shell_wrapped_account_command["cutoverCommands"] = [
+            *cutover_commands,
+            ["/bin/sh", "-c", script],
+        ]
+        with pytest.raises(ActivationPackageError, match="principal bootstrap"):
+            activation_package_module._validate_contract_principal_bootstrap(
+                Path(str(contract["packageRoot"])),
+                shell_wrapped_account_command,
+            )
     traversing_release = dict(contract)
     traversing_release["releaseRoot"] = "/opt/overseer/releases/../unexpected"
     with pytest.raises(ActivationPackageError, match="release root"):
@@ -2664,7 +2760,10 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     ]
     assert len(rollback_transients) == 2
     assert all("--user" not in command for command in rollback_transients)
-    assert all("--uid=god" in command and "--gid=god" in command for command in rollback_transients)
+    assert all(
+        f"--uid={os.getuid()}" in command and f"--gid={os.getgid()}" in command
+        for command in rollback_transients
+    )
     assert all(
         f"--setenv=LD_LIBRARY_PATH={manifest['releaseRoot']}/lib" in command
         for command in rollback_transients
@@ -4460,8 +4559,8 @@ def _rollback_transient_command() -> list[str]:
         [
             "/usr/bin/systemd-run",
             "--collect",
-            "--uid=god",
-            "--gid=god",
+            f"--uid={os.getuid()}",
+            f"--gid={os.getgid()}",
             "--unit=overseer-v1-1-5-rollback-runtime-dddddddddddddddd.service",
             "--service-type=simple",
             "--property=Restart=on-failure",
@@ -4610,8 +4709,8 @@ def test_rollback_transient_snapshot_is_bound_to_all_sealed_properties(
         "Transient": "yes",
         "FragmentPath": f"/run/systemd/transient/{unit}",
         "Description": str(spec["description"]),
-        "User": "god",
-        "Group": "god",
+        "User": str(os.getuid()),
+        "Group": str(os.getgid()),
         "WorkingDirectory": str(spec["workingDirectory"]),
         "Type": "simple",
         "Restart": "on-failure",
@@ -4739,6 +4838,28 @@ def test_rollback_transient_retries_sealed_start_after_loaded_unit_is_collected(
 
     assert calls[0][:2] == ["/usr/bin/systemctl", "restart"]
     assert calls[1] == command
+
+
+def test_rollback_transient_rejects_numeric_principal_outside_sealed_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = _rollback_transient_command()
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid() + 1, "gid": os.getgid()},
+    }
+    monkeypatch.setattr(
+        activation_package_module,
+        "_inspect_rollback_transient_unit",
+        lambda _spec: pytest.fail("mismatched principal must be rejected before unit inspection"),
+    )
+
+    with pytest.raises(ActivationPackageError, match="principal does not match"):
+        activation_package_module._execute_rollback_transient(contract, command, resume=True)
 
 
 def test_rollback_recovery_rejects_saved_command_digest_mismatch() -> None:

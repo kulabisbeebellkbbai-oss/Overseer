@@ -6,7 +6,7 @@ After=overseer-codex-user-bridge.socket
 [Service]
 Type=simple
 User=@GOD_UID@
-Group=@GOD_UID@
+Group=@GOD_GID@
 WorkingDirectory=@OVERSEER_RELEASE@
 Environment=PYTHONPATH=@OVERSEER_RELEASE@/app/src:@OVERSEER_RELEASE@/site-packages
 Environment=PYTHONHOME=@OVERSEER_RELEASE@/runtime

@@ -3404,26 +3404,115 @@ def _read_configuration_file(
         os.close(descriptor)
 
 
+def _read_bounded_descriptor(descriptor: int, *, maximum_bytes: int) -> bytes:
+    chunks = []
+    remaining = maximum_bytes + 1
+    while remaining:
+        chunk = os.read(descriptor, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    value = b"".join(chunks)
+    if len(value) > maximum_bytes:
+        raise ValueError("private file is too large")
+    return value
+
+
+def _open_root_directory_chain(path: Path) -> int:
+    if not path.is_absolute():
+        raise ValueError("systemd credential directory must be absolute")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open("/", flags)
+    try:
+        components = path.parts[1:]
+        for component in components:
+            if component in {"", ".", ".."}:
+                raise ValueError("systemd credential directory is unsafe")
+            opened = os.open(component, flags, dir_fd=descriptor)
+            try:
+                metadata = os.fstat(opened)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != 0
+                    or metadata.st_mode & 0o022
+                ):
+                    raise ValueError("systemd credential directory is unsafe")
+            except Exception:
+                os.close(opened)
+                raise
+            os.close(descriptor)
+            descriptor = opened
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_systemd_credential(
+    path: Path,
+    credential_root: Path,
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    directory_descriptor = _open_root_directory_chain(credential_root)
+    try:
+        directory_metadata = os.fstat(directory_descriptor)
+        if (
+            directory_metadata.st_uid != 0
+            or directory_metadata.st_gid != 0
+            or stat.S_IMODE(directory_metadata.st_mode) not in {0o500, 0o550}
+        ):
+            raise ValueError("systemd credential directory is unsafe")
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o440
+                or metadata.st_size > maximum_bytes
+            ):
+                raise ValueError("systemd credential is unsafe")
+            return _read_bounded_descriptor(descriptor, maximum_bytes=maximum_bytes)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
 def _read_private_file(path: Path, *, maximum_bytes: int = MAX_BODY_BYTES) -> bytes:
-    if not path.is_absolute(): raise ValueError("private file path must be absolute")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    if not path.is_absolute():
+        raise ValueError("private file path must be absolute")
+    credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if credential_directory:
+        credential_root = Path(credential_directory)
+        if credential_root.is_absolute() and path.parent == credential_root:
+            return _read_systemd_credential(
+                path,
+                credential_root,
+                maximum_bytes=maximum_bytes,
+            )
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+    )
     try:
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
             or metadata.st_uid not in {0, os.getuid()}
             or metadata.st_mode & 0o077
             or metadata.st_size > maximum_bytes
         ):
             raise ValueError("private file is unsafe")
-        chunks = []
-        remaining = maximum_bytes + 1
-        while remaining:
-            chunk = os.read(descriptor, min(65536, remaining))
-            if not chunk: break
-            chunks.append(chunk); remaining -= len(chunk)
-        value = b"".join(chunks)
-        if len(value) > maximum_bytes: raise ValueError("private file is too large")
-        return value
+        return _read_bounded_descriptor(descriptor, maximum_bytes=maximum_bytes)
     finally:
         os.close(descriptor)

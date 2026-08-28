@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import secrets
 import sqlite3
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 import threading
@@ -2251,6 +2252,217 @@ def test_private_peer_secret_accepts_root_managed_credential_file(
     assert _read_secret(secret) == SECRET
 
 
+@pytest.mark.parametrize("credential_directory_mode", (0o500, 0o550))
+def test_private_peer_secret_accepts_root_managed_systemd_credential_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    credential_directory_mode: int,
+):
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    secret = credential_root / "psychlo-peer-secret"
+    secret.write_bytes(SECRET)
+    secret.chmod(0o440)
+    credential_root.chmod(credential_directory_mode)
+    request.addfinalizer(lambda: credential_root.chmod(0o700))
+    real_fstat = psychlo_bridge_module.os.fstat
+
+    def root_owned_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        opened_path = Path(psychlo_bridge_module.os.readlink(f"/proc/self/fd/{descriptor}"))
+        opened_mode = metadata.st_mode
+        if stat.S_ISDIR(opened_mode):
+            opened_mode = stat.S_IFDIR | (
+                credential_directory_mode if opened_path == credential_root else 0o755
+            )
+        return SimpleNamespace(
+            st_mode=opened_mode,
+            st_nlink=metadata.st_nlink,
+            st_uid=0,
+            st_gid=0,
+            st_size=metadata.st_size,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", root_owned_fstat)
+    monkeypatch.setattr(psychlo_bridge_module.os, "getuid", lambda: 984)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credential_root))
+
+    assert _read_secret(secret) == SECRET
+
+
+def test_private_peer_secret_rejects_hard_linked_file(tmp_path: Path):
+    secret = tmp_path / "secret"
+    secret.write_bytes(SECRET)
+    secret.chmod(0o600)
+    (tmp_path / "second-name").hardlink_to(secret)
+
+    with pytest.raises(ValueError, match="Psychlo peer secret is unavailable"):
+        _read_secret(secret)
+
+
+def test_private_peer_secret_rejects_systemd_credential_below_symlinked_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+):
+    actual_parent = tmp_path / "actual"
+    credential_root = actual_parent / "credentials"
+    credential_root.mkdir(parents=True)
+    secret = credential_root / "psychlo-peer-secret"
+    secret.write_bytes(SECRET)
+    secret.chmod(0o440)
+    credential_root.chmod(0o550)
+    request.addfinalizer(lambda: credential_root.chmod(0o700))
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(actual_parent, target_is_directory=True)
+    presented_root = linked_parent / "credentials"
+    presented_secret = presented_root / secret.name
+    real_fstat = psychlo_bridge_module.os.fstat
+
+    def root_owned_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        opened_path = Path(psychlo_bridge_module.os.readlink(f"/proc/self/fd/{descriptor}"))
+        opened_mode = metadata.st_mode
+        if stat.S_ISDIR(opened_mode):
+            opened_mode = stat.S_IFDIR | (0o550 if opened_path == credential_root else 0o755)
+        return SimpleNamespace(
+            st_mode=opened_mode,
+            st_nlink=metadata.st_nlink,
+            st_uid=0,
+            st_gid=0,
+            st_size=metadata.st_size,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", root_owned_fstat)
+    monkeypatch.setattr(psychlo_bridge_module.os, "getuid", lambda: 984)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(presented_root))
+
+    with pytest.raises(ValueError, match="Psychlo peer secret is unavailable"):
+        _read_secret(presented_secret)
+
+
+@pytest.mark.parametrize("link_kind", ("hard", "symbolic"))
+def test_private_peer_secret_rejects_linked_systemd_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    link_kind: str,
+):
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    target = credential_root / "target"
+    target.write_bytes(SECRET)
+    target.chmod(0o440)
+    secret = credential_root / "psychlo-peer-secret"
+    if link_kind == "hard":
+        secret.hardlink_to(target)
+    else:
+        secret.symlink_to(target)
+    credential_root.chmod(0o550)
+    request.addfinalizer(lambda: credential_root.chmod(0o700))
+    real_fstat = psychlo_bridge_module.os.fstat
+
+    def root_owned_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        opened_path = Path(psychlo_bridge_module.os.readlink(f"/proc/self/fd/{descriptor}"))
+        opened_mode = metadata.st_mode
+        if stat.S_ISDIR(opened_mode):
+            opened_mode = stat.S_IFDIR | (0o550 if opened_path == credential_root else 0o755)
+        return SimpleNamespace(
+            st_mode=opened_mode,
+            st_nlink=metadata.st_nlink,
+            st_uid=0,
+            st_gid=0,
+            st_size=metadata.st_size,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", root_owned_fstat)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credential_root))
+
+    with pytest.raises(ValueError, match="Psychlo peer secret is unavailable"):
+        _read_secret(secret)
+
+
+@pytest.mark.parametrize(
+    ("directory_uid", "directory_gid", "directory_mode"),
+    ((1001, 0, 0o550), (0, 1001, 0o550), (0, 0, 0o570)),
+)
+def test_private_peer_secret_rejects_unsafe_systemd_credential_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    directory_uid: int,
+    directory_gid: int,
+    directory_mode: int,
+):
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    secret = credential_root / "psychlo-peer-secret"
+    secret.write_bytes(SECRET)
+    secret.chmod(0o440)
+    credential_root.chmod(directory_mode)
+    request.addfinalizer(lambda: credential_root.chmod(0o700))
+    real_fstat = psychlo_bridge_module.os.fstat
+
+    def credential_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        opened_path = Path(psychlo_bridge_module.os.readlink(f"/proc/self/fd/{descriptor}"))
+        is_credential_root = opened_path == credential_root
+        opened_mode = metadata.st_mode
+        if stat.S_ISDIR(opened_mode):
+            opened_mode = stat.S_IFDIR | (directory_mode if is_credential_root else 0o755)
+        return SimpleNamespace(
+            st_mode=opened_mode,
+            st_nlink=metadata.st_nlink,
+            st_uid=directory_uid if is_credential_root else 0,
+            st_gid=directory_gid if is_credential_root else 0,
+            st_size=metadata.st_size,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", credential_fstat)
+    monkeypatch.setattr(psychlo_bridge_module.os, "getuid", lambda: 984)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credential_root))
+
+    with pytest.raises(ValueError, match="Psychlo peer secret is unavailable"):
+        _read_secret(secret)
+
+
+def test_private_peer_secret_rejects_root_owned_group_readable_file_outside_systemd_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    secret = tmp_path / "psychlo-peer-secret"
+    secret.write_bytes(SECRET)
+    secret.chmod(0o440)
+    real_fstat = psychlo_bridge_module.os.fstat
+
+    def root_owned_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_nlink=metadata.st_nlink,
+            st_uid=0,
+            st_gid=0,
+            st_size=metadata.st_size,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", root_owned_fstat)
+    monkeypatch.setattr(psychlo_bridge_module.os, "getuid", lambda: 984)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credential_root))
+
+    with pytest.raises(ValueError, match="Psychlo peer secret is unavailable"):
+        _read_secret(secret)
+
+
 def test_private_peer_secret_rejects_foreign_non_root_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2264,7 +2476,9 @@ def test_private_peer_secret_rejects_foreign_non_root_owner(
         metadata = real_fstat(descriptor)
         return SimpleNamespace(
             st_mode=metadata.st_mode,
+            st_nlink=metadata.st_nlink,
             st_uid=1001,
+            st_gid=metadata.st_gid,
             st_size=metadata.st_size,
         )
 

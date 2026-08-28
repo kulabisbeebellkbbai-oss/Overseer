@@ -4,11 +4,17 @@ from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import threading
 from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
 
 from overseer.api import make_api_handler
+import overseer.psychlo_bridge as psychlo_bridge_module
 from overseer.psychlo_bridge import PsychloBridge, PsychloBridgeStore, PsychloPeerSender, _require_project_thread_peer_receipt, create_bridge_from_environment, sign_peer_message
 from overseer.roadex_project_threads import (
     QUESTION_ENDPOINT_PATH,
@@ -127,6 +133,63 @@ def test_factory_constructs_distinct_relay_secret_and_database(tmp_path: Path):
         assert bridge.project_thread_relay.secret == ROADEX_SECRET
         assert bridge.peer_secret == PSYCHLO_SECRET
         assert bridge.project_thread_relay.store.filename == tmp_path / "roadex-thread.sqlite"
+    finally:
+        bridge.close()
+
+
+def test_factory_accepts_roadex_secret_from_systemd_credential_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+):
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    psychlo_secret_file = tmp_path / "psychlo.secret"
+    roadex_secret_file = credential_root / "roadex-peer-secret"
+    bindings_file = tmp_path / "bindings.json"
+    psychlo_secret_file.write_bytes(PSYCHLO_SECRET)
+    psychlo_secret_file.chmod(0o600)
+    roadex_secret_file.write_bytes(ROADEX_SECRET)
+    roadex_secret_file.chmod(0o440)
+    credential_root.chmod(0o550)
+    request.addfinalizer(lambda: credential_root.chmod(0o700))
+    bindings_file.write_text("{}")
+    bindings_file.chmod(0o644)
+    real_fstat = os.fstat
+
+    def root_owned_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = real_fstat(descriptor)
+        opened_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        opened_mode = metadata.st_mode
+        is_directory = stat.S_ISDIR(opened_mode)
+        if is_directory:
+            opened_mode = stat.S_IFDIR | (0o550 if opened_path == credential_root else 0o755)
+        is_root_managed = is_directory or opened_path == roadex_secret_file
+        return SimpleNamespace(
+            st_mode=opened_mode,
+            st_nlink=metadata.st_nlink,
+            st_uid=0 if is_root_managed else metadata.st_uid,
+            st_gid=0 if is_root_managed else metadata.st_gid,
+            st_size=metadata.st_size,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+        )
+
+    monkeypatch.setattr(psychlo_bridge_module.os, "fstat", root_owned_fstat)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credential_root))
+    bridge = create_bridge_from_environment({
+        "OVERSEER_PSYCHLO_BRIDGE_DATABASE": str(tmp_path / "psychlo.sqlite"),
+        "OVERSEER_STORE_DATABASE": str(tmp_path / "primary.sqlite"),
+        "OVERSEER_PSYCHLO_PEER_SECRET_FILE": str(psychlo_secret_file),
+        "OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE": str(bindings_file),
+        "OVERSEER_PSYCHLO_ENDPOINT": "http://127.0.0.1:8798",
+        "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_SECRET_FILE": str(roadex_secret_file),
+        "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE": str(tmp_path / "roadex-thread.sqlite"),
+        "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT": "http://127.0.0.1:8780" + QUESTION_ENDPOINT_PATH,
+    }, recover=False)
+    try:
+        assert bridge.project_thread_relay is not None
+        assert bridge.project_thread_relay.secret == ROADEX_SECRET
     finally:
         bridge.close()
 

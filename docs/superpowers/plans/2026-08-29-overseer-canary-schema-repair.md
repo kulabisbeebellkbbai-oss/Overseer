@@ -360,14 +360,18 @@ Resolve and validate the immutable local inputs, then run the two inert package-
 OVERSEER_CHECKOUT=$(pwd -P)
 OVERSEER_COMMIT=$(git rev-parse HEAD^{commit})
 OVERSEER_TREE=$(git rev-parse "${OVERSEER_COMMIT}^{tree}")
-OVERSEER_SHORT=$(git rev-parse --short=7 "${OVERSEER_COMMIT}")
+OVERSEER_SHORT="${OVERSEER_COMMIT:0:7}"
 OVERSEER_PACKAGE="/home/god/.local/share/overseer/activation-packages/v1.1.6-${OVERSEER_SHORT}"
 OVERSEER_PRIOR_PACKAGE=/home/god/.local/share/overseer/activation-packages/v1.1.6-b70dc0c
-OVERSEER_PRIOR_RELEASE=$(find "${OVERSEER_PRIOR_PACKAGE}/public/release" -mindepth 1 -maxdepth 1 -type d -print -quit)
+mapfile -t OVERSEER_PRIOR_RELEASES < <(
+  find -P "${OVERSEER_PRIOR_PACKAGE}/public/release" -mindepth 1 -maxdepth 1 \
+    -type d -printf '%f\n' | LC_ALL=C sort
+)
+test "${#OVERSEER_PRIOR_RELEASES[@]}" -eq 1
+OVERSEER_PRIOR_RELEASE="${OVERSEER_PRIOR_PACKAGE}/public/release/${OVERSEER_PRIOR_RELEASES[0]}"
 
-test -n "${OVERSEER_PRIOR_RELEASE}"
 test ! -e "${OVERSEER_PACKAGE}"
-test "$(git status --porcelain)" = ""
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /usr/bin/python3.13 -B -s -P \
   -m overseer.activation_package stage-sqlite-runtime \
@@ -402,9 +406,25 @@ nice -n 10 ionice -c 3 env PYTHONDONTWRITEBYTECODE=1 \
   --rollback-input "v1.1.5-approved-activation=${OVERSEER_PRIOR_PACKAGE}/private/rollback-inputs/v1.1.5-approved-activation"
 ```
 
-Expected: status `awaiting_human_verifiers`. Reuse only local owner-side verifier documents if the package workflow validates that reuse without plaintext; otherwise stop at the hidden interactive verifier gate. Never place secrets in chat, argv, environment, logs, or test output.
+Expected: status `awaiting_human_verifiers`. Do not reuse verifier documents from a prior package; no supported primitive validates their provenance for reuse, and the package requires fresh hidden entry. Never place secrets in chat, argv, environment, logs, or test output.
 
-- [ ] **Step 6: Independently verify the package tree and digest**
+- [ ] **Step 6: Stop for fresh hidden human-verifier entry**
+
+The authorized human runs this command in a local terminal and enters both
+fresh, distinct verifier secrets only at the hidden prompts:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+  LD_LIBRARY_PATH="${OVERSEER_PACKAGE}/private/runtime-input" \
+  PYTHONPATH=src /usr/bin/python3.13 -B -s -P \
+  -m overseer.activation_package create-human-verifiers \
+  --package-root "${OVERSEER_PACKAGE}"
+```
+
+Expected: JSON status `created`. Do not proceed from prompt completion alone;
+inspect package status and require `credentials_complete` before finalization.
+
+- [ ] **Step 7: Independently verify the package tree and digest**
 
 After verifier creation, finalize and independently verify with:
 
@@ -425,6 +445,6 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 Confirm migration report status, the complete canary-required schema subset, `sourceMutationPerformed: false`, sealed manifest consistency, and no activation approval files.
 
-- [ ] **Step 7: Confirm the activation boundary**
+- [ ] **Step 8: Confirm the activation boundary**
 
 Read-only checks must prove no archive/import was created, no Phase B or cutover approval exists for the new digest, no staging/canary/cutover command ran, and live services were not restarted.

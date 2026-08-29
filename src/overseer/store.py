@@ -89,6 +89,32 @@ from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, U
 
 
 CURRENT_SCHEMA_VERSION = 12
+_SCHEMA_CURRENT_REQUIRED_TABLES = frozenset(
+    {
+        "schema_migrations",
+        "agent_schema_migrations",
+        "roadex_approval_fixtures",
+        "psychlo_legacy_abandonment_execution_claims",
+        "claim_approval_continuations",
+        "claim_activation_groups",
+        "claim_approval_continuation_attempts",
+        "audit_event_normalization_state",
+        "package_inspection_records",
+        "package_reconciliation_evidence",
+        "collection_jobs",
+        "collection_job_states",
+        "collection_requests",
+        "collection_runs",
+        "triage_incidents",
+        "repair_runbooks",
+        "repair_attempts",
+        "dashboard_projections",
+        "admin_change_plans",
+        "admin_executions",
+        "admin_execution_claims",
+        "admin_history_archives",
+    }
+)
 MAX_COLLECTION_PAYLOAD_LENGTH = 65536
 MAX_DASHBOARD_PROJECTION_PAYLOAD_LENGTH = 512 * 1024
 _COLLECTION_INDEX_SPECS = {
@@ -751,41 +777,17 @@ class SQLiteStore:
     def _schema_is_current(self) -> bool:
         if self._observation_schema_status() != "exact":
             return False
+        required_tables = tuple(sorted(_SCHEMA_CURRENT_REQUIRED_TABLES))
+        placeholders = ", ".join("?" for _ in required_tables)
         tables = {
             str(row[0])
             for row in self._connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('schema_migrations', 'agent_schema_migrations', "
-                "'roadex_approval_fixtures', 'psychlo_legacy_abandonment_execution_claims', "
-                "'claim_approval_continuations', 'claim_activation_groups', "
-                "'claim_approval_continuation_attempts', "
-                "'audit_event_normalization_state', 'package_inspection_records', "
-                "'package_reconciliation_evidence', 'collection_jobs', "
-                "'collection_job_states', 'collection_requests', 'collection_runs', "
-                "'triage_incidents', 'repair_runbooks', 'repair_attempts', "
-                "'dashboard_projections')"
+                f"AND name IN ({placeholders})",
+                required_tables,
             ).fetchall()
         }
-        if tables != {
-            "schema_migrations",
-            "agent_schema_migrations",
-            "roadex_approval_fixtures",
-            "psychlo_legacy_abandonment_execution_claims",
-            "claim_approval_continuations",
-            "claim_activation_groups",
-            "claim_approval_continuation_attempts",
-            "audit_event_normalization_state",
-            "package_inspection_records",
-            "package_reconciliation_evidence",
-            "collection_jobs",
-            "collection_job_states",
-            "collection_requests",
-            "collection_runs",
-            "triage_incidents",
-            "repair_runbooks",
-            "repair_attempts",
-            "dashboard_projections",
-        }:
+        if tables != _SCHEMA_CURRENT_REQUIRED_TABLES:
             return False
         if not all(
             self._collection_index_is_canonical(index_name)

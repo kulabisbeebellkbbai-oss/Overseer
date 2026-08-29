@@ -157,6 +157,47 @@ def test_schema_v12_is_normalized_and_repairs_claimed_current_missing_tables(tmp
         ) == CURRENT_SCHEMA_VERSION == 12
 
 
+def test_current_marked_store_recreates_missing_admin_execution_claim_table(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path):
+        pass
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE admin_execution_claims")
+        connection.commit()
+
+    with SQLiteStore(path) as reopened:
+        table = reopened._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ("admin_execution_claims",),
+        ).fetchone()
+        assert table is not None
+        assert reopened._schema_is_current()
+
+
+def test_collection_context_rejects_current_marked_store_missing_admin_execution_claim_table(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path):
+        pass
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE admin_execution_claims")
+        connection.commit()
+
+    with collection_deadline_scope(time.monotonic() + 5.0):
+        with pytest.raises(RuntimeError, match="pre-migrated SQLite store"):
+            SQLiteStore(path)
+
+    with sqlite3.connect(path) as connection:
+        table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ("admin_execution_claims",),
+        ).fetchone()
+    assert table is None
+
+
 def test_collection_context_refuses_to_initialize_or_migrate_a_store(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     connection = sqlite3.connect(path)

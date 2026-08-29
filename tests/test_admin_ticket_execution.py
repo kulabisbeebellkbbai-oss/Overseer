@@ -75,6 +75,21 @@ def _receipt(raw_ticket: bytes, *, status: str = "completed", restart: int = 0, 
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
+def _preclaim_rejection(raw_ticket: bytes) -> bytes:
+    ticket = parse_ticket(raw_ticket).to_dict()
+    value = {
+        "operation": ticket["operation"],
+        "planDigest": ticket["planDigest"],
+        "planId": ticket["planId"],
+        "reason": "operation and target are not allowlisted",
+        "schemaVersion": "overseer.admin-executor-preclaim-rejection.v1",
+        "status": "blocked",
+        "target": ticket["target"],
+        "ticketId": ticket["ticketId"],
+    }
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
 def test_issues_exactly_bound_ticket_and_sends_only_ticket_bytes(tmp_path: Path) -> None:
     calls: list[tuple[object, bytes]] = []
 
@@ -117,6 +132,104 @@ def test_rejects_a_tampered_or_generic_executor_receipt(tmp_path: Path) -> None:
         return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
 
     with pytest.raises(ValueError, match="receipt.*planDigest"):
+        execute_system_service_restart_ticket(
+            _ExecutablePlan(),
+            PLAN_DIGEST,
+            private_key_file=_private_key_file(tmp_path),
+            executor_socket="executor.sock",
+            clock=lambda: NOW,
+            ticket_id_factory=lambda: "ticket.restart.1",
+            nonce_factory=lambda: "nonce.restart.1",
+            sender=sender,
+        )
+
+
+def test_maps_exact_preclaim_rejection_to_blocked_without_command_mutation(
+    tmp_path: Path,
+) -> None:
+    def sender(_socket_address: object, raw_ticket: bytes) -> bytes:
+        return _preclaim_rejection(raw_ticket)
+
+    result = execute_system_service_restart_ticket(
+        _ExecutablePlan(),
+        PLAN_DIGEST,
+        private_key_file=_private_key_file(tmp_path),
+        executor_socket="executor.sock",
+        clock=lambda: NOW,
+        ticket_id_factory=lambda: "ticket.restart.1",
+        nonce_factory=lambda: "nonce.restart.1",
+        sender=sender,
+    )
+
+    assert result.status is AdminExecutionStatus.BLOCKED
+    assert result.plan_id == "admin.restart-system.smoke"
+    assert result.plan_digest == PLAN_DIGEST
+    assert result.command_results == ()
+    assert result.summary == "approved system-service restart ticket blocked"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        None,
+        lambda value: {**value, "ticketId": "tampered"},
+        lambda value: {**value, "planId": "tampered"},
+        lambda value: {**value, "planDigest": "b" * 64},
+        lambda value: {**value, "operation": "tampered"},
+        lambda value: {**value, "target": "tampered.service"},
+        lambda value: {**value, "status": "failed"},
+        lambda value: {**value, "reason": "details leaked"},
+        lambda value: {**value, "reason": 7},
+        lambda value: {
+            **value,
+            "schemaVersion": "overseer.admin-executor-preclaim-rejection.v0",
+        },
+        lambda value: {key: item for key, item in value.items() if key != "reason"},
+        lambda value: {**value, "extra": True},
+    ],
+)
+def test_rejects_tampered_preclaim_rejection_or_generic_error(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    def sender(_socket_address: object, raw_ticket: bytes) -> bytes:
+        value = json.loads(_preclaim_rejection(raw_ticket))
+        if mutation is None:
+            return json.dumps(
+                {
+                    "schemaVersion": "overseer.admin-executor-error.v1",
+                    "error": "request rejected",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        return json.dumps(mutation(value), sort_keys=True, separators=(",", ":")).encode("ascii")
+
+    with pytest.raises(ValueError):
+        execute_system_service_restart_ticket(
+            _ExecutablePlan(),
+            PLAN_DIGEST,
+            private_key_file=_private_key_file(tmp_path),
+            executor_socket="executor.sock",
+            clock=lambda: NOW,
+            ticket_id_factory=lambda: "ticket.restart.1",
+            nonce_factory=lambda: "nonce.restart.1",
+            sender=sender,
+        )
+
+
+@pytest.mark.parametrize("encoding", ["noncanonical", "duplicate"])
+def test_rejects_noncanonical_or_duplicate_preclaim_rejection(
+    tmp_path: Path,
+    encoding: str,
+) -> None:
+    def sender(_socket_address: object, raw_ticket: bytes) -> bytes:
+        raw = _preclaim_rejection(raw_ticket)
+        if encoding == "noncanonical":
+            return json.dumps(json.loads(raw), indent=2).encode("ascii")
+        return raw[:-1] + b',"status":"blocked"}'
+
+    with pytest.raises(ValueError):
         execute_system_service_restart_ticket(
             _ExecutablePlan(),
             PLAN_DIGEST,

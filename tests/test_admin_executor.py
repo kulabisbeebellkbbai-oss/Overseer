@@ -157,6 +157,46 @@ def test_executor_claims_before_fixed_commands_and_persists_receipt(tmp_path: Pa
     assert stat.S_IMODE(os.stat(ledger).st_mode) == 0o600
 
 
+def test_serve_one_returns_exact_preclaim_rejection_without_claiming_or_running(tmp_path: Path) -> None:
+    allowlist, key, ledger = _executor_files(tmp_path)
+    raw_ticket = _ticket(target="overseer-not-allowlisted.service")
+    calls: list[tuple[str, ...]] = []
+    server, client = socket.socketpair()
+
+    def serve() -> None:
+        serve_one(
+            server,
+            allowlist_file=allowlist,
+            public_key_file=key,
+            ledger=ledger,
+            authority_uid=os.getuid(),
+            expected_owner_uid=os.getuid(),
+            now=NOW,
+            runner=_runner(calls),
+        )
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    received = send_ticket(client, raw_ticket)
+    thread.join(timeout=3)
+    client.close()
+    server.close()
+
+    assert json.loads(received) == {
+        "operation": "restart-system-unit",
+        "planDigest": "a" * 64,
+        "planId": "plan-1",
+        "reason": "operation and target are not allowlisted",
+        "schemaVersion": "overseer.admin-executor-preclaim-rejection.v1",
+        "status": "blocked",
+        "target": "overseer-not-allowlisted.service",
+        "ticketId": "ticket-1",
+    }
+    assert calls == []
+    with sqlite3.connect(ledger) as db:
+        assert db.execute("SELECT COUNT(*) FROM admin_executions").fetchone() == (0,)
+
+
 def test_terminal_replay_returns_receipt_without_running_commands(tmp_path: Path) -> None:
     allowlist, key, ledger = _executor_files(tmp_path)
     calls: list[tuple[str, ...]] = []

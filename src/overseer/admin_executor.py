@@ -23,6 +23,8 @@ from . import admin_tickets
 ALLOWLIST_SCHEMA_VERSION = "overseer.admin-executor-allowlist.v1"
 RECEIPT_SCHEMA_VERSION = "overseer.admin-execution-receipt.v1"
 ERROR_SCHEMA_VERSION = "overseer.admin-executor-error.v1"
+PRECLAIM_REJECTION_SCHEMA_VERSION = "overseer.admin-executor-preclaim-rejection.v1"
+PRECLAIM_REJECTION_REASON = "operation and target are not allowlisted"
 MAX_ALLOWLIST_BYTES = 4096
 MAX_RECEIPT_BYTES = 8192
 MAX_SOCKET_BYTES = 4096
@@ -34,6 +36,23 @@ _UNIT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 
 class AdminExecutorError(ValueError):
     """Raised for a rejected request or an unsafe executor state."""
+
+
+class AdminExecutorPreClaimRejection(AdminExecutorError):
+    """A verified ticket rejected before it can create a root-ledger claim."""
+
+    def __init__(self, ticket: admin_tickets.AdminExecutionTicket) -> None:
+        self.response = {
+            "operation": ticket.operation,
+            "planDigest": ticket.plan_digest,
+            "planId": ticket.plan_id,
+            "reason": PRECLAIM_REJECTION_REASON,
+            "schemaVersion": PRECLAIM_REJECTION_SCHEMA_VERSION,
+            "status": "blocked",
+            "target": ticket.target,
+            "ticketId": ticket.ticket_id,
+        }
+        super().__init__(PRECLAIM_REJECTION_REASON)
 
 
 def _duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -379,7 +398,7 @@ class AdminExecutor:
         except admin_tickets.AdminTicketError as error:
             raise AdminExecutorError("ticket verification failed") from error
         if (ticket.operation, ticket.target) not in self.allowed:
-            raise AdminExecutorError("ticket operation and target are not allowlisted")
+            raise AdminExecutorPreClaimRejection(ticket)
         mode, stored = self.ledger.claim(ticket, self.clock())
         if mode == "replay":
             assert stored is not None
@@ -542,6 +561,8 @@ def serve_one(
                 now=now,
             )
             encoded = _canonical_json(response, label="receipt")
+        except AdminExecutorPreClaimRejection as error:
+            encoded = _canonical_json(error.response, label="pre-claim rejection")
         except Exception:
             encoded = _error_bytes()
         try:
@@ -597,10 +618,13 @@ __all__ = [
     "ALLOWLIST_SCHEMA_VERSION",
     "AdminExecutor",
     "AdminExecutorError",
+    "AdminExecutorPreClaimRejection",
     "MAX_ALLOWLIST_BYTES",
     "MAX_OUTPUT_BYTES",
     "MAX_RECEIPT_BYTES",
     "MAX_SOCKET_IO_TIMEOUT_SECONDS",
+    "PRECLAIM_REJECTION_REASON",
+    "PRECLAIM_REJECTION_SCHEMA_VERSION",
     "RECEIPT_SCHEMA_VERSION",
     "SOCKET_IO_TIMEOUT_SECONDS",
     "execute_ticket",

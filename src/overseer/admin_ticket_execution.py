@@ -53,6 +53,19 @@ _RECEIPT_STRING_FIELDS = frozenset(
         "stderr",
     }
 )
+_PRECLAIM_REJECTION_FIELDS = frozenset(
+    {
+        "schemaVersion",
+        "ticketId",
+        "planId",
+        "planDigest",
+        "operation",
+        "target",
+        "status",
+        "reason",
+    }
+)
+_PRECLAIM_REJECTION_STRING_FIELDS = frozenset(_PRECLAIM_REJECTION_FIELDS)
 
 
 class AdminTicketExecutionError(ValueError):
@@ -131,7 +144,7 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
         raise AdminTicketExecutionError("receipt is not canonical JSON") from error
 
 
-def _parse_receipt(raw: bytes) -> dict[str, Any]:
+def _parse_json_object(raw: bytes) -> dict[str, Any]:
     if type(raw) is not bytes or len(raw) > admin_executor.MAX_RECEIPT_BYTES:
         raise AdminTicketExecutionError("receipt exceeds the maximum size")
     try:
@@ -144,7 +157,13 @@ def _parse_receipt(raw: bytes) -> dict[str, Any]:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AdminTicketExecutionError("receipt must be bounded UTF-8 JSON") from error
-    if type(document) is not dict or set(document) != _RECEIPT_FIELDS:
+    if type(document) is not dict:
+        raise AdminTicketExecutionError("receipt schema is invalid")
+    return document
+
+
+def _validate_receipt(document: Mapping[str, Any], raw: bytes) -> dict[str, Any]:
+    if set(document) != _RECEIPT_FIELDS:
         raise AdminTicketExecutionError("receipt schema is invalid")
     if _canonical_json(document) != raw:
         raise AdminTicketExecutionError("receipt JSON is not canonical")
@@ -173,6 +192,26 @@ def _parse_receipt(raw: bytes) -> dict[str, Any]:
         document["restartExitCode"] == 0 and document["verifyExitCode"] == 0
     ):
         raise AdminTicketExecutionError("failed receipt has no failed command")
+    return document
+
+
+def _parse_receipt(raw: bytes) -> dict[str, Any]:
+    return _validate_receipt(_parse_json_object(raw), raw)
+
+
+def _validate_preclaim_rejection(document: Mapping[str, Any], raw: bytes) -> dict[str, Any]:
+    if set(document) != _PRECLAIM_REJECTION_FIELDS:
+        raise AdminTicketExecutionError("pre-claim rejection schema is invalid")
+    if _canonical_json(document) != raw:
+        raise AdminTicketExecutionError("pre-claim rejection JSON is not canonical")
+    if document["schemaVersion"] != admin_executor.PRECLAIM_REJECTION_SCHEMA_VERSION:
+        raise AdminTicketExecutionError("pre-claim rejection schema version is unsupported")
+    if any(type(document[field]) is not str for field in _PRECLAIM_REJECTION_STRING_FIELDS):
+        raise AdminTicketExecutionError("pre-claim rejection string fields have invalid types")
+    if document["status"] != "blocked":
+        raise AdminTicketExecutionError("pre-claim rejection status is invalid")
+    if document["reason"] != admin_executor.PRECLAIM_REJECTION_REASON:
+        raise AdminTicketExecutionError("pre-claim rejection reason is invalid")
     return document
 
 
@@ -244,6 +283,27 @@ def _check_receipt_binding(
         raise AdminTicketExecutionError("fresh authority execution received a replayed receipt")
 
 
+def _check_preclaim_rejection_binding(
+    rejection: Mapping[str, Any],
+    ticket: admin_tickets.AdminExecutionTicket,
+    plan_id: str,
+    plan_digest: str,
+    target: str,
+) -> None:
+    expected = {
+        "ticketId": ticket.ticket_id,
+        "planId": plan_id,
+        "planDigest": plan_digest,
+        "operation": admin_tickets.OPERATION_RESTART_SYSTEM_UNIT,
+        "target": target,
+    }
+    for field, value in expected.items():
+        if rejection[field] != value:
+            raise AdminTicketExecutionError(
+                f"pre-claim rejection {field} does not match the ticket and plan"
+            )
+
+
 def execute_system_service_restart_ticket(
     plan: object,
     plan_digest: str,
@@ -284,7 +344,19 @@ def execute_system_service_restart_ticket(
         )
     )
     raw_receipt = actual_sender(executor_socket, raw_ticket)
-    receipt = _parse_receipt(raw_receipt)
+    document = _parse_json_object(raw_receipt)
+    if document.get("schemaVersion") == admin_executor.PRECLAIM_REJECTION_SCHEMA_VERSION:
+        rejection = _validate_preclaim_rejection(document, raw_receipt)
+        _check_preclaim_rejection_binding(rejection, ticket, plan_id, plan_digest, target)
+        return AdminExecutionResult(
+            id=f"admin.exec.{plan_id}.blocked",
+            plan_id=plan_id,
+            status=AdminExecutionStatus.BLOCKED,
+            summary="approved system-service restart ticket blocked",
+            command_results=(),
+            plan_digest=plan_digest,
+        )
+    receipt = _validate_receipt(document, raw_receipt)
     _check_receipt_binding(receipt, ticket, plan_id, plan_digest, target)
 
     status = AdminExecutionStatus(receipt["status"])

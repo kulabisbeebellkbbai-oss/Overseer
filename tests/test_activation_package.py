@@ -3086,6 +3086,7 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     assert staging_commands[-1] == [
         "/usr/bin/systemctl",
         "stop",
+        "overseer-approval-smoke.service",
         "overseer-api-canary.service",
         "overseer-admin-executor.socket",
         "overseer-codex-user-bridge.socket",
@@ -3100,6 +3101,20 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         if command[-2:] == ["start", "overseer-api-canary.service"]
     )
     assert staging_verify_index < canary_start_index
+    canary_command_index = next(
+        index for index, command in enumerate(staging_commands) if "run-approved-canary" in command
+    )
+    assert activation_package_module._canary_authorization_boundary_index(
+        staging_commands,
+        canary_command_index=canary_command_index,
+        failure_cleanup_commands=contract["canary"]["failureCleanupCommands"],
+    ) == canary_start_index - 1
+    with pytest.raises(ActivationPackageError, match="canary cleanup boundary"):
+        activation_package_module._canary_authorization_boundary_index(
+            staging_commands,
+            canary_command_index=canary_command_index,
+            failure_cleanup_commands=[["/bin/true", "cleanup"]],
+        )
     assert contract["canary"] == {
         "store": "/var/lib/overseer/overseer-canary.sqlite3",
         "unixSocket": "/run/overseer-canary/api.sock",
@@ -3111,6 +3126,7 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
             [
                 "/usr/bin/systemctl",
                 "stop",
+                "overseer-approval-smoke.service",
                 "overseer-api-canary.service",
                 "overseer-admin-executor.socket",
                 "overseer-codex-user-bridge.socket",
@@ -4337,9 +4353,20 @@ def test_installed_artifact_verifier_compares_targets_to_sealed_hashes(
         )
 
 
+@pytest.mark.parametrize(
+    ("unlisted_status", "replay_status", "expected_error"),
+    [
+        ("blocked", "completed", None),
+        ("failed", "completed", "canary unlisted-unit control did not fail closed"),
+        ("blocked", "failed", "canary executor replay control failed"),
+    ],
+)
 def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unlisted_status: str,
+    replay_status: str,
+    expected_error: str | None,
 ) -> None:
     package, digest = _finalized_package(tmp_path)
     installed = tmp_path / "installed-credentials"
@@ -4435,17 +4462,34 @@ def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls
             plan_id = str(payload["plan_id"])
             self.executions[plan_id] = self.executions.get(plan_id, 0) + 1
             if ".unlisted." in plan_id:
-                return {"status": "blocked", "mutation_performed": False, "id": f"exec.{plan_id}"}
+                return {
+                    "status": unlisted_status,
+                    "mutation_performed": False,
+                    "id": f"exec.{plan_id}",
+                }
             if self.executions[plan_id] == 1:
                 return {"status": "completed", "mutation_performed": True, "id": f"exec.{plan_id}"}
             return {
-                "status": "completed",
+                "status": replay_status,
                 "mutation_performed": False,
                 "replayed": True,
                 "id": f"exec.{plan_id}",
             }
 
     monkeypatch.setattr("overseer.client.OverseerApiClient", FakeClient)
+
+    if expected_error is not None:
+        with pytest.raises(ActivationPackageError, match=expected_error):
+            run_canary_acceptance(
+                package,
+                expected_package_digest=digest,
+                admin_secret="admin-approval-secret-123456",
+                roadex_secret="roadex-approval-secret-12345",
+                attestation_path=attestation,
+                unix_socket_path=canary_socket,
+            )
+        assert not attestation.exists()
+        return
 
     result = run_canary_acceptance(
         package,
@@ -4798,6 +4842,7 @@ def test_delayed_human_authorization_precedes_timed_canary_start(
     canary_stop = [
         "/usr/bin/systemctl",
         "stop",
+        "overseer-approval-smoke.service",
         "overseer-api-canary.service",
         "overseer-admin-executor.socket",
         "overseer-codex-user-bridge.socket",
@@ -4820,7 +4865,7 @@ def test_delayed_human_authorization_precedes_timed_canary_start(
         ],
         "cutoverCommands": [["/bin/true", "cutover"]],
         "rollbackCommands": [["/bin/true", "rollback"]],
-        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+        "canary": {"failureCleanupCommands": [canary_stop]},
     }
     state_path = tmp_path / "executor" / "activation-state.json"
     timeline: list[str] = []
@@ -5146,6 +5191,7 @@ def test_canary_boundary_rejects_alternate_earlier_canary_start(
     stop = [
         "/usr/bin/systemctl",
         "stop",
+        "overseer-approval-smoke.service",
         "overseer-api-canary.service",
         "overseer-admin-executor.socket",
         "overseer-codex-user-bridge.socket",
@@ -5163,6 +5209,7 @@ def test_canary_boundary_rejects_alternate_earlier_canary_start(
         activation_package_module._canary_authorization_boundary_index(
             commands,
             canary_command_index=4,
+            failure_cleanup_commands=[stop],
         )
 
 
@@ -5186,6 +5233,7 @@ def test_canary_boundary_requires_exact_canonical_suffix() -> None:
         [
             "/usr/bin/systemctl",
             "stop",
+            "overseer-approval-smoke.service",
             "overseer-api-canary.service",
             "overseer-admin-executor.socket",
             "overseer-codex-user-bridge.socket",
@@ -5196,6 +5244,7 @@ def test_canary_boundary_requires_exact_canonical_suffix() -> None:
         activation_package_module._canary_authorization_boundary_index(
             commands,
             canary_command_index=4,
+            failure_cleanup_commands=[commands[-1]],
         )
 
 

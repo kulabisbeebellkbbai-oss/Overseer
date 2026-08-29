@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -24,6 +25,8 @@ from overseer.admin import (
 from overseer.admin_executor import (
     ALLOWLIST_SCHEMA_VERSION,
     execute_ticket,
+    send_ticket,
+    serve_one,
 )
 from overseer.admin_ticket_execution import execute_system_service_restart_ticket
 from overseer.approval_auth import create_approval_document, load_approval_verifier
@@ -411,6 +414,294 @@ def test_ticketed_approval_api_runs_allowlisted_restart_once_and_replays(
         ("/usr/bin/systemctl", "restart", "--", target),
         ("/usr/bin/systemctl", "is-active", "--quiet", "--", target),
     ]
+
+
+def test_ticketed_approval_api_finalizes_bound_unlisted_rejection_without_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    target = "overseer-api.service"
+    plan_id = "admin.approval.ticket-unlisted"
+    plan_admin_change_status(
+        store_path,
+        plan_id,
+        "system_service_restart",
+        target,
+        "prove an executor allowlist rejection is durably blocked",
+        "inactive",
+    )
+
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    private_key_path = tmp_path / "authority.key"
+    private_key_path.write_bytes(bytes(range(32)))
+    private_key_path.chmod(0o600)
+    public_key_path = tmp_path / "executor-public.key"
+    public_key_path.write_bytes(private_key.public_key().public_bytes_raw())
+    public_key_path.chmod(0o644)
+    allowlist_path = tmp_path / "allowlist.json"
+    allowlist_path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": ALLOWLIST_SCHEMA_VERSION,
+                "allowed": [
+                    {
+                        "operation": "restart-system-unit",
+                        "unit": "overseer-approval-smoke.service",
+                    }
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    allowlist_path.chmod(0o644)
+    ledger_dir = tmp_path / "executor-state"
+    ledger_dir.mkdir(mode=0o700)
+    ledger_path = ledger_dir / "ledger.sqlite3"
+    socket_path = tmp_path / "executor.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    monkeypatch.setenv("OVERSEER_ADMIN_TICKET_PRIVATE_KEY", str(private_key_path))
+    monkeypatch.setenv("OVERSEER_ADMIN_EXECUTOR_SOCKET", str(socket_path))
+    command_calls: list[tuple[str, ...]] = []
+
+    def runner(argv):
+        command_calls.append(tuple(argv))
+        return 0, b"unexpected\n", b""
+
+    def adapter(plan, plan_digest, **kwargs):
+        def sender(_socket_address, raw_ticket):
+            server, client = socket.socketpair()
+            errors: list[BaseException] = []
+
+            def serve() -> None:
+                try:
+                    serve_one(
+                        server,
+                        allowlist_file=allowlist_path,
+                        public_key_file=public_key_path,
+                        ledger=ledger_path,
+                        authority_uid=os.geteuid(),
+                        expected_owner_uid=os.geteuid(),
+                        runner=runner,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=serve)
+            thread.start()
+            try:
+                response = send_ticket(client, raw_ticket)
+                thread.join(timeout=3)
+                assert thread.is_alive() is False
+                assert errors == []
+                return response
+            finally:
+                client.close()
+                server.close()
+
+        return execute_system_service_restart_ticket(
+            plan,
+            plan_digest,
+            sender=sender,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(cli_module, "execute_system_service_restart_ticket", adapter)
+    try:
+        with approval_api(store_path) as base_url:
+            post_json(
+                base_url,
+                "/admin/approve",
+                {"plan_id": plan_id},
+                "approval-token-strong-1",
+            )
+            execution_status, executed = post_json(
+                base_url,
+                "/admin/execute",
+                {"plan_id": plan_id},
+                "agent-token",
+            )
+            replay_status, replayed = post_json(
+                base_url,
+                "/admin/execute",
+                {"plan_id": plan_id},
+                "agent-token",
+            )
+    finally:
+        listener.close()
+
+    with SQLiteStore(store_path) as store:
+        claim = store.load_admin_execution_claim_for_plan(plan_id)
+        persisted = store.load_admin_execution(executed["id"])
+    with sqlite3.connect(ledger_path) as ledger:
+        root_claim_count = ledger.execute("SELECT COUNT(*) FROM admin_executions").fetchone()[0]
+
+    assert execution_status == 200
+    assert executed["status"] == "blocked"
+    assert executed["mutation_performed"] is False
+    assert replay_status == 200
+    assert replayed["id"] == executed["id"]
+    assert replayed["replayed"] is True
+    assert replayed["mutation_performed"] is False
+    assert claim is not None
+    assert claim.state.value == "blocked"
+    assert claim.result_id == executed["id"]
+    assert persisted.status.value == "blocked"
+    assert command_calls == []
+    assert root_claim_count == 0
+
+
+def test_ticketed_approval_api_preserves_claim_for_indeterminate_executor_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    target = "overseer-approval-smoke.service"
+    plan_id = "admin.approval.ticket-indeterminate"
+    plan_admin_change_status(
+        store_path,
+        plan_id,
+        "system_service_restart",
+        target,
+        "preserve reconciliation after an unbound executor failure",
+        "inactive",
+    )
+
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    private_key_path = tmp_path / "authority.key"
+    private_key_path.write_bytes(bytes(range(32)))
+    private_key_path.chmod(0o600)
+    public_key_path = tmp_path / "executor-public.key"
+    public_key_path.write_bytes(private_key.public_key().public_bytes_raw())
+    public_key_path.chmod(0o644)
+    allowlist_path = tmp_path / "allowlist.json"
+    allowlist_path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": ALLOWLIST_SCHEMA_VERSION,
+                "allowed": [
+                    {
+                        "operation": "restart-system-unit",
+                        "unit": target,
+                    }
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    allowlist_path.chmod(0o644)
+    ledger_dir = tmp_path / "executor-state"
+    ledger_dir.mkdir(mode=0o700)
+    ledger_path = ledger_dir / "ledger.sqlite3"
+    socket_path = tmp_path / "executor.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    monkeypatch.setenv("OVERSEER_ADMIN_TICKET_PRIVATE_KEY", str(private_key_path))
+    monkeypatch.setenv("OVERSEER_ADMIN_EXECUTOR_SOCKET", str(socket_path))
+    adapter_calls = 0
+    command_calls: list[tuple[str, ...]] = []
+
+    def broken_runner(argv):
+        command_calls.append(tuple(argv))
+        raise RuntimeError("executor lost command outcome")
+
+    def indeterminate_adapter(plan, plan_digest, **kwargs):
+        nonlocal adapter_calls
+        adapter_calls += 1
+
+        def sender(_socket_address, raw_ticket):
+            server, client = socket.socketpair()
+            errors: list[BaseException] = []
+
+            def serve() -> None:
+                try:
+                    serve_one(
+                        server,
+                        allowlist_file=allowlist_path,
+                        public_key_file=public_key_path,
+                        ledger=ledger_path,
+                        authority_uid=os.geteuid(),
+                        expected_owner_uid=os.geteuid(),
+                        runner=broken_runner,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=serve)
+            thread.start()
+            try:
+                response = send_ticket(client, raw_ticket)
+                thread.join(timeout=3)
+                assert thread.is_alive() is False
+                assert errors == []
+                return response
+            finally:
+                client.close()
+                server.close()
+
+        return execute_system_service_restart_ticket(
+            plan,
+            plan_digest,
+            sender=sender,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "execute_system_service_restart_ticket",
+        indeterminate_adapter,
+    )
+    try:
+        with approval_api(store_path) as base_url:
+            post_json(
+                base_url,
+                "/admin/approve",
+                {"plan_id": plan_id},
+                "approval-token-strong-1",
+            )
+            with pytest.raises(HTTPError) as first_error:
+                post_json(
+                    base_url,
+                    "/admin/execute",
+                    {"plan_id": plan_id},
+                    "agent-token",
+                )
+            with pytest.raises(HTTPError) as retry_error:
+                post_json(
+                    base_url,
+                    "/admin/execute",
+                    {"plan_id": plan_id},
+                    "agent-token",
+                )
+            retry_payload = json.loads(retry_error.value.read().decode("utf-8"))
+    finally:
+        listener.close()
+
+    with SQLiteStore(store_path) as store:
+        claim = store.load_admin_execution_claim_for_plan(plan_id)
+    with sqlite3.connect(ledger_path) as ledger:
+        root_claim = ledger.execute(
+            "SELECT state, terminal_receipt FROM admin_executions"
+        ).fetchone()
+
+    assert first_error.value.code == 400
+    assert retry_error.value.code == 400
+    assert "reconciliation required" in retry_payload["error"]
+    assert claim is not None
+    assert claim.state.value == "claimed"
+    assert claim.result_id is None
+    assert adapter_calls == 1
+    assert command_calls == [
+        ("/usr/bin/systemctl", "restart", "--", target),
+    ]
+    assert root_claim == ("claimed", None)
 
 
 def test_direct_cli_admin_approval_is_retired(tmp_path: Path) -> None:

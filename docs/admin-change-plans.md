@@ -85,6 +85,14 @@ the same plan ID then fails closed with `reconciliation required` and never
 automatically repeats a command. A normal terminal result and its audit event
 are committed atomically with claim finalization.
 
+If a valid signed ticket names an operation or target outside the root-owned
+allowlist, the executor returns a canonical ticket-bound pre-claim rejection
+without creating a root-ledger claim or invoking a command. The authority
+records that exact response as a terminal `blocked` result. Malformed,
+unbound, generic, or post-claim executor errors remain indeterminate: the
+authority claim stays `claimed`, and retries fail closed with
+`reconciliation required`.
+
 O'Brien may request package adapter enablement and route a plan to Sisko, but
 it cannot approve either record itself. The maintenance cycle remains blocked
 until independently recorded approvals satisfy both gates.

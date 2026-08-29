@@ -4070,6 +4070,7 @@ def render_activation_contract(
         [
             "/usr/bin/systemctl",
             "stop",
+            "overseer-approval-smoke.service",
             "overseer-api-canary.service",
             "overseer-admin-executor.socket",
             "overseer-codex-user-bridge.socket",
@@ -4299,6 +4300,7 @@ def render_activation_contract(
                 [
                     "/usr/bin/systemctl",
                     "stop",
+                    "overseer-approval-smoke.service",
                     "overseer-api-canary.service",
                     "overseer-admin-executor.socket",
                     "overseer-codex-user-bridge.socket",
@@ -5791,6 +5793,7 @@ def run_canary_acceptance(
     if (
         executed.get("status") != "completed"
         or executed.get("mutation_performed") is not True
+        or replayed.get("status") != "completed"
         or replayed.get("replayed") is not True
         or replayed.get("mutation_performed") is not False
         or replayed.get("id") != executed.get("id")
@@ -5809,7 +5812,10 @@ def run_canary_acceptance(
     )
     admin.approve_admin_change(unlisted_plan_id)
     unlisted = ordinary.execute_admin_change({"plan_id": unlisted_plan_id})
-    if unlisted.get("status") not in {"blocked", "failed"} or unlisted.get("mutation_performed") is not False:
+    if (
+        unlisted.get("status") != "blocked"
+        or unlisted.get("mutation_performed") is not False
+    ):
         raise ActivationPackageError("canary unlisted-unit control did not fail closed")
 
     controls = {
@@ -7447,6 +7453,7 @@ def _canary_authorization_boundary_index(
     commands: list[list[str]],
     *,
     canary_command_index: int,
+    failure_cleanup_commands: list[list[str]],
 ) -> int:
     resources_start = [
         "/usr/bin/systemctl",
@@ -7482,6 +7489,7 @@ def _canary_authorization_boundary_index(
     stop = [
         "/usr/bin/systemctl",
         "stop",
+        "overseer-approval-smoke.service",
         "overseer-api-canary.service",
         "overseer-admin-executor.socket",
         "overseer-codex-user-bridge.socket",
@@ -7494,6 +7502,7 @@ def _canary_authorization_boundary_index(
     ]
     boundary = resource_indexes[0] if len(resource_indexes) == 1 else -1
     protected_unit_names = {
+        "overseer-approval-smoke.service",
         "overseer-api-canary.service",
         "overseer-admin-executor.socket",
         "overseer-codex-user-bridge.socket",
@@ -7515,6 +7524,10 @@ def _canary_authorization_boundary_index(
         if 0 <= canary_command_index < len(commands)
         else []
     )
+    if failure_cleanup_commands != [stop]:
+        raise ActivationPackageError(
+            "sealed staging contract has an invalid canary cleanup boundary"
+        )
     if (
         len(resource_indexes) != 1
         or len(service_indexes) != 1
@@ -7555,7 +7568,7 @@ def _execute_approved_staging_canary_locked(
         expected_runner_state=None,
     )
     staging = _contract_commands(contract, "stagingAndCanaryCommands")
-    _cleanup_commands(contract)
+    cleanup_commands = _cleanup_commands(contract)
     canary_command_index: int | None = None
     authorization_boundary_index: int | None = None
     if any("run-approved-canary" in command for command in staging):
@@ -7571,6 +7584,7 @@ def _execute_approved_staging_canary_locked(
         authorization_boundary_index = _canary_authorization_boundary_index(
             staging,
             canary_command_index=canary_command_index,
+            failure_cleanup_commands=cleanup_commands,
         )
     canary_authorization_input: bytes | None = None
 
@@ -7601,6 +7615,7 @@ def _execute_approved_staging_canary_locked(
                 refreshed_boundary_index = _canary_authorization_boundary_index(
                     refreshed_staging,
                     canary_command_index=refreshed_canary_index,
+                    failure_cleanup_commands=_cleanup_commands(refreshed_contract),
                 )
                 _read_activation_phase_approval(
                     package,

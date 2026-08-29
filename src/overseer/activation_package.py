@@ -198,6 +198,14 @@ class ActivationPackageError(ValueError):
     """Raised when a package input or staged artifact is unsafe or unstable."""
 
 
+class _CleanupCommandFailure(ActivationPackageError):
+    """Carry only the bounded classification of a failed cleanup command."""
+
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        super().__init__("staging cleanup command failed")
+
+
 def _validate_principal_binding(
     *,
     god_uid: int,
@@ -6509,6 +6517,7 @@ def _execute_cleanup_sequence(
     contract: Mapping[str, object],
     *,
     package_digest: str,
+    originating_failure: str | None = None,
 ) -> None:
     for index, command in enumerate(_cleanup_commands(contract)):
         _write_activation_state(
@@ -6518,6 +6527,7 @@ def _execute_cleanup_sequence(
                 phase="staging_cleanup",
                 command_index=index,
                 command=command,
+                failure=originating_failure,
             )
         )
         returncode, start_error = _validated_command_outcome(contract, command)
@@ -6534,7 +6544,7 @@ def _execute_cleanup_sequence(
                     failure=start_error or f"exit-{returncode}",
                 )
             )
-            raise ActivationPackageError("staging cleanup command failed")
+            raise _CleanupCommandFailure(start_error or f"exit-{returncode}")
         _write_activation_state(
             _runner_state(
                 package_digest=package_digest,
@@ -6542,6 +6552,7 @@ def _execute_cleanup_sequence(
                 phase="staging_cleanup",
                 command_index=index,
                 command=command,
+                failure=originating_failure,
             )
         )
 
@@ -6574,9 +6585,17 @@ def _execute_resilient_cleanup(
     contract: Mapping[str, object],
     *,
     package_digest: str,
+    originating_failure: str | None = None,
 ) -> bool:
     try:
-        _execute_cleanup_sequence(contract, package_digest=package_digest)
+        _execute_cleanup_sequence(
+            contract,
+            package_digest=package_digest,
+            originating_failure=originating_failure,
+        )
+    except _CleanupCommandFailure as error:
+        _execute_emergency_cleanup_sequence(contract)
+        originating_failure = error.failure
     except BaseException:
         _execute_emergency_cleanup_sequence(contract)
     return _write_recovery_state_best_effort(
@@ -6584,6 +6603,7 @@ def _execute_resilient_cleanup(
             package_digest=package_digest,
             status="aborted_before_cutover",
             phase="staging_cleanup",
+            failure=originating_failure,
         )
     )
 
@@ -7564,6 +7584,7 @@ def _execute_approved_staging_canary_locked(
                     cleanup_durable = _execute_resilient_cleanup(
                         contract,
                         package_digest=digest,
+                        originating_failure=type(authorization_error).__name__,
                     )
                 except BaseException as cleanup_error:
                     raise ActivationPackageError(
@@ -7587,7 +7608,11 @@ def _execute_approved_staging_canary_locked(
             _write_activation_state(command_state)
         except BaseException as checkpoint_error:
             try:
-                cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
+                cleanup_durable = _execute_resilient_cleanup(
+                    contract,
+                    package_digest=digest,
+                    originating_failure=type(checkpoint_error).__name__,
+                )
             except BaseException as cleanup_error:
                 raise ActivationPackageError(
                     "staging command entry checkpoint failed and sealed cleanup did not complete"
@@ -7617,7 +7642,11 @@ def _execute_approved_staging_canary_locked(
             canary_authorization_input = None
             command_failure = start_error or f"exit-{returncode}"
             try:
-                cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
+                cleanup_durable = _execute_resilient_cleanup(
+                    contract,
+                    package_digest=digest,
+                    originating_failure=command_failure,
+                )
             except BaseException as cleanup_error:
                 raise ActivationPackageError(
                     "staged activation command failed and sealed cleanup did not complete"
@@ -7639,7 +7668,11 @@ def _execute_approved_staging_canary_locked(
             )
         except BaseException as checkpoint_error:
             try:
-                cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
+                cleanup_durable = _execute_resilient_cleanup(
+                    contract,
+                    package_digest=digest,
+                    originating_failure=type(checkpoint_error).__name__,
+                )
             except BaseException as cleanup_error:
                 raise ActivationPackageError(
                     "checkpoint failed after staging command and immediate cleanup failed"
@@ -7656,7 +7689,11 @@ def _execute_approved_staging_canary_locked(
         verify_approved_cutover(package)
     except BaseException as error:
         try:
-            cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
+            cleanup_durable = _execute_resilient_cleanup(
+                contract,
+                package_digest=digest,
+                originating_failure=type(error).__name__,
+            )
         except BaseException as cleanup_error:
             raise ActivationPackageError(
                 "cutover gate failed and sealed staging cleanup did not complete"
@@ -7676,7 +7713,11 @@ def _execute_approved_staging_canary_locked(
         )
     except BaseException as checkpoint_error:
         try:
-            cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
+            cleanup_durable = _execute_resilient_cleanup(
+                contract,
+                package_digest=digest,
+                originating_failure=type(checkpoint_error).__name__,
+            )
         except BaseException as cleanup_error:
             raise ActivationPackageError(
                 "final staging checkpoint failed and immediate cleanup failed"
@@ -7869,7 +7910,12 @@ def _execute_approved_rollback_locked(
             "replayed": True,
         }
     if state.get("phase") in {"staging", "staging-canary", "staging_cleanup"}:
-        if not _execute_resilient_cleanup(contract, package_digest=digest):
+        prior_failure = state.get("failure")
+        if not _execute_resilient_cleanup(
+            contract,
+            package_digest=digest,
+            originating_failure=prior_failure if isinstance(prior_failure, str) else None,
+        ):
             raise ActivationPackageError(
                 "staging cleanup completed but terminal recovery state is not durable"
             )

@@ -6868,6 +6868,365 @@ def test_staging_later_command_entry_checkpoint_failure_runs_cleanup(
     assert calls == [tuple(first), tuple(cleanup)]
 
 
+def _staging_failure_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    digest: str,
+    staging: list[list[str]],
+) -> tuple[Path, dict[str, object], Path]:
+    package = tmp_path / "package"
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": staging,
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "staging-canary"},
+    )
+    return package, contract, state_path
+
+
+def test_failed_staging_command_preserves_bounded_failure_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="f" * 64,
+        staging=[["/bin/false", "staging"]],
+    )
+    staging = contract["stagingAndCanaryCommands"][0]
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: 1 if command == staging else 0,
+    )
+
+    with pytest.raises(ActivationPackageError, match="failed before cutover"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "exit-1"
+    assert state["secretValuesRecorded"] is False
+
+
+def test_staging_later_command_entry_checkpoint_failure_preserves_bounded_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, _contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="e" * 64,
+        staging=[["/bin/true", "first"], ["/bin/true", "second"]],
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(command) or 0,
+    )
+    original_write = activation_package_module._write_activation_state
+
+    def fail_second_entry(document: dict[str, object]) -> None:
+        if document.get("status") == "command_running" and document.get("commandIndex") == 1:
+            raise OSError("simulated later command-entry checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_second_entry)
+
+    with pytest.raises(ActivationPackageError, match="entry checkpoint failed"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "OSError"
+    assert state["secretValuesRecorded"] is False
+    assert calls == [["/bin/true", "first"], ["/bin/true", "cleanup"]]
+
+
+def test_canary_authorization_failure_preserves_bounded_failure_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = ["/bin/true", "run-approved-canary"]
+    package, _contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="d" * 64,
+        staging=[canary],
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_expected_canary_acceptance_command",
+        lambda *_args, **_kwargs: canary,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_canary_acceptance_command_index",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_canary_authorization_boundary_index",
+        lambda *_args, **_kwargs: 0,
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_prepare_canary_authorization_input",
+        lambda _package: (_ for _ in ()).throw(ActivationPackageError("authorization rejected")),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(command) or 0,
+    )
+
+    with pytest.raises(ActivationPackageError, match="authorization failed"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "ActivationPackageError"
+    assert state["secretValuesRecorded"] is False
+    assert calls == [["/bin/true", "cleanup"]]
+
+
+def test_staging_command_completion_checkpoint_failure_preserves_bounded_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, _contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="c" * 64,
+        staging=[["/bin/true", "staging"]],
+    )
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", lambda _command: 0)
+    original_write = activation_package_module._write_activation_state
+
+    def fail_completion(document: dict[str, object]) -> None:
+        if document.get("status") == "command_complete":
+            raise OSError("simulated completion checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_completion)
+
+    with pytest.raises(ActivationPackageError, match="checkpoint failed after staging command"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "OSError"
+    assert state["secretValuesRecorded"] is False
+
+
+def test_cutover_gate_failure_preserves_bounded_failure_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, _contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="b" * 64,
+        staging=[["/bin/true", "staging"]],
+    )
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", lambda _command: 0)
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_approved_cutover",
+        lambda _package: (_ for _ in ()).throw(ActivationPackageError("cutover denied")),
+    )
+
+    with pytest.raises(ActivationPackageError, match="cutover gate failed"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "ActivationPackageError"
+    assert state["secretValuesRecorded"] is False
+
+
+def test_final_staging_checkpoint_failure_preserves_bounded_failure_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, _contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="a" * 64,
+        staging=[["/bin/true", "staging"]],
+    )
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", lambda _command: 0)
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_approved_cutover",
+        lambda _package: {"verified": True},
+    )
+    original_write = activation_package_module._write_activation_state
+
+    def fail_final_checkpoint(document: dict[str, object]) -> None:
+        if document.get("status") == "canary_passed_awaiting_cutover_approval":
+            raise OSError("simulated final staging checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(activation_package_module, "_write_activation_state", fail_final_checkpoint)
+
+    with pytest.raises(ActivationPackageError, match="final staging checkpoint failed"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "OSError"
+    assert state["secretValuesRecorded"] is False
+
+
+def test_cleanup_command_failure_supersedes_originating_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "9" * 64
+    package = tmp_path / "package"
+    state_path = tmp_path / "executor" / "activation-state.json"
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [cleanup]},
+    }
+    calls = 0
+
+    def execute(_command: list[str]) -> int:
+        nonlocal calls
+        calls += 1
+        return 2 if calls == 1 else 0
+
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_validate_contract_principal_binding", lambda _contract: None)
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+
+    assert activation_package_module._execute_resilient_cleanup(
+        contract,
+        package_digest=digest,
+        originating_failure="exit-7",
+    ) is True
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "exit-2"
+    assert state["secretValuesRecorded"] is False
+    assert calls == 2
+
+
+def test_staging_recovery_preserves_prior_bounded_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "8" * 64
+    package = tmp_path / "package"
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [cleanup]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", lambda _command: 0)
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="command_running",
+            phase="staging-canary",
+            command_index=0,
+            command=["/bin/true", "staging"],
+            failure="OSError",
+        )
+    )
+
+    result = activation_package_module.execute_approved_rollback(package)
+
+    assert result["status"] == "aborted_before_cutover"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "OSError"
+    assert state["secretValuesRecorded"] is False
+
+
 def test_cutover_later_command_entry_checkpoint_failure_runs_rollback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

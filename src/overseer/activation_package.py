@@ -28,6 +28,8 @@ import signal
 import sqlite3
 import stat
 import subprocess
+import sys
+import termios
 import time
 from contextlib import contextmanager
 from urllib.parse import quote
@@ -66,6 +68,8 @@ APPROVED_PACKAGE_PARENT = Path("/home/god/.local/share/overseer/activation-packa
 APPROVED_EXECUTION_PACKAGE = Path("/var/lib/overseer-executor/approved-package")
 CANARY_API_SOCKET = Path("/run/overseer-canary/api.sock")
 ACTIVATION_LOCK_FD_ENV = "OVERSEER_ACTIVATION_LOCK_FD"
+CANARY_AUTHORIZATION_INPUT_SCHEMA = "overseer.canary-authorization-input.v1"
+MAX_CANARY_AUTHORIZATION_INPUT_BYTES = 1024
 _ACTIVE_EXECUTION_LOCK_DESCRIPTOR: int | None = None
 APPROVED_SQLITE_VERSION = "3.53.4"
 APPROVED_SQLITE_SOURCE_ID = (
@@ -5400,6 +5404,227 @@ def _validate_canary_socket(
     return metadata
 
 
+def _validate_canary_authorization(
+    credential_root: Path,
+    *,
+    expected_owner_uid: int,
+    admin_secret: str,
+    roadex_secret: str,
+) -> None:
+    admin_verifier = load_approval_verifier(
+        credential_root / "admin-approval-verifier.json",
+        expected_owner_uid=expected_owner_uid,
+    )
+    roadex_verifier = load_approval_verifier(
+        credential_root / "roadex-fixture-approval-verifier.json",
+        expected_owner_uid=expected_owner_uid,
+    )
+    if (
+        admin_verifier.scope != "admin-plan-approval"
+        or roadex_verifier.scope != "roadex-fixture-approval"
+    ):
+        raise ActivationPackageError("canary approval verifier scopes are invalid")
+    if not admin_verifier.verify(admin_secret) or roadex_verifier.verify(admin_secret):
+        raise ActivationPackageError(
+            "admin canary secret does not match exactly one approved scope"
+        )
+    if not roadex_verifier.verify(roadex_secret) or admin_verifier.verify(roadex_secret):
+        raise ActivationPackageError(
+            "Roadex canary secret does not match exactly one approved scope"
+        )
+
+
+def _prepare_canary_authorization_input(package: Path) -> bytes:
+    descriptor = _open_canary_prompt_terminal()
+    try:
+        admin_secret = _read_canary_secret_from_terminal(
+            descriptor,
+            "Admin approval secret for canary: ",
+        )
+        roadex_secret = _read_canary_secret_from_terminal(
+            descriptor,
+            "Roadex fixture approval secret for negative control: ",
+        )
+    finally:
+        os.close(descriptor)
+    _validate_canary_authorization(
+        package / "private" / "credentials",
+        expected_owner_uid=package.lstat().st_uid,
+        admin_secret=admin_secret,
+        roadex_secret=roadex_secret,
+    )
+    payload = _canonical(
+        {
+            "schemaVersion": CANARY_AUTHORIZATION_INPUT_SCHEMA,
+            "adminSecret": admin_secret,
+            "roadexSecret": roadex_secret,
+        }
+    ) + b"\n"
+    if len(payload) > MAX_CANARY_AUTHORIZATION_INPUT_BYTES:
+        raise ActivationPackageError(
+            "canary authorization input exceeds its maximum size"
+        )
+    return payload
+
+
+def _open_canary_prompt_terminal() -> int:
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0)
+    descriptor = -1
+    accepted = False
+    try:
+        descriptor = os.open("/dev/tty", flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISCHR(metadata.st_mode) or not os.isatty(descriptor):
+            raise ActivationPackageError(
+                "canary authorization requires a secure terminal"
+            )
+        accepted = True
+        return descriptor
+    except ActivationPackageError:
+        raise
+    except OSError as error:
+        raise ActivationPackageError(
+            "canary authorization requires a secure terminal"
+        ) from error
+    finally:
+        if descriptor >= 0 and not accepted:
+            os.close(descriptor)
+
+
+def _read_canary_secret_from_terminal(descriptor: int, prompt: str) -> str:
+    if not os.isatty(descriptor):
+        raise ActivationPackageError("canary authorization terminal was lost")
+    try:
+        original = termios.tcgetattr(descriptor)
+    except termios.error as error:
+        raise ActivationPackageError("canary authorization terminal was lost") from error
+    hidden = original[:]
+    hidden[3] &= ~termios.ECHO
+    change_flags = termios.TCSAFLUSH
+    if hasattr(termios, "TCSASOFT"):
+        change_flags |= termios.TCSASOFT
+    try:
+        termios.tcsetattr(descriptor, change_flags, hidden)
+    except termios.error as error:
+        raise ActivationPackageError(
+            "canary authorization could not disable terminal echo"
+        ) from error
+
+    secret_bytes = bytearray()
+    read_error: BaseException | None = None
+    try:
+        prompt_bytes = prompt.encode("ascii", "strict")
+        written = 0
+        while written < len(prompt_bytes):
+            count = os.write(descriptor, prompt_bytes[written:])
+            if count <= 0:
+                raise OSError(errno.EIO, "terminal write failed")
+            written += count
+        while True:
+            value = os.read(descriptor, 1)
+            if not value:
+                raise OSError(errno.EIO, "terminal input ended")
+            if value in {b"\n", b"\r"}:
+                break
+            secret_bytes.extend(value)
+            if len(secret_bytes) > MAX_CANARY_AUTHORIZATION_INPUT_BYTES:
+                raise ActivationPackageError(
+                    "canary authorization input exceeds its maximum size"
+                )
+    except BaseException as error:
+        read_error = error
+    finally:
+        restore_error: termios.error | None = None
+        try:
+            termios.tcsetattr(descriptor, change_flags, original)
+        except termios.error as error:
+            restore_error = error
+        try:
+            os.write(descriptor, b"\n")
+        except OSError:
+            if read_error is None and restore_error is None:
+                read_error = OSError(errno.EIO, "terminal write failed")
+    if restore_error is not None:
+        secret_bytes[:] = b"\0" * len(secret_bytes)
+        raise ActivationPackageError(
+            "canary authorization could not restore terminal echo"
+        ) from restore_error
+    if read_error is not None:
+        secret_bytes[:] = b"\0" * len(secret_bytes)
+        if isinstance(read_error, ActivationPackageError):
+            raise read_error
+        raise ActivationPackageError("canary authorization terminal was lost") from read_error
+    try:
+        return secret_bytes.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ActivationPackageError("canary authorization input is invalid") from error
+    finally:
+        secret_bytes[:] = b"\0" * len(secret_bytes)
+
+
+def _read_canary_authorization_input() -> tuple[str, str]:
+    if sys.stdin.isatty():
+        raise ActivationPackageError(
+            "canary authorization must be supplied by the active staging runner"
+        )
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    raw = stream.read(MAX_CANARY_AUTHORIZATION_INPUT_BYTES + 1)
+    if isinstance(raw, str):
+        try:
+            raw = raw.encode("utf-8", "strict")
+        except UnicodeEncodeError as error:
+            raise ActivationPackageError("canary authorization input is invalid") from error
+    if len(raw) > MAX_CANARY_AUTHORIZATION_INPUT_BYTES:
+        raise ActivationPackageError(
+            "canary authorization input exceeds its maximum size"
+        )
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ActivationPackageError("canary authorization input is invalid") from error
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schemaVersion", "adminSecret", "roadexSecret"}
+        or document.get("schemaVersion") != CANARY_AUTHORIZATION_INPUT_SCHEMA
+        or type(document.get("adminSecret")) is not str
+        or type(document.get("roadexSecret")) is not str
+        or raw != _canonical(document) + b"\n"
+    ):
+        raise ActivationPackageError("canary authorization input contract is invalid")
+    return str(document["adminSecret"]), str(document["roadexSecret"])
+
+
+def _require_active_canary_command(
+    package: Path,
+    *,
+    expected_package_digest: str,
+) -> tuple[dict[str, object], int]:
+    contract, lock_descriptor = _require_active_phase_command(
+        package,
+        phase="staging-canary",
+        command_name="run-approved-canary",
+        expected_options={"--package-root": str(package)},
+        expected_package_digest=expected_package_digest,
+    )
+    commands = _contract_commands(contract, "stagingAndCanaryCommands")
+    expected_command = _expected_canary_acceptance_command(
+        package,
+        expected_package_digest=expected_package_digest,
+        contract=contract,
+    )
+    _canary_acceptance_command_index(
+        commands,
+        expected_command=expected_command,
+    )
+    state = _load_activation_state()
+    index = state.get("commandIndex") if isinstance(state, Mapping) else None
+    if type(index) is not int or commands[index] != expected_command:
+        raise ActivationPackageError(
+            "active runner command is not the exact sealed canary command"
+        )
+    return contract, lock_descriptor
+
+
 def run_canary_acceptance(
     package_root: str | os.PathLike[str],
     *,
@@ -5424,11 +5649,8 @@ def run_canary_acceptance(
         or Path(attestation_path) != _canary_attestation_path(expected_package_digest)
     ):
         raise ActivationPackageError("canary runtime arguments are not the sealed command arguments")
-    _require_active_phase_command(
+    _require_active_canary_command(
         package,
-        phase="staging-canary",
-        command_name="run-approved-canary",
-        expected_options={"--package-root": str(package)},
         expected_package_digest=expected_package_digest,
     )
     verified = verify_activation_package(package, expected_package_digest)
@@ -5441,13 +5663,11 @@ def run_canary_acceptance(
         expected_owner_gid=APPROVED_OVERSEER_GID,
     )
     credential_root = _installed_credential_root()
-    admin_verifier = load_approval_verifier(
-        credential_root / "admin-approval-verifier.json",
+    _validate_canary_authorization(
+        credential_root,
         expected_owner_uid=APPROVED_OVERSEER_UID,
-    )
-    roadex_verifier = load_approval_verifier(
-        credential_root / "roadex-fixture-approval-verifier.json",
-        expected_owner_uid=APPROVED_OVERSEER_UID,
+        admin_secret=admin_secret,
+        roadex_secret=roadex_secret,
     )
     token_raw, token_metadata = _stable_read(credential_root / "api-token")
     if (
@@ -5460,10 +5680,6 @@ def run_canary_acceptance(
         api_token = token_raw.decode("ascii", "strict")
     except UnicodeDecodeError as error:
         raise ActivationPackageError("canary API token is invalid") from error
-    if not admin_verifier.verify(admin_secret) or roadex_verifier.verify(admin_secret):
-        raise ActivationPackageError("admin canary secret does not match exactly one approved scope")
-    if not roadex_verifier.verify(roadex_secret) or admin_verifier.verify(roadex_secret):
-        raise ActivationPackageError("Roadex canary secret does not match exactly one approved scope")
 
     client_transport = {
         "base_url": base_url,
@@ -5697,6 +5913,32 @@ def _activation_state_path() -> Path:
 
 def _activation_lock_path() -> Path:
     return _activation_state_path().with_name("activation.lock")
+
+
+def _require_active_execution_lock_descriptor() -> int:
+    descriptor = _ACTIVE_EXECUTION_LOCK_DESCRIPTOR
+    if descriptor is None:
+        raise ActivationPackageError("activation command requires the active execution lock")
+    target = _activation_lock_path()
+    try:
+        inherited = os.fstat(descriptor)
+        lexical = target.lstat()
+    except OSError as error:
+        raise ActivationPackageError("active execution lock is unavailable") from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        target.is_symlink()
+        or not stat.S_ISREG(inherited.st_mode)
+        or not stat.S_ISREG(lexical.st_mode)
+        or inherited.st_nlink != 1
+        or lexical.st_nlink != 1
+        or inherited.st_uid != root_uid
+        or inherited.st_gid != root_gid
+        or stat.S_IMODE(inherited.st_mode) != 0o600
+        or (inherited.st_dev, inherited.st_ino) != (lexical.st_dev, lexical.st_ino)
+    ):
+        raise ActivationPackageError("active execution lock identity is invalid")
+    return descriptor
 
 
 def _require_inherited_activation_lock() -> int:
@@ -6119,14 +6361,12 @@ def _contract_commands(contract: Mapping[str, object], field: str) -> list[list[
     return result
 
 
-def _execute_contract_command(command: list[str]) -> int:
-    lock_descriptor = _ACTIVE_EXECUTION_LOCK_DESCRIPTOR
-    if lock_descriptor is None:
-        raise ActivationPackageError("activation command requires the inherited execution lock")
-    try:
-        os.fstat(lock_descriptor)
-    except OSError as error:
-        raise ActivationPackageError("activation execution lock descriptor is unavailable") from error
+def _execute_contract_command(
+    command: list[str],
+    *,
+    stdin_payload: bytes | None = None,
+) -> int:
+    lock_descriptor = _require_active_execution_lock_descriptor()
     environment = {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME": "/root",
@@ -6135,23 +6375,40 @@ def _execute_contract_command(command: list[str]) -> int:
         ACTIVATION_LOCK_FD_ENV: str(lock_descriptor),
     }
     try:
-        result = subprocess.run(
-            command,
-            stdin=None,
-            stdout=None,
-            stderr=None,
-            check=False,
-            env=environment,
-            pass_fds=(lock_descriptor,),
-        )
+        if stdin_payload is None:
+            result = subprocess.run(
+                command,
+                stdin=None,
+                stdout=None,
+                stderr=None,
+                check=False,
+                env=environment,
+                pass_fds=(lock_descriptor,),
+            )
+        else:
+            result = subprocess.run(
+                command,
+                input=stdin_payload,
+                stdout=None,
+                stderr=None,
+                check=False,
+                env=environment,
+                pass_fds=(lock_descriptor,),
+            )
     except OSError as error:
         raise ActivationPackageError(f"activation command could not start: {command[0]}") from error
     return int(result.returncode)
 
 
-def _command_outcome(command: list[str]) -> tuple[int, str | None]:
+def _command_outcome(
+    command: list[str],
+    *,
+    stdin_payload: bytes | None = None,
+) -> tuple[int, str | None]:
     try:
-        return _execute_contract_command(command), None
+        if stdin_payload is None:
+            return _execute_contract_command(command), None
+        return _execute_contract_command(command, stdin_payload=stdin_payload), None
     except BaseException as error:
         return 127, type(error).__name__
 
@@ -6159,12 +6416,14 @@ def _command_outcome(command: list[str]) -> tuple[int, str | None]:
 def _validated_command_outcome(
     contract: Mapping[str, object],
     command: list[str],
+    *,
+    stdin_payload: bytes | None = None,
 ) -> tuple[int, str | None]:
     try:
         _validate_contract_principal_binding(contract)
     except BaseException as error:
         return 126, type(error).__name__
-    return _command_outcome(command)
+    return _command_outcome(command, stdin_payload=stdin_payload)
 
 
 def _cleanup_commands(contract: Mapping[str, object]) -> list[list[str]]:
@@ -7025,6 +7284,162 @@ def _normalize_rollback_contract(contract: Mapping[str, object]) -> dict[str, ob
     return normalized
 
 
+def _expected_canary_acceptance_command(
+    package: Path,
+    *,
+    expected_package_digest: str,
+    contract: Mapping[str, object],
+) -> list[str]:
+    release_root_raw = contract.get("releaseRoot")
+    if not isinstance(release_root_raw, str):
+        raise ActivationPackageError("sealed canary release root is invalid")
+    release_root = PurePosixPath(release_root_raw)
+    if (
+        release_root.parent != RELEASES_ROOT
+        or release_root.name in {"", ".", ".."}
+    ):
+        raise ActivationPackageError("sealed canary release root is invalid")
+    release_manifest = _sealed_package_json(
+        package,
+        expected_package_digest=expected_package_digest,
+        relative_path=f"public/release/{release_root.name}/release-manifest.json",
+    )
+    root_python = release_manifest.get("rootPython")
+    if (
+        release_manifest.get("schemaVersion") != RELEASE_SCHEMA
+        or release_manifest.get("releaseRoot") != release_root_raw
+        or release_manifest.get("manifestDigest")
+        != contract.get("releaseManifestDigest")
+        or not isinstance(root_python, Mapping)
+        or not isinstance(root_python.get("releasePath"), str)
+    ):
+        raise ActivationPackageError("sealed canary release manifest is invalid")
+    python = release_root / _safe_relative(str(root_python["releasePath"]))
+    return [
+        "/usr/bin/env",
+        f"LD_LIBRARY_PATH={release_root}/lib",
+        f"PYTHONHOME={release_root}/runtime",
+        f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
+        str(python),
+        "-B",
+        "-s",
+        "-P",
+        "-m",
+        "overseer.activation_package",
+        "run-approved-canary",
+        "--package-root",
+        str(package),
+    ]
+
+
+def _canary_acceptance_command_index(
+    commands: list[list[str]],
+    *,
+    expected_command: list[str],
+) -> int:
+    named_indexes = [
+        index
+        for index, command in enumerate(commands)
+        if "run-approved-canary" in command
+    ]
+    exact_indexes = [
+        index for index, command in enumerate(commands) if command == expected_command
+    ]
+    if len(named_indexes) != 1 or exact_indexes != named_indexes:
+        raise ActivationPackageError(
+            "staging contract does not contain one exact sealed canary command"
+        )
+    return exact_indexes[0]
+
+
+def _canary_authorization_boundary_index(
+    commands: list[list[str]],
+    *,
+    canary_command_index: int,
+) -> int:
+    resources_start = [
+        "/usr/bin/systemctl",
+        "start",
+        "overseer-codex-user-bridge.socket",
+        "overseer-admin-executor.socket",
+    ]
+    service_start = [
+        "/usr/bin/systemctl",
+        "start",
+        "overseer-api-canary.service",
+    ]
+    health_check = [
+        "/usr/bin/curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--connect-timeout",
+        "1",
+        "--max-time",
+        "3",
+        "--retry",
+        "10",
+        "--retry-delay",
+        "1",
+        "--retry-max-time",
+        "15",
+        "--retry-all-errors",
+        "--unix-socket",
+        str(CANARY_API_SOCKET),
+        "http://localhost/health",
+    ]
+    stop = [
+        "/usr/bin/systemctl",
+        "stop",
+        "overseer-api-canary.service",
+        "overseer-admin-executor.socket",
+        "overseer-codex-user-bridge.socket",
+    ]
+    resource_indexes = [
+        index for index, command in enumerate(commands) if command == resources_start
+    ]
+    service_indexes = [
+        index for index, command in enumerate(commands) if command == service_start
+    ]
+    boundary = resource_indexes[0] if len(resource_indexes) == 1 else -1
+    protected_unit_names = {
+        "overseer-api-canary.service",
+        "overseer-admin-executor.socket",
+        "overseer-codex-user-bridge.socket",
+    }
+    earlier_protected_commands = [
+        command
+        for command in commands[: max(boundary, 0)]
+        if (
+            any(argument in protected_unit_names for argument in command)
+            or (
+                command
+                and PurePosixPath(command[0]).name == "systemctl"
+                and command != ["/usr/bin/systemctl", "daemon-reload"]
+            )
+        )
+    ]
+    expected_suffix = (
+        [resources_start, service_start, health_check, commands[canary_command_index], stop]
+        if 0 <= canary_command_index < len(commands)
+        else []
+    )
+    if (
+        len(resource_indexes) != 1
+        or len(service_indexes) != 1
+        or earlier_protected_commands
+        or canary_command_index != boundary + 3
+        or commands[boundary:] != expected_suffix
+    ):
+        raise ActivationPackageError(
+            "sealed staging contract has an invalid canary startup boundary"
+        )
+    return boundary
+
+
 def _execute_approved_staging_canary_locked(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
@@ -7053,11 +7468,87 @@ def _execute_approved_staging_canary_locked(
     )
     staging = _contract_commands(contract, "stagingAndCanaryCommands")
     _cleanup_commands(contract)
+    canary_command_index: int | None = None
+    authorization_boundary_index: int | None = None
+    if any("run-approved-canary" in command for command in staging):
+        expected_canary_command = _expected_canary_acceptance_command(
+            package,
+            expected_package_digest=digest,
+            contract=contract,
+        )
+        canary_command_index = _canary_acceptance_command_index(
+            staging,
+            expected_command=expected_canary_command,
+        )
+        authorization_boundary_index = _canary_authorization_boundary_index(
+            staging,
+            canary_command_index=canary_command_index,
+        )
+    canary_authorization_input: bytes | None = None
 
     _write_activation_state(
         _runner_state(package_digest=digest, status="running", phase="staging-canary")
     )
     for index, command in enumerate(staging):
+        if index == authorization_boundary_index:
+            pre_prompt_state = _load_activation_state()
+            try:
+                canary_authorization_input = _prepare_canary_authorization_input(package)
+                refreshed_package, refreshed_digest, refreshed_contract = (
+                    _approved_activation_contract(package)
+                )
+                refreshed_staging = _contract_commands(
+                    refreshed_contract,
+                    "stagingAndCanaryCommands",
+                )
+                refreshed_expected_canary = _expected_canary_acceptance_command(
+                    refreshed_package,
+                    expected_package_digest=refreshed_digest,
+                    contract=refreshed_contract,
+                )
+                refreshed_canary_index = _canary_acceptance_command_index(
+                    refreshed_staging,
+                    expected_command=refreshed_expected_canary,
+                )
+                refreshed_boundary_index = _canary_authorization_boundary_index(
+                    refreshed_staging,
+                    canary_command_index=refreshed_canary_index,
+                )
+                _read_activation_phase_approval(
+                    package,
+                    phase="staging-canary",
+                )
+                _require_active_execution_lock_descriptor()
+                if (
+                    refreshed_package != package
+                    or refreshed_digest != digest
+                    or _canonical(refreshed_contract) != _canonical(contract)
+                    or refreshed_staging != staging
+                    or refreshed_canary_index != canary_command_index
+                    or refreshed_boundary_index != authorization_boundary_index
+                    or _load_activation_state() != pre_prompt_state
+                ):
+                    raise ActivationPackageError(
+                        "staging authority changed during canary authorization"
+                    )
+            except BaseException as authorization_error:
+                canary_authorization_input = None
+                try:
+                    cleanup_durable = _execute_resilient_cleanup(
+                        contract,
+                        package_digest=digest,
+                    )
+                except BaseException as cleanup_error:
+                    raise ActivationPackageError(
+                        "canary authorization failed and sealed cleanup did not complete"
+                    ) from cleanup_error
+                if not cleanup_durable:
+                    raise ActivationPackageError(
+                        "canary authorization failed; cleanup completed but terminal recovery state is not durable"
+                    ) from authorization_error
+                raise ActivationPackageError(
+                    "canary authorization failed before canary startup; immediate cleanup completed"
+                ) from authorization_error
         command_state = _runner_state(
             package_digest=digest,
             status="command_running",
@@ -7081,8 +7572,22 @@ def _execute_approved_staging_canary_locked(
             raise ActivationPackageError(
                 "staging command entry checkpoint failed; immediate cleanup completed"
             ) from checkpoint_error
-        returncode, start_error = _validated_command_outcome(contract, command)
+        command_input = (
+            canary_authorization_input
+            if index == canary_command_index
+            else None
+        )
+        try:
+            returncode, start_error = _validated_command_outcome(
+                contract,
+                command,
+                stdin_payload=command_input,
+            )
+        finally:
+            if index == canary_command_index:
+                canary_authorization_input = None
         if returncode != 0:
+            canary_authorization_input = None
             command_failure = start_error or f"exit-{returncode}"
             try:
                 cleanup_durable = _execute_resilient_cleanup(contract, package_digest=digest)
@@ -7739,8 +8244,11 @@ def _main(argv: list[str] | None = None) -> int:
         package = _validate_existing_package_destination(args.package_root)
         approval = _load_activation_approval(package)
         digest = str(approval["packageDigest"])
-        admin_secret = getpass.getpass("Admin approval secret for canary: ")
-        roadex_secret = getpass.getpass("Roadex fixture approval secret for negative control: ")
+        _require_active_canary_command(
+            package,
+            expected_package_digest=digest,
+        )
+        admin_secret, roadex_secret = _read_canary_authorization_input()
         result = run_canary_acceptance(
             package,
             expected_package_digest=digest,

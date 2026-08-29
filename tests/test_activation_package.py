@@ -7,11 +7,13 @@ import hashlib
 import io
 import json
 import os
+import pty
 import shutil
 import socket
 import sqlite3
 import subprocess
 import sys
+import termios
 import threading
 import time
 from pathlib import Path
@@ -4204,7 +4206,11 @@ def test_live_canary_runner_enforces_exact_positive_negative_and_replay_controls
         target.chmod(0o600)
     attestation = tmp_path / "canary-attestation.json"
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
-    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_active_canary_command",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_activation_root_identity",
@@ -4331,7 +4337,11 @@ def test_live_canary_rejects_prebound_socket_before_connecting_or_attesting(
         lambda _digest: attestation,
     )
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
-    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_active_canary_command",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "verify_installed_staging",
@@ -4571,6 +4581,538 @@ def test_phase_bounded_activation_runner_stops_for_cutover_approval(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["status"] == "complete"
     assert state["phase"] == "complete"
+
+
+def test_delayed_human_authorization_precedes_timed_canary_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "b" * 64
+    package = tmp_path / "package"
+    credentials = package / "private" / "credentials"
+    credentials.mkdir(parents=True)
+    admin_secret = "admin-approval-secret-123456"
+    roadex_secret = "roadex-approval-secret-12345"
+    activation_package_module.write_approval_document(
+        credentials / "admin-approval-verifier.json",
+        activation_package_module.create_approval_document(
+            admin_secret,
+            "admin-plan-approval",
+        ),
+    )
+    activation_package_module.write_approval_document(
+        credentials / "roadex-fixture-approval-verifier.json",
+        activation_package_module.create_approval_document(
+            roadex_secret,
+            "roadex-fixture-approval",
+        ),
+    )
+    canary_command = [
+        "/opt/overseer/python",
+        "-m",
+        "overseer.activation_package",
+        "run-approved-canary",
+        "--package-root",
+        str(package.resolve()),
+    ]
+    canary_start = [
+        "/usr/bin/systemctl",
+        "start",
+        "overseer-api-canary.service",
+    ]
+    canary_resources_start = [
+        "/usr/bin/systemctl",
+        "start",
+        "overseer-codex-user-bridge.socket",
+        "overseer-admin-executor.socket",
+    ]
+    canary_health = [
+        "/usr/bin/curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--connect-timeout",
+        "1",
+        "--max-time",
+        "3",
+        "--retry",
+        "10",
+        "--retry-delay",
+        "1",
+        "--retry-max-time",
+        "15",
+        "--retry-all-errors",
+        "--unix-socket",
+        str(activation_package_module.CANARY_API_SOCKET),
+        "http://localhost/health",
+    ]
+    canary_stop = [
+        "/usr/bin/systemctl",
+        "stop",
+        "overseer-api-canary.service",
+        "overseer-admin-executor.socket",
+        "overseer-codex-user-bridge.socket",
+    ]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [
+            ["/bin/true", "staging"],
+            canary_resources_start,
+            canary_start,
+            canary_health,
+            canary_command,
+            canary_stop,
+        ],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    timeline: list[str] = []
+    payloads: list[bytes | None] = []
+    simulated_elapsed_seconds = 0
+    answers = iter((admin_secret, roadex_secret))
+
+    def delayed_prompt(_descriptor: int, prompt: str) -> str:
+        nonlocal simulated_elapsed_seconds
+        simulated_elapsed_seconds += 601
+        timeline.append(f"prompt:{prompt}")
+        return next(answers)
+
+    def execute(command: list[str], *, stdin_payload: bytes | None = None) -> int:
+        if command == ["/bin/true", "staging"]:
+            timeline.append("staging")
+        elif command == canary_resources_start:
+            timeline.append("canary-resources-start")
+        elif command == canary_start:
+            timeline.append("canary-start")
+        elif command == canary_command:
+            timeline.append("canary-acceptance")
+            payloads.append(stdin_payload)
+        return 0
+
+    def load_phase_approval(*_args: object, **_kwargs: object) -> dict[str, str]:
+        timeline.append("phase-approval-check")
+        return {"packageDigest": digest, "phase": "staging-canary"}
+
+    def read_phase_approval(*_args: object, **_kwargs: object) -> dict[str, str]:
+        timeline.append("phase-approval-refresh")
+        return {"packageDigest": digest, "phase": "staging-canary"}
+
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_contract_principal_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_phase_approval",
+        load_phase_approval,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_read_activation_phase_approval",
+        read_phase_approval,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_approved_cutover",
+        lambda _package: {"verified": True},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_open_canary_prompt_terminal",
+        lambda: os.open(os.devnull, os.O_RDWR),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_read_canary_secret_from_terminal",
+        delayed_prompt,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_expected_canary_acceptance_command",
+        lambda *_args, **_kwargs: canary_command,
+        raising=False,
+    )
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+
+    result = activation_package_module.execute_approved_staging_canary(package)
+
+    assert result["status"] == "canary_passed_awaiting_cutover_approval"
+    assert simulated_elapsed_seconds > 600
+    assert timeline == [
+        "phase-approval-check",
+        "staging",
+        "prompt:Admin approval secret for canary: ",
+        "prompt:Roadex fixture approval secret for negative control: ",
+        "phase-approval-refresh",
+        "canary-resources-start",
+        "canary-start",
+        "canary-acceptance",
+    ]
+    assert len(payloads) == 1 and payloads[0] is not None
+    authorization = json.loads(payloads[0])
+    assert authorization == {
+        "adminSecret": admin_secret,
+        "roadexSecret": roadex_secret,
+        "schemaVersion": "overseer.canary-authorization-input.v1",
+    }
+    state_bytes = state_path.read_bytes()
+    assert admin_secret.encode() not in state_bytes
+    assert roadex_secret.encode() not in state_bytes
+    assert all(
+        admin_secret not in argument
+        for command in contract["stagingAndCanaryCommands"]
+        for argument in command
+    )
+    assert all(
+        roadex_secret not in argument
+        for command in contract["stagingAndCanaryCommands"]
+        for argument in command
+    )
+
+
+@pytest.mark.parametrize(
+    "malicious_command",
+    (
+        [
+            "/usr/bin/tee",
+            "run-approved-canary",
+            "--package-root",
+            "/var/lib/overseer-executor/approved-package",
+        ],
+        [
+            "/opt/overseer/runtime/bin/python",
+            "-m",
+            "overseer.not_activation_package",
+            "run-approved-canary",
+            "--package-root",
+            "/var/lib/overseer-executor/approved-package",
+        ],
+    ),
+)
+def test_canary_authorization_rejects_nonexact_executable_or_module(
+    malicious_command: list[str],
+) -> None:
+    expected = [
+        "/opt/overseer/runtime/bin/python",
+        "-B",
+        "-s",
+        "-P",
+        "-m",
+        "overseer.activation_package",
+        "run-approved-canary",
+        "--package-root",
+        "/var/lib/overseer-executor/approved-package",
+    ]
+
+    with pytest.raises(ActivationPackageError, match="exact sealed canary command"):
+        activation_package_module._canary_acceptance_command_index(
+            [malicious_command],
+            expected_command=expected,
+        )
+
+
+def test_canary_cli_proves_runner_provenance_before_reading_secret_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    events: list[str] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_existing_package_destination",
+        lambda _path: package,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": "c" * 64},
+    )
+
+    def reject(*_args: object, **_kwargs: object) -> None:
+        events.append("preflight")
+        raise ActivationPackageError("active staging-canary runner is unavailable")
+
+    def consume() -> tuple[str, str]:
+        events.append("stdin-read")
+        raise AssertionError("secret input was consumed before runner provenance")
+
+    monkeypatch.setattr(activation_package_module, "_require_active_phase_command", reject)
+    monkeypatch.setattr(activation_package_module, "_read_canary_authorization_input", consume)
+
+    with pytest.raises(ActivationPackageError, match="active staging-canary runner"):
+        activation_package_module._main(
+            ["run-approved-canary", "--package-root", str(package)]
+        )
+
+    assert events == ["preflight"]
+
+
+def test_canary_secret_collection_rejects_missing_secure_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    real_open = os.open
+    prompted = False
+
+    def non_tty_open(_path: object, flags: int, mode: int = 0o777) -> int:
+        return real_open(os.devnull, flags, mode)
+
+    def prompt(_label: str) -> str:
+        nonlocal prompted
+        prompted = True
+        return "must-not-be-collected"
+
+    monkeypatch.setattr(activation_package_module.os, "open", non_tty_open)
+    monkeypatch.setattr(activation_package_module.getpass, "getpass", prompt)
+
+    with pytest.raises(ActivationPackageError, match="secure terminal"):
+        activation_package_module._prepare_canary_authorization_input(package)
+
+    assert prompted is False
+
+
+def test_canary_secret_collection_rejects_echo_suppression_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    master_descriptor, slave_descriptor = pty.openpty()
+    real_dup = os.dup
+    validated = False
+
+    def tty_open(_path: object, _flags: int, _mode: int = 0o777) -> int:
+        return real_dup(slave_descriptor)
+
+    def fail_echo_suppression(
+        _descriptor: int,
+        _when: int,
+        _attributes: list[object],
+    ) -> None:
+        raise termios.error(errno.EIO, "terminal lost")
+
+    def validate(*_args: object, **_kwargs: object) -> None:
+        nonlocal validated
+        validated = True
+
+    monkeypatch.setattr(activation_package_module.os, "open", tty_open)
+    monkeypatch.setattr(termios, "tcsetattr", fail_echo_suppression)
+    monkeypatch.setattr(
+        activation_package_module.getpass,
+        "getpass",
+        lambda _prompt: "must-not-be-collected",
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_canary_authorization",
+        validate,
+    )
+
+    try:
+        with pytest.raises(ActivationPackageError, match="disable terminal echo"):
+            activation_package_module._prepare_canary_authorization_input(package)
+    finally:
+        os.close(master_descriptor)
+        os.close(slave_descriptor)
+
+    assert validated is False
+
+
+@pytest.mark.parametrize(
+    "earlier_start",
+    (
+        ["/usr/bin/systemctl", "restart", "overseer-api-canary.service"],
+        ["/usr/bin/systemctl", "restart", "overseer-api-canary"],
+    ),
+)
+def test_canary_boundary_rejects_alternate_earlier_canary_start(
+    earlier_start: list[str],
+) -> None:
+    resources_start = [
+        "/usr/bin/systemctl",
+        "start",
+        "overseer-codex-user-bridge.socket",
+        "overseer-admin-executor.socket",
+    ]
+    service_start = [
+        "/usr/bin/systemctl",
+        "start",
+        "overseer-api-canary.service",
+    ]
+    health = [
+        "/usr/bin/curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--connect-timeout",
+        "1",
+        "--max-time",
+        "3",
+        "--retry",
+        "10",
+        "--retry-delay",
+        "1",
+        "--retry-max-time",
+        "15",
+        "--retry-all-errors",
+        "--unix-socket",
+        str(activation_package_module.CANARY_API_SOCKET),
+        "http://localhost/health",
+    ]
+    acceptance = [
+        "/opt/overseer/python",
+        "-m",
+        "overseer.activation_package",
+        "run-approved-canary",
+    ]
+    stop = [
+        "/usr/bin/systemctl",
+        "stop",
+        "overseer-api-canary.service",
+        "overseer-admin-executor.socket",
+        "overseer-codex-user-bridge.socket",
+    ]
+    commands = [
+        earlier_start,
+        resources_start,
+        service_start,
+        health,
+        acceptance,
+        stop,
+    ]
+
+    with pytest.raises(ActivationPackageError, match="canary startup boundary"):
+        activation_package_module._canary_authorization_boundary_index(
+            commands,
+            canary_command_index=4,
+        )
+
+
+def test_canary_boundary_requires_exact_canonical_suffix() -> None:
+    commands = [
+        ["/bin/true", "staging"],
+        [
+            "/usr/bin/systemctl",
+            "start",
+            "overseer-codex-user-bridge.socket",
+            "overseer-admin-executor.socket",
+        ],
+        ["/usr/bin/systemctl", "start", "overseer-api-canary.service"],
+        ["/usr/bin/curl", "http://localhost/health"],
+        [
+            "/opt/overseer/python",
+            "-m",
+            "overseer.activation_package",
+            "run-approved-canary",
+        ],
+        [
+            "/usr/bin/systemctl",
+            "stop",
+            "overseer-api-canary.service",
+            "overseer-admin-executor.socket",
+            "overseer-codex-user-bridge.socket",
+        ],
+    ]
+
+    with pytest.raises(ActivationPackageError, match="canary startup boundary"):
+        activation_package_module._canary_authorization_boundary_index(
+            commands,
+            canary_command_index=4,
+        )
+
+
+def test_canary_authorization_pipe_requires_one_exact_canonical_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = {
+        "schemaVersion": "overseer.canary-authorization-input.v1",
+        "adminSecret": "admin-approval-secret-123456",
+        "roadexSecret": "roadex-approval-secret-12345",
+    }
+    canonical = json.dumps(
+        document,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii") + b"\n"
+    monkeypatch.setattr(
+        activation_package_module.sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(canonical)),
+    )
+
+    assert activation_package_module._read_canary_authorization_input() == (
+        document["adminSecret"],
+        document["roadexSecret"],
+    )
+
+    monkeypatch.setattr(
+        activation_package_module.sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(canonical + b"\n")),
+    )
+    with pytest.raises(ActivationPackageError, match="contract"):
+        activation_package_module._read_canary_authorization_input()
+
+
+def test_contract_command_delivers_authorization_only_through_anonymous_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "executor" / "activation-state.json"
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    payload = b"test-only-canary-authorization-packet\n"
+    command = [
+        "/usr/bin/python3",
+        "-c",
+        (
+            "import sys; expected=b'test-only-canary-authorization-packet\\n'; "
+            "raise SystemExit(0 if sys.stdin.buffer.read()==expected else 9)"
+        ),
+    ]
+
+    with activation_package_module._activation_execution_lock():
+        assert (
+            activation_package_module._execute_contract_command(
+                command,
+                stdin_payload=payload,
+            )
+            == 0
+        )
 
 
 def test_legacy_all_in_one_activation_runner_fails_closed(

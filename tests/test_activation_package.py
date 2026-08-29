@@ -1350,7 +1350,7 @@ def test_rehearsal_backup_fails_closed_on_retained_row_loss(
     monkeypatch.setattr(activation_package_module, "SQLiteStore", DestructiveMigrationStore)
     with pytest.raises(
         ActivationPackageError,
-        match="retained row count|canary-required store tables",
+        match="canary-required store tables",
     ):
         rehearse_store_migration(
             tmp_path / "activation-package",
@@ -2201,6 +2201,50 @@ def test_migration_rehearsal_restores_canary_required_store_tables(
         "admin_execution_claims",
         "admin_history_archives",
     } <= set(report["schemaAfter"]["tableNames"])
+
+
+def test_migration_rehearsal_rejects_schema_after_missing_canary_required_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_migration_evidence = activation_package_module._migration_evidence
+    evidence_calls = 0
+
+    def omit_canary_table_from_second_schema(
+        path: Path,
+        *,
+        counted_tables: tuple[str, ...] | None = None,
+    ) -> tuple[dict[str, int], dict[str, object]]:
+        nonlocal evidence_calls
+        evidence_calls += 1
+        row_counts, schema = real_migration_evidence(
+            path,
+            counted_tables=counted_tables,
+        )
+        if evidence_calls == 2:
+            schema = {
+                **schema,
+                "tableNames": [
+                    name
+                    for name in schema["tableNames"]
+                    if name != "admin_execution_claims"
+                ],
+            }
+        return row_counts, schema
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_migration_evidence",
+        omit_canary_table_from_second_schema,
+    )
+
+    with pytest.raises(
+        ActivationPackageError,
+        match="canary-required store tables",
+    ):
+        _prepared_package(tmp_path)
+
+    assert evidence_calls == 2
 
 
 def test_prepare_package_cli_stops_at_human_verifier_gate(
@@ -3333,6 +3377,22 @@ def test_package_verification_rejects_self_consistent_unapproved_migration_repor
     replacement_digest = _reseal_package_manifest_for_test(package)
 
     with pytest.raises(ActivationPackageError, match="approved semantics"):
+        verify_activation_package(package, replacement_digest)
+
+
+def test_package_verification_rejects_non_object_migration_report_with_canary_error(
+    tmp_path: Path,
+) -> None:
+    package, _digest = _finalized_package(tmp_path)
+    report_path = package / "private" / "migration" / "migration-report.json"
+    report_path.write_text("[]\n", encoding="utf-8")
+    report_path.chmod(0o600)
+    replacement_digest = _reseal_package_manifest_for_test(package)
+
+    with pytest.raises(
+        ActivationPackageError,
+        match="canary-required store tables",
+    ):
         verify_activation_package(package, replacement_digest)
 
 

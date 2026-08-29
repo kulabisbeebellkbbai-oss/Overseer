@@ -4445,6 +4445,8 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
     completed = bounds.get("completedUnixNs") if isinstance(bounds, dict) else None
     before_counts = report.get("rowCountsBefore") if isinstance(report, dict) else None
     after_counts = report.get("rowCountsAfter") if isinstance(report, dict) else None
+    schema_before = report.get("schemaBefore") if isinstance(report, dict) else None
+    schema_after = report.get("schemaAfter") if isinstance(report, dict) else None
     normalization = report.get("copyNormalization") if isinstance(report, dict) else None
     reindexed = (
         normalization.get("reindexedExpressionIndexes")
@@ -4473,7 +4475,7 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         )
     except ActivationPackageError as error:
         raise ActivationPackageError("migration rehearsal artifact evidence is invalid") from error
-    _require_canary_store_schema(report.get("schemaAfter"))
+    _require_canary_store_schema(schema_after)
     _require_canary_store_schema(observed_migrated["schema"])
     row_counts_valid = isinstance(before_counts, dict) and isinstance(after_counts, dict)
     if row_counts_valid:
@@ -4511,8 +4513,8 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         == sorted(COPIED_EXPRESSION_INDEX_SQL)
         and before_counts == observed_backup["rowCounts"]
         and after_counts == observed_migrated["rowCounts"]
-        and report.get("schemaBefore") == observed_backup["schema"]
-        and report.get("schemaAfter") == observed_migrated["schema"]
+        and schema_before == observed_backup["schema"]
+        and schema_after == observed_migrated["schema"]
         and isinstance(before_counts, dict)
         and bool(before_counts)
         and isinstance(after_counts, dict)

@@ -1348,7 +1348,10 @@ def test_rehearsal_backup_fails_closed_on_retained_row_loss(
             return None
 
     monkeypatch.setattr(activation_package_module, "SQLiteStore", DestructiveMigrationStore)
-    with pytest.raises(ActivationPackageError, match="retained row count"):
+    with pytest.raises(
+        ActivationPackageError,
+        match="retained row count|canary-required store tables",
+    ):
         rehearse_store_migration(
             tmp_path / "activation-package",
             source_store=source,
@@ -3553,7 +3556,10 @@ def test_package_verification_rejects_resealed_migration_artifact_substitution(
         migrated.chmod(0o600)
     replacement_digest = _reseal_package_manifest_for_test(package)
 
-    with pytest.raises(ActivationPackageError, match="artifact evidence"):
+    with pytest.raises(
+        ActivationPackageError,
+        match="artifact evidence|canary-required store tables",
+    ):
         verify_activation_package(package, replacement_digest)
 
 

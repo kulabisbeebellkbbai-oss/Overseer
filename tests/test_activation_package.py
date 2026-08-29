@@ -2065,6 +2065,7 @@ def _prepared_package(
     tmp_path: Path,
     *,
     stale_expression_index: bool = False,
+    missing_admin_execution_claims: bool = False,
 ) -> tuple[Path, dict[str, object], Path]:
     checkout = _reviewed_checkout(tmp_path)
     dependencies = _dependencies(tmp_path)
@@ -2108,6 +2109,15 @@ def _prepared_package(
     source = tmp_path / "overseer.sqlite3"
     if stale_expression_index:
         _stale_expression_index_store(source, journal_mode="WAL")
+    elif missing_admin_execution_claims:
+        store = activation_package_module.SQLiteStore(source)
+        store.close()
+        with sqlite3.connect(source) as connection:
+            connection.execute("DROP TABLE admin_execution_claims")
+            connection.commit()
+            assert connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()[0] == 0
     else:
         _wal_store(source)
     rehearse_store_migration(
@@ -2167,6 +2177,27 @@ def _reseal_package_manifest_for_test(package: Path) -> str:
     )
     manifest_path.chmod(0o644)
     return replacement_digest
+
+
+def test_migration_rehearsal_restores_canary_required_store_tables(
+    tmp_path: Path,
+) -> None:
+    package, _manifest, _source = _prepared_package(
+        tmp_path,
+        missing_admin_execution_claims=True,
+    )
+    report = json.loads(
+        (package / "private" / "migration" / "migration-report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert {
+        "admin_change_plans",
+        "admin_executions",
+        "admin_execution_claims",
+        "admin_history_archives",
+    } <= set(report["schemaAfter"]["tableNames"])
 
 
 def test_prepare_package_cli_stops_at_human_verifier_gate(
@@ -3390,6 +3421,58 @@ def test_package_verification_rejects_deleted_migrated_expression_index(
     replacement_digest = _reseal_package_manifest_for_test(package)
 
     with pytest.raises(ActivationPackageError, match="artifact evidence"):
+        verify_activation_package(package, replacement_digest)
+
+
+def test_package_verification_rejects_migrated_store_missing_canary_required_table(
+    tmp_path: Path,
+) -> None:
+    package, _digest = _finalized_package(tmp_path)
+    migrated = package / "private" / "migration" / "rehearsal-migrated.sqlite3"
+    with sqlite3.connect(migrated) as connection:
+        connection.execute("DROP TABLE admin_execution_claims")
+        connection.commit()
+        assert connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "PRAGMA journal_mode=DELETE"
+        ).fetchone()[0].lower() == "delete"
+    migrated.chmod(0o600)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{migrated}{suffix}")
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+
+    report_path = package / "private" / "migration" / "migration-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    observed = activation_package_module._sealed_migration_artifact_evidence(
+        migrated,
+        expected_uid=os.geteuid(),
+        counted_tables=tuple(report["schemaBefore"]["countedTables"]),
+    )
+    report["migrated"].update(
+        {
+            "sha256": observed["sha256"],
+            "size": observed["size"],
+            "integrityCheck": observed["integrityCheck"],
+        }
+    )
+    report["rowCountsAfter"] = observed["rowCounts"]
+    report["schemaAfter"] = observed["schema"]
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    report_path.chmod(0o600)
+    replacement_digest = _reseal_package_manifest_for_test(package)
+
+    with pytest.raises(
+        ActivationPackageError,
+        match="canary-required store tables",
+    ):
         verify_activation_package(package, replacement_digest)
 
 

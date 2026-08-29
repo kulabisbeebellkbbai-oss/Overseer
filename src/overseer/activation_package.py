@@ -159,6 +159,14 @@ MIGRATION_KEY_TABLES = (
     "crew_messages",
     "decisions",
 )
+CANARY_REQUIRED_STORE_TABLES = frozenset(
+    {
+        "admin_change_plans",
+        "admin_executions",
+        "admin_execution_claims",
+        "admin_history_archives",
+    }
+)
 COPIED_EXPRESSION_INDEX_SQL = {
     "idx_host_snapshots_captured_at": (
         "CREATE INDEX idx_host_snapshots_captured_at ON host_snapshots "
@@ -1805,6 +1813,20 @@ def _migration_evidence(
         connection.close()
 
 
+def _require_canary_store_schema(schema: object) -> None:
+    if not isinstance(schema, Mapping):
+        raise ActivationPackageError(
+            "migration rehearsal is missing canary-required store tables"
+        )
+    table_names = schema.get("tableNames")
+    if not isinstance(table_names, list) or any(
+        not isinstance(name, str) for name in table_names
+    ) or not CANARY_REQUIRED_STORE_TABLES.issubset(table_names):
+        raise ActivationPackageError(
+            "migration rehearsal is missing canary-required store tables"
+        )
+
+
 def rehearse_store_migration(
     package_root: str | os.PathLike[str],
     *,
@@ -1896,6 +1918,7 @@ def rehearse_store_migration(
         migrated,
         counted_tables=tuple(str(name) for name in schema_before["countedTables"]),
     )
+    _require_canary_store_schema(schema_after)
     for table, count in row_counts_before.items():
         if table in {"schema_migrations", "agent_schema_migrations"}:
             if row_counts_after.get(table, 0) < count:
@@ -4450,6 +4473,8 @@ def _validate_migration_rehearsal_semantics(package: Path) -> dict[str, object]:
         )
     except ActivationPackageError as error:
         raise ActivationPackageError("migration rehearsal artifact evidence is invalid") from error
+    _require_canary_store_schema(report.get("schemaAfter"))
+    _require_canary_store_schema(observed_migrated["schema"])
     row_counts_valid = isinstance(before_counts, dict) and isinstance(after_counts, dict)
     if row_counts_valid:
         for table, count in before_counts.items():

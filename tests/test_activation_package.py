@@ -6920,6 +6920,230 @@ def _staging_failure_case(
     return package, contract, state_path
 
 
+@pytest.mark.parametrize(
+    ("schema", "persisted_failure", "expected_failure"),
+    (
+        (
+            activation_package_module.LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA,
+            "cutover-exit-7",
+            "exit-7",
+        ),
+        (
+            activation_package_module.ACTIVATION_RUNNER_STATE_SCHEMA,
+            "cutover-exit-7",
+            "exit-7",
+        ),
+        (
+            activation_package_module.LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA,
+            "exit--9",
+            "exit-137",
+        ),
+        (
+            activation_package_module.ACTIVATION_RUNNER_STATE_SCHEMA,
+            "cutover-exit--15",
+            "exit-143",
+        ),
+    ),
+)
+def test_activation_state_load_normalizes_historical_exit_classification_without_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema: str,
+    persisted_failure: str,
+    expected_failure: str,
+) -> None:
+    state_path = tmp_path / "executor" / "activation-state.json"
+    state_path.parent.mkdir(parents=True)
+    document = {
+        "schemaVersion": schema,
+        "packageDigest": "5" * 64,
+        "status": "rollback_command_running",
+        "phase": "rollback",
+        "commandIndex": 0,
+        "commandDigest": "4" * 64,
+        "failure": persisted_failure,
+        "updatedAtNs": 1,
+        "secretValuesRecorded": False,
+    }
+    durable_text = json.dumps(document)
+    state_path.write_text(durable_text, encoding="utf-8")
+    state_path.chmod(0o600)
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    loaded = activation_package_module._load_activation_state()
+
+    assert loaded is not None
+    assert loaded["failure"] == expected_failure
+    assert state_path.read_text(encoding="utf-8") == durable_text
+
+
+@pytest.mark.parametrize(
+    "schema",
+    (
+        activation_package_module.LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA,
+        activation_package_module.ACTIVATION_RUNNER_STATE_SCHEMA,
+    ),
+)
+def test_rollback_recovery_accepts_prior_cutover_failure_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema: str,
+) -> None:
+    digest = "4" * 64
+    package, contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest=digest,
+        staging=[["/bin/true", "staging"]],
+    )
+    rollback = contract["rollbackCommands"][0]
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(command) or 0,
+    )
+    persisted = activation_package_module._runner_state(
+        package_digest=digest,
+        status="rollback_command_running",
+        phase="rollback",
+        command_index=0,
+        command=rollback,
+    )
+    persisted["schemaVersion"] = schema
+    persisted["failure"] = "cutover-exit-7"
+    activation_package_module._write_activation_state(persisted)
+
+    result = activation_package_module.execute_approved_rollback(package)
+
+    assert result == {"status": "rolled_back", "packageDigest": digest, "replayed": False}
+    assert calls == [rollback]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "rolled_back"
+    assert state["failure"] == "exit-7"
+    assert state["secretValuesRecorded"] is False
+
+
+def test_signaled_staging_command_publishes_shell_style_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="3" * 64,
+        staging=[["/bin/false", "staging"]],
+    )
+    staging = contract["stagingAndCanaryCommands"][0]
+    cleanup = contract["canary"]["failureCleanupCommands"][0]
+    calls: list[list[str]] = []
+
+    def execute(command: list[str]) -> int:
+        calls.append(command)
+        return -9 if command == staging else 0
+
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+
+    with pytest.raises(ActivationPackageError, match="failed before cutover"):
+        activation_package_module.execute_approved_staging_canary(package)
+
+    assert calls == [staging, cleanup]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "exit-137"
+    assert state["secretValuesRecorded"] is False
+
+
+def test_signaled_cleanup_command_publishes_shell_style_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "2" * 64
+    state_path = tmp_path / "executor" / "activation-state.json"
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {"canary": {"failureCleanupCommands": [cleanup]}}
+    calls = 0
+
+    def execute(_command: list[str]) -> int:
+        nonlocal calls
+        calls += 1
+        return -9 if calls == 1 else 0
+
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_validate_contract_principal_binding", lambda _contract: None)
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+
+    assert activation_package_module._execute_resilient_cleanup(
+        contract,
+        package_digest=digest,
+        originating_failure="exit-7",
+    ) is True
+
+    assert calls == 2
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "exit-137"
+    assert state["secretValuesRecorded"] is False
+
+
+def test_signaled_cutover_command_reports_shell_style_failure_after_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "1" * 64
+    package, contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest=digest,
+        staging=[["/bin/true", "staging"]],
+    )
+    cutover = contract["cutoverCommands"][0]
+    rollback = contract["rollbackCommands"][0]
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_approved_cutover",
+        lambda _package: {"verified": True},
+    )
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="canary_passed_awaiting_cutover_approval",
+            phase="staging-canary",
+        )
+    )
+
+    def execute(command: list[str]) -> int:
+        calls.append(command)
+        return -9 if command == cutover else 0
+
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+
+    with pytest.raises(ActivationPackageError, match="sealed rollback completed"):
+        activation_package_module.execute_approved_cutover(package)
+
+    assert calls == [cutover, rollback]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "rolled_back"
+    assert state["failure"] == "exit-137"
+    assert state["secretValuesRecorded"] is False
+
+
 def test_failed_staging_command_preserves_bounded_failure_after_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

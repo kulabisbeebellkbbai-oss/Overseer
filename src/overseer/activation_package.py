@@ -6074,6 +6074,27 @@ def _validate_bounded_failure_classification(failure: object) -> str | None:
     raise ActivationPackageError("activation runner failure classification is invalid")
 
 
+def _classify_command_failure(returncode: int, start_error: str | None) -> str:
+    if start_error is not None:
+        classification = _validate_bounded_failure_classification(start_error)
+        if classification is None or classification.startswith("exit-"):
+            raise ActivationPackageError(
+                "activation command start-error classification is invalid"
+            )
+        return classification
+    exit_status = returncode if returncode >= 0 else 128 + abs(returncode)
+    return f"exit-{exit_status}"
+
+
+def _normalize_persisted_failure_classification(failure: object) -> object:
+    if not isinstance(failure, str):
+        return failure
+    match = re.fullmatch(r"(?:cutover-)?exit-(-?[0-9]+)", failure)
+    if match is None:
+        return failure
+    return _classify_command_failure(int(match.group(1)), None)
+
+
 def _load_activation_state() -> dict[str, object] | None:
     target = _activation_state_path()
     try:
@@ -6100,7 +6121,11 @@ def _load_activation_state() -> dict[str, object] | None:
         not in {ACTIVATION_RUNNER_STATE_SCHEMA, LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA}
     ):
         raise ActivationPackageError("activation runner state schema is invalid")
-    _validate_bounded_failure_classification(document.get("failure"))
+    persisted_failure = document.get("failure")
+    normalized_failure = _normalize_persisted_failure_classification(persisted_failure)
+    validated_failure = _validate_bounded_failure_classification(normalized_failure)
+    if normalized_failure != persisted_failure:
+        document["failure"] = validated_failure
     return document
 
 
@@ -6546,7 +6571,7 @@ def _execute_cleanup_sequence(
         if returncode != 0 and not (
             start_error is None and _cleanup_command_satisfied(command)
         ):
-            cleanup_failure = start_error or f"exit-{returncode}"
+            cleanup_failure = _classify_command_failure(returncode, start_error)
             try:
                 _write_activation_state(
                     _runner_state(
@@ -6583,7 +6608,7 @@ def _execute_emergency_cleanup_sequence(contract: Mapping[str, object]) -> None:
         if returncode != 0 and not (
             start_error is None and _cleanup_command_satisfied(command)
         ):
-            detail = start_error or f"exit-{returncode}"
+            detail = _classify_command_failure(returncode, start_error)
             raise ActivationPackageError(
                 f"emergency staging cleanup command failed: {detail}"
             )
@@ -7056,7 +7081,7 @@ def _execute_rollback_transient(
         if raced_state == "unloaded":
             returncode, start_error = _validated_command_outcome(contract, command)
     if returncode != 0:
-        detail = start_error or f"exit-{returncode}"
+        detail = _classify_command_failure(returncode, start_error)
         raise ActivationPackageError(f"rollback transient unit start failed: {detail}")
     if inspect() != "active":
         raise ActivationPackageError("rollback transient unit did not become active")
@@ -7134,7 +7159,7 @@ def _execute_rollback_sequence(
                         phase="rollback",
                         command_index=index,
                         command=command,
-                        failure=start_error or f"exit-{returncode}",
+                        failure=_classify_command_failure(returncode, start_error),
                     )
                 )
                 raise ActivationPackageError("sealed rollback command failed")
@@ -7208,7 +7233,7 @@ def _execute_emergency_rollback_sequence(contract: Mapping[str, object]) -> None
             continue
         returncode, start_error = _command_outcome(command)
         if returncode != 0:
-            detail = start_error or f"exit-{returncode}"
+            detail = _classify_command_failure(returncode, start_error)
             raise ActivationPackageError(
                 f"emergency sealed rollback command failed: {detail}"
             )
@@ -7656,7 +7681,7 @@ def _execute_approved_staging_canary_locked(
                 canary_authorization_input = None
         if returncode != 0:
             canary_authorization_input = None
-            command_failure = start_error or f"exit-{returncode}"
+            command_failure = _classify_command_failure(returncode, start_error)
             try:
                 cleanup_durable = _execute_resilient_cleanup(
                     contract,
@@ -7812,7 +7837,7 @@ def _execute_approved_cutover_locked(
             ) from checkpoint_error
         returncode, start_error = _validated_command_outcome(contract, command)
         if returncode != 0:
-            command_failure = start_error or f"exit-{returncode}"
+            command_failure = _classify_command_failure(returncode, start_error)
             rollback_state = _runner_state(
                 package_digest=digest,
                 status="rollback_command_running",

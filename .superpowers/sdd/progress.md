@@ -17,3 +17,17 @@
 | 8. Update the responsive dashboard projection | Complete | Approved, no remaining findings |
 | 9. Add service templates and operator documentation | Complete | Corrected in `856497c`; independently approved in `3d12f44` |
 | 10. Complete verification and security review | Complete | Final Daybreak review approved source/package commit `2485a11`, tree `78adfc70`, and wheel SHA-256 `61644937...2887`; live activation remains separate |
+
+## Canary schema repair
+
+- Plan: `docs/superpowers/plans/2026-08-29-overseer-canary-schema-repair.md`
+- Branch: `fix/approval-smoke-v1-1-6`
+- Plan commit: `0166b2f`
+- Package boundary: prepare and verify only; import and every activation phase remain prohibited
+
+| Task | Status | Review |
+| --- | --- | --- |
+| 1. Repair store schema currentness | Complete (`3c67684`) | Spec compliant; code quality approved; no findings |
+| 2. Add package-time canary schema gates | Complete (`9857f57`, `7a6d972`, `d9cebb4`) | Re-reviewed; spec compliant and quality approved; no remaining findings |
+| 3. Preserve bounded staging failures through cleanup | Complete (`81808c5`, `b89852f`, `32d619e`) | Re-reviewed; approved with no remaining findings |
+| 4. Review, verify, and prepare replacement owner package | In progress | Broad implementation review approved; final security review pending |

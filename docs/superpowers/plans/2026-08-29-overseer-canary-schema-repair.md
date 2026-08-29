@@ -246,7 +246,7 @@ git commit -m "Gate activation packages on canary schema"
 
 **Interfaces:**
 - Consumes: `originating_failure: str | None` already bounded by `_command_outcome` or `type(error).__name__`.
-- Produces: `_execute_cleanup_sequence(contract: Mapping[str, object], *, package_digest: str, originating_failure: str | None = None) -> None` and `_execute_resilient_cleanup(contract: Mapping[str, object], *, package_digest: str, originating_failure: str | None = None) -> bool`.
+- Produces: `_CleanupCommandFailure.failure: str`, `_execute_cleanup_sequence(contract: Mapping[str, object], *, package_digest: str, originating_failure: str | None = None) -> None`, and `_execute_resilient_cleanup(contract: Mapping[str, object], *, package_digest: str, originating_failure: str | None = None) -> bool`.
 
 - [ ] **Step 1: Write failing terminal-state regressions**
 
@@ -258,7 +258,7 @@ assert state["failure"] == "exit-1"  # command failure
 assert state["secretValuesRecorded"] is False
 ```
 
-For the checkpoint case, assert `state["failure"] == "OSError"`. Add equivalent authorization-boundary and post-command checkpoint tests that inject `ActivationPackageError` and `OSError` respectively, then assert the same bounded class-only behavior.
+For the checkpoint case, assert `state["failure"] == "OSError"`. Add equivalent authorization-boundary, post-command checkpoint, cutover-gate, and final staging checkpoint tests that inject `ActivationPackageError` or `OSError`, then assert the same bounded class-only behavior. Add a cleanup-command regression that begins with `originating_failure="exit-7"`, makes the normal cleanup command return exit 2, lets emergency cleanup succeed, and proves terminal failure is `exit-2`. Add a recovery regression whose interrupted staging state already contains `failure="OSError"` and prove cleanup retains that value.
 
 - [ ] **Step 2: Run the new failure tests and verify they fail**
 
@@ -269,14 +269,18 @@ pytest -q \
   tests/test_activation_package.py::test_failed_staging_command_preserves_bounded_failure_after_cleanup \
   tests/test_activation_package.py::test_staging_later_command_entry_checkpoint_failure_preserves_bounded_failure \
   tests/test_activation_package.py::test_canary_authorization_failure_preserves_bounded_failure_after_cleanup \
-  tests/test_activation_package.py::test_staging_command_completion_checkpoint_failure_preserves_bounded_failure
+  tests/test_activation_package.py::test_staging_command_completion_checkpoint_failure_preserves_bounded_failure \
+  tests/test_activation_package.py::test_cutover_gate_failure_preserves_bounded_failure_after_cleanup \
+  tests/test_activation_package.py::test_final_staging_checkpoint_failure_preserves_bounded_failure_after_cleanup \
+  tests/test_activation_package.py::test_cleanup_command_failure_supersedes_originating_failure \
+  tests/test_activation_package.py::test_staging_recovery_preserves_prior_bounded_failure
 ```
 
 Expected before implementation: terminal `failure` is `None` because successful cleanup overwrites the originating classification.
 
 - [ ] **Step 3: Thread the bounded classification through cleanup**
 
-Add `originating_failure: str | None = None` to both cleanup helper signatures. Include it in cleanup running/completed states and in terminal `aborted_before_cutover`. Keep cleanup command failure behavior as the existing `start_error or f"exit-{returncode}"`, so an actual cleanup failure supersedes the originating value.
+Add `originating_failure: str | None = None` to both cleanup helper signatures. Include it in cleanup running/completed states and in terminal `aborted_before_cutover`. Define a private `_CleanupCommandFailure(ActivationPackageError)` that stores only its bounded `failure`. After durably writing `cleanup_failed`, raise this private exception with `start_error or f"exit-{returncode}"`. In `_execute_resilient_cleanup`, catch it separately, run emergency cleanup, and publish the terminal state with the cleanup failure instead of the originating value. A generic checkpoint failure still triggers emergency cleanup but retains the originating value.
 
 - [ ] **Step 4: Supply bounded values at every staging failure call site**
 
@@ -289,6 +293,8 @@ originating_failure=start_error or f"exit-{returncode}"
 ```
 
 Apply the same exception-class pattern to later staging checkpoint/gate failures. Do not pass `str(error)` or subprocess output.
+
+Update the interrupted staging recovery call to pass its already validated `state["failure"]` when that field is a string, otherwise `None`.
 
 - [ ] **Step 5: Verify focused runner tests**
 

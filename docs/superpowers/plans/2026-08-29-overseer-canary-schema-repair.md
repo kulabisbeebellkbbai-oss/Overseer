@@ -155,11 +155,11 @@ git commit -m "Repair current store admin execution schema"
 
 **Interfaces:**
 - Consumes: migration evidence dictionaries containing `tableNames: list[str]`.
-- Produces: `CANARY_REQUIRED_STORE_TABLES: frozenset[str]` and `_require_canary_store_schema(schema: Mapping[str, object]) -> None`.
+- Produces: `CANARY_REQUIRED_STORE_TABLES: frozenset[str]` and `_require_canary_store_schema(schema: object) -> None`.
 
 - [ ] **Step 1: Write the failing migration-rehearsal regression**
 
-Extend `_prepared_package` with `missing_admin_execution_claims: bool = False`. After `_wal_store(source)`, use `sqlite3.connect(source)` to drop `admin_execution_claims` when requested. Add a test that calls `_prepared_package(tmp_path, missing_admin_execution_claims=True)`, reads `private/migration/migration-report.json`, and asserts the complete canary-required table subset is present in `report["schemaAfter"]["tableNames"]`.
+Extend `_prepared_package` with `missing_admin_execution_claims: bool = False`. When requested, create and close a real `SQLiteStore(source)` so the source has current v12 markers and the complete initializer schema, then use a direct `sqlite3.connect(source)` block to drop `admin_execution_claims`, commit, and checkpoint the WAL. Keep `_wal_store(source)` for the existing minimal-source path. Add a test that calls `_prepared_package(tmp_path, missing_admin_execution_claims=True)`, reads `private/migration/migration-report.json`, and asserts the complete canary-required table subset is present in `report["schemaAfter"]["tableNames"]`.
 
 - [ ] **Step 2: Run the rehearsal regression and verify it fails**
 

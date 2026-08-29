@@ -7168,6 +7168,59 @@ def test_cleanup_command_failure_supersedes_originating_failure(
     assert calls == 2
 
 
+def test_cleanup_command_failure_survives_cleanup_failed_checkpoint_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "7" * 64
+    state_path = tmp_path / "executor" / "activation-state.json"
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {"canary": {"failureCleanupCommands": [cleanup]}}
+    calls = 0
+
+    def execute(_command: list[str]) -> int:
+        nonlocal calls
+        calls += 1
+        return 2 if calls == 1 else 0
+
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_validate_contract_principal_binding", lambda _contract: None)
+    monkeypatch.setattr(activation_package_module, "_execute_contract_command", execute)
+    original_write = activation_package_module._write_activation_state
+    checkpoint_failed = False
+
+    def fail_cleanup_failed_checkpoint(document: dict[str, object]) -> None:
+        nonlocal checkpoint_failed
+        if document.get("status") == "cleanup_failed" and not checkpoint_failed:
+            checkpoint_failed = True
+            raise OSError("simulated cleanup_failed checkpoint failure")
+        original_write(document)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_activation_state",
+        fail_cleanup_failed_checkpoint,
+    )
+
+    assert activation_package_module._execute_resilient_cleanup(
+        contract,
+        package_digest=digest,
+        originating_failure="exit-7",
+    ) is True
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+    assert state["failure"] == "exit-2"
+    assert state["secretValuesRecorded"] is False
+    assert checkpoint_failed is True
+    assert calls == 2
+
+
 def test_staging_recovery_preserves_prior_bounded_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7225,6 +7278,69 @@ def test_staging_recovery_preserves_prior_bounded_failure(
     assert state["status"] == "aborted_before_cutover"
     assert state["failure"] == "OSError"
     assert state["secretValuesRecorded"] is False
+
+
+def test_staging_recovery_rejects_unbounded_prior_failure_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "6" * 64
+    package = tmp_path / "package"
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.getuid(), "gid": os.getgid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [cleanup]},
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    calls: list[list[str]] = []
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(command) or 0,
+    )
+    persisted = activation_package_module._runner_state(
+        package_digest=digest,
+        status="command_running",
+        phase="staging-canary",
+        command_index=0,
+        command=["/bin/true", "staging"],
+    )
+    persisted["failure"] = "raw verifier output: denied!"
+    activation_package_module._write_activation_state(persisted)
+
+    with pytest.raises(ActivationPackageError, match="failure classification is invalid"):
+        activation_package_module.execute_approved_rollback(package)
+
+    assert calls == []
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "command_running"
+    assert state["failure"] == "raw verifier output: denied!"
 
 
 def test_cutover_later_command_entry_checkpoint_failure_runs_rollback(

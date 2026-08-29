@@ -6063,6 +6063,17 @@ def _activation_execution_lock():
             os.close(descriptor)
 
 
+def _validate_bounded_failure_classification(failure: object) -> str | None:
+    if failure is None:
+        return None
+    if isinstance(failure, str) and (
+        re.fullmatch(r"exit-[0-9]+", failure) is not None
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", failure) is not None
+    ):
+        return failure
+    raise ActivationPackageError("activation runner failure classification is invalid")
+
+
 def _load_activation_state() -> dict[str, object] | None:
     target = _activation_state_path()
     try:
@@ -6089,6 +6100,7 @@ def _load_activation_state() -> dict[str, object] | None:
         not in {ACTIVATION_RUNNER_STATE_SCHEMA, LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA}
     ):
         raise ActivationPackageError("activation runner state schema is invalid")
+    _validate_bounded_failure_classification(document.get("failure"))
     return document
 
 
@@ -6507,7 +6519,7 @@ def _runner_state(
         "phase": phase,
         "commandIndex": command_index,
         "commandDigest": _sha256(_canonical(command)) if command is not None else None,
-        "failure": failure,
+        "failure": _validate_bounded_failure_classification(failure),
         "updatedAtNs": time.time_ns(),
         "secretValuesRecorded": False,
     }
@@ -6534,17 +6546,21 @@ def _execute_cleanup_sequence(
         if returncode != 0 and not (
             start_error is None and _cleanup_command_satisfied(command)
         ):
-            _write_activation_state(
-                _runner_state(
-                    package_digest=package_digest,
-                    status="cleanup_failed",
-                    phase="staging_cleanup",
-                    command_index=index,
-                    command=command,
-                    failure=start_error or f"exit-{returncode}",
+            cleanup_failure = start_error or f"exit-{returncode}"
+            try:
+                _write_activation_state(
+                    _runner_state(
+                        package_digest=package_digest,
+                        status="cleanup_failed",
+                        phase="staging_cleanup",
+                        command_index=index,
+                        command=command,
+                        failure=cleanup_failure,
+                    )
                 )
-            )
-            raise _CleanupCommandFailure(start_error or f"exit-{returncode}")
+            except BaseException as checkpoint_error:
+                raise _CleanupCommandFailure(cleanup_failure) from checkpoint_error
+            raise _CleanupCommandFailure(cleanup_failure)
         _write_activation_state(
             _runner_state(
                 package_digest=package_digest,
@@ -7796,7 +7812,7 @@ def _execute_approved_cutover_locked(
             ) from checkpoint_error
         returncode, start_error = _validated_command_outcome(contract, command)
         if returncode != 0:
-            command_failure = start_error or f"cutover-exit-{returncode}"
+            command_failure = start_error or f"exit-{returncode}"
             rollback_state = _runner_state(
                 package_digest=digest,
                 status="rollback_command_running",
@@ -7910,11 +7926,11 @@ def _execute_approved_rollback_locked(
             "replayed": True,
         }
     if state.get("phase") in {"staging", "staging-canary", "staging_cleanup"}:
-        prior_failure = state.get("failure")
+        prior_failure = _validate_bounded_failure_classification(state.get("failure"))
         if not _execute_resilient_cleanup(
             contract,
             package_digest=digest,
-            originating_failure=prior_failure if isinstance(prior_failure, str) else None,
+            originating_failure=prior_failure,
         ):
             raise ActivationPackageError(
                 "staging cleanup completed but terminal recovery state is not durable"
@@ -7926,7 +7942,7 @@ def _execute_approved_rollback_locked(
         contract,
         package_digest=digest,
         prior_state=state,
-        originating_failure=str(state.get("failure")) if state.get("failure") else None,
+        originating_failure=_validate_bounded_failure_classification(state.get("failure")),
     ):
         raise ActivationPackageError(
             "sealed rollback completed but terminal recovery state is not durable"

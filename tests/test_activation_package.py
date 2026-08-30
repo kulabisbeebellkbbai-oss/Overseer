@@ -3759,10 +3759,16 @@ def test_canary_handoff_refuses_existing_service_process_then_starts_exact_unit(
         lambda *_args, **_kwargs: {"verified": True},
     )
     calls: list[list[str]] = []
+
+    def execute_inherited(command: list[str], *, lock_descriptor: int) -> int:
+        assert lock_descriptor == 29
+        calls.append(command)
+        return 3 if "is-active" in command else 0
+
     monkeypatch.setattr(
         activation_package_module,
-        "_execute_contract_command",
-        lambda command: calls.append(command) or 0,
+        "_execute_inherited_contract_command",
+        execute_inherited,
     )
     monkeypatch.setattr(
         activation_package_module,
@@ -3773,7 +3779,15 @@ def test_canary_handoff_refuses_existing_service_process_then_starts_exact_unit(
 
     with pytest.raises(ActivationPackageError, match="service principal process"):
         activation_package_module.handoff_start_canary(package)
-    assert calls == []
+    assert calls == [
+        [
+            "/usr/bin/systemctl",
+            "is-active",
+            "--quiet",
+            "overseer-api-canary.service",
+        ]
+    ]
+    calls.clear()
 
     monkeypatch.setattr(
         activation_package_module,
@@ -3784,7 +3798,158 @@ def test_canary_handoff_refuses_existing_service_process_then_starts_exact_unit(
     result = activation_package_module.handoff_start_canary(package)
 
     assert result["started"] is True
-    assert calls == [["/usr/bin/systemctl", "start", "overseer-api-canary.service"]]
+    assert calls == [
+        [
+            "/usr/bin/systemctl",
+            "is-active",
+            "--quiet",
+            "overseer-api-canary.service",
+        ],
+        ["/usr/bin/systemctl", "start", "overseer-api-canary.service"],
+    ]
+
+
+def test_inherited_child_executor_works_without_parent_process_global(
+    tmp_path: Path,
+) -> None:
+    lock = tmp_path / "activation.lock"
+    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    os.fchmod(descriptor, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    checkout = Path(__file__).resolve().parents[1]
+    script = "\n".join(
+        (
+            "import os",
+            "from pathlib import Path",
+            "import overseer.activation_package as package",
+            f"package._activation_lock_path = lambda: Path({str(lock)!r})",
+            "package._activation_root_identity = lambda: (os.geteuid(), os.getegid())",
+            "assert package._ACTIVE_EXECUTION_LOCK_DESCRIPTOR is None",
+            (
+                "raise SystemExit(package._execute_inherited_contract_command("
+                f"['/usr/bin/true'], lock_descriptor={descriptor}))"
+            ),
+        )
+    )
+    environment = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(checkout / "src"),
+        activation_package_module.ACTIVATION_LOCK_FD_ENV: str(descriptor),
+    }
+    try:
+        result = subprocess.run(
+            [sys.executable, "-B", "-s", "-P", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            pass_fds=(descriptor,),
+        )
+    finally:
+        os.close(descriptor)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path.chmod(0o755)
+    canary_root = tmp_path / "overseer-canary"
+    instance = "ab" * activation_package_module.CANARY_INSTANCE_BYTES
+    state_directory = canary_root / instance
+    canary_root.mkdir(mode=0o711)
+    state_directory.mkdir(mode=0o700)
+    names = (
+        "overseer.sqlite3",
+        "psychlo-bridge.sqlite3",
+        "roadex-relay.sqlite3",
+        "overseer.sqlite3-wal",
+        "roadex-relay.sqlite3-shm",
+    )
+    for name in names:
+        path = state_directory / name
+        path.write_bytes(name.encode("ascii"))
+        path.chmod(0o600)
+    contract = {
+        "canary": {
+            "canaryInstanceId": instance,
+            "stateDirectory": str(state_directory),
+            "store": str(state_directory / "overseer.sqlite3"),
+            "psychloBridgeDatabase": str(state_directory / "psychlo-bridge.sqlite3"),
+            "roadexRelayDatabase": str(state_directory / "roadex-relay.sqlite3"),
+            "preserveFailedStateForEvidence": True,
+            "ownershipHandoffCommand": "handoff-start-canary",
+            "requiresNoExistingServicePrincipalProcesses": True,
+        }
+    }
+    monkeypatch.setattr(activation_package_module, "CANARY_STATE_ROOT", canary_root)
+    monkeypatch.setattr(activation_package_module, "APPROVED_OVERSEER_UID", os.geteuid())
+    monkeypatch.setattr(activation_package_module, "APPROVED_OVERSEER_GID", os.getegid())
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_cleanup_command_satisfied",
+        lambda _command: True,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda _uid: (12345,),
+    )
+
+    with pytest.raises(ActivationPackageError, match="service principal process"):
+        activation_package_module._seal_canary_state_from_contract(contract, required=True)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda _uid: (),
+    )
+    result = activation_package_module._seal_canary_state_from_contract(
+        contract,
+        required=True,
+    )
+
+    assert result["sealed"] is True
+    assert state_directory.stat().st_mode & 0o777 == 0o500
+    assert sorted(path.name for path in state_directory.iterdir()) == sorted(names)
+    assert all(path.stat().st_mode & 0o777 == 0o400 for path in state_directory.iterdir())
+
+
+def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = {"canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]}}
+    events: list[str] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_cleanup_sequence",
+        lambda *_args, **_kwargs: events.append("stopped"),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **kwargs: events.append(f"sealed:{kwargs['required']}")
+        or {"sealed": True},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_recovery_state_best_effort",
+        lambda _document: True,
+    )
+
+    assert activation_package_module._execute_resilient_cleanup(
+        contract,
+        package_digest="a" * 64,
+    ) is True
+    assert events == ["stopped", "sealed:False"]
 
 
 def test_canary_health_retry_handles_an_initially_missing_unix_socket(
@@ -5269,6 +5434,11 @@ def test_phase_bounded_activation_runner_stops_for_cutover_approval(
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(
         activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_validate_contract_principal_bootstrap",
         lambda *_args: None,
     )
@@ -5480,6 +5650,11 @@ def test_delayed_human_authorization_precedes_timed_canary_start(
         return {"packageDigest": digest, "phase": "staging-canary"}
 
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_validate_contract_principal_bootstrap",
@@ -7948,6 +8123,11 @@ def test_final_staging_checkpoint_failure_preserves_bounded_failure_after_cleanu
         staging=[["/bin/true", "staging"]],
     )
     monkeypatch.setattr(activation_package_module, "_execute_contract_command", lambda _command: 0)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
     monkeypatch.setattr(
         activation_package_module,
         "verify_approved_cutover",

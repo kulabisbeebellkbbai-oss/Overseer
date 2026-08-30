@@ -139,9 +139,16 @@ primitive proves the active runner command and inherited lock, rejects any
 existing process carrying the dedicated UID, descriptor-opens the exact
 root-owned namespace and three expected files, rechecks the process boundary,
 transfers only those objects to UID/GID 984, fsyncs the resulting metadata, and
-immediately starts only `overseer-api-canary.service`. A failed or completed
-namespace is retained as immutable package-specific evidence and is never
-reused by another package.
+immediately starts only `overseer-api-canary.service`. The child-safe executor
+revalidates and explicitly carries the inherited activation-lock descriptor;
+it does not depend on the parent process's in-memory lock registration.
+
+After either normal canary stop or failure cleanup, the runner confirms the
+unit is inactive and no process carries UID 984, descriptor-reopens only the
+three database names and their bounded WAL, SHM, or journal sidecars, rejects
+links and foreign artifacts, and changes every artifact to root-owned mode
+`0400` plus the namespace to root-owned mode `0500`. The resulting immutable
+package-specific evidence is never reused by another package.
 
 ### Error handling and retry behavior
 
@@ -177,6 +184,10 @@ Tests will be written and observed failing before production changes.
    substitutions are rejected, target size is rejected before hashing, and an
    existing UID 984 process blocks the sealed ownership handoff and service
    start.
+7. A fresh-interpreter regression will prove the child handoff can pass its
+   validated inherited lock to the exact systemd command without relying on a
+   parent-process global. Cleanup and success-path regressions will prove the
+   stopped namespace is root-sealed before terminal state or cutover gating.
 
 ## Security review criteria
 

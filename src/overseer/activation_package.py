@@ -6027,6 +6027,197 @@ def _handoff_canary_state(paths: Mapping[str, Path | str]) -> None:
             ) from sync_error
 
 
+def _canary_state_paths_from_contract(
+    contract: Mapping[str, object],
+) -> dict[str, Path | str] | None:
+    canary = contract.get("canary")
+    if not isinstance(canary, Mapping):
+        return None
+    names = (
+        "canaryInstanceId",
+        "stateDirectory",
+        "store",
+        "psychloBridgeDatabase",
+        "roadexRelayDatabase",
+    )
+    if any(not isinstance(canary.get(name), str) for name in names):
+        return None
+    instance = str(canary["canaryInstanceId"])
+    state_directory = Path(str(canary["stateDirectory"]))
+    paths: dict[str, Path | str] = {
+        "canaryInstanceId": instance,
+        "stateDirectory": state_directory,
+        "store": Path(str(canary["store"])),
+        "psychloBridgeDatabase": Path(str(canary["psychloBridgeDatabase"])),
+        "roadexRelayDatabase": Path(str(canary["roadexRelayDatabase"])),
+    }
+    expected = {
+        "store": state_directory / "overseer.sqlite3",
+        "psychloBridgeDatabase": state_directory / "psychlo-bridge.sqlite3",
+        "roadexRelayDatabase": state_directory / "roadex-relay.sqlite3",
+    }
+    if (
+        len(instance) != CANARY_INSTANCE_BYTES * 2
+        or set(instance) - _HEX
+        or state_directory != CANARY_STATE_ROOT / instance
+        or any(paths[name] != value for name, value in expected.items())
+        or canary.get("preserveFailedStateForEvidence") is not True
+        or canary.get("ownershipHandoffCommand") != "handoff-start-canary"
+        or canary.get("requiresNoExistingServicePrincipalProcesses") is not True
+    ):
+        raise ActivationPackageError("activation canary evidence path contract drifted")
+    return paths
+
+
+def _seal_canary_state_from_contract(
+    contract: Mapping[str, object],
+    *,
+    required: bool,
+) -> dict[str, object]:
+    """Make a stopped canary namespace root-owned read-only evidence."""
+
+    paths = _canary_state_paths_from_contract(contract)
+    if paths is None:
+        if required:
+            raise ActivationPackageError("activation canary evidence contract is unavailable")
+        return {"sealed": False, "status": "not-inventoried"}
+    state_directory = Path(str(paths["stateDirectory"]))
+    try:
+        state_directory.lstat()
+    except FileNotFoundError:
+        if required:
+            raise ActivationPackageError("canary evidence namespace is unavailable")
+        return {"sealed": False, "status": "absent"}
+    except OSError as error:
+        raise ActivationPackageError("canary evidence namespace could not be inspected") from error
+    inactive = ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"]
+    if not _cleanup_command_satisfied(inactive):
+        raise ActivationPackageError("canary service is not quiescent before evidence sealing")
+    if _processes_for_uid(APPROVED_OVERSEER_UID):
+        raise ActivationPackageError("service principal process exists before evidence sealing")
+
+    root_uid, root_gid = _activation_root_identity()
+    parent_descriptor = -1
+    root_descriptor = -1
+    state_descriptor = -1
+    file_descriptors: list[int] = []
+    base_names = {
+        "overseer.sqlite3",
+        "psychlo-bridge.sqlite3",
+        "roadex-relay.sqlite3",
+    }
+    allowed_names = set(base_names)
+    for base in base_names:
+        allowed_names.update(f"{base}{suffix}" for suffix in ("-wal", "-shm", "-journal"))
+    try:
+        parent_descriptor = _open_verified_directory(
+            CANARY_STATE_ROOT.parent,
+            expected_uid=root_uid,
+            expected_gid=root_gid,
+            expected_mode=0o755,
+            label="canary state root parent",
+        )
+        root_descriptor = _open_verified_directory(
+            CANARY_STATE_ROOT,
+            expected_uid=root_uid,
+            expected_gid=root_gid,
+            expected_mode=0o711,
+            label="canary state root",
+        )
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        state_descriptor = os.open(state_directory, flags)
+        opened_state = os.fstat(state_descriptor)
+        lexical_state = state_directory.lstat()
+        state_owner = (opened_state.st_uid, opened_state.st_gid)
+        if (
+            state_directory.is_symlink()
+            or not stat.S_ISDIR(opened_state.st_mode)
+            or not stat.S_ISDIR(lexical_state.st_mode)
+            or (opened_state.st_dev, opened_state.st_ino)
+            != (lexical_state.st_dev, lexical_state.st_ino)
+            or state_owner
+            not in {
+                (root_uid, root_gid),
+                (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID),
+            }
+            or stat.S_IMODE(opened_state.st_mode) not in {0o700, 0o500}
+            or (
+                stat.S_IMODE(opened_state.st_mode) == 0o500
+                and state_owner != (root_uid, root_gid)
+            )
+        ):
+            raise ActivationPackageError("canary evidence namespace identity is invalid")
+        entries = set(os.listdir(state_descriptor))
+        if not base_names.issubset(entries) or not entries.issubset(allowed_names):
+            raise ActivationPackageError("canary evidence namespace contains an invalid artifact")
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        total_size = 0
+        for name in sorted(entries):
+            descriptor = os.open(name, file_flags, dir_fd=state_descriptor)
+            file_descriptors.append(descriptor)
+            opened = os.fstat(descriptor)
+            lexical = os.stat(name, dir_fd=state_descriptor, follow_symlinks=False)
+            owner = (opened.st_uid, opened.st_gid)
+            mode = stat.S_IMODE(opened.st_mode)
+            total_size += opened.st_size
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(lexical.st_mode)
+                or (opened.st_dev, opened.st_ino) != (lexical.st_dev, lexical.st_ino)
+                or opened.st_nlink != 1
+                or owner
+                not in {
+                    (root_uid, root_gid),
+                    (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID),
+                }
+                or mode not in {0o600, 0o400}
+                or (mode == 0o400 and owner != (root_uid, root_gid))
+                or opened.st_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES
+                or total_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES
+            ):
+                raise ActivationPackageError("canary evidence artifact identity is invalid")
+        if _processes_for_uid(APPROVED_OVERSEER_UID):
+            raise ActivationPackageError("service principal process exists during evidence sealing")
+        for descriptor in file_descriptors:
+            os.fchown(descriptor, root_uid, root_gid)
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+        os.fchown(state_descriptor, root_uid, root_gid)
+        os.fchmod(state_descriptor, 0o500)
+        os.fsync(state_descriptor)
+        os.fsync(root_descriptor)
+    except OSError as error:
+        raise ActivationPackageError("canary evidence namespace could not be sealed safely") from error
+    finally:
+        sync_error: OSError | None = None
+        for descriptor in (*file_descriptors, state_descriptor, root_descriptor):
+            if descriptor < 0:
+                continue
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                if sync_error is None:
+                    sync_error = error
+        for descriptor in (*file_descriptors, state_descriptor, root_descriptor, parent_descriptor):
+            if descriptor >= 0:
+                os.close(descriptor)
+        if sync_error is not None:
+            raise ActivationPackageError(
+                "canary evidence sealing could not be made durable"
+            ) from sync_error
+    return {
+        "sealed": True,
+        "status": "root-read-only",
+        "stateDirectory": str(state_directory),
+        "artifactCount": len(file_descriptors),
+    }
+
+
 def handoff_start_canary(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
@@ -6034,7 +6225,7 @@ def handoff_start_canary(
 
     _require_root_activation()
     package = Path(package_root).resolve()
-    contract, _lock_descriptor = _require_active_phase_command(
+    contract, lock_descriptor = _require_active_phase_command(
         package,
         phase="staging-canary",
         command_name="handoff-start-canary",
@@ -6059,11 +6250,31 @@ def handoff_start_canary(
         expected_package_digest=expected_digest,
         pre_handoff=True,
     )
+    inactive_command = [
+        "/usr/bin/systemctl",
+        "is-active",
+        "--quiet",
+        "overseer-api-canary.service",
+    ]
+    if (
+        _execute_inherited_contract_command(
+            inactive_command,
+            lock_descriptor=lock_descriptor,
+        )
+        != 3
+    ):
+        raise ActivationPackageError("canary service is not inactive before ownership handoff")
     if _processes_for_uid(APPROVED_OVERSEER_UID):
         raise ActivationPackageError("service principal process exists before canary handoff")
     _handoff_canary_state(paths)
     start_command = ["/usr/bin/systemctl", "start", "overseer-api-canary.service"]
-    if _execute_contract_command(start_command) != 0:
+    if (
+        _execute_inherited_contract_command(
+            start_command,
+            lock_descriptor=lock_descriptor,
+        )
+        != 0
+    ):
         raise ActivationPackageError("canary service failed to start after ownership handoff")
     return {
         "started": True,
@@ -7280,12 +7491,12 @@ def _contract_commands(contract: Mapping[str, object], field: str) -> list[list[
     return result
 
 
-def _execute_contract_command(
+def _run_contract_command_with_lock(
     command: list[str],
     *,
+    lock_descriptor: int,
     stdin_payload: bytes | None = None,
 ) -> int:
-    lock_descriptor = _require_active_execution_lock_descriptor()
     environment = {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME": "/root",
@@ -7317,6 +7528,34 @@ def _execute_contract_command(
     except OSError as error:
         raise ActivationPackageError(f"activation command could not start: {command[0]}") from error
     return int(result.returncode)
+
+
+def _execute_contract_command(
+    command: list[str],
+    *,
+    stdin_payload: bytes | None = None,
+) -> int:
+    return _run_contract_command_with_lock(
+        command,
+        lock_descriptor=_require_active_execution_lock_descriptor(),
+        stdin_payload=stdin_payload,
+    )
+
+
+def _execute_inherited_contract_command(
+    command: list[str],
+    *,
+    lock_descriptor: int,
+    stdin_payload: bytes | None = None,
+) -> int:
+    inherited = _require_inherited_activation_lock()
+    if inherited != lock_descriptor:
+        raise ActivationPackageError("inherited activation lock descriptor changed")
+    return _run_contract_command_with_lock(
+        command,
+        lock_descriptor=lock_descriptor,
+        stdin_payload=stdin_payload,
+    )
 
 
 def _command_outcome(
@@ -7486,6 +7725,7 @@ def _execute_resilient_cleanup(
         originating_failure = error.failure
     except BaseException:
         _execute_emergency_cleanup_sequence(contract)
+    _seal_canary_state_from_contract(contract, required=False)
     return _write_recovery_state_best_effort(
         _runner_state(
             package_digest=package_digest,
@@ -8589,6 +8829,7 @@ def _execute_approved_staging_canary_locked(
             ) from checkpoint_error
 
     try:
+        _seal_canary_state_from_contract(contract, required=True)
         verify_approved_cutover(package)
     except BaseException as error:
         try:

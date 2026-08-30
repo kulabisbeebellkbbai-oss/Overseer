@@ -6093,10 +6093,18 @@ def _inspect_canary_state_from_contract(
     except OSError as error:
         raise ActivationPackageError("canary evidence namespace could not be inspected") from error
     inactive = ["/usr/bin/systemctl", "stop", "overseer-api-canary.service"]
-    if not _cleanup_command_satisfied(inactive):
-        raise ActivationPackageError("canary service is not quiescent before evidence sealing")
-    if _processes_for_uid(APPROVED_OVERSEER_UID):
-        raise ActivationPackageError("service principal process exists before evidence sealing")
+
+    def require_quiescence() -> None:
+        if not _cleanup_command_satisfied(inactive):
+            raise ActivationPackageError(
+                "canary service is not quiescent during evidence sealing"
+            )
+        if _processes_for_uid(APPROVED_OVERSEER_UID):
+            raise ActivationPackageError(
+                "service principal process exists during evidence sealing"
+            )
+
+    require_quiescence()
 
     root_uid, root_gid = _activation_root_identity()
     parent_descriptor = -1
@@ -6249,8 +6257,7 @@ def _inspect_canary_state_from_contract(
                         "canary evidence artifact identity is invalid"
                     )
             validated_descriptors.append(descriptor)
-        if _processes_for_uid(APPROVED_OVERSEER_UID):
-            raise ActivationPackageError("service principal process exists during evidence sealing")
+        require_quiescence()
         if seal:
             for descriptor in validated_descriptors:
                 os.fchown(descriptor, root_uid, root_gid)
@@ -6260,6 +6267,7 @@ def _inspect_canary_state_from_contract(
             os.fchmod(state_descriptor, 0o500)
             os.fsync(state_descriptor)
             os.fsync(root_descriptor)
+        require_quiescence()
     except OSError as error:
         raise ActivationPackageError("canary evidence namespace could not be sealed safely") from error
     finally:
@@ -7799,6 +7807,7 @@ def _execute_resilient_cleanup(
     *,
     package_digest: str,
     originating_failure: str | None = None,
+    require_canary_evidence: bool | None = None,
 ) -> bool:
     try:
         _execute_cleanup_sequence(
@@ -7811,8 +7820,15 @@ def _execute_resilient_cleanup(
         originating_failure = error.failure
     except BaseException:
         _execute_emergency_cleanup_sequence(contract)
+    if require_canary_evidence is None:
+        require_canary_evidence = (
+            contract.get("schemaVersion") == ACTIVATION_CONTRACT_SCHEMA
+        )
     try:
-        _seal_canary_state_from_contract(contract, required=False)
+        _seal_canary_state_from_contract(
+            contract,
+            required=require_canary_evidence,
+        )
     except BaseException:
         _write_recovery_state_best_effort(
             _runner_state(
@@ -9130,13 +9146,15 @@ def _execute_approved_rollback_locked(
     package = Path(package_root).resolve()
     approval = _load_activation_approval_for_rollback(package)
     digest = str(approval["packageDigest"])
-    contract = _normalize_rollback_contract(
-        _sealed_package_json(
-            package,
-            expected_package_digest=digest,
-            relative_path="public/activation-contract.json",
-        )
+    sealed_contract = _sealed_package_json(
+        package,
+        expected_package_digest=digest,
+        relative_path="public/activation-contract.json",
     )
+    require_canary_evidence = (
+        sealed_contract.get("schemaVersion") == ACTIVATION_CONTRACT_SCHEMA
+    )
+    contract = _normalize_rollback_contract(sealed_contract)
     if contract.get("packageRoot") != str(package):
         raise ActivationPackageError("activation contract package root is not approval-bound")
     state = _load_activation_state()
@@ -9145,8 +9163,10 @@ def _execute_approved_rollback_locked(
     if state.get("status") == "rolled_back":
         return {"status": "rolled_back", "packageDigest": digest, "replayed": True}
     if state.get("status") == "aborted_before_cutover":
-        if _canary_state_paths_from_contract(contract) is not None:
-            _verify_sealed_canary_state_from_contract(contract, required=True)
+        _verify_sealed_canary_state_from_contract(
+            contract,
+            required=require_canary_evidence,
+        )
         return {
             "status": "aborted_before_cutover",
             "packageDigest": digest,
@@ -9158,6 +9178,7 @@ def _execute_approved_rollback_locked(
             contract,
             package_digest=digest,
             originating_failure=prior_failure,
+            require_canary_evidence=require_canary_evidence,
         ):
             raise ActivationPackageError(
                 "staging cleanup completed but terminal recovery state is not durable"

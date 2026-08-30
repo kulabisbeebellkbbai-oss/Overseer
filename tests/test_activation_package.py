@@ -3992,6 +3992,7 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
     finally:
         activation_package_module.fcntl.flock = real_flock
     authority_lock.write_bytes(b"")
+    inactive_checks.clear()
     result = activation_package_module._seal_canary_state_from_contract(
         contract,
         required=True,
@@ -4027,7 +4028,7 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
     assert after_verification == before_verification
     assert inactive_checks == [
         ["/usr/bin/systemctl", "is-active", "--quiet", "overseer-api-canary.service"]
-    ] * 9
+    ] * 6
 
 
 def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
@@ -4097,6 +4098,82 @@ def test_resilient_cleanup_checkpoints_evidence_sealing_failure(
     assert checkpoints[0]["status"] == "cleanup_evidence_seal_failed"
     assert checkpoints[0]["failure"] == "ActivationPackageError"
     assert checkpoints[0]["secretValuesRecorded"] is False
+
+
+def test_current_schema_cleanup_requires_inventoried_canary_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    checkpoints: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_cleanup_sequence",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_recovery_state_best_effort",
+        lambda document: checkpoints.append(dict(document)) or True,
+    )
+
+    with pytest.raises(ActivationPackageError, match="evidence contract is unavailable"):
+        activation_package_module._execute_resilient_cleanup(
+            contract,
+            package_digest="b" * 64,
+            originating_failure="ActivationPackageError",
+        )
+
+    assert checkpoints[0]["status"] == "cleanup_evidence_seal_failed"
+    assert checkpoints[0]["phase"] == "staging_cleanup"
+    assert checkpoints[0]["secretValuesRecorded"] is False
+
+
+def test_current_schema_aborted_replay_requires_canary_evidence_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "e" * 64
+    package = tmp_path / "package"
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {"user": "overseer", "uid": 984, "group": "overseer", "gid": 984},
+        "sourceStore": {"uid": os.geteuid(), "gid": os.getegid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]},
+    }
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_state",
+        lambda: activation_package_module._runner_state(
+            package_digest=digest,
+            status="aborted_before_cutover",
+            phase="staging_cleanup",
+            failure="ActivationPackageError",
+        ),
+    )
+
+    with pytest.raises(ActivationPackageError, match="evidence contract is unavailable"):
+        activation_package_module._execute_approved_rollback_locked(package)
 
 
 def test_staging_rollback_recovers_and_revalidates_sealed_authority_lock_evidence(
@@ -5771,6 +5848,11 @@ def test_phase_bounded_activation_runner_stops_for_cutover_approval(
         "_execute_contract_command",
         lambda command: calls.append(tuple(command)) or 0,
     )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
 
     staged = activation_package_module.execute_approved_staging_canary(package)
     replayed = activation_package_module.execute_approved_staging_canary(package)
@@ -6609,6 +6691,11 @@ def test_interrupted_staging_recovery_runs_and_records_cleanup(
         "_execute_contract_command",
         lambda command: calls.append(tuple(command)) or 0,
     )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
     activation_package_module._write_activation_state(
         activation_package_module._runner_state(
             package_digest=digest,
@@ -7367,6 +7454,11 @@ def test_staging_checkpoint_failure_runs_immediate_cleanup(
     )
     monkeypatch.setattr(
         activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
         "_execute_contract_command",
         lambda command: calls.append(tuple(command)) or 0,
     )
@@ -7632,6 +7724,11 @@ def test_failed_staging_command_cleans_up_when_cleanup_checkpoint_fails(
         activation_package_module,
         "_load_activation_phase_approval",
         lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "staging-canary"},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
     )
 
     def execute(command: list[str]) -> int:
@@ -8003,6 +8100,11 @@ def _staging_failure_case(
         "_load_activation_phase_approval",
         lambda *_args, **_kwargs: {"packageDigest": digest, "phase": "staging-canary"},
     )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
     return package, contract, state_path
 
 
@@ -8178,6 +8280,7 @@ def test_signaled_cleanup_command_publishes_shell_style_failure(
         contract,
         package_digest=digest,
         originating_failure="exit-7",
+        require_canary_evidence=False,
     ) is True
 
     assert calls == 2
@@ -8474,6 +8577,7 @@ def test_cleanup_command_failure_supersedes_originating_failure(
         contract,
         package_digest=digest,
         originating_failure="exit-7",
+        require_canary_evidence=False,
     ) is True
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -8575,6 +8679,11 @@ def test_staging_recovery_preserves_prior_bounded_failure(
         lambda *_args, **_kwargs: contract,
     )
     monkeypatch.setattr(activation_package_module, "_execute_contract_command", lambda _command: 0)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
     activation_package_module._write_activation_state(
         activation_package_module._runner_state(
             package_digest=digest,

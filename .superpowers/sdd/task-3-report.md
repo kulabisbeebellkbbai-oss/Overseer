@@ -2,11 +2,12 @@
 
 ## Outcome
 
-Repaired every Critical and Important finding from
-`.superpowers/sdd/task-3-review.md` without amending `54a53bc`. The host tool
-remains inert: preflight is read-only and rendering is pure. No future
-command, VM/image operation, package action, service action, Phase B, or
-cutover was executed.
+Repaired the original findings from `.superpowers/sdd/task-3-review.md`, then
+resolved the later cleanup/runtime/capability findings from
+`.superpowers/sdd/task-3-review-final.md`, without amending `54a53bc`. The
+host tool remains inert: preflight is read-only and rendering is pure. No
+future command, VM/image operation, package action, service action, Phase B,
+or cutover was executed.
 
 ## Repair TDD evidence
 
@@ -80,17 +81,46 @@ are part of the plan and therefore part of the separate `planDigest` approval
 boundary. Source-share and no-network evidence is derived from the rendered
 domain inputs rather than caller assertions.
 
+## Fresh-review rejection and test-first repair
+
+The first fresh final review correctly returned `NON-COMPLIANT / CHANGES
+REQUIRED`. Its Critical finding showed that a failed `virsh dominfo` query was
+being treated as authoritative absence, which could permit artifact deletion
+while VM state was unknown. Four Important findings required lifecycle-spec
+alignment, exact offline-runtime provenance and execution-time replay,
+path-filesystem capability binding, and executable cleanup failure tests.
+
+The new RED round produced `18 failed, 14 passed`. The repaired plan schema is
+now `overseer.phase-b-disposable-rehearsal-plan.v3` and:
+
+1. derives presence only from a successful exact-name `virsh list --all
+   --name` inventory;
+2. retains every artifact and returns failure for unknown inventory or domain
+   state;
+3. deletes only after graceful stop, confirmed inactivity, successful
+   undefine, and a second authoritative absence inventory;
+4. records Python 3.13 patch/ABI and exact module origins, isolates the host
+   import path, replays the byte-identical probe before artifact creation, and
+   verifies the ABI/imports again in the guest; and
+5. parses, records, digest-binds, and replays x86_64 KVM path-filesystem
+   capability for the two read-only 9p shares.
+
 ## Files
 
 - `tools/phase_b_rehearsal.py`
 - `tests/test_phase_b_rehearsal_tool.py`
 - `docs/phase-b-disposable-rehearsal.md`
+- `docs/superpowers/plans/2026-08-30-overseer-phase-b-disposable-rehearsal.md`
 - `.superpowers/sdd/task-3-report.md`
 
 ## Final verification
 
-- Commit message: `Repair fail-closed Phase B VM rehearsal`
-- Focused tests after independent schema hardening: `27 passed in 0.24s`
+- Repair commits include `Repair fail-closed Phase B VM rehearsal` and
+  `Validate Phase B rehearsal domain schema`; final review-repair commit:
+  `Harden Phase B rehearsal approval boundary`
+- Focused tests after cleanup/runtime/capability hardening: `33 passed in 0.32s`
+- Cross-layer activation-package, guest, and host rehearsal tests: `295 passed
+  in 24.05s`
 - In-memory Python compile of tool and tests: clean, no output
 - Future Bash syntax parse with `bash -n`: clean, no output; no future command
   executed
@@ -100,11 +130,9 @@ domain inputs rather than caller assertions.
 - `git diff --check`: clean, no output
 - Actual preflight: exit `2` with canonical fail-closed dirty-tree rejection;
   it stopped before KVM, image, runtime, or libvirt probes
-- Pure render fixture: exit `0`, canonical plan digest
-  `29907184774c56dd55ef8e197d5e4006235d317110c2337d32e87f99aabdc3de`
-  and future-script digest
-  `a078a83682a31f8972c147fa9d7c772dd834eb841805725d0b80971444c1eb34`;
-  this is source-only fixture evidence, not an approved runnable plan
+- All earlier v2 fixture digests are superseded. A v3 source-only render was
+  used for syntax/probe verification only; no digest is approved or runnable.
+  The exact approval digest remains a Task 5 output after a clean preflight.
 - Read-only `virsh --connect qemu:///session list --all`: only pre-existing
   `overseer-dax-disposable-libvirt` remains shut off; no new VM appeared
 

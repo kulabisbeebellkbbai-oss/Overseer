@@ -19,8 +19,9 @@ Preflight fails closed unless all of these conditions hold:
 
 - the repository is clean and its full SHA is the requested source commit;
 - `/dev/kvm` is a character device readable and writable by the caller;
-- `qemu:///session` is the reported URI, supports an x86_64 KVM domain, and
-  has no domain with the exact target name;
+- `qemu:///session` is the reported URI, supports an x86_64 KVM domain and a
+  path-backed filesystem device for the two read-only 9p shares, and has no
+  domain with the exact target name;
 - source, runtime-site, base-image, and temporary-parent paths use the
   conservative absolute host-path grammar and have safe types, permissions,
   and caller access;
@@ -30,24 +31,29 @@ Preflight fails closed unless all of these conditions hold:
   --output=json --force-share` identifies it as qcow2;
 - every future host tool is present, including Bash, `awk`, `cat`, `grep`,
   `install`, `rm`, `rmdir`, `sleep`, `python3`, and `timeout`;
-- a `python3 -B -s -P` no-bytecode probe imports `cryptography`,
-  `overseer.cli`, `overseer.user_bridge`, and `overseer.admin_executor` using
-  the selected source and runtime-site paths; and
+- an isolated `python3 -B -s -P -S` no-bytecode probe imports
+  `cryptography`, `overseer.cli`, `overseer.user_bridge`, and
+  `overseer.admin_executor`; records Python 3.13's patch version and ABI plus
+  every resolved module origin; and rejects `cryptography` outside the
+  selected runtime site or an Overseer module outside the selected source;
+  and
 - the exact rendered domain inputs contain no network interface and expose
   both 9p shares read-only.
 
 The default offline dependency source is
 `/usr/lib/python3/dist-packages`. Preflight returns the complete bounded
-runtime-probe record and its digest. It does not create the future temporary
-directory.
+runtime-probe record, the exact KVM/path-filesystem capability record, and
+both digests. It does not create the future temporary directory.
 
 ## Rendered data and approval digest
 
-`render-plan` requires the exact passed runtime-probe JSON returned by
-preflight. The selected runtime-site path, complete probe record, probe
-digest, source commit, pinned image, domain XML, cloud-init, and canonical
-future Bash script are all covered by `planDigest`. That digest is the
-separate explicit user-approval boundary.
+`render-plan` requires the exact passed runtime-probe and capability-probe
+JSON returned by preflight. The selected runtime-site path, complete probe
+records and digests, source commit, pinned image, domain XML, cloud-init, and
+canonical future Bash script are all covered by `planDigest`. That digest is
+the separate explicit user-approval boundary. Immediately before creating
+any temporary artifact, the future script reruns both probes and requires
+byte-identical canonical records and matching SHA-256 digests.
 
 The domain shape is fixed to `qemu:///session`,
 `overseer-phase-b-rehearsal-<source7>`, 2048 MiB, two vCPUs, an 8 GiB
@@ -71,11 +77,14 @@ persistent form provides enforceable autostart state.
 
 The one rendered future Bash script is data only. It uses `set -Eeuo
 pipefail`, `umask 077`, a fixed path/locale, exact immutable variables, and
-EXIT/INT/TERM cleanup. Cleanup attempts only graceful shutdown, undefines
-only after confirmed inactivity, and then removes only the six exact files
-inside the validated temporary directory: domain XML, user-data, meta-data,
-overlay, seed ISO, and serial log. It uses no recursive deletion and never
-deletes the base image, source, runtime site, or another directory.
+EXIT/INT/TERM cleanup. A successful `virsh list --all --name` inventory is
+the only authority for present/absent state; a failed inventory or domain
+state query is unknown, returns failure, and retains every artifact. Cleanup
+attempts only graceful shutdown, undefines only after confirmed inactivity,
+confirms authoritative absence after undefine, and then removes only the six
+exact files inside the validated temporary directory: domain XML, user-data,
+meta-data, overlay, seed ISO, and serial log. It uses no recursive deletion
+and never deletes the base image, source, runtime site, or another directory.
 
 The script never redirects `virsh console` into the serial file. It polls the
 libvirt-written serial log for up to 960 seconds, exceeding Task 2's
@@ -89,8 +98,9 @@ to true, and contain no failure or secret-bearing identifiers.
 
 Cloud-init disables default users; creates exact `overseer` UID/GID 984 and
 `god` UID/GID 1000 identities; mounts both 9p shares read-only; copies the
-offline runtime into `/usr/local/lib/python3.13/dist-packages`; installs
-`guest_rehearsal.py` and the outer one-shot unit; creates and revalidates the
+offline runtime into `/usr/local/lib/python3.13/dist-packages`; verifies the
+guest Python 3.13 ABI and all four required imports before starting anything;
+installs `guest_rehearsal.py` and the outer one-shot unit; creates and revalidates the
 six exact empty root-owned mode `0644` child-unit placeholders; runs
 `systemctl daemon-reload`; and starts only the guest-local outer one-shot.
 

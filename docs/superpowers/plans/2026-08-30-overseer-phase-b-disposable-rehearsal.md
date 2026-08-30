@@ -14,7 +14,10 @@
 - Do not run `/home/god/.local/bin/overseer-approved-phase-b`.
 - Do not modify or restart live `overseer.service`, `overseer-api.service`, system units, user units, firewall, routing, VPN, gateway, or another project.
 - Do not use the existing empty `overseer-dax-disposable-libvirt` disk as evidence of a systemd rehearsal.
-- Use a new transient user-session VM with no network interface and no host-writable filesystem share.
+- Use a new temporary user-session VM with no network interface and no
+  host-writable filesystem share. Its persistent definition may exist only
+  for the bounded run, must have autostart disabled, and must be explicitly
+  undefined after authoritative inactive/absent confirmation.
 - The source checkout may be exposed to the guest only through a read-only 9p mount.
 - Use only throwaway deterministic rehearsal credentials generated inside the guest; never copy owner-package verifiers, API tokens, keys, or human secrets into the VM.
 - The guest must use three distinct identities: root runner, UID/GID 984 canary principal, and UID/GID 1000 bridge owner.
@@ -258,7 +261,7 @@ git commit -m "Add disposable Phase B guest rehearsal"
 
 - [ ] **Step 1: Write failing preflight and command-plan tests**
 
-Require `preflight` to reject a dirty tree, a source commit other than the requested full SHA, a missing KVM device, a non-user libvirt URI, an existing target VM, a writable source-share specification, any network device, or an unverified base image. Require `render-plan` to emit canonical JSON without running subprocesses.
+Require `preflight` to reject a dirty tree, a source commit other than the requested full SHA, a missing KVM device, a non-user libvirt URI, missing x86_64 KVM/path-filesystem capability, an existing target VM, a writable source-share specification, any network device, an unverified base image, or runtime imports outside the selected source/runtime roots and Python 3.13 ABI. Require `render-plan` to emit canonical JSON without running subprocesses.
 
 - [ ] **Step 2: Implement inert `preflight` and `render-plan` subcommands**
 
@@ -276,7 +279,7 @@ source mount: read-only 9p tag overseer-source
 serial log: owner-only file under a fresh mktemp directory
 ```
 
-It must define explicit future commands for checksum verification, qcow2 overlay creation, NoCloud ISO creation, transient VM definition/start, bounded wait, serial-result extraction, graceful shutdown, undefine, and deletion of only the exact temporary overlay/seed/log directory. This task must not execute those commands.
+It must define explicit future commands for checksum verification, qcow2 overlay creation, NoCloud ISO creation, `virsh define --validate`, disabled-autostart verification, start, bounded wait, serial-result extraction, graceful shutdown, authoritative inactive/absent confirmation, undefine, and deletion of only the exact temporary overlay/seed/log directory. The persistent definition is temporary and fail-closed because `virsh define` has no valid `--transient` option. Unknown libvirt state must retain all artifacts. This task must not execute those commands.
 
 - [ ] **Step 3: Document the separate approval boundary**
 
@@ -289,7 +292,7 @@ Run:
 ```bash
 pytest -q tests/test_phase_b_rehearsal_tool.py
 python3 -B -s -P tools/phase_b_rehearsal.py preflight --source-commit "$(git rev-parse HEAD)"
-python3 -B -s -P tools/phase_b_rehearsal.py render-plan --source-commit "$(git rev-parse HEAD)"
+python3 -B -s -P tools/phase_b_rehearsal.py render-plan --source-commit "$(git rev-parse HEAD)" --runtime-probe-json '<exact-preflight-runtime-probe-json>' --capability-probe-json '<exact-preflight-capability-probe-json>'
 virsh --connect qemu:///session list --all
 ```
 
@@ -361,4 +364,3 @@ Run `render-plan` twice and require byte-identical canonical output and an ident
 - [ ] **Step 3: Stop for explicit approval**
 
 Present the exact plan digest, image checksum, VM resource limits, no-network assertion, source commit, expected controls, stop conditions, and cleanup targets. Do not download, define, start, console into, stop, undefine, or delete the VM until the user approves that exact plan.
-

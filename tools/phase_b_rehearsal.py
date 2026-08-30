@@ -42,7 +42,7 @@ DEFAULT_BASE_IMAGE = Path(
 )
 DEFAULT_RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
 DEFAULT_TEMP_PARENT = Path("/var/tmp")
-REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v2"
+REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v3"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
 RESULT_TIMEOUT_SECONDS = 960
 
@@ -84,6 +84,7 @@ REQUIRED_TOOLS = (
     "virsh",
     "qemu-img",
     "cloud-localds",
+    "sha256sum",
     "sha512sum",
     "mktemp",
     "timeout",
@@ -100,6 +101,8 @@ REQUIRED_TOOLS = (
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _HOST_PATH = re.compile(r"/[A-Za-z0-9._/+ \-]+\Z")
+_PYTHON_VERSION = re.compile(r"3\.13\.[0-9]+\Z")
+_PYTHON_ABI = re.compile(r"cpython-313-[A-Za-z0-9_.-]+\Z")
 
 
 class PreflightError(RuntimeError):
@@ -134,24 +137,133 @@ def _validate_host_path(path: Path, label: str) -> None:
         raise PreflightError(f"{label} path is unsafe")
 
 
-def _runtime_probe_record(*, source_root: Path, runtime_site: Path) -> dict[str, object]:
-    return {
-        "status": "passed",
-        "noBytecode": True,
-        "python": "/usr/bin/python3",
-        "sourceRoot": str(source_root),
-        "runtimeSite": str(runtime_site),
-        "imports": list(REQUIRED_IMPORTS),
-    }
+def _runtime_probe_python() -> str:
+    return "\n".join(
+        (
+            "import importlib,json,sys,sysconfig",
+            "from pathlib import Path",
+            "sys.dont_write_bytecode=True",
+            "source=Path(sys.argv[1]).resolve(strict=True)",
+            "runtime=Path(sys.argv[2]).resolve(strict=True)",
+            "source_modules=(source/'src').resolve(strict=True)",
+            "stdlib=Path(sysconfig.get_path('stdlib')).resolve(strict=True)",
+            "platstdlib=Path(sysconfig.get_path('platstdlib')).resolve(strict=True)",
+            "stdlib_dynamic=(stdlib/'lib-dynload').resolve(strict=True)",
+            "sys.path[:]=list(dict.fromkeys(map(str,(source_modules,runtime,stdlib,platstdlib,stdlib_dynamic))))",
+            "assert sys.version_info[:2] == (3,13)",
+            f"names={REQUIRED_IMPORTS!r}",
+            "origins={}",
+            "for name in names:",
+            " module=importlib.import_module(name)",
+            " origin=Path(module.__file__).resolve(strict=True)",
+            " expected=runtime if name == 'cryptography' else source_modules",
+            " origin.relative_to(expected)",
+            " origins[name]=str(origin)",
+            "record={'status':'passed','noBytecode':True,'python':str(Path(sys.executable).resolve()),'pythonVersion':'.'.join(map(str,sys.version_info[:3])),'pythonAbi':sysconfig.get_config_var('SOABI'),'sourceRoot':str(source),'runtimeSite':str(runtime),'imports':origins}",
+            "print(json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(',',':')))",
+        )
+    )
 
 
 def _validate_runtime_probe(
     probe: Mapping[str, object], *, source_root: Path, runtime_site: Path
 ) -> dict[str, object]:
-    expected = _runtime_probe_record(source_root=source_root, runtime_site=runtime_site)
-    if dict(probe) != expected:
+    record = dict(probe)
+    if set(record) != {
+        "status",
+        "noBytecode",
+        "python",
+        "pythonVersion",
+        "pythonAbi",
+        "sourceRoot",
+        "runtimeSite",
+        "imports",
+    }:
         raise PreflightError("runtime probe is not the exact passed no-bytecode result")
+    if (
+        record.get("status") != "passed"
+        or record.get("noBytecode") is not True
+        or record.get("python") != "/usr/bin/python3.13"
+        or record.get("sourceRoot") != str(source_root)
+        or record.get("runtimeSite") != str(runtime_site)
+        or not isinstance(record.get("pythonVersion"), str)
+        or _PYTHON_VERSION.fullmatch(record["pythonVersion"]) is None
+        or not isinstance(record.get("pythonAbi"), str)
+        or _PYTHON_ABI.fullmatch(record["pythonAbi"]) is None
+    ):
+        raise PreflightError("runtime probe is not the exact passed no-bytecode result")
+    imports = record.get("imports")
+    if not isinstance(imports, Mapping) or set(imports) != set(REQUIRED_IMPORTS):
+        raise PreflightError("runtime probe is not the exact passed no-bytecode result")
+    normalized_imports: dict[str, str] = {}
+    for name in REQUIRED_IMPORTS:
+        origin_value = imports.get(name)
+        if not isinstance(origin_value, str):
+            raise PreflightError("runtime probe is not the exact passed no-bytecode result")
+        origin = Path(origin_value)
+        _validate_host_path(origin, "runtime probe import")
+        expected_root = runtime_site if name == "cryptography" else source_root / "src"
+        if not origin.is_relative_to(expected_root):
+            raise PreflightError("runtime probe is not the exact passed no-bytecode result")
+        normalized_imports[name] = origin_value
+    record["imports"] = normalized_imports
+    return record
+
+
+def _capability_probe_record() -> dict[str, object]:
+    return {
+        "status": "passed",
+        "libvirtUri": LIBVIRT_URI,
+        "domain": "kvm",
+        "arch": "x86_64",
+        "filesystem": {"supported": True, "driverType": "path"},
+    }
+
+
+def _validate_capability_probe(probe: Mapping[str, object]) -> dict[str, object]:
+    expected = _capability_probe_record()
+    if dict(probe) != expected:
+        raise PreflightError("capability probe is not the exact passed KVM filesystem result")
     return expected
+
+
+def _parse_domain_capabilities(value: str) -> dict[str, object]:
+    try:
+        root = ElementTree.fromstring(value)
+    except ElementTree.ParseError as error:
+        raise PreflightError("KVM domain capabilities are unavailable") from error
+    filesystem = root.find("./devices/filesystem")
+    driver_types = {
+        item.text
+        for item in root.findall("./devices/filesystem/enum[@name='driverType']/value")
+    }
+    if (
+        root.findtext("domain") != "kvm"
+        or root.findtext("arch") != "x86_64"
+        or filesystem is None
+        or filesystem.get("supported") != "yes"
+        or "path" not in driver_types
+    ):
+        raise PreflightError("KVM path filesystem capability is unavailable")
+    return _capability_probe_record()
+
+
+def _capability_probe_python() -> str:
+    return "\n".join(
+        (
+            "import json,sys",
+            "from xml.etree import ElementTree",
+            "root=ElementTree.fromstring(sys.stdin.read())",
+            "filesystem=root.find('./devices/filesystem')",
+            "drivers={item.text for item in root.findall(\"./devices/filesystem/enum[@name='driverType']/value\")}",
+            "assert root.findtext('domain') == 'kvm'",
+            "assert root.findtext('arch') == 'x86_64'",
+            "assert filesystem is not None and filesystem.get('supported') == 'yes'",
+            "assert 'path' in drivers",
+            f"record={_capability_probe_record()!r}",
+            "print(json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(',',':')))",
+        )
+    )
 
 
 def _read_only_runner(command: tuple[str, ...]) -> str:
@@ -181,17 +293,17 @@ def _read_only_runner(command: tuple[str, ...]) -> str:
     elif label == "qemu-img-info":
         argv = ("qemu-img", "info", "--output=json", "--force-share", command[1])
     elif label == "import-probe":
-        probe_code = (
-            "import importlib,json,sys;"
-            "sys.dont_write_bytecode=True;"
-            "sys.path.insert(0,sys.argv[1]+'/src');"
-            "sys.path.insert(1,sys.argv[2]);"
-            f"names={REQUIRED_IMPORTS!r};"
-            "[importlib.import_module(name) for name in names];"
-            "print(json.dumps({'imports':list(names),'noBytecode':True,'status':'passed'},"
-            "sort_keys=True,separators=(',',':')))"
+        argv = (
+            "python3",
+            "-B",
+            "-s",
+            "-P",
+            "-S",
+            "-c",
+            _runtime_probe_python(),
+            command[1],
+            command[2],
         )
-        argv = ("python3", "-B", "-s", "-P", "-c", probe_code, command[1], command[2])
         env = os.environ.copy()
         env.update(
             {
@@ -433,12 +545,10 @@ def preflight(
     if target_name in domains:
         raise PreflightError(f"target VM already exists: {target_name}")
 
-    try:
-        capabilities = ElementTree.fromstring(runner(("domain-capabilities",)))
-    except ElementTree.ParseError as error:
-        raise PreflightError("KVM domain capabilities are unavailable") from error
-    if capabilities.findtext("domain") != "kvm":
-        raise PreflightError("KVM domain capabilities are unavailable")
+    capability_probe = _parse_domain_capabilities(runner(("domain-capabilities",)))
+    capability_probe_digest = hashlib.sha256(
+        canonical_json(capability_probe).encode()
+    ).hexdigest()
     try:
         image_info = json.loads(runner(("qemu-img-info", str(base_image))))
     except (json.JSONDecodeError, TypeError) as error:
@@ -457,16 +567,14 @@ def preflight(
         )
     except (json.JSONDecodeError, TypeError) as error:
         raise PreflightError("runtime import probe failed") from error
-    expected_probe_output = {
-        "status": "passed",
-        "noBytecode": True,
-        "imports": list(REQUIRED_IMPORTS),
-    }
-    if probe_output != expected_probe_output:
+    if not isinstance(probe_output, Mapping):
         raise PreflightError("runtime import probe failed")
-    runtime_probe = _runtime_probe_record(
-        source_root=source_root, runtime_site=runtime_site
-    )
+    try:
+        runtime_probe = _validate_runtime_probe(
+            probe_output, source_root=source_root, runtime_site=runtime_site
+        )
+    except PreflightError as error:
+        raise PreflightError("runtime import probe failed") from error
     probe_digest = hashlib.sha256(canonical_json(runtime_probe).encode()).hexdigest()
     inputs = _plan_inputs(source_root=source_root, runtime_site=runtime_site)
     return {
@@ -477,13 +585,18 @@ def preflight(
         "baseImageSha512": BASE_IMAGE_SHA512,
         "runtimeProbe": runtime_probe,
         "runtimeProbeDigest": probe_digest,
+        "capabilityProbe": capability_probe,
+        "capabilityProbeDigest": capability_probe_digest,
         "planInputs": inputs,
         "checkedTools": list(REQUIRED_TOOLS),
         "tempDirectoryCreated": False,
     }
 
 
-def _cloud_init() -> str:
+def _cloud_init(runtime_probe: Mapping[str, object]) -> str:
+    python_abi = runtime_probe["pythonAbi"]
+    if not isinstance(python_abi, str) or _PYTHON_ABI.fullmatch(python_abi) is None:
+        raise PreflightError("runtime probe Python ABI is invalid")
     lines = [
         "#cloud-config",
         "users: []",
@@ -521,6 +634,7 @@ def _cloud_init() -> str:
             "      test \"$(getent passwd 1000 | cut -d: -f1,3,4)\" = god:1000:1000",
             "      install -d -m 0755 /usr/local/lib/python3.13/dist-packages",
             "      cp -a /mnt/overseer-runtime-site/. /usr/local/lib/python3.13/dist-packages/",
+            f'      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH=/mnt/overseer-source/src /usr/bin/python3 -B -s -P -c "import sys,sysconfig; assert sys.version_info[:2] == (3,13); assert sysconfig.get_config_var(\\"SOABI\\") == \\"{python_abi}\\"; import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor"',
             "      install -D -m 0755 /mnt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.py /opt/overseer-phase-b-rehearsal/guest_rehearsal.py",
             "      install -D -m 0644 /mnt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.service /etc/systemd/system/overseer-phase-b-rehearsal.service",
             f"      for placeholder in {placeholders}; do test ! -s \"$placeholder\"; chown root:root \"$placeholder\"; chmod 0644 \"$placeholder\"; done",
@@ -591,6 +705,10 @@ def _future_script(
     vm_name: str,
     source_root: Path,
     runtime_site: Path,
+    runtime_probe: Mapping[str, object],
+    runtime_probe_digest: str,
+    capability_probe: Mapping[str, object],
+    capability_probe_digest: str,
     base_image: Path,
     temp_parent: Path,
     domain_xml: str,
@@ -598,11 +716,17 @@ def _future_script(
     meta_data: str,
 ) -> str:
     validator = _result_validator_python()
+    runtime_probe_json = canonical_json(runtime_probe)
+    capability_probe_json = canonical_json(capability_probe)
+    runtime_probe_code = _runtime_probe_python()
+    capability_probe_code = _capability_probe_python()
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
 
 readonly LIBVIRT_URI={shlex.quote(LIBVIRT_URI)}
 readonly SOURCE_COMMIT={shlex.quote(source_commit)}
@@ -612,6 +736,10 @@ readonly RUNTIME_SITE={shlex.quote(str(runtime_site))}
 readonly BASE_IMAGE={shlex.quote(str(base_image))}
 readonly TEMP_PARENT={shlex.quote(str(temp_parent))}
 readonly EXPECTED_SHA512={shlex.quote(BASE_IMAGE_SHA512)}
+readonly EXPECTED_RUNTIME_PROBE_JSON={shlex.quote(runtime_probe_json)}
+readonly EXPECTED_RUNTIME_PROBE_SHA256={shlex.quote(runtime_probe_digest)}
+readonly EXPECTED_CAPABILITY_PROBE_JSON={shlex.quote(capability_probe_json)}
+readonly EXPECTED_CAPABILITY_PROBE_SHA256={shlex.quote(capability_probe_digest)}
 readonly RESULT_TIMEOUT_SECONDS={RESULT_TIMEOUT_SECONDS}
 readonly SHUTDOWN_TIMEOUT_SECONDS=120
 
@@ -623,21 +751,87 @@ DOMAIN_XML=""
 USER_DATA=""
 META_DATA=""
 
-domain_exists() {{
-  virsh --connect "$LIBVIRT_URI" dominfo "$VM_NAME" >/dev/null 2>&1
+domain_presence() {{
+  local names count
+  if ! names="$(virsh --connect "$LIBVIRT_URI" list --all --name 2>/dev/null)"; then
+    return 2
+  fi
+  if ! count="$(printf '%s\n' "$names" | awk -v expected="$VM_NAME" '$0 == expected {{ count++ }} END {{ print count + 0 }}')"; then
+    return 2
+  fi
+  case "$count" in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) return 2 ;;
+  esac
 }}
 
-domain_is_inactive() {{
-  [[ "$(virsh --connect "$LIBVIRT_URI" domstate "$VM_NAME" 2>/dev/null || true)" == "shut off" ]]
+domain_state() {{
+  local state
+  if ! state="$(virsh --connect "$LIBVIRT_URI" domstate "$VM_NAME" 2>/dev/null)"; then
+    return 2
+  fi
+  printf '%s\n' "$state"
 }}
 
 wait_for_inactive() {{
-  local deadline=$((SECONDS + SHUTDOWN_TIMEOUT_SECONDS))
-  while domain_exists && ! domain_is_inactive; do
+  local deadline=$((SECONDS + SHUTDOWN_TIMEOUT_SECONDS)) presence state
+  while true; do
+    if domain_presence; then
+      presence=0
+    else
+      presence=$?
+    fi
+    case "$presence" in
+      1) return 0 ;;
+      2) return 1 ;;
+    esac
+    if ! state="$(domain_state)"; then
+      return 1
+    fi
+    [[ "$state" == "shut off" ]] && return 0
     (( SECONDS < deadline )) || return 1
     sleep 2
   done
-  ! domain_exists || domain_is_inactive
+}}
+
+shutdown_and_undefine() {{
+  local presence state
+  if domain_presence; then
+    presence=0
+  else
+    presence=$?
+  fi
+  case "$presence" in
+    1) return 0 ;;
+    2) return 1 ;;
+  esac
+  if ! state="$(domain_state)"; then
+    return 1
+  fi
+  if [[ "$state" != "shut off" ]]; then
+    virsh --connect "$LIBVIRT_URI" shutdown "$VM_NAME" >/dev/null 2>&1 || return 1
+    wait_for_inactive || return 1
+  fi
+  if domain_presence; then
+    presence=0
+  else
+    presence=$?
+  fi
+  case "$presence" in
+    1) return 0 ;;
+    2) return 1 ;;
+  esac
+  if ! state="$(domain_state)" || [[ "$state" != "shut off" ]]; then
+    return 1
+  fi
+  virsh --connect "$LIBVIRT_URI" undefine "$VM_NAME" >/dev/null 2>&1 || return 1
+  if domain_presence; then
+    return 1
+  else
+    presence=$?
+  fi
+  [[ "$presence" -eq 1 ]]
 }}
 
 temp_layout_is_exact() {{
@@ -652,22 +846,15 @@ temp_layout_is_exact() {{
 
 cleanup() {{
   local original_status="${{1:-1}}"
-  local cleanup_status=0
+  local cleanup_status=0 confirmed_absent=0
   trap - EXIT INT TERM
   set +e
-  if domain_exists; then
-    if ! domain_is_inactive; then
-      virsh --connect "$LIBVIRT_URI" shutdown "$VM_NAME" >/dev/null 2>&1 || cleanup_status=1
-      wait_for_inactive || cleanup_status=1
-    fi
-    if (( cleanup_status == 0 )) && domain_is_inactive; then
-      virsh --connect "$LIBVIRT_URI" undefine "$VM_NAME" >/dev/null 2>&1 || cleanup_status=1
-    fi
-  fi
-  if domain_exists; then
+  if shutdown_and_undefine; then
+    confirmed_absent=1
+  else
     cleanup_status=1
   fi
-  if (( cleanup_status == 0 )) && temp_layout_is_exact; then
+  if (( confirmed_absent == 1 )) && temp_layout_is_exact; then
     rm -f -- "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$SERIAL_LOG"
     rmdir -- "$TEMP_DIR" || cleanup_status=1
   elif [[ -n "$TEMP_DIR" ]]; then
@@ -689,12 +876,24 @@ trap 'cleanup 143' TERM
 [[ "$RUNTIME_SITE" == {shlex.quote(str(runtime_site))} ]]
 [[ "$BASE_IMAGE" == {shlex.quote(str(base_image))} ]]
 [[ "$TEMP_PARENT" == {shlex.quote(str(temp_parent))} ]]
-if domain_exists; then
+if domain_presence; then
   printf '%s\n' 'target VM already exists at future execution boundary' >&2
   exit 1
+else
+  presence=$?
+  if [[ "$presence" -ne 1 ]]; then
+    printf '%s\n' 'libvirt domain inventory is unavailable at future execution boundary' >&2
+    exit 1
+  fi
 fi
 [[ "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
 [[ -z "$(git -C "$SOURCE_ROOT" status --porcelain --untracked-files=all)" ]]
+ACTUAL_RUNTIME_PROBE_JSON="$(python3 -B -s -P -S -c {shlex.quote(runtime_probe_code)} "$SOURCE_ROOT" "$RUNTIME_SITE")"
+[[ "$ACTUAL_RUNTIME_PROBE_JSON" == "$EXPECTED_RUNTIME_PROBE_JSON" ]]
+[[ "$(printf '%s' "$ACTUAL_RUNTIME_PROBE_JSON" | sha256sum | awk '{{print $1}}')" == "$EXPECTED_RUNTIME_PROBE_SHA256" ]]
+ACTUAL_CAPABILITY_PROBE_JSON="$(virsh --connect "$LIBVIRT_URI" domcapabilities --virttype kvm --arch x86_64 | python3 -B -s -P -S -c {shlex.quote(capability_probe_code)})"
+[[ "$ACTUAL_CAPABILITY_PROBE_JSON" == "$EXPECTED_CAPABILITY_PROBE_JSON" ]]
+[[ "$(printf '%s' "$ACTUAL_CAPABILITY_PROBE_JSON" | sha256sum | awk '{{print $1}}')" == "$EXPECTED_CAPABILITY_PROBE_SHA256" ]]
 
 TEMP_DIR="$(mktemp -d -p "$TEMP_PARENT" overseer-phase-b-rehearsal.XXXXXX)"
 OVERLAY="$TEMP_DIR/overlay.qcow2"
@@ -738,12 +937,7 @@ fi
 python3 -B -s -P - "$SERIAL_LOG" <<'PY_RESULT_VALIDATOR'
 {validator}PY_RESULT_VALIDATOR
 
-if domain_exists && ! domain_is_inactive; then
-  virsh --connect "$LIBVIRT_URI" shutdown "$VM_NAME"
-fi
-wait_for_inactive
-domain_is_inactive
-virsh --connect "$LIBVIRT_URI" undefine "$VM_NAME"
+shutdown_and_undefine
 """
 
 
@@ -753,6 +947,7 @@ def render_plan(
     source_root: Path,
     runtime_site: Path,
     runtime_probe: Mapping[str, object],
+    capability_probe: Mapping[str, object],
     base_image: Path = DEFAULT_BASE_IMAGE,
     temp_parent: Path = DEFAULT_TEMP_PARENT,
 ) -> dict[str, object]:
@@ -770,8 +965,12 @@ def render_plan(
         runtime_probe, source_root=source_root, runtime_site=runtime_site
     )
     probe_digest = hashlib.sha256(canonical_json(validated_probe).encode()).hexdigest()
+    validated_capability_probe = _validate_capability_probe(capability_probe)
+    capability_probe_digest = hashlib.sha256(
+        canonical_json(validated_capability_probe).encode()
+    ).hexdigest()
     vm_name = f"overseer-phase-b-rehearsal-{source_commit[:7]}"
-    cloud_init = _cloud_init()
+    cloud_init = _cloud_init(validated_probe)
     meta_data = _meta_data(vm_name)
     domain_xml = _domain_xml(
         vm_name=vm_name, source_root=source_root, runtime_site=runtime_site
@@ -782,6 +981,10 @@ def render_plan(
         vm_name=vm_name,
         source_root=source_root,
         runtime_site=runtime_site,
+        runtime_probe=validated_probe,
+        runtime_probe_digest=probe_digest,
+        capability_probe=validated_capability_probe,
+        capability_probe_digest=capability_probe_digest,
         base_image=base_image,
         temp_parent=temp_parent,
         domain_xml=domain_xml,
@@ -819,6 +1022,8 @@ def render_plan(
         },
         "runtimeProbe": validated_probe,
         "runtimeProbeDigest": probe_digest,
+        "capabilityProbe": validated_capability_probe,
+        "capabilityProbeDigest": capability_probe_digest,
         "taskTwoPlaceholders": list(TASK_TWO_PLACEHOLDERS),
         "cloudInit": cloud_init,
         "metaData": meta_data,
@@ -845,6 +1050,7 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("--temp-parent", type=Path, default=DEFAULT_TEMP_PARENT)
     preflight_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     render_parser.add_argument("--runtime-probe-json", required=True)
+    render_parser.add_argument("--capability-probe-json", required=True)
     return parser
 
 
@@ -867,11 +1073,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise PreflightError("runtime probe JSON is invalid") from error
             if not isinstance(runtime_probe, dict):
                 raise PreflightError("runtime probe JSON is invalid")
+            try:
+                capability_probe = json.loads(args.capability_probe_json)
+            except json.JSONDecodeError as error:
+                raise PreflightError("capability probe JSON is invalid") from error
+            if not isinstance(capability_probe, dict):
+                raise PreflightError("capability probe JSON is invalid")
             result = render_plan(
                 source_commit=args.source_commit,
                 source_root=args.source_root,
                 runtime_site=args.runtime_site,
                 runtime_probe=runtime_probe,
+                capability_probe=capability_probe,
                 base_image=args.base_image,
                 temp_parent=args.temp_parent,
             )

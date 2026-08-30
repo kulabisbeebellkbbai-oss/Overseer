@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -27,6 +28,8 @@ EXPECTED_IMPORTS = (
     "overseer.user_bridge",
     "overseer.admin_executor",
 )
+EXPECTED_PYTHON_VERSION = "3.13.5"
+EXPECTED_PYTHON_ABI = "cpython-313-x86_64-linux-gnu"
 EXPECTED_CONTROLS = frozenset(
     {
         "systemdCredentials",
@@ -60,10 +63,27 @@ def runtime_probe() -> dict[str, object]:
     return {
         "status": "passed",
         "noBytecode": True,
-        "python": "/usr/bin/python3",
+        "python": "/usr/bin/python3.13",
+        "pythonVersion": EXPECTED_PYTHON_VERSION,
+        "pythonAbi": EXPECTED_PYTHON_ABI,
         "sourceRoot": str(SOURCE_ROOT),
         "runtimeSite": str(RUNTIME_SITE),
-        "imports": list(EXPECTED_IMPORTS),
+        "imports": {
+            "cryptography": str(RUNTIME_SITE / "cryptography/__init__.py"),
+            "overseer.cli": str(SOURCE_ROOT / "src/overseer/cli.py"),
+            "overseer.user_bridge": str(SOURCE_ROOT / "src/overseer/user_bridge.py"),
+            "overseer.admin_executor": str(SOURCE_ROOT / "src/overseer/admin_executor.py"),
+        },
+    }
+
+
+def capability_probe() -> dict[str, object]:
+    return {
+        "status": "passed",
+        "libvirtUri": "qemu:///session",
+        "domain": "kvm",
+        "arch": "x86_64",
+        "filesystem": {"supported": True, "driverType": "path"},
     }
 
 
@@ -73,6 +93,7 @@ def render(module, **overrides: object) -> dict[str, object]:
         "source_root": SOURCE_ROOT,
         "runtime_site": RUNTIME_SITE,
         "runtime_probe": runtime_probe(),
+        "capability_probe": capability_probe(),
         "base_image": BASE_IMAGE,
         "temp_parent": TEMP_PARENT,
     }
@@ -97,9 +118,13 @@ def valid_preflight_kwargs(module) -> dict[str, object]:
         "git-head": SOURCE_COMMIT,
         "libvirt-uri": module.LIBVIRT_URI,
         "domains": "",
-        "domain-capabilities": "<domainCapabilities><domain>kvm</domain></domainCapabilities>",
+        "domain-capabilities": (
+            "<domainCapabilities><domain>kvm</domain><arch>x86_64</arch><devices>"
+            "<filesystem supported='yes'><enum name='driverType'><value>path</value>"
+            "</enum></filesystem></devices></domainCapabilities>"
+        ),
         "qemu-img-info": json.dumps({"format": "qcow2", "filename": str(BASE_IMAGE)}),
-        "import-probe": json.dumps({"status": "passed", "noBytecode": True, "imports": list(EXPECTED_IMPORTS)}),
+        "import-probe": json.dumps(runtime_probe()),
     }
     return {
         "source_commit": SOURCE_COMMIT,
@@ -126,7 +151,21 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
     )
     assert module.DEFAULT_RUNTIME_SITE == RUNTIME_SITE
     assert module.RUNTIME_MOUNT_TAG == "overseer-runtime-site"
-    assert set(("bash", "awk", "cat", "grep", "install", "rm", "rmdir", "sleep", "python3", "timeout")) <= set(module.REQUIRED_TOOLS)
+    assert set(
+        (
+            "bash",
+            "awk",
+            "cat",
+            "grep",
+            "install",
+            "rm",
+            "rmdir",
+            "sha256sum",
+            "sleep",
+            "python3",
+            "timeout",
+        )
+    ) <= set(module.REQUIRED_TOOLS)
 
 
 def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
@@ -137,6 +176,10 @@ def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
     assert result["runtimeProbe"] == runtime_probe()
     assert result["runtimeProbeDigest"] == hashlib.sha256(
         module.canonical_json(runtime_probe()).encode()
+    ).hexdigest()
+    assert result["capabilityProbe"] == capability_probe()
+    assert result["capabilityProbeDigest"] == hashlib.sha256(
+        module.canonical_json(capability_probe()).encode()
     ).hexdigest()
     assert result["planInputs"]["networkDevices"] == []
     assert result["planInputs"]["sourceMount"]["readOnly"] is True
@@ -157,6 +200,8 @@ def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
         ("unsafe-temp", "temporary path"),
         ("raw-image", "qcow2"),
         ("failed-import", "import probe"),
+        ("missing-filesystem", "filesystem"),
+        ("missing-path-driver", "filesystem"),
         ("missing-tool", "tooling"),
     ),
 )
@@ -188,6 +233,21 @@ def test_preflight_rejects_unsafe_kvm_path_image_runtime_and_tool_states(case: s
         values["runner"] = lambda command: '{"format":"raw"}' if command[0] == "qemu-img-info" else original_runner(command)
     elif case == "failed-import":
         values["runner"] = lambda command: '{"status":"failed"}' if command[0] == "import-probe" else original_runner(command)
+    elif case == "missing-filesystem":
+        values["runner"] = lambda command: (
+            "<domainCapabilities><domain>kvm</domain><arch>x86_64</arch><devices>"
+            "<filesystem supported='no'/></devices></domainCapabilities>"
+            if command[0] == "domain-capabilities"
+            else original_runner(command)
+        )
+    elif case == "missing-path-driver":
+        values["runner"] = lambda command: (
+            "<domainCapabilities><domain>kvm</domain><arch>x86_64</arch><devices>"
+            "<filesystem supported='yes'><enum name='driverType'><value>virtiofs</value>"
+            "</enum></filesystem></devices></domainCapabilities>"
+            if command[0] == "domain-capabilities"
+            else original_runner(command)
+        )
     elif case == "missing-tool":
         values["which"] = lambda name: None if name == "awk" else f"/usr/bin/{name}"
     with pytest.raises(module.PreflightError, match=message):
@@ -250,8 +310,10 @@ def test_default_runner_import_probe_is_no_bytecode_and_all_commands_are_read_on
     rendered = "\n".join(" ".join(argv) for argv, _ in calls)
     assert " define " not in rendered and " start " not in rendered and " shutdown " not in rendered
     import_argv, import_kwargs = calls[-1]
-    assert import_argv[:5] == ("python3", "-B", "-s", "-P", "-c")
-    assert all(name in import_argv[5] for name in EXPECTED_IMPORTS)
+    assert import_argv[:6] == ("python3", "-B", "-s", "-P", "-S", "-c")
+    assert all(name in import_argv[6] for name in EXPECTED_IMPORTS)
+    assert "relative_to(expected)" in import_argv[6]
+    assert "sys.version_info[:2] == (3,13)" in import_argv[6]
     assert import_kwargs["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 
 
@@ -262,11 +324,16 @@ def test_render_plan_is_pure_canonical_and_probe_bound(monkeypatch: pytest.Monke
 
     rendered = render(module)
     plan = rendered["plan"]
+    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v3"
     assert module.canonical_json(rendered) == json.dumps(rendered, sort_keys=True, separators=(",", ":"))
     assert rendered["planDigest"] == hashlib.sha256(module.canonical_json(plan).encode()).hexdigest()
     assert plan["runtimeSite"]["hostPath"] == str(RUNTIME_SITE)
     assert plan["runtimeProbe"] == runtime_probe()
     assert plan["runtimeProbeDigest"] == hashlib.sha256(module.canonical_json(runtime_probe()).encode()).hexdigest()
+    assert plan["capabilityProbe"] == capability_probe()
+    assert plan["capabilityProbeDigest"] == hashlib.sha256(
+        module.canonical_json(capability_probe()).encode()
+    ).hexdigest()
     assert plan["futureScriptSha256"] == hashlib.sha256(plan["futureScript"].encode()).hexdigest()
 
 
@@ -334,6 +401,8 @@ def test_cloud_init_installs_complete_task_two_guest_contract() -> None:
         "/mnt/overseer-runtime-site",
         "trans=virtio,version=9p2000.L,ro",
         "/usr/local/lib/python3.13/dist-packages",
+        EXPECTED_PYTHON_ABI,
+        "import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor",
         "guest_rehearsal.py",
         "guest_rehearsal.service",
         "systemctl daemon-reload",
@@ -366,6 +435,12 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert "target VM already exists at future execution boundary" in script
     assert 'git -C "$SOURCE_ROOT" rev-parse HEAD' in script
     assert 'git -C "$SOURCE_ROOT" status --porcelain' in script
+    assert "readonly EXPECTED_RUNTIME_PROBE_JSON=" in script
+    assert "readonly EXPECTED_CAPABILITY_PROBE_JSON=" in script
+    assert "ACTUAL_RUNTIME_PROBE_JSON=" in script
+    assert "ACTUAL_CAPABILITY_PROBE_JSON=" in script
+    assert script.index("ACTUAL_RUNTIME_PROBE_JSON=") < script.index("qemu-img create")
+    assert script.index("ACTUAL_CAPABILITY_PROBE_JSON=") < script.index("qemu-img create")
     assert "virsh console" not in script
     assert "readonly RESULT_TIMEOUT_SECONDS=960" in script
     assert "wait_for_inactive" in script
@@ -376,6 +451,84 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     for exact in ("$DOMAIN_XML", "$USER_DATA", "$META_DATA", "$OVERLAY", "$SEED_ISO", "$SERIAL_LOG"):
         assert exact in cleanup_line
     assert "$BASE_IMAGE" not in cleanup_line and "$SOURCE_ROOT" not in cleanup_line and "$RUNTIME_SITE" not in cleanup_line
+
+
+def _run_cleanup_harness(script: str, temp_dir: Path, virsh_function: str) -> subprocess.CompletedProcess[str]:
+    start = script.index("domain_presence() {")
+    end = script.index("trap 'cleanup $?' EXIT")
+    helpers = script[start:end]
+    paths = {
+        "OVERLAY": temp_dir / "overlay.qcow2",
+        "SEED_ISO": temp_dir / "seed.iso",
+        "SERIAL_LOG": temp_dir / "serial.log",
+        "DOMAIN_XML": temp_dir / "domain.xml",
+        "USER_DATA": temp_dir / "user-data",
+        "META_DATA": temp_dir / "meta-data",
+    }
+    temp_dir.mkdir()
+    for path in paths.values():
+        path.write_text("fixture", encoding="utf-8")
+    assignments = [
+        "set -Eeuo pipefail",
+        "LIBVIRT_URI=qemu:///session",
+        "VM_NAME=overseer-phase-b-rehearsal-54a53bc",
+        "SHUTDOWN_TIMEOUT_SECONDS=1",
+        f"TEMP_DIR={shlex.quote(str(temp_dir))}",
+        *(f"{name}={shlex.quote(str(path))}" for name, path in paths.items()),
+        virsh_function,
+        helpers,
+        "cleanup 0",
+    ]
+    return subprocess.run(
+        ("bash", "-c", "\n".join(assignments)),
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.parametrize(
+    "virsh_function",
+    (
+        "virsh() { return 9; }",
+        "virsh() { case \"$*\" in *\" list --all --name\") printf '%s\\n' \"$VM_NAME\"; return 0;; *\" domstate \"*) return 9;; *) return 9;; esac; }",
+    ),
+)
+def test_cleanup_retains_every_artifact_when_libvirt_state_is_unknown(
+    tmp_path: Path, virsh_function: str
+) -> None:
+    module = load_tool()
+    temp_dir = tmp_path / "unknown-state"
+
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"], temp_dir, virsh_function
+    )
+
+    assert completed.returncode != 0
+    assert temp_dir.is_dir()
+    assert {path.name for path in temp_dir.iterdir()} == {
+        "overlay.qcow2",
+        "seed.iso",
+        "serial.log",
+        "domain.xml",
+        "user-data",
+        "meta-data",
+    }
+
+
+def test_cleanup_deletes_exact_artifacts_only_after_authoritative_absence(tmp_path: Path) -> None:
+    module = load_tool()
+    temp_dir = tmp_path / "absent-state"
+
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"],
+        temp_dir,
+        "virsh() { case \"$*\" in *\" list --all --name\") return 0;; *) return 9;; esac; }",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not temp_dir.exists()
 
 
 def test_future_script_requires_one_canonical_passing_secret_free_result() -> None:
@@ -421,3 +574,27 @@ def test_render_rejects_unpassed_or_mismatched_runtime_probe() -> None:
     mismatched["runtimeSite"] = "/other/runtime"
     with pytest.raises(module.PreflightError, match="runtime probe"):
         render(module, runtime_probe=mismatched)
+
+    wrong_origin = runtime_probe()
+    wrong_origin["imports"] = dict(wrong_origin["imports"])
+    wrong_origin["imports"]["cryptography"] = "/usr/local/lib/python3.13/site-packages/cryptography/__init__.py"
+    with pytest.raises(module.PreflightError, match="runtime probe"):
+        render(module, runtime_probe=wrong_origin)
+
+    wrong_abi = runtime_probe()
+    wrong_abi["pythonAbi"] = "cpython-312-x86_64-linux-gnu"
+    with pytest.raises(module.PreflightError, match="runtime probe"):
+        render(module, runtime_probe=wrong_abi)
+
+
+def test_render_rejects_unpassed_or_mismatched_capability_probe() -> None:
+    module = load_tool()
+    failed = capability_probe()
+    failed["status"] = "failed"
+    with pytest.raises(module.PreflightError, match="capability probe"):
+        render(module, capability_probe=failed)
+
+    wrong_driver = capability_probe()
+    wrong_driver["filesystem"] = {"supported": True, "driverType": "virtiofs"}
+    with pytest.raises(module.PreflightError, match="capability probe"):
+        render(module, capability_probe=wrong_driver)

@@ -20,10 +20,16 @@ import pytest
 
 
 TOOL = Path(__file__).parents[1] / "tools" / "phase_b_rehearsal.py"
+ACTIVE_DUMPXML_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "phase_b_rehearsal_active_dumpxml.xml"
+)
 SOURCE_COMMIT = "54a53bc34078c42a4303d6fe4de7e517a9e8f44b"
 SOURCE_ROOT = Path("/home/god/Documents/Codex Workspace/Overseer/source")
 RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
 BASE_IMAGE = Path("/var/lib/overseer-phase-b-rehearsal/debian-13-genericcloud-amd64.qcow2")
+FIRMWARE_CODE = Path("/usr/share/OVMF/OVMF_CODE_4M.fd")
+FIRMWARE_VARS_TEMPLATE = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
+MACHINE_TYPE = "pc-i440fx-10.0"
 TEMP_PARENT = Path("/var/tmp")
 EXPECTED_IMPORTS = (
     "cryptography",
@@ -103,7 +109,18 @@ def capability_probe() -> dict[str, object]:
         "libvirtUri": "qemu:///session",
         "domain": "kvm",
         "arch": "x86_64",
+        "machine": MACHINE_TYPE,
         "filesystem": {"supported": True, "driverType": "path"},
+        "firmware": {
+            "mode": "efi",
+            "loader": str(FIRMWARE_CODE),
+            "loaderType": "pflash",
+            "loaderReadonly": True,
+            "loaderSecure": False,
+            "loaderSha256": "624e06de18b4fa535e90db7160d00d3d07d206422b89999bf1e27d920264e4e0",
+            "varsTemplate": str(FIRMWARE_VARS_TEMPLATE),
+            "varsTemplateSha256": "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e",
+        },
     }
 
 
@@ -175,9 +192,17 @@ def fake_stat(path: Path) -> SimpleNamespace:
         SOURCE_ROOT: stat.S_IFDIR | 0o755,
         RUNTIME_SITE: stat.S_IFDIR | 0o755,
         BASE_IMAGE: stat.S_IFREG | 0o640,
+        FIRMWARE_CODE: stat.S_IFREG | 0o644,
+        FIRMWARE_VARS_TEMPLATE: stat.S_IFREG | 0o644,
         TEMP_PARENT: stat.S_IFDIR | 0o1777,
     }
-    return SimpleNamespace(st_mode=modes[path], st_uid=os.geteuid(), st_gid=os.getegid())
+    firmware_paths = {FIRMWARE_CODE, FIRMWARE_VARS_TEMPLATE}
+    return SimpleNamespace(
+        st_mode=modes[path],
+        st_uid=0 if path in firmware_paths else os.geteuid(),
+        st_gid=0 if path in firmware_paths else os.getegid(),
+        st_nlink=1,
+    )
 
 
 def valid_preflight_kwargs(module) -> dict[str, object]:
@@ -188,7 +213,13 @@ def valid_preflight_kwargs(module) -> dict[str, object]:
         "libvirt-uri": module.LIBVIRT_URI,
         "domains": "",
         "domain-capabilities": (
-            "<domainCapabilities><domain>kvm</domain><arch>x86_64</arch><devices>"
+            "<domainCapabilities><domain>kvm</domain><arch>x86_64</arch>"
+            f"<machine>{MACHINE_TYPE}</machine>"
+            "<os supported='yes'><enum name='firmware'><value>efi</value></enum>"
+            "<loader supported='yes'><value>/usr/share/OVMF/OVMF_CODE_4M.fd</value>"
+            "<enum name='type'><value>pflash</value></enum>"
+            "<enum name='readonly'><value>yes</value></enum>"
+            "<enum name='secure'><value>no</value></enum></loader></os><devices>"
             "<filesystem supported='yes'><enum name='driverType'><value>path</value>"
             "</enum></filesystem></devices></domainCapabilities>"
         ),
@@ -203,11 +234,24 @@ def valid_preflight_kwargs(module) -> dict[str, object]:
         "base_image": BASE_IMAGE,
         "temp_parent": TEMP_PARENT,
         "runner": lambda command: responses[command[0]],
-        "path_exists": lambda path: path in {Path("/dev/kvm"), SOURCE_ROOT, RUNTIME_SITE, BASE_IMAGE, TEMP_PARENT},
+        "path_exists": lambda path: path
+        in {
+            Path("/dev/kvm"),
+            SOURCE_ROOT,
+            RUNTIME_SITE,
+            BASE_IMAGE,
+            FIRMWARE_CODE,
+            FIRMWARE_VARS_TEMPLATE,
+            TEMP_PARENT,
+        },
         "path_stat": fake_stat,
         "path_access": lambda path, mode: True,
         "is_symlink": lambda path: False,
         "image_sha512": lambda path: module.BASE_IMAGE_SHA512,
+        "firmware_sha256": lambda path: {
+            FIRMWARE_CODE: module.FIRMWARE_CODE_SHA256,
+            FIRMWARE_VARS_TEMPLATE: module.FIRMWARE_VARS_SHA256,
+        }[path],
         "tool_exists": lambda path: str(path) in set(module.EXACT_TOOLS.values()),
         "tool_stat": lambda path: SimpleNamespace(
             st_mode=stat.S_IFREG | 0o755,
@@ -228,7 +272,8 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
         "184761b0dad0f9ace02f9298050ca96ce3caa39a461a47706d47ff9698b59933918b91b40177fbd4d392f6446af8b4d18ecb94caca988169b19641606bf34003"
     )
     assert module.DEFAULT_RUNTIME_SITE == RUNTIME_SITE
-    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v4"
+    assert module.MACHINE_TYPE == MACHINE_TYPE
+    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v5"
     assert module.MAX_SERIAL_BYTES == 1024 * 1024
     assert module.MAX_SERIAL_LINE_BYTES == 64 * 1024
     assert module.EXACT_TOOLS["python"] == "/usr/bin/python3.13"
@@ -256,6 +301,70 @@ def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
     assert result["tempDirectoryCreated"] is False
 
 
+@pytest.mark.parametrize("machine", ("", "pc-i440fx-9.2"))
+def test_preflight_rejects_missing_or_wrong_machine_capability(machine: str) -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    original_runner = values["runner"]
+
+    def runner(command: tuple[str, ...]) -> str:
+        value = original_runner(command)
+        if command[0] != "domain-capabilities":
+            return value
+        if not machine:
+            return value.replace(f"<machine>{MACHINE_TYPE}</machine>", "")
+        return value.replace(MACHINE_TYPE, machine)
+
+    values["runner"] = runner
+    with pytest.raises(module.PreflightError, match="KVM path filesystem capability"):
+        module.preflight(**values)
+
+
+@pytest.mark.parametrize(
+    "firmware_path",
+    (FIRMWARE_CODE, FIRMWARE_VARS_TEMPLATE),
+)
+def test_preflight_rejects_unverified_firmware_digest(firmware_path: Path) -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    expected = values["firmware_sha256"]
+    values["firmware_sha256"] = lambda path: (
+        "0" * 64 if path == firmware_path else expected(path)
+    )
+
+    with pytest.raises(module.PreflightError, match="firmware.*SHA-256"):
+        module.preflight(**values)
+
+
+@pytest.mark.parametrize(
+    "firmware_path",
+    (FIRMWARE_CODE, FIRMWARE_VARS_TEMPLATE),
+)
+def test_preflight_rejects_linked_firmware(firmware_path: Path) -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    values["is_symlink"] = lambda path: path == firmware_path
+
+    with pytest.raises(module.PreflightError, match="firmware.*missing or linked"):
+        module.preflight(**values)
+
+
+def test_preflight_rejects_domain_capabilities_without_exact_uefi_loader() -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    original_runner = values["runner"]
+    values["runner"] = lambda command: (
+        "<domainCapabilities><domain>kvm</domain><arch>x86_64</arch><devices>"
+        "<filesystem supported='yes'><enum name='driverType'><value>path</value>"
+        "</enum></filesystem></devices></domainCapabilities>"
+        if command[0] == "domain-capabilities"
+        else original_runner(command)
+    )
+
+    with pytest.raises(module.PreflightError, match="KVM path filesystem capability"):
+        module.preflight(**values)
+
+
 def _run_domain_ownership_validator(module, plan: dict[str, object], root: ET.Element):
     return subprocess.run(
         (
@@ -273,12 +382,123 @@ def _run_domain_ownership_validator(module, plan: dict[str, object], root: ET.El
             "/tmp/owned/seed.iso",
             "/tmp/owned/serial",
             str(BASE_IMAGE),
+            "/tmp/owned/nvram.fd",
+            str(FIRMWARE_CODE),
+            str(FIRMWARE_VARS_TEMPLATE),
+            MACHINE_TYPE,
         ),
         input=ET.tostring(root, encoding="unicode"),
         check=False,
         capture_output=True,
         text=True,
     )
+
+
+def _captured_active_dumpxml_root(
+    plan: dict[str, object], *, with_uefi: bool
+) -> ET.Element:
+    xml = ACTIVE_DUMPXML_FIXTURE.read_text(encoding="utf-8")
+    replacements = {
+        "${VM_NAME}": str(plan["vm"]["name"]),
+        "${VM_UUID}": str(plan["vm"]["uuid"]),
+        "${RUN_ID}": str(plan["vm"]["runId"]),
+        "${OVERLAY}": "/tmp/owned/overlay.qcow2",
+        "${SEED_ISO}": "/tmp/owned/seed.iso",
+        "${SERIAL_PIPE}": "/tmp/owned/serial",
+        "${BASE_IMAGE}": str(BASE_IMAGE),
+    }
+    for placeholder, value in replacements.items():
+        xml = xml.replace(placeholder, value)
+    root = ET.fromstring(xml)
+    if with_uefi:
+        os_node = root.find("./os")
+        boot = root.find("./os/boot")
+        assert os_node is not None and boot is not None
+        os_node.set("firmware", "efi")
+        loader = ET.Element(
+            "loader",
+            {"readonly": "yes", "secure": "no", "type": "pflash"},
+        )
+        loader.text = str(FIRMWARE_CODE)
+        nvram = ET.Element(
+            "nvram", {"template": str(FIRMWARE_VARS_TEMPLATE)}
+        )
+        nvram.text = "/tmp/owned/nvram.fd"
+        os_node.insert(list(os_node).index(boot), loader)
+        os_node.insert(list(os_node).index(boot), nvram)
+    return root
+
+
+def test_domain_ownership_validator_accepts_captured_active_libvirt_normalization() -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = _captured_active_dumpxml_root(plan, with_uefi=True)
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_domain_ownership_validator_rejects_captured_bios_boot_domain() -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = _captured_active_dumpxml_root(plan, with_uefi=False)
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "cpu-feature-policy",
+        "disk-source-index",
+        "backing-index",
+        "cdrom-index",
+        "console-alias",
+        "firmware-loader",
+        "nvram-path",
+    ),
+)
+def test_domain_ownership_validator_rejects_mutated_captured_active_xml(
+    mutation: str,
+) -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = _captured_active_dumpxml_root(plan, with_uefi=True)
+    if mutation == "cpu-feature-policy":
+        feature = root.find("./cpu/feature[@name='x2apic']")
+        assert feature is not None
+        feature.set("policy", "optional")
+    elif mutation == "disk-source-index":
+        source = root.find("./devices/disk[@device='disk']/source")
+        assert source is not None
+        source.set("index", "9")
+    elif mutation == "backing-index":
+        backing = root.find("./devices/disk[@device='disk']/backingStore")
+        assert backing is not None
+        backing.set("index", "9")
+    elif mutation == "cdrom-index":
+        source = root.find("./devices/disk[@device='cdrom']/source")
+        assert source is not None
+        source.set("index", "9")
+    elif mutation == "console-alias":
+        alias = root.find("./devices/console/alias")
+        assert alias is not None
+        alias.set("name", "foreign-console")
+    elif mutation == "firmware-loader":
+        loader = root.find("./os/loader")
+        assert loader is not None
+        loader.text = "/tmp/foreign-firmware.fd"
+    else:
+        nvram = root.find("./os/nvram")
+        assert nvram is not None
+        nvram.text = "/tmp/foreign-nvram.fd"
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode != 0
 
 
 def _libvirt_pipe_console_root(
@@ -292,6 +512,7 @@ def _libvirt_pipe_console_root(
         .replace("$" + "{OVERLAY}", "/tmp/owned/overlay.qcow2")
         .replace("$" + "{SEED_ISO}", "/tmp/owned/seed.iso")
         .replace("$" + "{SERIAL_PIPE}", "/tmp/owned/serial")
+        .replace("$" + "{NVRAM}", "/tmp/owned/nvram.fd")
     )
     serial_target = root.find("./devices/serial/target")
     console = root.find("./devices/console")
@@ -303,15 +524,46 @@ def _libvirt_pipe_console_root(
     ET.SubElement(console, "target", {"type": "serial", "port": "0"})
     if active:
         root.set("id", "7")
+        os_type = root.find("./os/type")
+        assert os_type is not None
+        os_type.set("machine", "pc-i440fx-10.0")
         overlay = next(
             disk
             for disk in root.findall("./devices/disk")
             if disk.attrib["device"] == "disk"
         )
-        backing = ET.SubElement(overlay, "backingStore", {"type": "file", "index": "1"})
+        overlay_source = overlay.find("source")
+        assert overlay_source is not None
+        overlay_source.set("index", "2")
+        backing = ET.SubElement(overlay, "backingStore", {"type": "file", "index": "3"})
         ET.SubElement(backing, "format", {"type": "qcow2"})
         ET.SubElement(backing, "source", {"file": str(BASE_IMAGE)})
         ET.SubElement(backing, "backingStore")
+        cdrom = next(
+            disk
+            for disk in root.findall("./devices/disk")
+            if disk.attrib["device"] == "cdrom"
+        )
+        cdrom_source = cdrom.find("source")
+        assert cdrom_source is not None
+        cdrom_source.set("index", "1")
+        ET.SubElement(cdrom, "backingStore")
+        serial = root.find("./devices/serial")
+        assert serial is not None
+        ET.SubElement(serial, "alias", {"name": "serial0"})
+        ET.SubElement(console, "alias", {"name": "serial0"})
+        cpu = ET.SubElement(
+            root, "cpu", {"mode": "custom", "match": "exact", "check": "full"}
+        )
+        ET.SubElement(cpu, "model", {"fallback": "forbid"}).text = "qemu64"
+        for name, policy in (
+            ("x2apic", "require"),
+            ("hypervisor", "require"),
+            ("lahf_lm", "require"),
+            ("svm", "disable"),
+        ):
+            ET.SubElement(cpu, "feature", {"policy": policy, "name": name})
+        ET.SubElement(root, "clock", {"offset": "utc"})
     ET.indent(root, space="  ")
     return plan, root
 
@@ -585,6 +837,9 @@ def test_default_runner_import_probe_is_no_bytecode_and_all_commands_are_read_on
         assert Path(argv[0]).is_absolute()
         assert kwargs["env"] == module.MINIMAL_ENV
 
+    capability_argv = next(argv for argv, _ in calls if "domcapabilities" in argv)
+    assert capability_argv[-2:] == ("--machine", MACHINE_TYPE)
+
 
 def test_default_runner_ignores_path_pythonpath_and_loader_injection(
     monkeypatch: pytest.MonkeyPatch,
@@ -821,7 +1076,7 @@ def test_render_plan_is_pure_canonical_and_probe_bound(monkeypatch: pytest.Monke
 
     rendered = render(module)
     plan = rendered["plan"]
-    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v4"
+    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v5"
     assert module.canonical_json(rendered) == json.dumps(rendered, sort_keys=True, separators=(",", ":"))
     assert rendered["planDigest"] == hashlib.sha256(module.canonical_json(plan).encode()).hexdigest()
     assert plan["sourceArtifact"]["manifest"] == artifact_manifest("source")
@@ -857,6 +1112,18 @@ def test_domain_xml_parses_and_has_seed_only_no_host_share_with_owned_pipe_seria
     assert marker.attrib["id"] == render(module)["plan"]["vm"]["runId"]
     assert root.findtext("memory") == "2048"
     assert root.findtext("vcpu") == "2"
+    os_type = root.find("./os/type")
+    assert os_type is not None
+    assert os_type.attrib == {"arch": "x86_64", "machine": MACHINE_TYPE}
+    loader = root.find("./os/loader")
+    nvram = root.find("./os/nvram")
+    assert loader is not None
+    assert loader.attrib == {"readonly": "yes", "secure": "no", "type": "pflash"}
+    assert loader.text == str(FIRMWARE_CODE)
+    assert nvram is not None and nvram.attrib == {
+        "template": str(FIRMWARE_VARS_TEMPLATE)
+    }
+    assert nvram.text == "${NVRAM}"
     disks = root.findall("./devices/disk")
     assert len(disks) == 2
     overlay = next(disk for disk in disks if disk.attrib["device"] == "disk")
@@ -904,6 +1171,7 @@ def test_domain_ownership_validator_rejects_unapproved_devices(
         .replace("${OVERLAY}", "/tmp/owned/overlay.qcow2")
         .replace("${SEED_ISO}", "/tmp/owned/seed.iso")
         .replace("${SERIAL_PIPE}", "/tmp/owned/serial")
+        .replace("${NVRAM}", "/tmp/owned/nvram.fd")
     )
     devices = root.find("./devices")
     assert devices is not None
@@ -963,28 +1231,7 @@ def test_domain_ownership_validator_rejects_unapproved_devices(
         ET.SubElement(backing, "format", {"type": "qcow2"})
         ET.SubElement(backing, "source", {"file": str(BASE_IMAGE)})
         ET.SubElement(backing, "backingStore")
-    completed = subprocess.run(
-        (
-            sys.executable,
-            "-B",
-            "-s",
-            "-P",
-            "-S",
-            "-c",
-            module._ownership_validator_python(),
-            plan["vm"]["name"],
-            plan["vm"]["uuid"],
-            plan["vm"]["runId"],
-            "/tmp/owned/overlay.qcow2",
-            "/tmp/owned/seed.iso",
-            "/tmp/owned/serial",
-            str(BASE_IMAGE),
-        ),
-        input=ET.tostring(root, encoding="unicode"),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_domain_ownership_validator(module, plan, root)
     assert completed.returncode != 0
 
 
@@ -996,29 +1243,9 @@ def test_domain_ownership_validator_accepts_only_the_rendered_device_contract() 
         .replace("${OVERLAY}", "/tmp/owned/overlay.qcow2")
         .replace("${SEED_ISO}", "/tmp/owned/seed.iso")
         .replace("${SERIAL_PIPE}", "/tmp/owned/serial")
+        .replace("${NVRAM}", "/tmp/owned/nvram.fd")
     )
-    completed = subprocess.run(
-        (
-            sys.executable,
-            "-B",
-            "-s",
-            "-P",
-            "-S",
-            "-c",
-            module._ownership_validator_python(),
-            plan["vm"]["name"],
-            plan["vm"]["uuid"],
-            plan["vm"]["runId"],
-            "/tmp/owned/overlay.qcow2",
-            "/tmp/owned/seed.iso",
-            "/tmp/owned/serial",
-            str(BASE_IMAGE),
-        ),
-        input=xml,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_domain_ownership_validator(module, plan, ET.fromstring(xml))
     assert completed.returncode == 0, completed.stderr
 
 
@@ -1030,6 +1257,7 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
         .replace("${OVERLAY}", "/tmp/owned/overlay.qcow2")
         .replace("${SEED_ISO}", "/tmp/owned/seed.iso")
         .replace("${SERIAL_PIPE}", "/tmp/owned/serial")
+        .replace("${NVRAM}", "/tmp/owned/nvram.fd")
     )
     devices = root.find("./devices")
     assert devices is not None
@@ -1055,6 +1283,7 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
     )
     ET.SubElement(balloon, "alias", {"name": "balloon0"})
     disks = devices.findall("disk")
+    disks[0].find("source").set("index", "2")
     ET.SubElement(
         disks[0],
         "address",
@@ -1067,10 +1296,12 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
         },
     )
     ET.SubElement(disks[0], "alias", {"name": "virtio-disk0"})
-    backing = ET.SubElement(disks[0], "backingStore", {"type": "file", "index": "1"})
+    backing = ET.SubElement(disks[0], "backingStore", {"type": "file", "index": "3"})
     ET.SubElement(backing, "format", {"type": "qcow2"})
     ET.SubElement(backing, "source", {"file": str(BASE_IMAGE)})
     ET.SubElement(backing, "backingStore")
+    disks[1].find("source").set("index", "1")
+    ET.SubElement(disks[1], "backingStore")
     ET.SubElement(
         disks[1],
         "address",
@@ -1079,7 +1310,6 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
     serial = devices.find("serial")
     console = devices.find("console")
     assert serial is not None and console is not None
-    ET.SubElement(serial, "address", {"type": "isa", "iobase": "0x3f8", "irq": "4"})
     ET.SubElement(serial, "alias", {"name": "serial0"})
     console.set("tty", "/dev/pts/7")
     ET.SubElement(console, "source", {"path": "/dev/pts/7"})
@@ -1087,32 +1317,60 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
     os_type = root.find("./os/type")
     assert os_type is not None
     os_type.set("machine", "pc-i440fx-10.0")
-    cpu = ET.SubElement(root, "cpu", {"mode": "custom", "match": "exact", "check": "none"})
+    cpu = ET.SubElement(root, "cpu", {"mode": "custom", "match": "exact", "check": "full"})
     ET.SubElement(cpu, "model", {"fallback": "forbid"}).text = "qemu64"
+    for name, policy in (
+        ("x2apic", "require"),
+        ("hypervisor", "require"),
+        ("lahf_lm", "require"),
+        ("svm", "disable"),
+    ):
+        ET.SubElement(cpu, "feature", {"policy": policy, "name": name})
     ET.SubElement(root, "clock", {"offset": "utc"})
-    completed = subprocess.run(
-        (
-            sys.executable,
-            "-B",
-            "-s",
-            "-P",
-            "-S",
-            "-c",
-            module._ownership_validator_python(),
-            plan["vm"]["name"],
-            plan["vm"]["uuid"],
-            plan["vm"]["runId"],
-            "/tmp/owned/overlay.qcow2",
-            "/tmp/owned/seed.iso",
-            "/tmp/owned/serial",
-            str(BASE_IMAGE),
-        ),
-        input=ET.tostring(root, encoding="unicode"),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_domain_ownership_validator(module, plan, root)
     assert completed.returncode == 0, completed.stderr
+
+
+def test_domain_ownership_validator_rejects_foreign_active_pty_console_alias() -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = ET.fromstring(
+        plan["domainXml"]
+        .replace("${OVERLAY}", "/tmp/owned/overlay.qcow2")
+        .replace("${SEED_ISO}", "/tmp/owned/seed.iso")
+        .replace("${SERIAL_PIPE}", "/tmp/owned/serial")
+        .replace("${NVRAM}", "/tmp/owned/nvram.fd")
+    )
+    root.set("id", "7")
+    disks = root.findall("./devices/disk")
+    disks[0].find("source").set("index", "2")
+    backing = ET.SubElement(disks[0], "backingStore", {"type": "file", "index": "3"})
+    ET.SubElement(backing, "format", {"type": "qcow2"})
+    ET.SubElement(backing, "source", {"file": str(BASE_IMAGE)})
+    ET.SubElement(backing, "backingStore")
+    disks[1].find("source").set("index", "1")
+    ET.SubElement(disks[1], "backingStore")
+    serial = root.find("./devices/serial")
+    console = root.find("./devices/console")
+    assert serial is not None and console is not None
+    ET.SubElement(serial, "alias", {"name": "serial0"})
+    console.set("tty", "/dev/pts/7")
+    ET.SubElement(console, "source", {"path": "/dev/pts/7"})
+    ET.SubElement(console, "alias", {"name": "foreign-console"})
+    cpu = ET.SubElement(root, "cpu", {"mode": "custom", "match": "exact", "check": "full"})
+    ET.SubElement(cpu, "model", {"fallback": "forbid"}).text = "qemu64"
+    for name, policy in (
+        ("x2apic", "require"),
+        ("hypervisor", "require"),
+        ("lahf_lm", "require"),
+        ("svm", "disable"),
+    ):
+        ET.SubElement(cpu, "feature", {"policy": policy, "name": name})
+    ET.SubElement(root, "clock", {"offset": "utc"})
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode != 0
 
 
 def test_concrete_domain_xml_passes_installed_libvirt_schema(tmp_path: Path) -> None:
@@ -1124,6 +1382,7 @@ def test_concrete_domain_xml_passes_installed_libvirt_schema(tmp_path: Path) -> 
     xml = xml.replace("${OVERLAY}", str(tmp_path / "overlay.qcow2"))
     xml = xml.replace("${SEED_ISO}", str(tmp_path / "seed.iso"))
     xml = xml.replace("${SERIAL_PIPE}", str(tmp_path / "serial"))
+    xml = xml.replace("${NVRAM}", str(tmp_path / "nvram.fd"))
     domain_xml = tmp_path / "domain.xml"
     domain_xml.write_text(xml, encoding="utf-8")
 
@@ -1204,7 +1463,7 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert "define --transient" not in script and "virsh create" not in script
     assert "<<DOMAIN_XML" in script and "<<'DOMAIN_XML'" not in script
     disable = script.index("autostart --disable")
-    start = script.index('start "$VM_NAME"')
+    start = script.index('start "$VM_UUID"')
     assert disable < start
     assert script.rindex("verify_domain_ownership", disable, start) > disable
     assert "target VM already exists at future execution boundary" in script
@@ -1220,6 +1479,11 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert "domuuid" in script and "dumpxml" in script
     assert "readonly EXPECTED_RUNTIME_PROBE_JSON=" in script
     assert "readonly EXPECTED_CAPABILITY_PROBE_JSON=" in script
+    assert f"readonly FIRMWARE_CODE={FIRMWARE_CODE}" in script
+    assert f"readonly FIRMWARE_VARS_TEMPLATE={FIRMWARE_VARS_TEMPLATE}" in script
+    assert f"readonly MACHINE_TYPE={MACHINE_TYPE}" in script
+    assert 'NVRAM="$TEMP_DIR/nvram.fd"' in script
+    assert '"$FIRMWARE_VARS_TEMPLATE" "$NVRAM"' in script
     assert "ACTUAL_RUNTIME_PROBE_JSON=" in script
     assert "ACTUAL_CAPABILITY_PROBE_JSON=" in script
     assert script.index("ACTUAL_RUNTIME_PROBE_JSON=") < script.index("qemu-img create")
@@ -1227,8 +1491,18 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert "virsh console" not in script
     assert "readonly RESULT_TIMEOUT_SECONDS=960" in script
     assert "wait_for_inactive" in script
-    assert 'shutdown "$VM_NAME"' in script
-    assert 'undefine "$VM_NAME"' in script
+    assert 'shutdown "$VM_UUID"' in script
+    assert 'undefine "$VM_UUID" --nvram' in script
+    assert 'start "$VM_UUID"' in script
+    assert 'autostart --disable "$VM_UUID"' in script
+    assert 'domstate "$VM_UUID"' in script
+    assert 'dumpxml "$VM_UUID"' in script
+    assert 'dominfo "$VM_UUID"' in script
+    assert 'list --all --uuid' in script
+    assert 'domcapabilities --virttype kvm --arch x86_64 --machine "$MACHINE_TYPE"' in script
+    runtime_firmware_call = script.index("\nvalidate_firmware_runtime\n")
+    assert script.index("ACTUAL_CAPABILITY_PROBE_JSON=") < runtime_firmware_call
+    assert runtime_firmware_call < script.index('TEMP_DIR="$(/usr/bin/mktemp')
     assert "rm -rf" not in script and "rm -r" not in script
     assert script.count('SERIAL_RESULT="$(<"$SERIAL_STATUS")"') == 2
     assert script.rindex('SERIAL_RESULT="$(<"$SERIAL_STATUS")"') > script.index("stop_collector")
@@ -1237,9 +1511,85 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
         for line in script.splitlines()
         if line.strip().startswith("/usr/bin/rm -f --") and "$DOMAIN_XML" in line
     )
-    for exact in ("$DOMAIN_XML", "$USER_DATA", "$META_DATA", "$OVERLAY", "$SEED_ISO", "$SERIAL_LOG"):
+    for exact in (
+        "$DOMAIN_XML",
+        "$USER_DATA",
+        "$META_DATA",
+        "$OVERLAY",
+        "$SEED_ISO",
+        "$NVRAM",
+        "$SERIAL_LOG",
+    ):
         assert exact in cleanup_line
     assert "$BASE_IMAGE" not in cleanup_line and "$SOURCE_ROOT" not in cleanup_line and "$RUNTIME_SITE" not in cleanup_line
+
+
+def _run_firmware_validator(
+    module,
+    code: Path,
+    code_digest: str,
+    variables: Path,
+    variables_digest: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-S",
+            "-c",
+            module._firmware_validator_python(),
+            str(code),
+            code_digest,
+            str(variables),
+            variables_digest,
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def test_runtime_firmware_validator_accepts_exact_pinned_root_owned_files() -> None:
+    module = load_tool()
+
+    completed = _run_firmware_validator(
+        module,
+        FIRMWARE_CODE,
+        module.FIRMWARE_CODE_SHA256,
+        FIRMWARE_VARS_TEMPLATE,
+        module.FIRMWARE_VARS_SHA256,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_runtime_firmware_validator_rejects_symlink_and_non_root_file(tmp_path: Path) -> None:
+    module = load_tool()
+    linked = tmp_path / "firmware.fd"
+    linked.symlink_to(FIRMWARE_CODE)
+    copied = tmp_path / "vars.fd"
+    copied.write_bytes(FIRMWARE_VARS_TEMPLATE.read_bytes())
+
+    linked_result = _run_firmware_validator(
+        module,
+        linked,
+        module.FIRMWARE_CODE_SHA256,
+        FIRMWARE_VARS_TEMPLATE,
+        module.FIRMWARE_VARS_SHA256,
+    )
+    copied_result = _run_firmware_validator(
+        module,
+        FIRMWARE_CODE,
+        module.FIRMWARE_CODE_SHA256,
+        copied,
+        module.FIRMWARE_VARS_SHA256,
+    )
+
+    assert linked_result.returncode != 0
+    assert copied_result.returncode != 0
 
 
 def _run_cleanup_harness(
@@ -1258,6 +1608,7 @@ def _run_cleanup_harness(
     paths = {
         "OVERLAY": temp_dir / "overlay.qcow2",
         "SEED_ISO": temp_dir / "seed.iso",
+        "NVRAM": temp_dir / "nvram.fd",
         "SERIAL_PIPE": temp_dir / "serial",
         "SERIAL_LOG": temp_dir / "serial.log",
         "SERIAL_STATUS": temp_dir / "serial.status",
@@ -1288,6 +1639,8 @@ def _run_cleanup_harness(
         f"VM_UUID={shlex.quote(vm_uuid)}",
         f"RUN_ID={shlex.quote(run_id)}",
         f"BASE_IMAGE={shlex.quote(str(BASE_IMAGE))}",
+        f"FIRMWARE_CODE={shlex.quote(str(FIRMWARE_CODE))}",
+        f"FIRMWARE_VARS_TEMPLATE={shlex.quote(str(FIRMWARE_VARS_TEMPLATE))}",
         "SHUTDOWN_TIMEOUT_SECONDS=1",
         "COLLECTOR_PID=",
         "LOCK_HELD=1",
@@ -1311,7 +1664,7 @@ def _run_cleanup_harness(
     "virsh_function",
     (
         "virsh() { return 9; }",
-        "virsh() { case \"$*\" in *\" list --all --name\") printf '%s\\n' \"$VM_NAME\"; return 0;; *\" domstate \"*) return 9;; *) return 9;; esac; }",
+        "virsh() { case \"$*\" in *\" list --all --name\") printf '%s\\n' \"$VM_NAME\"; return 0;; *\" list --all --uuid\") printf '%s\\n' \"$VM_UUID\"; return 0;; *\" domuuid \"*) printf '%s\\n' \"$VM_UUID\"; return 0;; *\" domname \"*) printf '%s\\n' \"$VM_NAME\"; return 0;; *\" dumpxml \"*) /usr/bin/cat \"$DOMAIN_XML\"; return 0;; *\" domstate \"*) return 9;; *) return 9;; esac; }",
     ),
 )
 def test_cleanup_retains_every_artifact_when_libvirt_state_is_unknown(
@@ -1329,6 +1682,7 @@ def test_cleanup_retains_every_artifact_when_libvirt_state_is_unknown(
     assert {path.name for path in temp_dir.iterdir()} == {
         "overlay.qcow2",
         "seed.iso",
+        "nvram.fd",
         "serial.in",
         "serial.out",
         "serial.log",
@@ -1358,7 +1712,9 @@ def test_cleanup_never_mutates_an_owned_domain_in_an_unsafe_state(
         f"virsh() {{ printf '%s\\n' \"$*\" >>{shlex.quote(str(calls))}; "
         "case \"$*\" in "
         "*\" list --all --name\") printf '%s\\n' \"$VM_NAME\"; return 0;; "
+        "*\" list --all --uuid\") printf '%s\\n' \"$VM_UUID\"; return 0;; "
         "*\" domuuid \"*) printf '%s\\n' \"$VM_UUID\"; return 0;; "
+        "*\" domname \"*) printf '%s\\n' \"$VM_NAME\"; return 0;; "
         "*\" dumpxml \"*) /usr/bin/cat \"$DOMAIN_XML\"; return 0;; "
         f"*\" domstate \"*) printf '%s\\n' {shlex.quote(unsafe_state)}; return 0;; "
         "*\" shutdown \"*) return 9;; "
@@ -1369,6 +1725,7 @@ def test_cleanup_never_mutates_an_owned_domain_in_an_unsafe_state(
         .replace("/tmp/owned/overlay.qcow2", str(temp_dir / "overlay.qcow2"))
         .replace("/tmp/owned/seed.iso", str(temp_dir / "seed.iso"))
         .replace("/tmp/owned/serial", str(temp_dir / "serial"))
+        .replace("/tmp/owned/nvram.fd", str(temp_dir / "nvram.fd"))
     )
 
     completed = _run_cleanup_harness(
@@ -1395,7 +1752,7 @@ def test_cleanup_deletes_exact_artifacts_only_after_authoritative_absence(tmp_pa
     completed = _run_cleanup_harness(
         render(module)["plan"]["futureScript"],
         temp_dir,
-        "virsh() { case \"$*\" in *\" list --all --name\") return 0;; *) return 9;; esac; }",
+        "virsh() { case \"$*\" in *\" list --all --name\") return 0;; *\" list --all --uuid\") return 0;; *) return 9;; esac; }",
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -1410,6 +1767,7 @@ def test_cleanup_never_mutates_a_same_name_foreign_domain(tmp_path: Path) -> Non
         f"virsh() {{ printf '%s\\n' \"$*\" >>{shlex.quote(str(calls))}; "
         "case \"$*\" in "
         "*\" list --all --name\") printf '%s\\n' \"$VM_NAME\"; return 0;; "
+        "*\" list --all --uuid\") printf '%s\\n' 11111111-1111-5111-8111-111111111111; return 0;; "
         "*\" domuuid \"*) printf '%s\\n' 11111111-1111-5111-8111-111111111111; return 0;; "
         "*) return 9;; esac; }"
     )
@@ -1421,7 +1779,32 @@ def test_cleanup_never_mutates_a_same_name_foreign_domain(tmp_path: Path) -> Non
     assert completed.returncode != 0
     assert temp_dir.is_dir()
     observed = calls.read_text(encoding="utf-8")
-    assert " domuuid " in observed
+    assert " list --all --uuid" in observed
+    assert " shutdown " not in observed
+    assert " undefine " not in observed
+
+
+def test_cleanup_retains_artifacts_when_owned_uuid_was_renamed(tmp_path: Path) -> None:
+    module = load_tool()
+    temp_dir = tmp_path / "renamed-owned-domain"
+    calls = tmp_path / "renamed.calls"
+    virsh = (
+        f"virsh() {{ printf '%s\\n' \"$*\" >>{shlex.quote(str(calls))}; "
+        "case \"$*\" in "
+        "*\" list --all --name\") printf '%s\\n' renamed-owned-domain; return 0;; "
+        "*\" list --all --uuid\") printf '%s\\n' \"$VM_UUID\"; return 0;; "
+        "*\" domname \"*) printf '%s\\n' renamed-owned-domain; return 0;; "
+        "*) return 9;; esac; }"
+    )
+
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"], temp_dir, virsh
+    )
+
+    assert completed.returncode != 0
+    assert temp_dir.is_dir()
+    observed = calls.read_text(encoding="utf-8")
+    assert " list --all --uuid" in observed
     assert " shutdown " not in observed
     assert " undefine " not in observed
 

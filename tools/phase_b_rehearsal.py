@@ -34,15 +34,20 @@ BASE_IMAGE_SHA512 = (
     "184761b0dad0f9ace02f9298050ca96ce3caa39a461a47706d47ff9698b59933918b91b40177fbd4d392f6446af8b4d18ecb94caca988169b19641606bf34003"
 )
 LIBVIRT_URI = "qemu:///session"
+MACHINE_TYPE = "pc-i440fx-10.0"
 MEMORY_MIB = 2048
 VCPUS = 2
 OVERLAY_GIB = 8
 DEFAULT_BASE_IMAGE = Path(
     "/var/lib/overseer-phase-b-rehearsal/debian-13-genericcloud-amd64.qcow2"
 )
+FIRMWARE_CODE = Path("/usr/share/OVMF/OVMF_CODE_4M.fd")
+FIRMWARE_CODE_SHA256 = "624e06de18b4fa535e90db7160d00d3d07d206422b89999bf1e27d920264e4e0"
+FIRMWARE_VARS_TEMPLATE = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
+FIRMWARE_VARS_SHA256 = "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e"
 DEFAULT_RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
 DEFAULT_TEMP_PARENT = Path("/var/tmp")
-REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v4"
+REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v5"
 ARTIFACT_MANIFEST_SCHEMA = "overseer.rehearsal-artifact-manifest.v1"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
 RESULT_TIMEOUT_SECONDS = 960
@@ -151,6 +156,14 @@ def canonical_json(value: object) -> str:
 
 def sha512_file(path: Path) -> str:
     digest = hashlib.sha512()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
@@ -555,7 +568,18 @@ def _capability_probe_record() -> dict[str, object]:
         "libvirtUri": LIBVIRT_URI,
         "domain": "kvm",
         "arch": "x86_64",
+        "machine": MACHINE_TYPE,
         "filesystem": {"supported": True, "driverType": "path"},
+        "firmware": {
+            "mode": "efi",
+            "loader": str(FIRMWARE_CODE),
+            "loaderType": "pflash",
+            "loaderReadonly": True,
+            "loaderSecure": False,
+            "loaderSha256": FIRMWARE_CODE_SHA256,
+            "varsTemplate": str(FIRMWARE_VARS_TEMPLATE),
+            "varsTemplateSha256": FIRMWARE_VARS_SHA256,
+        },
     }
 
 
@@ -576,12 +600,29 @@ def _parse_domain_capabilities(value: str) -> dict[str, object]:
         item.text
         for item in root.findall("./devices/filesystem/enum[@name='driverType']/value")
     }
+    firmware = {item.text for item in root.findall("./os/enum[@name='firmware']/value")}
+    loaders = {item.text for item in root.findall("./os/loader/value")}
+    loader_types = {
+        item.text for item in root.findall("./os/loader/enum[@name='type']/value")
+    }
+    loader_readonly = {
+        item.text for item in root.findall("./os/loader/enum[@name='readonly']/value")
+    }
+    loader_secure = {
+        item.text for item in root.findall("./os/loader/enum[@name='secure']/value")
+    }
     if (
         root.findtext("domain") != "kvm"
         or root.findtext("arch") != "x86_64"
+        or root.findtext("machine") != MACHINE_TYPE
         or filesystem is None
         or filesystem.get("supported") != "yes"
         or "path" not in drivers
+        or "efi" not in firmware
+        or str(FIRMWARE_CODE) not in loaders
+        or "pflash" not in loader_types
+        or "yes" not in loader_readonly
+        or "no" not in loader_secure
     ):
         raise PreflightError("KVM path filesystem capability is unavailable")
     return _capability_probe_record()
@@ -595,10 +636,21 @@ def _capability_probe_python() -> str:
             "root=ElementTree.fromstring(sys.stdin.read())",
             "filesystem=root.find('./devices/filesystem')",
             "drivers={item.text for item in root.findall(\"./devices/filesystem/enum[@name='driverType']/value\")}",
+            "firmware={item.text for item in root.findall(\"./os/enum[@name='firmware']/value\")}",
+            "loaders={item.text for item in root.findall('./os/loader/value')}",
+            "loader_types={item.text for item in root.findall(\"./os/loader/enum[@name='type']/value\")}",
+            "loader_readonly={item.text for item in root.findall(\"./os/loader/enum[@name='readonly']/value\")}",
+            "loader_secure={item.text for item in root.findall(\"./os/loader/enum[@name='secure']/value\")}",
             "assert root.findtext('domain') == 'kvm'",
             "assert root.findtext('arch') == 'x86_64'",
+            f"assert root.findtext('machine') == {MACHINE_TYPE!r}",
             "assert filesystem is not None and filesystem.get('supported') == 'yes'",
             "assert 'path' in drivers",
+            "assert 'efi' in firmware",
+            f"assert {str(FIRMWARE_CODE)!r} in loaders",
+            "assert 'pflash' in loader_types",
+            "assert 'yes' in loader_readonly",
+            "assert 'no' in loader_secure",
             f"record={_capability_probe_record()!r}",
             "print(json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(',',':')))",
         )
@@ -651,6 +703,8 @@ def _read_only_runner(command: tuple[str, ...]) -> str:
             "kvm",
             "--arch",
             "x86_64",
+            "--machine",
+            MACHINE_TYPE,
         )
     elif label == "qemu-img-info":
         argv = (
@@ -796,6 +850,7 @@ def preflight(
     path_access: Callable[[Path, int], bool] = os.access,
     is_symlink: Callable[[Path], bool] = lambda path: path.is_symlink(),
     image_sha512: Callable[[Path], str] = sha512_file,
+    firmware_sha256: Callable[[Path], str] = sha256_file,
     tool_exists: Callable[[Path], bool] = lambda path: path.exists(),
     tool_stat: Callable[[Path], object] = lambda path: path.stat(),
     tool_access: Callable[[Path, int], bool] = os.access,
@@ -812,6 +867,8 @@ def preflight(
         (source_root, "source"),
         (runtime_site, "runtime"),
         (base_image, "base image"),
+        (FIRMWARE_CODE, "firmware code"),
+        (FIRMWARE_VARS_TEMPLATE, "firmware variables template"),
         (temp_parent, "temporary"),
     ):
         _validate_host_path(path, label)
@@ -867,6 +924,26 @@ def preflight(
         path_access=path_access,
         is_symlink=is_symlink,
     )
+    firmware_code_mode = _require_path_state(
+        FIRMWARE_CODE,
+        label="firmware code",
+        expected_kind="regular",
+        access_mode=os.R_OK,
+        path_exists=path_exists,
+        path_stat=path_stat,
+        path_access=path_access,
+        is_symlink=is_symlink,
+    )
+    firmware_vars_mode = _require_path_state(
+        FIRMWARE_VARS_TEMPLATE,
+        label="firmware variables template",
+        expected_kind="regular",
+        access_mode=os.R_OK,
+        path_exists=path_exists,
+        path_stat=path_stat,
+        path_access=path_access,
+        is_symlink=is_symlink,
+    )
     temp_mode = _require_path_state(
         temp_parent,
         label="temporary path",
@@ -883,6 +960,20 @@ def preflight(
         raise PreflightError("runtime path permissions are unsafe")
     if base_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise PreflightError("base image permissions are unsafe")
+    if firmware_code_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PreflightError("firmware code permissions are unsafe")
+    if firmware_vars_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PreflightError("firmware variables template permissions are unsafe")
+    for path, label in (
+        (FIRMWARE_CODE, "firmware code"),
+        (FIRMWARE_VARS_TEMPLATE, "firmware variables template"),
+    ):
+        try:
+            firmware_state = path_stat(path)
+        except OSError as error:
+            raise PreflightError(f"{label} state is unavailable") from error
+        if firmware_state.st_uid != 0 or getattr(firmware_state, "st_nlink", 1) != 1:
+            raise PreflightError(f"{label} ownership is unsafe")
     _validate_temp_mode(temp_mode)
     _validate_exact_tools(
         tool_exists=tool_exists, tool_stat=tool_stat, tool_access=tool_access
@@ -920,6 +1011,19 @@ def preflight(
             raise PreflightError("base image SHA-512 is unverified")
     except (OSError, ValueError, AttributeError) as error:
         raise PreflightError("base image SHA-512 could not be verified") from error
+    for path, expected, label in (
+        (FIRMWARE_CODE, FIRMWARE_CODE_SHA256, "firmware code"),
+        (
+            FIRMWARE_VARS_TEMPLATE,
+            FIRMWARE_VARS_SHA256,
+            "firmware variables template",
+        ),
+    ):
+        try:
+            if firmware_sha256(path).lower() != expected:
+                raise PreflightError(f"{label} SHA-256 is unverified")
+        except (OSError, ValueError, AttributeError) as error:
+            raise PreflightError(f"{label} SHA-256 could not be verified") from error
 
     try:
         probe_output = json.loads(
@@ -959,6 +1063,7 @@ def preflight(
         "targetVmUuid": vm_uuid,
         "libvirtUri": LIBVIRT_URI,
         "baseImageSha512": BASE_IMAGE_SHA512,
+        "firmware": dict(_capability_probe_record()["firmware"]),
         "runtimeProbe": runtime_probe,
         "runtimeProbeDigest": probe_digest,
         "capabilityProbe": capability_probe,
@@ -1115,7 +1220,12 @@ def _domain_xml(*, vm_name: str, vm_uuid: str, run_id: str) -> str:
   <memory unit='MiB'>{MEMORY_MIB}</memory>
   <currentMemory unit='MiB'>{MEMORY_MIB}</currentMemory>
   <vcpu placement='static'>{VCPUS}</vcpu>
-  <os><type arch='x86_64'>hvm</type><boot dev='hd'/></os>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='{MACHINE_TYPE}'>hvm</type>
+    <loader readonly='yes' secure='no' type='pflash'>{escape(str(FIRMWARE_CODE))}</loader>
+    <nvram template='{escape(str(FIRMWARE_VARS_TEMPLATE))}'>${{NVRAM}}</nvram>
+    <boot dev='hd'/>
+  </os>
   <features><acpi/></features>
   <on_poweroff>destroy</on_poweroff>
   <on_reboot>restart</on_reboot>
@@ -1206,6 +1316,38 @@ for key,value in identifiers.items():
 for forbidden in ("phase-b-rehearsal-admin-secret","phase-b-rehearsal-roadex-secret","phase-b-rehearsal-api-token"):
     if forbidden in payload: raise SystemExit("result contains secret material")
 print(payload)
+"""
+
+
+def _firmware_validator_python() -> str:
+    return r"""import hashlib,os,stat,sys
+if len(sys.argv)!=5: raise SystemExit("firmware validator argument set is invalid")
+def verify(path,expected):
+    if len(expected)!=64 or expected.lower()!=expected or any(value not in "0123456789abcdef" for value in expected): raise SystemExit("firmware digest is invalid")
+    try: path_state=os.lstat(path)
+    except OSError as error: raise SystemExit("firmware path is unavailable") from error
+    if not stat.S_ISREG(path_state.st_mode) or path_state.st_uid!=0 or path_state.st_nlink!=1 or path_state.st_mode&(stat.S_IWGRP|stat.S_IWOTH): raise SystemExit("firmware path state is unsafe")
+    flags=os.O_RDONLY|getattr(os,"O_CLOEXEC",0)|getattr(os,"O_NOFOLLOW",0)
+    try: descriptor=os.open(path,flags)
+    except OSError as error: raise SystemExit("firmware path cannot be opened safely") from error
+    try:
+        before=os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid!=0 or before.st_nlink!=1 or before.st_mode&(stat.S_IWGRP|stat.S_IWOTH): raise SystemExit("firmware descriptor state is unsafe")
+        if (path_state.st_dev,path_state.st_ino)!=(before.st_dev,before.st_ino): raise SystemExit("firmware path changed before read")
+        digest=hashlib.sha256()
+        while True:
+            block=os.read(descriptor,1048576)
+            if not block: break
+            digest.update(block)
+        after=os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    before_state=(before.st_dev,before.st_ino,before.st_mode,before.st_uid,before.st_gid,before.st_nlink,before.st_size,before.st_mtime_ns,before.st_ctime_ns)
+    after_state=(after.st_dev,after.st_ino,after.st_mode,after.st_uid,after.st_gid,after.st_nlink,after.st_size,after.st_mtime_ns,after.st_ctime_ns)
+    if before_state!=after_state: raise SystemExit("firmware changed while read")
+    if digest.hexdigest()!=expected: raise SystemExit("firmware digest does not match the approved value")
+verify(sys.argv[1],sys.argv[2])
+verify(sys.argv[3],sys.argv[4])
 """
 
 
@@ -1329,13 +1471,16 @@ def memory_ok(name):
     return node is not None and node.attrib in ({"unit":"MiB"},{"unit":"KiB"}) and node.text==("2048" if node.get("unit")=="MiB" else "2097152") and not list(node)
 vcpu=root.find("vcpu")
 vcpu_valid=vcpu is not None and vcpu.text=="2" and vcpu.attrib in ({"placement":"static"},{"placement":"static","current":"2"}) and not list(vcpu)
-os_node=root.find("os"); os_children=[] if os_node is None else list(os_node); os_type=None if os_node is None else os_node.find("type"); boots=[] if os_node is None else os_node.findall("boot")
-machine=None if os_type is None else os_type.get("machine")
-os_valid=os_node is not None and os_node.attrib=={} and all(item.tag in {"type","boot"} for item in os_children) and len(os_node.findall("type"))==1 and len(boots)==1 and os_type.text=="hvm" and os_type.attrib in ({"arch":"x86_64"},{"arch":"x86_64","machine":"pc-i440fx-10.0"}) and not list(os_type) and boots[0].attrib=={"dev":"hd"} and whitespace_only(boots[0].text) and not list(boots[0])
+os_node=root.find("os"); os_children=[] if os_node is None else list(os_node); os_type=None if os_node is None else os_node.find("type"); loaders=[] if os_node is None else os_node.findall("loader"); nvrams=[] if os_node is None else os_node.findall("nvram"); boots=[] if os_node is None else os_node.findall("boot")
+os_valid=os_node is not None and os_node.attrib=={"firmware":"efi"} and [item.tag for item in os_children]==["type","loader","nvram","boot"] and len(os_node.findall("type"))==1 and len(loaders)==1 and len(nvrams)==1 and len(boots)==1 and os_type.text=="hvm" and os_type.attrib=={"arch":"x86_64","machine":sys.argv[11]} and not list(os_type) and leaf_ok(loaders[0],{"readonly":"yes","secure":"no","type":"pflash"},sys.argv[9]) and leaf_ok(nvrams[0],{"template":sys.argv[10]},sys.argv[8]) and boots[0].attrib=={"dev":"hd"} and whitespace_only(boots[0].text) and not list(boots[0])
 features=root.find("features"); feature_children=[] if features is None else list(features)
 features_valid=features is not None and features.attrib=={} and len(feature_children)==1 and leaf_ok(feature_children[0],{},None) and feature_children[0].tag=="acpi"
 cpus=root.findall("cpu"); cpu_model=None if not cpus else cpus[0].find("model")
-cpu_valid=not cpus or len(cpus)==1 and cpus[0].attrib=={"mode":"custom","match":"exact","check":"none"} and len(list(cpus[0]))==1 and leaf_ok(cpu_model,{"fallback":"forbid"},"qemu64")
+cpu_features=[] if not cpus else cpus[0].findall("feature")
+inactive_cpu_valid=not cpus or len(cpus)==1 and cpus[0].attrib=={"mode":"custom","match":"exact","check":"none"} and len(list(cpus[0]))==1 and leaf_ok(cpu_model,{"fallback":"forbid"},"qemu64")
+active_cpu_contract=[("x2apic","require"),("hypervisor","require"),("lahf_lm","require"),("svm","disable")]
+active_cpu_valid=len(cpus)==1 and cpus[0].attrib=={"mode":"custom","match":"exact","check":"full"} and [item.tag for item in list(cpus[0])]==["model","feature","feature","feature","feature"] and leaf_ok(cpu_model,{"fallback":"forbid"},"qemu64") and [(item.get("name"),item.get("policy")) for item in cpu_features]==active_cpu_contract and all(set(item.attrib)=={"name","policy"} and whitespace_only(item.text) and not list(item) for item in cpu_features)
+cpu_valid=active_cpu_valid if active else inactive_cpu_valid
 clocks=root.findall("clock"); clock_valid=not clocks or len(clocks)==1 and clocks[0].attrib=={"offset":"utc"} and whitespace_only(clocks[0].text) and not list(clocks[0])
 power_valid=leaf_ok(root.find("on_poweroff"),{},"destroy") and leaf_ok(root.find("on_reboot"),{},"restart") and leaf_ok(root.find("on_crash"),{},"destroy")
 if not memory_ok("memory") or not memory_ok("currentMemory") or not vcpu_valid or not os_valid or not features_valid or not cpu_valid or not clock_valid or not power_valid: raise SystemExit(1)
@@ -1365,12 +1510,14 @@ disks=root.findall("./devices/disk")
 def backing_store_ok(item):
     if item is None: return True
     children=list(item); terminal=item.find("backingStore"); format_node=item.find("format"); source=item.find("source")
-    return item.attrib in ({"type":"file"},{"type":"file","index":"1"}) and len(children)==3 and {child.tag for child in children}=={"format","source","backingStore"} and leaf_ok(format_node,{"type":"qcow2"},None) and leaf_ok(source,{"file":sys.argv[7]},None) and leaf_ok(terminal,{},None)
+    return item.attrib=={"type":"file","index":"3"} and [child.tag for child in children]==["format","source","backingStore"] and leaf_ok(format_node,{"type":"qcow2"},None) and leaf_ok(source,{"file":sys.argv[7]},None) and leaf_ok(terminal,{},None)
 def disk_ok(item,device,path,driver_type,target,bus,readonly):
     driver=item.find("driver");source=item.find("source");target_node=item.find("target");backing=item.find("backingStore")
     readonly_node=item.find("readonly")
-    backing_allowed=(device=="disk" and backing_store_ok(backing) and (not active or backing is not None)) or (device!="disk" and backing is None)
-    return item.attrib=={"type":"file","device":device} and children_exact(item,("driver","source","target"),("readonly","backingStore")) and leaf_ok(driver,{"name":"qemu","type":driver_type},None) and leaf_ok(source,{"file":path},None) and leaf_ok(target_node,{"dev":target,"bus":bus},None) and (readonly_node is not None)==readonly and (readonly_node is None or leaf_ok(readonly_node,{},None)) and backing_allowed
+    source_attrs={"file":path}
+    if active: source_attrs["index"]="2" if device=="disk" else "1"
+    backing_allowed=(device=="disk" and ((active and backing_store_ok(backing)) or (not active and backing is None))) or (device=="cdrom" and ((active and leaf_ok(backing,{},None)) or (not active and backing is None)))
+    return item.attrib=={"type":"file","device":device} and children_exact(item,("driver","source","target"),("readonly","backingStore")) and leaf_ok(driver,{"name":"qemu","type":driver_type},None) and leaf_ok(source,source_attrs,None) and leaf_ok(target_node,{"dev":target,"bus":bus},None) and (readonly_node is not None)==readonly and (readonly_node is None or leaf_ok(readonly_node,{},None)) and backing_allowed
 disk_valid=len(disks)==2 and any(disk_ok(item,"disk",sys.argv[4],"qcow2","vda","virtio",False) for item in disks) and any(disk_ok(item,"cdrom",sys.argv[5],"raw","sda","sata",True) for item in disks)
 serials=root.findall("./devices/serial")
 consoles=root.findall("./devices/console")
@@ -1383,10 +1530,16 @@ console_source=None if console is None else console.find("source")
 serial_model=None if serial_target is None else serial_target.find("model")
 serial_target_text_valid=serial_target is not None and (serial_target.text is None or not serial_target.text.strip())
 serial_target_valid=serial_target is not None and serial_target.attrib=={"type":"isa-serial","port":"0"} and serial_target_text_valid and ((not list(serial_target)) or len(list(serial_target))==1 and leaf_ok(serial_model,{"name":"isa-serial"},None))
-serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and children_exact(serial,("source","target")) and leaf_ok(serial_source,{"path":sys.argv[6]},None) and serial_target_valid
+serial_alias=None if serial is None else serial.find("alias")
+serial_shape_valid=([item.tag for item in list(serial)]==["source","target","alias"] and leaf_ok(serial_alias,{"name":"serial0"},None)) if active else [item.tag for item in list(serial)]==["source","target"]
+serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and serial_shape_valid and leaf_ok(serial_source,{"path":sys.argv[6]},None) and serial_target_valid
 tty=None if console is None else console.get("tty"); tty_valid=tty is not None and re.fullmatch(r"/dev/pts/[0-9]+",tty) is not None
-console_pty_valid=console is not None and (console.attrib=={"type":"pty"} or tty_valid and console.attrib=={"type":"pty","tty":tty}) and children_exact(console,("target",),("source",)) and leaf_ok(console_target,{"type":"serial","port":"0"},None) and ((not active and console_source is None and tty is None) or tty_valid and leaf_ok(console_source,{"path":tty},None))
-console_pipe_valid=console is not None and console.attrib=={"type":"pipe"} and [item.tag for item in list(console)]==["source","target"] and leaf_ok(console_source,{"path":sys.argv[6]},None) and leaf_ok(console_target,{"type":"serial","port":"0"},None)
+console_alias=None if console is None else console.find("alias")
+inactive_console_pty_valid=not active and console is not None and console.attrib=={"type":"pty"} and [item.tag for item in list(console)]==["target"] and console_source is None and console_alias is None and leaf_ok(console_target,{"type":"serial","port":"0"},None)
+active_console_pty_valid=active and console is not None and tty_valid and console.attrib=={"type":"pty","tty":tty} and children_exact(console,("target","source")) and leaf_ok(console_target,{"type":"serial","port":"0"},None) and leaf_ok(console_source,{"path":tty},None) and leaf_ok(console_alias,{"name":"serial0"},None)
+console_pty_valid=inactive_console_pty_valid or active_console_pty_valid
+console_pipe_shape=([item.tag for item in list(console)]==["source","target","alias"] and leaf_ok(console_alias,{"name":"serial0"},None)) if active else [item.tag for item in list(console)]==["source","target"]
+console_pipe_valid=console is not None and console.attrib=={"type":"pipe"} and console_pipe_shape and leaf_ok(console_source,{"path":sys.argv[6]},None) and leaf_ok(console_target,{"type":"serial","port":"0"},None)
 console_valid=console_pty_valid or console_pipe_valid
 emulators=root.findall("./devices/emulator")
 emulator_valid=not emulators or len(emulators)==1 and leaf_ok(emulators[0],{},"/usr/bin/qemu-system-x86_64")
@@ -1430,6 +1583,7 @@ def _future_script(
     collector = _serial_collector_python()
     archive_builder = _archive_builder_python()
     ownership_validator = _ownership_validator_python()
+    firmware_validator = _firmware_validator_python()
     runtime_probe_code = _runtime_probe_python()
     capability_probe_code = _capability_probe_python()
     source_manifest_json = canonical_json(source_manifest)
@@ -1451,6 +1605,7 @@ export GIT_OPTIONAL_LOCKS=0
 export GIT_TERMINAL_PROMPT=0
 
 readonly LIBVIRT_URI={shlex.quote(LIBVIRT_URI)}
+readonly MACHINE_TYPE={shlex.quote(MACHINE_TYPE)}
 readonly SOURCE_COMMIT={shlex.quote(source_commit)}
 readonly VM_NAME={shlex.quote(vm_name)}
 readonly VM_UUID={shlex.quote(vm_uuid)}
@@ -1458,6 +1613,10 @@ readonly RUN_ID={shlex.quote(run_id)}
 readonly SOURCE_ROOT={shlex.quote(str(source_root))}
 readonly RUNTIME_SITE={shlex.quote(str(runtime_site))}
 readonly BASE_IMAGE={shlex.quote(str(base_image))}
+readonly FIRMWARE_CODE={shlex.quote(str(FIRMWARE_CODE))}
+readonly FIRMWARE_CODE_SHA256={shlex.quote(FIRMWARE_CODE_SHA256)}
+readonly FIRMWARE_VARS_TEMPLATE={shlex.quote(str(FIRMWARE_VARS_TEMPLATE))}
+readonly FIRMWARE_VARS_SHA256={shlex.quote(FIRMWARE_VARS_SHA256)}
 readonly TEMP_PARENT={shlex.quote(str(temp_parent))}
 readonly EXPECTED_SHA512={shlex.quote(BASE_IMAGE_SHA512)}
 readonly EXPECTED_SOURCE_MANIFEST_JSON={shlex.quote(source_manifest_json)}
@@ -1475,6 +1634,7 @@ readonly RUN_LOCK="/run/user/$(/usr/bin/id -u)/overseer-phase-b-rehearsal.lock"
 TEMP_DIR=""
 OVERLAY=""
 SEED_ISO=""
+NVRAM=""
 SERIAL_PIPE=""
 SERIAL_LOG=""
 SERIAL_STATUS=""
@@ -1490,11 +1650,21 @@ SOURCE_MANIFEST_FILE=""
 RUNTIME_MANIFEST_FILE=""
 LOCK_HELD=0
 
+validate_firmware_runtime() {{
+  /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(firmware_validator)} "$FIRMWARE_CODE" "$FIRMWARE_CODE_SHA256" "$FIRMWARE_VARS_TEMPLATE" "$FIRMWARE_VARS_SHA256"
+}}
+
 domain_presence() {{
-  local names count
+  local names uuids name_count uuid_count actual_uuid actual_name
   if ! names="$(/usr/bin/virsh --connect "$LIBVIRT_URI" list --all --name 2>/dev/null)"; then return 2; fi
-  if ! count="$(printf '%s\\n' "$names" | /usr/bin/awk -v expected="$VM_NAME" '$0 == expected {{ count++ }} END {{ print count + 0 }}')"; then return 2; fi
-  case "$count" in 0) return 1;; 1) return 0;; *) return 2;; esac
+  if ! uuids="$(/usr/bin/virsh --connect "$LIBVIRT_URI" list --all --uuid 2>/dev/null)"; then return 2; fi
+  if ! name_count="$(printf '%s\\n' "$names" | /usr/bin/awk -v expected="$VM_NAME" '$0 == expected {{ count++ }} END {{ print count + 0 }}')"; then return 2; fi
+  if ! uuid_count="$(printf '%s\\n' "$uuids" | /usr/bin/awk -v expected="$VM_UUID" '$0 == expected {{ count++ }} END {{ print count + 0 }}')"; then return 2; fi
+  if [[ "$name_count" == 0 && "$uuid_count" == 0 ]]; then return 1; fi
+  [[ "$name_count" == 1 && "$uuid_count" == 1 ]] || return 2
+  if ! actual_uuid="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domuuid "$VM_NAME" 2>/dev/null)" || [[ "$actual_uuid" != "$VM_UUID" ]]; then return 2; fi
+  if ! actual_name="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domname "$VM_UUID" 2>/dev/null)" || [[ "$actual_name" != "$VM_NAME" ]]; then return 2; fi
+  return 0
 }}
 
 verify_domain_ownership() {{
@@ -1503,14 +1673,14 @@ verify_domain_ownership() {{
   if domain_presence; then presence=0; else presence=$?; fi
   case "$presence" in 1) return 1;; 2) return 2;; esac
   if ! actual_uuid="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domuuid "$VM_NAME" 2>/dev/null)" || [[ "$actual_uuid" != "$VM_UUID" ]]; then return 2; fi
-  if ! xml="$(/usr/bin/virsh --connect "$LIBVIRT_URI" dumpxml "$VM_NAME" 2>/dev/null)"; then return 2; fi
-  if ! printf '%s' "$xml" | /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(ownership_validator)} "$VM_NAME" "$VM_UUID" "$RUN_ID" "$OVERLAY" "$SEED_ISO" "$SERIAL_PIPE" "$BASE_IMAGE"; then return 2; fi
+  if ! xml="$(/usr/bin/virsh --connect "$LIBVIRT_URI" dumpxml "$VM_UUID" 2>/dev/null)"; then return 2; fi
+  if ! printf '%s' "$xml" | /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(ownership_validator)} "$VM_NAME" "$VM_UUID" "$RUN_ID" "$OVERLAY" "$SEED_ISO" "$SERIAL_PIPE" "$BASE_IMAGE" "$NVRAM" "$FIRMWARE_CODE" "$FIRMWARE_VARS_TEMPLATE" "$MACHINE_TYPE"; then return 2; fi
   return 0
 }}
 
 domain_state() {{
   verify_domain_ownership || return 2
-  /usr/bin/virsh --connect "$LIBVIRT_URI" domstate "$VM_NAME" 2>/dev/null
+  /usr/bin/virsh --connect "$LIBVIRT_URI" domstate "$VM_UUID" 2>/dev/null
 }}
 
 wait_for_inactive() {{
@@ -1537,7 +1707,7 @@ shutdown_and_undefine() {{
   case "$state" in
     "shut off") ;;
     "running")
-      /usr/bin/virsh --connect "$LIBVIRT_URI" shutdown "$VM_NAME" >/dev/null 2>&1 || return 1
+      /usr/bin/virsh --connect "$LIBVIRT_URI" shutdown "$VM_UUID" >/dev/null 2>&1 || return 1
       wait_for_inactive || return 1
       ;;
     "in shutdown") wait_for_inactive || return 1;;
@@ -1545,7 +1715,7 @@ shutdown_and_undefine() {{
   esac
   verify_domain_ownership || return 1
   if ! state="$(domain_state)" || [[ "$state" != "shut off" ]]; then return 1; fi
-  /usr/bin/virsh --connect "$LIBVIRT_URI" undefine "$VM_NAME" >/dev/null 2>&1 || return 1
+  /usr/bin/virsh --connect "$LIBVIRT_URI" undefine "$VM_UUID" --nvram >/dev/null 2>&1 || return 1
   if domain_presence; then return 1; else ownership=$?; fi
   [[ "$ownership" -eq 1 ]]
 }}
@@ -1554,6 +1724,7 @@ temp_layout_is_exact() {{
   [[ -n "$TEMP_DIR" ]] &&
   [[ "$OVERLAY" == "$TEMP_DIR/overlay.qcow2" ]] &&
   [[ "$SEED_ISO" == "$TEMP_DIR/seed.iso" ]] &&
+  [[ "$NVRAM" == "$TEMP_DIR/nvram.fd" ]] &&
   [[ "$SERIAL_PIPE" == "$TEMP_DIR/serial" ]] &&
   [[ "$SERIAL_LOG" == "$TEMP_DIR/serial.log" ]] &&
   [[ "$SERIAL_STATUS" == "$TEMP_DIR/serial.status" ]] &&
@@ -1598,7 +1769,7 @@ cleanup() {{
   stop_collector
   if shutdown_and_undefine; then confirmed_absent=1; else cleanup_status=1; fi
   if (( confirmed_absent == 1 )) && temp_layout_is_exact; then
-    /usr/bin/rm -f -- "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$SERIAL_LOG" "$SERIAL_STATUS" "$SERIAL_STOP" "$SERIAL_COLLECTOR" "$SERIAL_PIPE.in" "$SERIAL_PIPE.out" "$SOURCE_ARCHIVE" "$RUNTIME_ARCHIVE" "$SOURCE_MANIFEST_FILE" "$RUNTIME_MANIFEST_FILE"
+    /usr/bin/rm -f -- "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$NVRAM" "$SERIAL_LOG" "$SERIAL_STATUS" "$SERIAL_STOP" "$SERIAL_COLLECTOR" "$SERIAL_PIPE.in" "$SERIAL_PIPE.out" "$SOURCE_ARCHIVE" "$RUNTIME_ARCHIVE" "$SOURCE_MANIFEST_FILE" "$RUNTIME_MANIFEST_FILE"
     /usr/bin/rmdir -- "$TEMP_DIR" || cleanup_status=1
   elif [[ -n "$TEMP_DIR" ]]; then
     printf '%s\\n' 'cleanup retained exact temporary artifacts because domain ownership/state was not confirmed' >&2
@@ -1631,13 +1802,15 @@ fi
 ACTUAL_RUNTIME_PROBE_JSON="$(/usr/bin/python3.13 -B -s -P -S -c {shlex.quote(runtime_probe_code)} "$SOURCE_ROOT" "$RUNTIME_SITE" "$EXPECTED_SOURCE_MANIFEST_JSON" "$EXPECTED_RUNTIME_MANIFEST_JSON")"
 [[ "$ACTUAL_RUNTIME_PROBE_JSON" == "$EXPECTED_RUNTIME_PROBE_JSON" ]]
 [[ "$(printf '%s' "$ACTUAL_RUNTIME_PROBE_JSON" | /usr/bin/sha256sum | /usr/bin/awk '{{print $1}}')" == "$EXPECTED_RUNTIME_PROBE_SHA256" ]]
-ACTUAL_CAPABILITY_PROBE_JSON="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domcapabilities --virttype kvm --arch x86_64 | /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(capability_probe_code)})"
+ACTUAL_CAPABILITY_PROBE_JSON="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domcapabilities --virttype kvm --arch x86_64 --machine "$MACHINE_TYPE" | /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(capability_probe_code)})"
 [[ "$ACTUAL_CAPABILITY_PROBE_JSON" == "$EXPECTED_CAPABILITY_PROBE_JSON" ]]
 [[ "$(printf '%s' "$ACTUAL_CAPABILITY_PROBE_JSON" | /usr/bin/sha256sum | /usr/bin/awk '{{print $1}}')" == "$EXPECTED_CAPABILITY_PROBE_SHA256" ]]
+validate_firmware_runtime
 
 TEMP_DIR="$(/usr/bin/mktemp -d -p "$TEMP_PARENT" overseer-phase-b-rehearsal.XXXXXX)"
 OVERLAY="$TEMP_DIR/overlay.qcow2"
 SEED_ISO="$TEMP_DIR/seed.iso"
+NVRAM="$TEMP_DIR/nvram.fd"
 SERIAL_PIPE="$TEMP_DIR/serial"
 SERIAL_LOG="$TEMP_DIR/serial.log"
 SERIAL_STATUS="$TEMP_DIR/serial.status"
@@ -1667,6 +1840,8 @@ printf '%s' "$EXPECTED_RUNTIME_MANIFEST_JSON" >"$RUNTIME_MANIFEST_FILE"
 
 printf '%s  %s\\n' "$EXPECTED_SHA512" "$BASE_IMAGE" | /usr/bin/sha512sum --check -
 /usr/bin/qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMAGE" "$OVERLAY" {OVERLAY_GIB}G
+/usr/bin/install -m 0600 "$FIRMWARE_VARS_TEMPLATE" "$NVRAM"
+printf '%s  %s\n' "$FIRMWARE_VARS_SHA256" "$NVRAM" | /usr/bin/sha256sum --check -
 /usr/bin/cat >"$USER_DATA" <<'CLOUD_INIT'
 {cloud_init}CLOUD_INIT
 /usr/bin/cat >"$META_DATA" <<'META_DATA'
@@ -1680,12 +1855,13 @@ COLLECTOR_PID=$!
 /usr/bin/cat >"$DOMAIN_XML" <<DOMAIN_XML
 {domain_xml}DOMAIN_XML
 verify_lock
+validate_firmware_runtime
 /usr/bin/virsh --connect "$LIBVIRT_URI" define --validate "$DOMAIN_XML"
 verify_domain_ownership
-/usr/bin/virsh --connect "$LIBVIRT_URI" autostart --disable "$VM_NAME"
-/usr/bin/virsh --connect "$LIBVIRT_URI" dominfo "$VM_NAME" | /usr/bin/awk -F: '/^Autostart/ {{gsub(/[[:space:]]/, "", $2); print $2}}' | /usr/bin/grep -qx disable
+/usr/bin/virsh --connect "$LIBVIRT_URI" autostart --disable "$VM_UUID"
+/usr/bin/virsh --connect "$LIBVIRT_URI" dominfo "$VM_UUID" | /usr/bin/awk -F: '/^Autostart/ {{gsub(/[[:space:]]/, "", $2); print $2}}' | /usr/bin/grep -qx disable
 verify_domain_ownership
-/usr/bin/virsh --connect "$LIBVIRT_URI" start "$VM_NAME"
+/usr/bin/virsh --connect "$LIBVIRT_URI" start "$VM_UUID"
 
 if ! /usr/bin/timeout --foreground "${{RESULT_TIMEOUT_SECONDS}}s" /usr/bin/bash -c '
   status="$1"
@@ -1791,6 +1967,11 @@ def render_plan(
             "sha512": BASE_IMAGE_SHA512,
             "localPath": str(base_image),
             "format": "qcow2",
+        },
+        "firmware": {
+            **dict(_capability_probe_record()["firmware"]),
+            "nvramPath": "$TEMP_DIR/nvram.fd",
+            "nvramMode": "0600",
         },
         "libvirtUri": LIBVIRT_URI,
         "vm": {

@@ -1,0 +1,29 @@
+[Unit]
+Description=Disposable Overseer Phase B guest rehearsal
+After=local-fs.target
+ConditionPathIsDirectory=/mnt/overseer-source
+ConditionPathIsDirectory=/opt/overseer-phase-b-rehearsal
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/overseer-phase-b-rehearsal
+ExecStart=/usr/bin/python3 -s -P /opt/overseer-phase-b-rehearsal/guest_rehearsal.py
+StandardOutput=journal+console
+StandardError=journal
+TimeoutStartSec=15min
+TimeoutStopSec=10s
+NoNewPrivileges=no
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/mnt/overseer-source
+ReadWritePaths=/etc/overseer-phase-b-rehearsal /run/overseer-phase-b-rehearsal /opt/overseer-phase-b-rehearsal /var/lib/overseer-phase-b-rehearsal
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

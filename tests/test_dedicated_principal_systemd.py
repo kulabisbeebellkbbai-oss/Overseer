@@ -170,15 +170,22 @@ def test_disposable_api_canary_is_separate_bounded_and_principal_owned() -> None
     command = _one(canary, "ExecStart")
     assert _one(canary, "User") == "@OVERSEER_UID@"
     assert _one(canary, "Group") == "@OVERSEER_UID@"
-    assert "--store /var/lib/overseer/overseer-canary.sqlite3" in command
+    assert "--store @OVERSEER_CANARY_STATE@/overseer.sqlite3" in command
     assert "--socket-fd" not in command
     assert "--socket-path /run/overseer-canary/api.sock" in command
     assert "--socket-peer-uid 0" in command
     assert "--socket-owner-uid 984 --socket-owner-gid 984" in command
     assert "--host" not in command and "--port" not in command
     assert "overseer-api-canary.socket" not in canary
-    assert "OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-canary-bridge.sqlite3" in canary
-    assert "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-canary-relay.sqlite3" in canary
+    assert (
+        "OVERSEER_PSYCHLO_BRIDGE_DATABASE="
+        "@OVERSEER_CANARY_STATE@/psychlo-bridge.sqlite3"
+    ) in canary
+    assert (
+        "OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE="
+        "@OVERSEER_CANARY_STATE@/roadex-relay.sqlite3"
+    ) in canary
+    assert _one(canary, "ReadWritePaths") == "@OVERSEER_CANARY_STATE@"
     assert (
         "Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT="
         "http://127.0.0.1:8780/api/internal/overseer/project-human-thread/questions"

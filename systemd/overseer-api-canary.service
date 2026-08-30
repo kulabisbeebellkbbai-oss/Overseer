@@ -20,16 +20,16 @@ Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock
 Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock
 Environment=OVERSEER_USER_BRIDGE_SERVER_UID=@GOD_UID@
 Environment=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798
-Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=/var/lib/overseer/psychlo-canary-bridge.sqlite3
+Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=@OVERSEER_CANARY_STATE@/psychlo-bridge.sqlite3
 Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=/etc/overseer/psychlo-project-bindings.json
 Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-peer-secret
-Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=/var/lib/overseer/roadex-canary-relay.sqlite3
+Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_DATABASE=@OVERSEER_CANARY_STATE@/roadex-relay.sqlite3
 Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_SECRET_FILE=%d/roadex-peer-secret
 Environment=OVERSEER_ROADEX_PROJECT_HUMAN_THREAD_QUESTION_ENDPOINT=http://127.0.0.1:8780/api/internal/overseer/project-human-thread/questions
 LoadCredential=api-token:/etc/overseer/api-token
 LoadCredential=psychlo-peer-secret:/etc/overseer/psychlo-peer-secret
 LoadCredential=roadex-peer-secret:/etc/overseer/roadex-project-human-thread-secret
-ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.cli serve-api --store /var/lib/overseer/overseer-canary.sqlite3 --socket-path /run/overseer-canary/api.sock --socket-peer-uid 0 --socket-owner-uid 984 --socket-owner-gid 984 --auth-token-file %d/api-token --admin-approval-verifier-file /etc/overseer/admin-approval-verifier.json --roadex-fixture-approval-verifier-file /etc/overseer/roadex-fixture-approval-verifier.json
+ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.cli serve-api --store @OVERSEER_CANARY_STATE@/overseer.sqlite3 --socket-path /run/overseer-canary/api.sock --socket-peer-uid 0 --socket-owner-uid 984 --socket-owner-gid 984 --auth-token-file %d/api-token --admin-approval-verifier-file /etc/overseer/admin-approval-verifier.json --roadex-fixture-approval-verifier-file /etc/overseer/roadex-fixture-approval-verifier.json
 RuntimeMaxSec=10min
 TimeoutStopSec=10s
 RuntimeDirectory=overseer-canary
@@ -38,7 +38,7 @@ StateDirectory=overseer
 StateDirectoryMode=0700
 ReadOnlyPaths=@OVERSEER_RELEASE@
 ReadOnlyPaths=/etc/overseer
-ReadWritePaths=/var/lib/overseer
+ReadWritePaths=@OVERSEER_CANARY_STATE@
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=true

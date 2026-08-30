@@ -420,9 +420,19 @@ def _write_precreated_unit(path: Path, data: bytes) -> None:
         or metadata.st_size != 0
     ):
         raise RehearsalError("guest unit placeholder metadata is invalid")
-    flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
+        opened = os.fstat(descriptor)
+        lexical = path.lstat()
+        if (
+            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or (lexical.st_dev, lexical.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or opened.st_nlink != 1
+            or opened.st_size != 0
+        ):
+            raise RehearsalError("guest unit placeholder changed while opening")
+        os.ftruncate(descriptor, 0)
         written = 0
         while written < len(data):
             count = os.write(descriptor, data[written:])
@@ -542,11 +552,72 @@ def handoff_canary_namespace(
             or metadata.st_nlink != 1
         ):
             raise RehearsalError("canary namespace contains unexpected artifact metadata")
-    for child in sorted(children):
-        chown(child, CANARY_UID, CANARY_UID)
-        chmod(child, 0o600)
-    chown(state_directory, CANARY_UID, CANARY_UID)
-    chmod(state_directory, 0o700)
+    if chown is os.chown and chmod is os.chmod:
+        directory_descriptor = -1
+        file_descriptors: list[int] = []
+        try:
+            directory_descriptor = os.open(
+                state_directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened_directory = os.fstat(directory_descriptor)
+            if (
+                (opened_directory.st_dev, opened_directory.st_ino)
+                != (state_metadata.st_dev, state_metadata.st_ino)
+            ):
+                raise RehearsalError("canary namespace changed during handoff")
+            for child in sorted(children):
+                descriptor = os.open(
+                    child.name,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_descriptor,
+                )
+                file_descriptors.append(descriptor)
+                opened = os.fstat(descriptor)
+                lexical = os.stat(
+                    child.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (lexical.st_dev, lexical.st_ino)
+                    or opened.st_uid != expected_owner_uid
+                    or opened.st_gid != expected_owner_gid
+                    or stat.S_IMODE(opened.st_mode) != 0o600
+                    or opened.st_nlink != 1
+                ):
+                    raise RehearsalError("canary namespace changed during handoff")
+            for descriptor in file_descriptors:
+                os.fchown(descriptor, CANARY_UID, CANARY_UID)
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            os.fchown(directory_descriptor, CANARY_UID, CANARY_UID)
+            os.fchmod(directory_descriptor, 0o700)
+            os.fsync(directory_descriptor)
+            if any(
+                os.fstat(descriptor).st_uid != CANARY_UID
+                or os.fstat(descriptor).st_gid != CANARY_UID
+                or stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600
+                for descriptor in file_descriptors
+            ):
+                raise RehearsalError("canary namespace handoff was not durable")
+        finally:
+            for descriptor in file_descriptors:
+                os.close(descriptor)
+            if directory_descriptor >= 0:
+                os.close(directory_descriptor)
+    else:
+        for child in sorted(children):
+            chown(child, CANARY_UID, CANARY_UID)
+            chmod(child, 0o600)
+        chown(state_directory, CANARY_UID, CANARY_UID)
+        chmod(state_directory, 0o700)
 
 
 def render_guest_units(

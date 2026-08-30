@@ -41,6 +41,7 @@ CANARY_STATE_ROOT = Path("/var/lib/overseer-canary")
 EXECUTOR_STATE_ROOT = Path("/var/lib/overseer-executor")
 OVERSEER_RUNTIME = Path("/run/overseer")
 CANARY_RUNTIME = Path("/run/overseer-canary")
+RUNTIME_SITE = Path("/usr/local/lib/python3.13/dist-packages")
 
 ADMIN_SECRET = "phase-b-rehearsal-admin-secret"
 ROADEX_SECRET = "phase-b-rehearsal-roadex-secret"
@@ -696,7 +697,7 @@ def render_guest_units(
     store = state_directory / "overseer.sqlite3"
     common = (
         f"WorkingDirectory={source}\n"
-        f"Environment=PYTHONPATH={source / 'src'}\n"
+        f"Environment=PYTHONPATH={source / 'src'}:{RUNTIME_SITE}\n"
         "Environment=PYTHONDONTWRITEBYTECODE=1\n"
         "PrivateNetwork=yes\nNoNewPrivileges=yes\nProtectSystem=strict\n"
     )
@@ -720,7 +721,7 @@ def render_guest_units(
             "Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock\n"
             "Environment=OVERSEER_USER_BRIDGE_SERVER_UID=1000\n"
             + common
-            + f"ExecStart={python} -B -s -P -m overseer.cli serve-api "
+            + f"ExecStart={python} -B -s -P -S -m overseer.cli serve-api "
             f"--store {store} --socket-path {CANARY_RUNTIME / 'api.sock'} "
             f"--socket-peer-uid 0 --socket-owner-uid {CANARY_UID} "
             f"--socket-owner-gid {CANARY_UID} --auth-token-file %d/api-token "
@@ -737,7 +738,7 @@ def render_guest_units(
             "[Unit]\nRequires=overseer-codex-user-bridge.socket\n"
             "[Service]\nType=simple\nUser=1000\nGroup=1000\n"
             + common
-            + f"ExecStart={python} -B -s -P -m overseer.user_bridge serve "
+            + f"ExecStart={python} -B -s -P -S -m overseer.user_bridge serve "
             f"--socket-fd=3 --peer-uid={CANARY_UID}\n"
         ),
         "overseer-admin-executor.socket": (
@@ -749,7 +750,7 @@ def render_guest_units(
             "[Unit]\nDescription=Disposable Overseer admin executor connection\n"
             "[Service]\nType=oneshot\nUser=root\nGroup=root\nStandardInput=socket\nStandardOutput=socket\n"
             + common
-            + f"ExecStart={python} -B -s -P -m overseer.admin_executor serve-one "
+            + f"ExecStart={python} -B -s -P -S -m overseer.admin_executor serve-one "
             f"--allowlist-file {GUEST_ETC / 'allowlist.json'} "
             f"--public-key-file {GUEST_ETC / 'admin-ticket-public-key'} "
             f"--ledger {EXECUTOR_STATE_ROOT / 'executor-ledger.sqlite3'}\n"

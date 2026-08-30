@@ -31,8 +31,11 @@ Preflight fails closed unless:
   selected `_cffi_backend` extension, excluding links, `__pycache__`, and
   bytecode, within its independent bounds; and
 - `/usr/bin/python3.13 -B -s -P -S` imports the four required modules through a
-  manifest-enforcing finder. The probe redirects `sys.pycache_prefix` to an
-  inaccessible location, so ignored adjacent bytecode is not eligible.
+  manifest-enforcing finder. Every source loader opens with `O_NOFOLLOW`,
+  revalidates stable descriptor metadata, mode, size, and SHA-256, then compiles
+  those verified bytes directly; native loaders verify before module creation
+  and execution. The probe redirects `sys.pycache_prefix` to an inaccessible
+  location, so ignored adjacent bytecode is not eligible.
 
 Every probe uses an absolute executable and this exact minimal environment:
 
@@ -87,8 +90,9 @@ bind-remounted read-only. Runtime is extracted to the guest's local Python 3.13
 site directory and independently bind-remounted read-only. The live host
 checkout and runtime remain unmounted. Before systemd starts, Python 3.13 must
 prove the `cryptography` and `_cffi_backend` origins are under the extracted
-runtime and all Overseer origins are under the extracted source. The outer
-unit pins `/usr/bin/python3.13` and both exact import roots.
+runtime and all Overseer origins are under the extracted source. The outer and
+child units pin `/usr/bin/python3.13 -B -s -P -S` and both exact import roots,
+so system site-packages, `.pth`, `sitecustomize`, and user sites are ineligible.
 
 ## Owned VM lifecycle
 
@@ -103,8 +107,11 @@ contains the UUID and a namespaced immutable run marker. It contains only:
 
 The future script acquires an atomic per-user rehearsal lock and never removes a
 stale or foreign lock. Before start, shutdown, or undefine, it requires the lock
-marker and parses `virsh dumpxml` to revalidate the exact name, UUID, run marker,
-overlay, ISO, pipe, and absence of a network interface. A missing lock,
+marker and parses `virsh dumpxml` to revalidate the exact name, UUID, sole run
+marker, disk types/drivers/targets, overlay, ISO, serial pipe/console, and a
+strict device whitelist. Filesystem shares, interfaces, host devices, channels,
+duplicate disks, changed disk attributes, and every other unapproved device are
+rejected. A missing lock,
 same-name foreign domain, UUID/metadata/device mismatch, or unknown libvirt
 state prevents mutation and retains artifacts for an explicitly approved
 recovery.

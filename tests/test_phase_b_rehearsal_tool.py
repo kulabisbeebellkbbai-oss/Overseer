@@ -546,6 +546,46 @@ def test_import_probe_ignores_valid_adjacent_untracked_bytecode(
     assert not marker.exists()
 
 
+def test_import_probe_rejects_manifested_path_replacement_before_execution(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    source = tmp_path / "source"
+    package = source / "src/overseer"
+    runtime = tmp_path / "runtime"
+    cryptography = runtime / "cryptography"
+    package.mkdir(parents=True)
+    cryptography.mkdir(parents=True)
+    for relative in ("__init__.py", "cli.py", "user_bridge.py", "admin_executor.py"):
+        (package / relative).write_text("VALUE = 'approved'\n", encoding="utf-8")
+    (cryptography / "__init__.py").write_text("VALUE = 'approved'\n", encoding="utf-8")
+    (runtime / "_cffi_backend.cpython-313-x86_64-linux-gnu.so").write_bytes(b"fixture")
+    tracked = tuple(
+        f"src/overseer/{name}"
+        for name in ("__init__.py", "admin_executor.py", "cli.py", "user_bridge.py")
+    )
+    source_manifest = module.build_source_manifest(source, tracked)
+    runtime_manifest = module.build_runtime_manifest(runtime)
+    marker = tmp_path / "replacement-executed"
+    (package / "cli.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        module._read_only_runner(
+            (
+                "import-probe",
+                str(source),
+                str(runtime),
+                module.canonical_json(source_manifest),
+                module.canonical_json(runtime_manifest),
+            )
+        )
+
+    assert not marker.exists()
+
+
 def test_render_plan_is_pure_canonical_and_probe_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     module = load_tool()
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("render ran subprocess"))
@@ -603,6 +643,90 @@ def test_domain_xml_parses_and_has_seed_only_no_host_share_with_owned_pipe_seria
     assert root.find("./devices/serial/source").attrib == {"path": "${SERIAL_PIPE}"}
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("filesystem", "hostdev", "channel", "duplicate-disk", "changed-driver"),
+)
+def test_domain_ownership_validator_rejects_unapproved_devices(
+    mutation: str,
+) -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = ET.fromstring(
+        plan["domainXml"]
+        .replace("${OVERLAY}", "/tmp/owned/overlay.qcow2")
+        .replace("${SEED_ISO}", "/tmp/owned/seed.iso")
+        .replace("${SERIAL_PIPE}", "/tmp/owned/serial")
+    )
+    devices = root.find("./devices")
+    assert devices is not None
+    if mutation == "filesystem":
+        ET.SubElement(devices, "filesystem", {"type": "mount"})
+    elif mutation == "hostdev":
+        ET.SubElement(devices, "hostdev", {"mode": "subsystem", "type": "usb"})
+    elif mutation == "channel":
+        ET.SubElement(devices, "channel", {"type": "unix"})
+    elif mutation == "duplicate-disk":
+        devices.append(ET.fromstring(ET.tostring(devices.findall("disk")[0])))
+    else:
+        devices.findall("disk")[0].find("driver").set("type", "raw")
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-S",
+            "-c",
+            module._ownership_validator_python(),
+            plan["vm"]["name"],
+            plan["vm"]["uuid"],
+            plan["vm"]["runId"],
+            "/tmp/owned/overlay.qcow2",
+            "/tmp/owned/seed.iso",
+            "/tmp/owned/serial",
+        ),
+        input=ET.tostring(root, encoding="unicode"),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+
+
+def test_domain_ownership_validator_accepts_only_the_rendered_device_contract() -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    xml = (
+        plan["domainXml"]
+        .replace("${OVERLAY}", "/tmp/owned/overlay.qcow2")
+        .replace("${SEED_ISO}", "/tmp/owned/seed.iso")
+        .replace("${SERIAL_PIPE}", "/tmp/owned/serial")
+    )
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-S",
+            "-c",
+            module._ownership_validator_python(),
+            plan["vm"]["name"],
+            plan["vm"]["uuid"],
+            plan["vm"]["runId"],
+            "/tmp/owned/overlay.qcow2",
+            "/tmp/owned/seed.iso",
+            "/tmp/owned/serial",
+        ),
+        input=xml,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_concrete_domain_xml_passes_installed_libvirt_schema(tmp_path: Path) -> None:
     validator = shutil.which("virt-xml-validate")
     if validator is None:
@@ -651,6 +775,7 @@ def test_cloud_init_installs_complete_task_two_guest_contract() -> None:
         "import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor",
         "relative_to(runtime)",
         "import _cffi_backend",
+        "/usr/bin/python3.13 -B -s -P -S -c",
         "/etc/overseer-phase-b-rehearsal/source-commit",
         SOURCE_COMMIT,
         "permissions: '0444'",

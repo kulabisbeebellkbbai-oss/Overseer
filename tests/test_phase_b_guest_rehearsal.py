@@ -530,6 +530,7 @@ def test_guest_marker_powers_off_after_any_main_error(monkeypatch: pytest.Monkey
 
 
 def test_outer_service_allows_only_explicit_guest_and_unit_paths() -> None:
+    module = load_guest_module()
     service = (GUEST_SCRIPT.parent / "guest_rehearsal.service").read_text(encoding="utf-8")
     assert "Environment=OVERSEER_PHASE_B_GUEST=1" in service
     for path in (
@@ -559,8 +560,20 @@ def test_outer_service_allows_only_explicit_guest_and_unit_paths() -> None:
     )
     assert "ReadOnlyPaths=/opt/overseer-source" in service
     assert "ReadOnlyPaths=/usr/local/lib/python3.13/dist-packages" in service
-    assert "ExecStart=/usr/bin/python3.13 -s -P" in service
+    assert "ExecStart=/usr/bin/python3.13 -B -s -P -S" in service
     assert (
         "Environment=PYTHONPATH=/opt/overseer-source/src:/usr/local/lib/python3.13/dist-packages"
         in service
     )
+    units = module.render_guest_units(
+        source_root=Path("/opt/overseer-source"),
+        python_path=Path("/usr/bin/python3.13"),
+        state_directory=Path("/var/lib/overseer-canary/0123456789abcdef0123456789abcdef"),
+    )
+    for content in units.values():
+        if "ExecStart=" in content and "ExecStart=/usr/bin/true" not in content:
+            assert " -B -s -P -S -m overseer." in content
+            assert (
+                "Environment=PYTHONPATH=/opt/overseer-source/src:/usr/local/lib/python3.13/dist-packages"
+                in content
+            )

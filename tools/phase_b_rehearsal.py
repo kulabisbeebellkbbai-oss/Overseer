@@ -407,7 +407,7 @@ def build_artifact_archive(root: Path, manifest: Mapping[str, object]) -> bytes:
 def _runtime_probe_python() -> str:
     return "\n".join(
         (
-            "import importlib,importlib.abc,importlib.machinery,json,sys,sysconfig",
+            "import hashlib,importlib,importlib.abc,importlib.machinery,json,os,stat,sys,sysconfig",
             "from pathlib import Path",
             "sys.dont_write_bytecode=True",
             "sys.pycache_prefix='/proc/overseer-disabled-bytecode-cache'",
@@ -419,16 +419,47 @@ def _runtime_probe_python() -> str:
             "stdlib=Path(sysconfig.get_path('stdlib')).resolve(strict=True)",
             "platstdlib=Path(sysconfig.get_path('platstdlib')).resolve(strict=True)",
             "stdlib_dynamic=(stdlib/'lib-dynload').resolve(strict=True)",
-            "def allowed(root,manifest): return {str((root/item['path']).resolve(strict=True)) for item in manifest['files']}",
+            "def allowed(root,manifest): return {str((root/item['path']).resolve(strict=True)):item for item in manifest['files']}",
             "allowed_source=allowed(source,source_manifest)",
             "allowed_runtime=allowed(runtime,runtime_manifest)",
+            "def read_verified(origin,record):",
+            " fd=os.open(origin,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)",
+            " try:",
+            "  before=os.fstat(fd)",
+            "  if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1: raise ImportError('manifested import is not a single-link regular file')",
+            "  chunks=[]",
+            "  while True:",
+            "   block=os.read(fd,1048576)",
+            "   if not block: break",
+            "   chunks.append(block)",
+            "  after=os.fstat(fd)",
+            " finally: os.close(fd)",
+            " if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns): raise ImportError('manifested import changed while read')",
+            " payload=b''.join(chunks)",
+            " mode=0o755 if before.st_mode&stat.S_IXUSR else 0o644",
+            " if mode!=record['mode'] or len(payload)!=record['size'] or hashlib.sha256(payload).hexdigest()!=record['sha256']: raise ImportError('manifested import content mismatch')",
+            " return payload",
+            "class ManifestSourceLoader(importlib.abc.Loader):",
+            " def __init__(self,origin,record): self.origin=origin; self.record=record",
+            " def create_module(self,spec): return None",
+            " def exec_module(self,module): exec(compile(read_verified(self.origin,self.record),self.origin,'exec',dont_inherit=True),module.__dict__)",
+            "class ManifestDelegatingLoader(importlib.abc.Loader):",
+            " def __init__(self,delegate,origin,record): self.delegate=delegate; self.origin=origin; self.record=record",
+            " def create_module(self,spec):",
+            "  read_verified(self.origin,self.record)",
+            "  create=getattr(self.delegate,'create_module',None)",
+            "  return None if create is None else create(spec)",
+            " def exec_module(self,module): read_verified(self.origin,self.record); self.delegate.exec_module(module)",
+            " def __getattr__(self,name): return getattr(self.delegate,name)",
             "class ManifestFinder(importlib.abc.MetaPathFinder):",
             " def find_spec(self,fullname,path=None,target=None):",
             "  spec=importlib.machinery.PathFinder.find_spec(fullname,path,target)",
             "  if spec is None or spec.origin in (None,'built-in','frozen'): return spec",
             "  origin=str(Path(spec.origin).resolve(strict=True))",
-            "  if Path(origin).is_relative_to(source) and origin not in allowed_source: raise ImportError('source origin is not manifested')",
-            "  if Path(origin).is_relative_to(runtime) and origin not in allowed_runtime: raise ImportError('runtime origin is not manifested')",
+            "  record=allowed_source.get(origin) if Path(origin).is_relative_to(source) else allowed_runtime.get(origin) if Path(origin).is_relative_to(runtime) else None",
+            "  if Path(origin).is_relative_to(source) and record is None: raise ImportError('source origin is not manifested')",
+            "  if Path(origin).is_relative_to(runtime) and record is None: raise ImportError('runtime origin is not manifested')",
+            "  if record is not None: spec.loader=ManifestSourceLoader(origin,record) if origin.endswith(('.py','.pyw')) else ManifestDelegatingLoader(spec.loader,origin,record)",
             "  return spec",
             "sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder),ManifestFinder())",
             "sys.path[:]=list(dict.fromkeys(map(str,(source_modules,runtime,stdlib,platstdlib,stdlib_dynamic))))",
@@ -1042,7 +1073,7 @@ def _cloud_init(
             "      /usr/sbin/useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash god",
             "      test \"$(getent passwd 984 | cut -d: -f1,3,4)\" = overseer:984:984",
             "      test \"$(getent passwd 1000 | cut -d: -f1,3,4)\" = god:1000:1000",
-            f'      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH=/opt/overseer-source/src:/usr/local/lib/python3.13/dist-packages /usr/bin/python3.13 -B -s -P -c "import sys,sysconfig; from pathlib import Path; assert sys.version_info[:2] == (3,13); assert sysconfig.get_config_var(\\"SOABI\\") == \\"{python_abi}\\"; import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor; import _cffi_backend; runtime=Path(\\"/usr/local/lib/python3.13/dist-packages\\").resolve(); source=Path(\\"/opt/overseer-source/src\\").resolve(); Path(cryptography.__file__).resolve().relative_to(runtime); Path(_cffi_backend.__file__).resolve().relative_to(runtime); Path(overseer.cli.__file__).resolve().relative_to(source); Path(overseer.user_bridge.__file__).resolve().relative_to(source); Path(overseer.admin_executor.__file__).resolve().relative_to(source)"',
+            f'      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH=/opt/overseer-source/src:/usr/local/lib/python3.13/dist-packages /usr/bin/python3.13 -B -s -P -S -c "import sys,sysconfig; from pathlib import Path; assert sys.version_info[:2] == (3,13); assert sysconfig.get_config_var(\\"SOABI\\") == \\"{python_abi}\\"; import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor; import _cffi_backend; runtime=Path(\\"/usr/local/lib/python3.13/dist-packages\\").resolve(); source=Path(\\"/opt/overseer-source/src\\").resolve(); Path(cryptography.__file__).resolve().relative_to(runtime); Path(_cffi_backend.__file__).resolve().relative_to(runtime); Path(overseer.cli.__file__).resolve().relative_to(source); Path(overseer.user_bridge.__file__).resolve().relative_to(source); Path(overseer.admin_executor.__file__).resolve().relative_to(source)"',
             "      /usr/bin/install -D -m 0755 /opt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.py /opt/overseer-phase-b-rehearsal/guest_rehearsal.py",
             "      /usr/bin/install -D -m 0644 /opt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.service /etc/systemd/system/overseer-phase-b-rehearsal.service",
             f"      for placeholder in {placeholders}; do test ! -s \"$placeholder\"; chown root:root \"$placeholder\"; chmod 0644 \"$placeholder\"; done",
@@ -1263,12 +1294,28 @@ def _ownership_validator_python() -> str:
     return r"""import sys
 from xml.etree import ElementTree
 root=ElementTree.fromstring(sys.stdin.read())
-marker=root.find("./metadata/{urn:overseer:phase-b-rehearsal}run")
+metadata=root.find("./metadata")
+markers=[] if metadata is None else list(metadata)
+marker=markers[0] if len(markers)==1 and markers[0].tag=="{urn:overseer:phase-b-rehearsal}run" else None
+devices=root.find("./devices")
+children=[] if devices is None else list(devices)
+allowed={"disk","serial","console","controller","input","memballoon","emulator"}
+if devices is None or any(item.tag not in allowed for item in children): raise SystemExit(1)
 disks=root.findall("./devices/disk")
-disk_sources={(item.get("device"),item.find("source").get("file")) for item in disks}
-serial=root.find("./devices/serial")
+def disk_ok(item,device,path,driver_type,target,bus,readonly):
+    driver=item.find("driver");source=item.find("source");target_node=item.find("target")
+    return item.attrib=={"type":"file","device":device} and driver is not None and driver.attrib=={"name":"qemu","type":driver_type} and source is not None and source.attrib=={"file":path} and target_node is not None and target_node.attrib=={"dev":target,"bus":bus} and (item.find("readonly") is not None)==readonly
+disk_valid=len(disks)==2 and any(disk_ok(item,"disk",sys.argv[4],"qcow2","vda","virtio",False) for item in disks) and any(disk_ok(item,"cdrom",sys.argv[5],"raw","sda","sata",True) for item in disks)
+serials=root.findall("./devices/serial")
+consoles=root.findall("./devices/console")
+serial=serials[0] if len(serials)==1 else None
 serial_source=None if serial is None else serial.find("source")
-if root.findtext("name")!=sys.argv[1] or root.findtext("uuid")!=sys.argv[2] or marker is None or marker.get("id")!=sys.argv[3] or root.findall("./devices/interface") or disk_sources!={("disk",sys.argv[4]),("cdrom",sys.argv[5])} or serial is None or serial.get("type")!="pipe" or serial_source is None or serial_source.get("path")!=sys.argv[6]:
+serial_target=None if serial is None else serial.find("target")
+console=consoles[0] if len(consoles)==1 else None
+console_target=None if console is None else console.find("target")
+serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and serial_source is not None and serial_source.attrib=={"path":sys.argv[6]} and serial_target is not None and serial_target.attrib=={"type":"isa-serial","port":"0"}
+console_valid=console is not None and console.get("type")=="pty" and console_target is not None and console_target.attrib=={"type":"serial","port":"0"}
+if root.findtext("name")!=sys.argv[1] or root.findtext("uuid")!=sys.argv[2] or marker is None or marker.attrib!={"id":sys.argv[3]} or not disk_valid or not serial_valid or not console_valid:
     raise SystemExit(1)
 """
 

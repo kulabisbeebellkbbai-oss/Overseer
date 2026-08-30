@@ -80,6 +80,10 @@ EXACT_TOOLS = {
 }
 REQUIRED_TOOLS = tuple(EXACT_TOOLS)
 MINIMAL_ENV = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
     "LANG": "C",
     "LC_ALL": "C",
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
@@ -128,6 +132,13 @@ _ARTIFACT_PATH = re.compile(r"[A-Za-z0-9._/+@ \-]+\Z")
 _PYTHON_VERSION = re.compile(r"3\.13\.[0-9]+\Z")
 _PYTHON_ABI = re.compile(r"cpython-313-[A-Za-z0-9_.-]+\Z")
 _RUN_NAMESPACE = uuid.UUID("4c7e2e88-e69b-5a43-9896-ffae89196717")
+_GIT_SAFE_FLAGS = (
+    "--no-optional-locks",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+)
 
 
 class PreflightError(RuntimeError):
@@ -552,11 +563,33 @@ def _read_only_runner(command: tuple[str, ...]) -> str:
 
     label = command[0]
     if label == "git-status":
-        argv = (EXACT_TOOLS["git"], "-C", command[1], "status", "--porcelain", "--untracked-files=all")
+        argv = (
+            EXACT_TOOLS["git"],
+            *_GIT_SAFE_FLAGS,
+            "-C",
+            command[1],
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        )
     elif label == "git-head":
-        argv = (EXACT_TOOLS["git"], "-C", command[1], "rev-parse", "HEAD")
+        argv = (
+            EXACT_TOOLS["git"],
+            *_GIT_SAFE_FLAGS,
+            "-C",
+            command[1],
+            "rev-parse",
+            "HEAD",
+        )
     elif label == "git-files":
-        argv = (EXACT_TOOLS["git"], "-C", command[1], "ls-files", "-z")
+        argv = (
+            EXACT_TOOLS["git"],
+            *_GIT_SAFE_FLAGS,
+            "-C",
+            command[1],
+            "ls-files",
+            "-z",
+        )
     elif label == "libvirt-uri":
         argv = (EXACT_TOOLS["virsh"], "--connect", LIBVIRT_URI, "uri")
     elif label == "domains":
@@ -1009,7 +1042,7 @@ def _cloud_init(
             "      /usr/sbin/useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash god",
             "      test \"$(getent passwd 984 | cut -d: -f1,3,4)\" = overseer:984:984",
             "      test \"$(getent passwd 1000 | cut -d: -f1,3,4)\" = god:1000:1000",
-            f'      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH=/opt/overseer-source/src /usr/bin/python3.13 -B -s -P -c "import sys,sysconfig; assert sys.version_info[:2] == (3,13); assert sysconfig.get_config_var(\\"SOABI\\") == \\"{python_abi}\\"; import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor"',
+            f'      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH=/opt/overseer-source/src:/usr/local/lib/python3.13/dist-packages /usr/bin/python3.13 -B -s -P -c "import sys,sysconfig; from pathlib import Path; assert sys.version_info[:2] == (3,13); assert sysconfig.get_config_var(\\"SOABI\\") == \\"{python_abi}\\"; import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor; import _cffi_backend; runtime=Path(\\"/usr/local/lib/python3.13/dist-packages\\").resolve(); source=Path(\\"/opt/overseer-source/src\\").resolve(); Path(cryptography.__file__).resolve().relative_to(runtime); Path(_cffi_backend.__file__).resolve().relative_to(runtime); Path(overseer.cli.__file__).resolve().relative_to(source); Path(overseer.user_bridge.__file__).resolve().relative_to(source); Path(overseer.admin_executor.__file__).resolve().relative_to(source)"',
             "      /usr/bin/install -D -m 0755 /opt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.py /opt/overseer-phase-b-rehearsal/guest_rehearsal.py",
             "      /usr/bin/install -D -m 0644 /opt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.service /etc/systemd/system/overseer-phase-b-rehearsal.service",
             f"      for placeholder in {placeholders}; do test ! -s \"$placeholder\"; chown root:root \"$placeholder\"; chmod 0644 \"$placeholder\"; done",
@@ -1195,16 +1228,18 @@ def publish(value):
         try: os.unlink(temp)
         except FileNotFoundError: pass
         with open(temp,"x",encoding="ascii") as stream:
-            stream.write(value+"\\n");stream.flush();os.fsync(stream.fileno())
+            stream.write(value+"\n");stream.flush();os.fsync(stream.fileno())
         os.replace(temp,status)
         terminal=value
 try:
     while True:
+        had_data=False
         ready,_,_=select.select([fd],[],[],0.2)
         if ready:
             try: block=os.read(fd,65536)
             except BlockingIOError: block=b""
             if block:
+                had_data=True
                 remaining=max_bytes-total
                 if remaining>0:
                     written=block[:remaining]
@@ -1218,7 +1253,7 @@ try:
                     elif len(line)<=max_line:
                         line.append(byte)
                     if len(line)>max_line: publish("overflow")
-        if os.path.exists(stop): break
+        if os.path.exists(stop) and not had_data: break
 finally:
     os.fsync(out);os.close(out);os.close(fd)
 """
@@ -1277,6 +1312,10 @@ export LANG=C
 export LC_ALL=C
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_OPTIONAL_LOCKS=0
+export GIT_TERMINAL_PROMPT=0
 
 readonly LIBVIRT_URI={shlex.quote(LIBVIRT_URI)}
 readonly SOURCE_COMMIT={shlex.quote(source_commit)}
@@ -1445,8 +1484,8 @@ else
   presence=$?
   [[ "$presence" -eq 1 ]] || {{ printf '%s\\n' 'libvirt domain inventory is unavailable at future execution boundary' >&2; exit 1; }}
 fi
-[[ "$(/usr/bin/git -C "$SOURCE_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
-[[ -z "$(/usr/bin/git -C "$SOURCE_ROOT" status --porcelain --untracked-files=all)" ]]
+[[ "$(/usr/bin/git --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -C "$SOURCE_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+[[ -z "$(/usr/bin/git --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -C "$SOURCE_ROOT" status --porcelain --untracked-files=all)" ]]
 ACTUAL_RUNTIME_PROBE_JSON="$(/usr/bin/python3.13 -B -s -P -S -c {shlex.quote(runtime_probe_code)} "$SOURCE_ROOT" "$RUNTIME_SITE" "$EXPECTED_SOURCE_MANIFEST_JSON" "$EXPECTED_RUNTIME_MANIFEST_JSON")"
 [[ "$ACTUAL_RUNTIME_PROBE_JSON" == "$EXPECTED_RUNTIME_PROBE_JSON" ]]
 [[ "$(printf '%s' "$ACTUAL_RUNTIME_PROBE_JSON" | /usr/bin/sha256sum | /usr/bin/awk '{{print $1}}')" == "$EXPECTED_RUNTIME_PROBE_SHA256" ]]
@@ -1521,6 +1560,12 @@ fi
 [[ "$SERIAL_RESULT" == "complete" ]]
 shutdown_and_undefine
 stop_collector
+SERIAL_RESULT="$(<"$SERIAL_STATUS")"
+if [[ "$SERIAL_RESULT" == "overflow" ]]; then
+  printf '%s\\n' 'serial output exceeded the bounded limit after completion' >&2
+  exit 1
+fi
+[[ "$SERIAL_RESULT" == "complete" ]]
 /usr/bin/python3.13 -B -s -P - "$SERIAL_LOG" <<'PY_RESULT_VALIDATOR'
 {validator}PY_RESULT_VALIDATOR
 """

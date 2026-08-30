@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
@@ -418,7 +419,18 @@ def test_default_runner_ignores_path_pythonpath_and_loader_injection(
 
     assert calls == [
         (
-            ("/usr/bin/git", "-C", str(SOURCE_ROOT), "rev-parse", "HEAD"),
+            (
+                "/usr/bin/git",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-C",
+                str(SOURCE_ROOT),
+                "rev-parse",
+                "HEAD",
+            ),
             {
                 "check": True,
                 "capture_output": True,
@@ -428,6 +440,31 @@ def test_default_runner_ignores_path_pythonpath_and_loader_injection(
             },
         )
     ]
+
+
+def test_git_status_disables_configured_fsmonitor_and_optional_locks(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(("/usr/bin/git", "init", "-q", str(repository)), check=True)
+    marker = tmp_path / "fsmonitor-ran"
+    helper = tmp_path / "fsmonitor-helper"
+    helper.write_text(
+        "#!/usr/bin/bash\nprintf ran >" + shlex.quote(str(marker)) + "\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    subprocess.run(
+        ("/usr/bin/git", "-C", str(repository), "config", "core.fsmonitor", str(helper)),
+        check=True,
+    )
+
+    assert module._read_only_runner(("git-status", str(repository))) == ""
+    assert not marker.exists()
+    assert module.MINIMAL_ENV["GIT_OPTIONAL_LOCKS"] == "0"
+    assert module.MINIMAL_ENV["GIT_CONFIG_NOSYSTEM"] == "1"
 
 
 def test_source_manifest_is_tracked_only_and_rejects_post_plan_replacement(
@@ -612,6 +649,8 @@ def test_cloud_init_installs_complete_task_two_guest_contract() -> None:
         "remount,bind,ro,nosuid,nodev /usr/local/lib/python3.13/dist-packages",
         EXPECTED_PYTHON_ABI,
         "import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor",
+        "relative_to(runtime)",
+        "import _cffi_backend",
         "/etc/overseer-phase-b-rehearsal/source-commit",
         SOURCE_COMMIT,
         "permissions: '0444'",
@@ -652,8 +691,9 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert disable < start
     assert script.rindex("verify_domain_ownership", disable, start) > disable
     assert "target VM already exists at future execution boundary" in script
-    assert "/usr/bin/git -C \"$SOURCE_ROOT\" rev-parse HEAD" in script
-    assert "/usr/bin/git -C \"$SOURCE_ROOT\" status --porcelain" in script
+    assert "/usr/bin/git --no-optional-locks -c core.fsmonitor=false" in script
+    assert '-C "$SOURCE_ROOT" rev-parse HEAD' in script
+    assert '-C "$SOURCE_ROOT" status --porcelain' in script
     assert "artifact changed after manifest" in script
     assert "source-manifest.json" in script and "runtime-manifest.json" in script
     assert "/usr/bin/genisoimage" in script
@@ -673,6 +713,8 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert 'shutdown "$VM_NAME"' in script
     assert 'undefine "$VM_NAME"' in script
     assert "rm -rf" not in script and "rm -r" not in script
+    assert script.count('SERIAL_RESULT="$(<"$SERIAL_STATUS")"') == 2
+    assert script.rindex('SERIAL_RESULT="$(<"$SERIAL_STATUS")"') > script.index("stop_collector")
     cleanup_line = next(
         line
         for line in script.splitlines()
@@ -896,6 +938,47 @@ def test_streaming_result_validator_rejects_bounded_and_framing_attacks(
 
     assert completed.returncode != 0
     assert message.lower() in completed.stderr.lower()
+
+
+def test_serial_collector_upgrades_complete_to_late_overflow(tmp_path: Path) -> None:
+    module = load_tool()
+    pipe = tmp_path / "serial.out"
+    log = tmp_path / "serial.log"
+    status = tmp_path / "serial.status"
+    stop = tmp_path / "serial.stop"
+    os.mkfifo(pipe, 0o600)
+    process = subprocess.Popen(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-c",
+            module._serial_collector_python(),
+            str(pipe),
+            str(log),
+            str(status),
+            str(stop),
+            str(module.MAX_SERIAL_BYTES),
+            str(module.MAX_SERIAL_LINE_BYTES),
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    with pipe.open("wb", buffering=0) as stream:
+        stream.write(_passing_serial_record(module))
+        stream.write(b"x\n" * (module.MAX_SERIAL_BYTES // 2 + 1))
+    deadline = time.monotonic() + 5
+    while (not status.exists() or status.read_text(encoding="ascii").strip() != "overflow") and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop.write_text("stop\n", encoding="ascii")
+    stdout, stderr = process.communicate(timeout=5)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert status.read_text(encoding="ascii").strip() == "overflow"
+    assert log.stat().st_size <= module.MAX_SERIAL_BYTES
 
 
 def test_guest_extractor_rejects_manifest_or_archive_tampering(tmp_path: Path) -> None:

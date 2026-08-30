@@ -42,10 +42,17 @@ LC_ALL=C
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 PYTHONDONTWRITEBYTECODE=1
 PYTHONNOUSERSITE=1
+GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_NOSYSTEM=1
+GIT_OPTIONAL_LOCKS=0
+GIT_TERMINAL_PROMPT=0
 ```
 
 `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PYTHONPATH`, `PYTHONHOME`, `BASH_ENV`, and
-the caller's command lookup do not enter a preflight child.
+the caller's command lookup do not enter a preflight child. Every Git command
+also supplies `--no-optional-locks`, disables `core.fsmonitor`, and disables
+the untracked cache so repository configuration cannot execute an fsmonitor
+helper or refresh the index during the read-only probe.
 
 ## Immutable host-to-guest handoff
 
@@ -78,7 +85,10 @@ type, mode, size, and hash before extraction. It rejects extras, links, path
 traversal, and replacement. Source is extracted to `/opt/overseer-source` and
 bind-remounted read-only. Runtime is extracted to the guest's local Python 3.13
 site directory and independently bind-remounted read-only. The live host
-checkout and runtime remain unmounted.
+checkout and runtime remain unmounted. Before systemd starts, Python 3.13 must
+prove the `cryptography` and `_cffi_backend` origins are under the extracted
+runtime and all Overseer origins are under the extracted source. The outer
+unit pins `/usr/bin/python3.13` and both exact import roots.
 
 ## Owned VM lifecycle
 
@@ -111,7 +121,8 @@ The serial device writes through a FIFO pair to a dedicated collector. The
 collector continuously drains the pipe, stores no more than 1 MiB, enforces a
 64 KiB line bound, and upgrades a previously seen completion to overflow if
 later data crosses either bound. After the owned VM is inactive, a streaming
-validator requires exactly one begin/end pair framing one canonical JSON line.
+validator rereads the collector's terminal status and requires it still be
+`complete`, then requires exactly one begin/end pair framing one canonical JSON line.
 It rejects over-limit output, oversized lines, duplicate or flooded sentinels,
 invalid UTF-8, incomplete frames, noncanonical JSON, missing controls, failure
 state, and secret markers. It never reads the complete serial file into memory.

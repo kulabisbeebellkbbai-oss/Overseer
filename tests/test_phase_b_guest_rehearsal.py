@@ -559,3 +559,8 @@ def test_outer_service_allows_only_explicit_guest_and_unit_paths() -> None:
     )
     assert "ReadOnlyPaths=/opt/overseer-source" in service
     assert "ReadOnlyPaths=/usr/local/lib/python3.13/dist-packages" in service
+    assert "ExecStart=/usr/bin/python3.13 -s -P" in service
+    assert (
+        "Environment=PYTHONPATH=/opt/overseer-source/src:/usr/local/lib/python3.13/dist-packages"
+        in service
+    )

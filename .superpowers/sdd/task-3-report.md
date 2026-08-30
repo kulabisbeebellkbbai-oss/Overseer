@@ -118,9 +118,9 @@ now `overseer.phase-b-disposable-rehearsal-plan.v3` and:
 - Repair commits include `Repair fail-closed Phase B VM rehearsal` and
   `Validate Phase B rehearsal domain schema`; final review-repair commit:
   `Harden Phase B rehearsal approval boundary`
-- Focused tests after cleanup/runtime/capability hardening: `33 passed in 0.32s`
-- Cross-layer activation-package, guest, and host rehearsal tests: `295 passed
-  in 24.05s`
+- Focused tests after cleanup/runtime/capability hardening: `33 passed in 0.41s`
+- Cross-layer activation-package, guest, and host rehearsal tests: `296 passed
+  in 24.34s`
 - In-memory Python compile of tool and tests: clean, no output
 - Future Bash syntax parse with `bash -n`: clean, no output; no future command
   executed

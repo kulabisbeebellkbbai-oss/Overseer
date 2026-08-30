@@ -195,6 +195,8 @@ def test_disposable_api_canary_is_separate_bounded_and_principal_owned() -> None
     assert _one(canary, "TimeoutStopSec") == "10s"
     assert _one(canary, "RuntimeDirectory") == "overseer-canary"
     assert _one(canary, "RuntimeDirectoryMode") == "0700"
+    assert "StateDirectory=" not in canary
+    assert "StateDirectoryMode=" not in canary
     assert _one(canary, "RestrictAddressFamilies") == "AF_UNIX"
     assert "[Install]" not in canary
     for setting in COMMON_HARDENING:

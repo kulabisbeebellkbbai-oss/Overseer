@@ -801,7 +801,7 @@ def test_stage_release_payload_and_render_units_are_exact(tmp_path: Path) -> Non
     canary_instance = json.loads(
         (package / "public/canary-instance.json").read_text(encoding="utf-8")
     )
-    canary_state = Path("/var/lib/overseer/canary") / canary_instance["canaryInstanceId"]
+    canary_state = Path("/var/lib/overseer-canary") / canary_instance["canaryInstanceId"]
     canary_unit = rendered["overseer-api-canary.service"].read_text(encoding="utf-8")
     assert f"--store {canary_state / 'overseer.sqlite3'}" in canary_unit
     assert (
@@ -3150,7 +3150,7 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     canary_instance = json.loads(
         (package / "public/canary-instance.json").read_text(encoding="utf-8")
     )
-    canary_state = Path("/var/lib/overseer/canary") / canary_instance["canaryInstanceId"]
+    canary_state = Path("/var/lib/overseer-canary") / canary_instance["canaryInstanceId"]
     assert contract["canary"] == {
         "canaryInstanceId": canary_instance["canaryInstanceId"],
         "stateDirectory": str(canary_state),
@@ -3305,15 +3305,16 @@ def test_canary_store_staging_uses_new_release_bound_directory_and_rejects_reuse
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     package, manifest, _source = _prepared_package(tmp_path)
-    state_parent = tmp_path / "state"
-    state_parent.mkdir(mode=0o700)
-    canary_root = state_parent / "canary"
+    tmp_path.chmod(0o755)
+    canary_root = tmp_path / "overseer-canary"
     canary_instance_id = json.loads(
         (package / "public/canary-instance.json").read_text(encoding="utf-8")
     )["canaryInstanceId"]
     state_directory = canary_root / canary_instance_id
     store = state_directory / "overseer.sqlite3"
-    stale_fixed_store = state_parent / "overseer-canary.sqlite3"
+    stale_state = tmp_path / "legacy-overseer-state"
+    stale_state.mkdir(mode=0o700)
+    stale_fixed_store = stale_state / "overseer-canary.sqlite3"
     stale_fixed_store.write_bytes(b"preserved failed canary evidence")
     stale_fixed_store.chmod(0o600)
     contract = {
@@ -3395,9 +3396,8 @@ def test_staged_canary_store_verification_rejects_sqlite_sidecars_and_hash_drift
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     package, manifest, _source = _prepared_package(tmp_path)
-    state_parent = tmp_path / "state"
-    state_parent.mkdir(mode=0o700)
-    canary_root = state_parent / "canary"
+    tmp_path.chmod(0o755)
+    canary_root = tmp_path / "overseer-canary"
     canary_instance_id = json.loads(
         (package / "public/canary-instance.json").read_text(encoding="utf-8")
     )["canaryInstanceId"]
@@ -3456,15 +3456,38 @@ def test_staged_canary_store_verification_rejects_sqlite_sidecars_and_hash_drift
     activation_package_module.stage_canary_store(package)
     activation_package_module._verify_staged_canary_store(package, contract)
 
-    for suffix in ("-wal", "-shm", "-journal"):
-        sidecar = Path(f"{store}{suffix}")
-        sidecar.write_bytes(b"stale sidecar")
-        with pytest.raises(ActivationPackageError, match="unexpected canary SQLite artifact"):
-            activation_package_module._verify_staged_canary_store(package, contract)
-        sidecar.unlink()
+    for database in (
+        store,
+        state_directory / "psychlo-bridge.sqlite3",
+        state_directory / "roadex-relay.sqlite3",
+    ):
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(f"{database}{suffix}")
+            sidecar.write_bytes(b"stale sidecar")
+            with pytest.raises(ActivationPackageError, match="unexpected canary SQLite artifact"):
+                activation_package_module._verify_staged_canary_store(package, contract)
+            sidecar.unlink()
+
+    psychlo_database = state_directory / "psychlo-bridge.sqlite3"
+    roadex_database = state_directory / "roadex-relay.sqlite3"
+    psychlo_database.unlink()
+    psychlo_database.symlink_to(roadex_database)
+    with pytest.raises(ActivationPackageError, match="regular file|symlink"):
+        activation_package_module._verify_staged_canary_store(package, contract)
+    psychlo_database.unlink()
+    psychlo_database.write_bytes(b"")
+    psychlo_database.chmod(0o600)
+
+    roadex_database.unlink()
+    os.link(psychlo_database, roadex_database)
+    with pytest.raises(ActivationPackageError, match="pristine"):
+        activation_package_module._verify_staged_canary_store(package, contract)
+    roadex_database.unlink()
+    roadex_database.write_bytes(b"")
+    roadex_database.chmod(0o600)
 
     drifted_contract = json.loads(json.dumps(contract))
-    drifted_contract["canary"]["store"] = str(state_parent / "overseer-canary.sqlite3")
+    drifted_contract["canary"]["store"] = str(tmp_path / "overseer-canary.sqlite3")
     with pytest.raises(ActivationPackageError, match="canary state contract drifted"):
         activation_package_module._verify_staged_canary_store(package, drifted_contract)
 
@@ -3472,6 +3495,85 @@ def test_staged_canary_store_verification_rejects_sqlite_sidecars_and_hash_drift
         target.write(b"drift")
     with pytest.raises(ActivationPackageError, match="canary store.*drift|SQLite"):
         activation_package_module._verify_staged_canary_store(package, contract)
+
+
+def test_failed_canary_store_copy_fsyncs_the_preserved_instance_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, manifest, _source = _prepared_package(tmp_path)
+    tmp_path.chmod(0o755)
+    canary_root = tmp_path / "overseer-canary"
+    canary_instance_id = json.loads(
+        (package / "public/canary-instance.json").read_text(encoding="utf-8")
+    )["canaryInstanceId"]
+    state_directory = canary_root / canary_instance_id
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "releaseRoot": str(manifest["releaseRoot"]),
+        "account": {
+            "user": "overseer",
+            "uid": os.geteuid(),
+            "group": "overseer",
+            "gid": os.getegid(),
+        },
+        "sourceStore": {"uid": os.geteuid(), "gid": os.getegid()},
+        "canary": {
+            "canaryInstanceId": canary_instance_id,
+            "stateDirectory": str(state_directory),
+            "store": str(state_directory / "overseer.sqlite3"),
+            "psychloBridgeDatabase": str(state_directory / "psychlo-bridge.sqlite3"),
+            "roadexRelayDatabase": str(state_directory / "roadex-relay.sqlite3"),
+            "preserveFailedStateForEvidence": True,
+        },
+    }
+    monkeypatch.setattr(activation_package_module, "CANARY_STATE_ROOT", canary_root)
+    monkeypatch.setattr(activation_package_module, "APPROVED_OVERSEER_UID", os.geteuid())
+    monkeypatch.setattr(activation_package_module, "APPROVED_OVERSEER_GID", os.getegid())
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_active_phase_command",
+        lambda *_args, **_kwargs: (contract, 29),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_canary_identity",
+        lambda _package, **_kwargs: {
+            "schemaVersion": activation_package_module.CANARY_INSTANCE_SCHEMA,
+            "canaryInstanceId": canary_instance_id,
+        },
+    )
+    synced_inodes: set[int] = set()
+    real_fsync = os.fsync
+
+    def tracked_fsync(descriptor: int) -> None:
+        synced_inodes.add(os.fstat(descriptor).st_ino)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", tracked_fsync)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_copy_canary_store_at",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ActivationPackageError("simulated canary copy failure")
+        ),
+    )
+
+    with pytest.raises(ActivationPackageError, match="simulated canary copy failure"):
+        activation_package_module.stage_canary_store(package)
+
+    assert state_directory.is_dir()
+    assert state_directory.stat().st_ino in synced_inodes
 
 
 def test_canary_health_retry_handles_an_initially_missing_unix_socket(
@@ -4586,6 +4688,35 @@ def test_canary_migration_expectation_is_bound_to_the_sealed_package_report(
         "size": report["migrated"]["size"],
         "integrityCheck": "ok",
     }
+
+
+def test_canary_identity_validation_is_bound_to_the_approved_package_digest(
+    tmp_path: Path,
+) -> None:
+    package, digest = _finalized_package(tmp_path)
+    contract = json.loads(
+        (package / "public/activation-contract.json").read_text(encoding="utf-8")
+    )
+    activation_package_module._validate_canary_contract_layout(
+        package,
+        contract,
+        expected_package_digest=digest,
+    )
+    identity_path = package / "public/canary-instance.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity["canaryInstanceId"] = "0" * 32
+    identity_path.write_text(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    identity_path.chmod(0o644)
+
+    with pytest.raises(ActivationPackageError, match="document drifted"):
+        activation_package_module._validate_canary_contract_layout(
+            package,
+            contract,
+            expected_package_digest=digest,
+        )
 
 
 @pytest.mark.parametrize(

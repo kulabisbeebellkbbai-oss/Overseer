@@ -65,6 +65,43 @@ def test_emit_activation_progress_writes_one_canonical_schema_record() -> None:
 
 
 @pytest.mark.parametrize(
+    "package_digest",
+    (
+        "g" * 64,
+        "A" * 64,
+        "a" * 63,
+        "a" * 65,
+    ),
+)
+def test_emit_activation_progress_rejects_invalid_package_digests(
+    package_digest: str,
+) -> None:
+    with pytest.raises(ValueError, match="package digest is invalid"):
+        emit_activation_progress(
+            package_digest=package_digest,
+            phase="staging-canary",
+            status="phase-started",
+            stage="unknown-sealed-command",
+            stream=io.StringIO(),
+        )
+
+
+def test_emit_activation_progress_defaults_to_canonical_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = emit_activation_progress(
+        package_digest="c" * 64,
+        phase="staging-canary",
+        status="phase-started",
+        stage="unknown-sealed-command",
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == json.dumps(result, separators=(",", ":"), sort_keys=True) + "\n"
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     (
         ("phase", "not-a-phase"),

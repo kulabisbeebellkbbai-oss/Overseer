@@ -1,158 +1,101 @@
-# Task 1 Report: Restore Overseer release baseline
+# Task 1 implementation, test, and self-review report
 
-## Outcome
+## Scope
 
-Implemented and committed Task 1 on the isolated worktree branch.
-
-- Implementation commit: `fabf774` — `Restore Overseer release baseline`
-- Follow-up repair commit: `ceb111b` — `Route claim cleanup approval through Sisko`
-- Independent review fix commit: `0725925` — `Enforce bound role approval identity`
-- Worktree: `/home/god/Documents/Codex Workspace/Overseer/.worktrees/overseer-v1-1-autonomous-operations`
-- No live Overseer services, gateways, systemd state, integrations, or user data were changed.
-- `.superpowers/sdd/progress.md` was not modified.
+- Task: Add bounded Phase B progress telemetry.
+- Worktree: `/home/god/Documents/Codex Workspace/Overseer/.worktrees/approval-smoke-v1-1-6`
+- Base commit: `c0f82169034ca8e70f6b3e2774f616bcdff65b41`
+- Implementation commit: `c5fa4d4` (`Add bounded Phase B progress telemetry`)
+- The plan and `.superpowers/sdd/progress.md` were not modified.
+- No live services, VM resources, package artifacts, other projects, or files outside the Task 1 scope were changed. The report itself was explicitly replaced per the task instruction.
 
 ## TDD evidence
 
-### RED
+1. Added the new progress-schema, validation, classifier, stderr-ordering, and secret-exclusion tests before adding the production module.
+2. Ran `pytest -q tests/test_activation_progress.py` and observed the intended RED failure during collection: `ModuleNotFoundError: No module named 'overseer.activation_progress'`.
+3. Added the minimal bounded emitter and Phase B command classifier.
+4. Added checkpoint instrumentation to the existing staging-canary runner and cleanup/evidence paths.
+5. Ran the focused command required by the brief:
 
-The exact brief RED command was rerun before edits:
+   `pytest -q tests/test_activation_progress.py tests/test_activation_package.py -k 'phase_bounded or delayed_human or cleanup or evidence_seal or staging_command'`
 
-```text
-pytest -q tests/test_agent_migration.py::test_legacy_facade_submits_whitespace_prompt_with_exact_tmux_sequence \
-  tests/test_codex_dispatch_activation.py::test_live_staged_spec_captures_exact_current_user_manager_identity \
-  tests/test_core.py::OverseerApiTests::test_loopback_api_runs_claim_lifecycle \
-  tests/test_core.py::OverseerApiClientTests::test_client_reviews_expired_claims \
-  tests/test_core.py::OverseerApiClientTests::test_client_runs_claim_lifecycle \
-  tests/test_core.py::HostInspectionTests::test_dispatch_ids_review_package_uses_codex_projects_adapter \
-  tests/test_psychlo_decision_reconcile.py::test_api_approves_and_activates_the_exact_structurally_bound_claim_before_delivering_outcome \
-  tests/test_roadex_approval_fixture.py \
-  tests/test_ui_full_regression.py::FullOperatorUiRegressionTests::test_safe_disposable_workflows_execute_through_gateway_routes
-```
+   Result: `25 passed, 203 deselected`.
 
-Result: `10 failed, 6 passed in 14.30s`. Failures reproduced stale `paste-buffer -p` expectations, the linked-worktree `_spec()` bootstrap rejection, role-authority mismatches, incomplete Roadex migration history/rollback, and the UI claim lifecycle fallout.
+6. Ran the complete activation-package and telemetry suites:
 
-After updating the tests first, the same focused command produced the expected second RED: `4 failed, 12 passed in 13.58s` (remaining stale tmux assertion, fail-closed error-message mismatch, and two migration-history failures).
+   `pytest -q tests/test_activation_progress.py tests/test_activation_package.py`
 
-### GREEN
+   Result: `228 passed`.
 
-After the minimal source changes, the exact focused set passed:
+7. Ran committed-state repository verification:
 
-```text
-16 passed in 12.66s
-```
+   `pytest -q`
 
-Additional focused verification:
+   Result: `2715 passed, 31 skipped`.
 
-- `pytest -q tests/test_codex_dispatch_activation.py`: `75 passed in 7.46s`
-- `pytest -q tests/test_agent_store.py`: `56 passed in 1.46s`
-- `pytest -q tests/test_agent_migration.py tests/test_codex_dispatch_activation.py tests/test_roadex_approval_fixture.py tests/test_psychlo_decision_reconcile.py`: passed during focused verification.
+8. Ran `python3 -m compileall -q src tests` and `git diff --check`; both passed.
 
-## Follow-up repair evidence
+## Implementation summary
 
-The two residual claim-cleanup tests were reproduced exactly before the repair:
+- Added `src/overseer/activation_progress.py` with the exact public interfaces from the brief.
+- Emits one canonical JSON line to `sys.stderr` by default, with exactly the required eight keys and `secretValuesRecorded: false`.
+- Validates lowercase 64-character package digests, allowed phases/statuses/stages, integer command indexes, and bounded failure classifications.
+- Classifies sealed Phase B commands into only the required bounded stage names and never emits command argv.
+- Emits phase, authorization, command-stage, cleanup, evidence-seal, and completion records at existing durable runner checkpoints.
+- Wraps emitter failures as `ActivationPackageError("activation progress could not be emitted")`; cleanup recovery identifies and re-raises telemetry failures instead of suppressing them.
+- Leaves runner-state schema, sealed command execution, authorization input, and activation command semantics unchanged.
 
-```text
-pytest -q tests/test_core.py::RuntimeTests::test_execute_claim_cleanup_handles_missing_release_evidence_and_blocked_claims tests/test_core.py::RuntimeTests::test_execute_claim_cleanup_re_evaluates_stale_queue_after_approval
-2 failed in 1.68s
-```
+## Self-review
 
-The failures showed cleanup subjects being classified as `ApprovalLevel.ROLE`, then rejected by the exact-Claim ROLE authority checks. Tests were first strengthened to require `ApprovalLevel.SISKO`; that test-only RED run remained `2 failed in 0.93s`, with both assertions observing `role != sisko`.
+- Confirmed all four source/test paths in the brief are the only staged Task 1 implementation paths.
+- Confirmed progress records contain no verifier secret in the delayed-authorization test output or persisted runner state.
+- Confirmed waiting telemetry occurs before terminal secret collection and authorization-complete telemetry occurs after refreshed authority/verifier checks.
+- Confirmed command-start telemetry follows the durable `command_running` write and command-complete telemetry follows the durable `command_complete` write.
+- Confirmed evidence-seal and cleanup telemetry is bounded and uses only classified failure values.
+- Confirmed the final commit contains the implementation and tests; the pre-existing progress-ledger modification remains outside the commit.
 
-The bounded attribution check was run ten times:
+## Review fixes
 
-```text
-for run in $(seq 1 10); do pytest -q tests/test_usage_attribution.py::test_cross_process_delivery_intent_has_one_winner || exit $?; done
-```
+### Findings addressed
 
-Result: `10/10` runs passed, each reporting `1 passed`; no speculative concurrency change was made.
+- Resilient cleanup no longer emits `evidence-seal-started` without a corresponding durable recovery checkpoint. Successful and failed evidence-seal progress is emitted only after the matching `aborted_before_cutover` or `cleanup_evidence_seal_failed` recovery state is durably written; the progress event is omitted when that best-effort write fails.
+- `_ActivationProgressEmissionError` is caught ahead of broad operational handlers at authorization, staging-command, evidence-seal/cutover-gate, and final-checkpoint telemetry boundaries. Mandatory sealed containment still runs, and the original `ActivationPackageError("activation progress could not be emitted")` is re-raised unchanged.
+- Added malformed non-hex, uppercase, short, and long digest rejection coverage, plus omitted-stream coverage proving canonical output goes to `sys.stderr` and not `stdout`.
 
-The repair changes `_claim_cleanup_approval_level` to always return `ApprovalLevel.SISKO`. This preserves Sisko as the administrative authority for cleanup mutations and leaves `ApprovalLevel.ROLE` reserved for exact still-requested Claims and their activation continuations. Affected verification after the repair:
+### Test-first evidence
 
-- Exact cleanup regressions: `2 passed in 0.53s`
-- `tests/test_claim_approval_continuation.py tests/test_claim_activation_group.py tests/test_usage_attribution.py::test_cross_process_delivery_intent_has_one_winner`: `28 passed in 1.60s`
-- `tests/test_core.py tests/test_claim_approval_continuation.py tests/test_claim_activation_group.py tests/test_usage_attribution.py`: `441 passed in 96.27s`
+After adding the review tests and before changing production code, ran:
 
-## Implementation and design decisions
+`pytest -q tests/test_activation_progress.py tests/test_activation_package.py -k 'invalid_package_digests or defaults_to_canonical_stderr or resilient_cleanup_seals_canary_evidence or resilient_cleanup_checkpoints_evidence_sealing_failure or omits_evidence_progress or omits_failed_evidence_progress or authorization_progress_emitter_failure or protected_stage_progress_emitter_failure'`
 
-- Roadex fixture migration now checks for the exact version-3 row, rather than using `MAX(version)`. The fixture migration runs before the aggregate schema marker, yielding `[2, 3, 10]` for legacy v2 stores and `[3, 10]` for new stores. Savepoint rollback removes both fixture DDL and migration history on injected failure.
-- `_activate_bound_decision_claim` now fails closed while the owner-role approval is pending. Roadex human approval cannot impersonate the owner role; the exact role claim must first be approved by `dax`.
-- Direct Dax claim lifecycle fixtures now approve with `dax`; the Psychlo regression explicitly proves human approval is rejected while role approval is pending, then succeeds after exact Dax approval.
-- The live user-manager identity test calls `activation._capture_user_bus_peer_binding()` directly and asserts current UID, GID, parent PID, and argv. It does not call `_spec()` and production bootstrap path validation was not weakened.
-- Test-only linked-worktree spec fixtures use a real Git common directory only to construct synthetic fixture metadata. Production `_bootstrap_binding()` still rejects the linked-worktree `.git` file.
-- Tmux expectations now include `paste-buffer -p`; the UI claim fixture includes the required activation-group and lifecycle bindings.
+RED output: `5 passed, 6 failed, 226 deselected`. The six intended failures showed both resilient evidence paths emitting before recovery durability, both non-durable recovery paths emitting progress, and authorization/protected-stage emitter failures being replaced by generic operational errors.
 
-## Files changed
+After the minimal production fix, reran the same command.
 
-- `src/overseer/api.py`
-- `src/overseer/cli.py`
-- `src/overseer/store.py`
-- `tests/test_agent_migration.py`
-- `tests/test_agent_store.py`
-- `tests/test_codex_dispatch_activation.py`
-- `tests/test_core.py`
-- `tests/test_psychlo_decision_reconcile.py`
-- `tests/test_roadex_approval_fixture.py`
-- `tests/test_ui_full_regression.py`
+GREEN output: `11 passed, 226 deselected in 0.35s`.
 
-## Full-suite verification
+Ran the brief's focused covering command:
 
-The required uninterrupted clean-worktree run before the follow-up repair was:
+`pytest -q tests/test_activation_progress.py tests/test_activation_package.py -k 'phase_bounded or delayed_human or cleanup or evidence_seal or staging_command'`
 
-```text
-pytest -q
-2025 passed, 31 skipped, 3 failed in 410.67s (0:06:50)
-```
+Output: `28 passed, 209 deselected in 0.61s`.
 
-Those three failures were repaired or classified as follows:
+Ran the complete Task 1 test files:
 
-1. The two cleanup failures were fixed in `ceb111b` by classifying synthetic cleanup subjects as Sisko approvals.
-2. The attribution failure was a one-run flake; ten bounded focused reruns passed.
+`pytest -q tests/test_activation_progress.py tests/test_activation_package.py`
 
-The earlier pre-commit full run is not treated as final evidence because source-lineage tests correctly saw the dirty worktree. The final authoritative clean-worktree run after `ceb111b` was:
+Output: `237 passed in 23.57s`.
 
-```text
-pytest -q
-2028 passed, 31 skipped in 406.93s (0:06:46)
-```
+Ran syntax and diff checks:
 
-## Independent review correction
+- `python3 -m compileall -q src/overseer/activation_progress.py src/overseer/activation_package.py tests/test_activation_progress.py tests/test_activation_package.py` — exit 0 with no output.
+- `git diff --check` — exit 0 with no output.
 
-Review finding: `_activate_bound_decision_claim` accepted an approved exact-subject record without proving that it was the required owner-role approval. The correction keeps exact approval id and subject binding, then fails closed unless the approval is `ApprovalLevel.ROLE`, its `owner_domain` equals `claim.owner_role`, its status is approved, and its `decided_by` equals `claim.owner_role.value`; activation remains limited to a requested claim. The pending-then-Dax-approved success path remains covered by `test_api_approves_and_activates_the_exact_structurally_bound_claim_before_delivering_outcome`.
+### Review-fix self-review
 
-Tests were added first for wrong approval level, wrong owner domain, and wrong `decided_by`. The focused RED command was:
-
-```text
-pytest -q tests/test_psychlo_decision_reconcile.py
-3 failed, 24 passed in 1.65s
-```
-
-Each failure was the expected `DID NOT RAISE`: the malformed approved record activated and delivered before the production guard existed. After the production fix, the focused GREEN command was:
-
-```text
-pytest -q tests/test_psychlo_decision_reconcile.py
-27 passed in 1.65s
-```
-
-All affected focused tests then passed:
-
-```text
-pytest -q tests/test_psychlo_decision_reconcile.py tests/test_claim_approval_continuation.py tests/test_claim_activation_group.py
-54 passed in 2.65s
-```
-
-The implementation was committed before the clean full-suite run:
-
-```text
-0725925f186575fb9c60e9bf7dc0448035fecc5c Enforce bound role approval identity
-```
-
-The fresh full suite on that clean committed implementation completed with zero failures:
-
-```text
-pytest -q
-2031 passed, 31 skipped in 409.06s (0:06:49)
-```
-
-## Residual concerns
-
-Task 1 implementation and independent review correction are complete with zero failures. The report update follows the implementation commit and records the final clean-worktree evidence.
+- Audited every staging-canary telemetry boundary: phase, command-start, command-complete, evidence recovery, and phase-complete events follow their durable state checkpoint; authorization waiting remains after the durable phase-running checkpoint and before terminal input, as required by the brief.
+- Confirmed recovery evidence telemetry is omitted whenever `_write_recovery_state_best_effort` returns false.
+- Confirmed injected emitter failures at `human-authorization-complete` and the post-start protected `canary-socket-start` completion both return exactly `activation progress could not be emitted`; the tests also prove sealed cleanup executes and the runner reaches `aborted_before_cutover`.
+- Confirmed telemetry failures raised during cleanup are not rewritten by any surrounding broad operational handler.
+- Confirmed digest validation and default-stderr behavior now have explicit interface coverage.
+- Confirmed no runner-state schema, sealed command, activation input, package artifact, service, VM, plan, or progress-ledger behavior was changed. The pre-existing `.superpowers/sdd/progress.md` modification remains untouched and outside the review-fix commit.

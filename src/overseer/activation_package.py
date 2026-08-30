@@ -7884,8 +7884,11 @@ def _execute_resilient_cleanup(
             package_digest=package_digest,
             originating_failure=originating_failure,
         )
-    except _ActivationProgressEmissionError:
-        _execute_emergency_cleanup_sequence(contract)
+    except _ActivationProgressEmissionError as progress_error:
+        try:
+            _execute_emergency_cleanup_sequence(contract)
+        except BaseException as containment_error:
+            raise progress_error from containment_error
         raise
     except _CleanupCommandFailure as error:
         _execute_emergency_cleanup_sequence(contract)
@@ -7895,35 +7898,14 @@ def _execute_resilient_cleanup(
     if require_canary_evidence is None:
         require_canary_evidence = (
             contract.get("schemaVersion") == ACTIVATION_CONTRACT_SCHEMA
-    )
-    try:
-        _emit_activation_progress(
-            package_digest=package_digest,
-            phase="staging-canary",
-            status="evidence-seal-started",
-            stage="evidence-seal",
-            failure=originating_failure,
         )
+    try:
         _seal_canary_state_from_contract(
             contract,
             required=require_canary_evidence,
         )
-        _emit_activation_progress(
-            package_digest=package_digest,
-            phase="staging-canary",
-            status="evidence-seal-complete",
-            stage="evidence-seal",
-            failure=originating_failure,
-        )
     except BaseException:
-        _emit_activation_progress(
-            package_digest=package_digest,
-            phase="staging-canary",
-            status="evidence-seal-failed",
-            stage="evidence-seal",
-            failure=originating_failure,
-        )
-        _write_recovery_state_best_effort(
+        recovery_durable = _write_recovery_state_best_effort(
             _runner_state(
                 package_digest=package_digest,
                 status="cleanup_evidence_seal_failed",
@@ -7931,8 +7913,16 @@ def _execute_resilient_cleanup(
                 failure=originating_failure,
             )
         )
+        if recovery_durable:
+            _emit_activation_progress(
+                package_digest=package_digest,
+                phase="staging-canary",
+                status="evidence-seal-failed",
+                stage="evidence-seal",
+                failure=originating_failure,
+            )
         raise
-    return _write_recovery_state_best_effort(
+    recovery_durable = _write_recovery_state_best_effort(
         _runner_state(
             package_digest=package_digest,
             status="aborted_before_cutover",
@@ -7940,6 +7930,32 @@ def _execute_resilient_cleanup(
             failure=originating_failure,
         )
     )
+    if recovery_durable:
+        _emit_activation_progress(
+            package_digest=package_digest,
+            phase="staging-canary",
+            status="evidence-seal-complete",
+            stage="evidence-seal",
+            failure=originating_failure,
+        )
+    return recovery_durable
+
+
+def _raise_progress_error_after_staging_containment(
+    contract: Mapping[str, object],
+    *,
+    package_digest: str,
+    progress_error: _ActivationProgressEmissionError,
+) -> None:
+    try:
+        _execute_resilient_cleanup(
+            contract,
+            package_digest=package_digest,
+            originating_failure=type(progress_error).__name__,
+        )
+    except BaseException as containment_error:
+        raise progress_error from containment_error
+    raise progress_error
 
 
 def _rollback_transient_spec(command: list[str]) -> dict[str, object] | None:
@@ -8947,6 +8963,13 @@ def _execute_approved_staging_canary_locked(
                     stage="human-authorization",
                     command_index=index,
                 )
+            except _ActivationProgressEmissionError as progress_error:
+                canary_authorization_input = None
+                _raise_progress_error_after_staging_containment(
+                    contract,
+                    package_digest=digest,
+                    progress_error=progress_error,
+                )
             except BaseException as authorization_error:
                 canary_authorization_input = None
                 try:
@@ -8955,6 +8978,8 @@ def _execute_approved_staging_canary_locked(
                         package_digest=digest,
                         originating_failure=type(authorization_error).__name__,
                     )
+                except _ActivationProgressEmissionError:
+                    raise
                 except BaseException as cleanup_error:
                     raise ActivationPackageError(
                         "canary authorization failed and sealed cleanup did not complete"
@@ -8982,6 +9007,12 @@ def _execute_approved_staging_canary_locked(
                 stage=classify_phase_b_command(command),
                 command_index=index,
             )
+        except _ActivationProgressEmissionError as progress_error:
+            _raise_progress_error_after_staging_containment(
+                contract,
+                package_digest=digest,
+                progress_error=progress_error,
+            )
         except BaseException as checkpoint_error:
             try:
                 cleanup_durable = _execute_resilient_cleanup(
@@ -8989,6 +9020,8 @@ def _execute_approved_staging_canary_locked(
                     package_digest=digest,
                     originating_failure=type(checkpoint_error).__name__,
                 )
+            except _ActivationProgressEmissionError:
+                raise
             except BaseException as cleanup_error:
                 raise ActivationPackageError(
                     "staging command entry checkpoint failed and sealed cleanup did not complete"
@@ -9023,6 +9056,8 @@ def _execute_approved_staging_canary_locked(
                     package_digest=digest,
                     originating_failure=command_failure,
                 )
+            except _ActivationProgressEmissionError:
+                raise
             except BaseException as cleanup_error:
                 raise ActivationPackageError(
                     "staged activation command failed and sealed cleanup did not complete"
@@ -9049,6 +9084,12 @@ def _execute_approved_staging_canary_locked(
                 stage=classify_phase_b_command(command),
                 command_index=index,
             )
+        except _ActivationProgressEmissionError as progress_error:
+            _raise_progress_error_after_staging_containment(
+                contract,
+                package_digest=digest,
+                progress_error=progress_error,
+            )
         except BaseException as checkpoint_error:
             try:
                 cleanup_durable = _execute_resilient_cleanup(
@@ -9056,6 +9097,8 @@ def _execute_approved_staging_canary_locked(
                     package_digest=digest,
                     originating_failure=type(checkpoint_error).__name__,
                 )
+            except _ActivationProgressEmissionError:
+                raise
             except BaseException as cleanup_error:
                 raise ActivationPackageError(
                     "checkpoint failed after staging command and immediate cleanup failed"
@@ -9083,6 +9126,12 @@ def _execute_approved_staging_canary_locked(
             stage="evidence-seal",
         )
         verify_approved_cutover(package)
+    except _ActivationProgressEmissionError as progress_error:
+        _raise_progress_error_after_staging_containment(
+            contract,
+            package_digest=digest,
+            progress_error=progress_error,
+        )
     except BaseException as error:
         try:
             cleanup_durable = _execute_resilient_cleanup(
@@ -9090,6 +9139,8 @@ def _execute_approved_staging_canary_locked(
                 package_digest=digest,
                 originating_failure=type(error).__name__,
             )
+        except _ActivationProgressEmissionError:
+            raise
         except BaseException as cleanup_error:
             raise ActivationPackageError(
                 "cutover gate failed and sealed staging cleanup did not complete"
@@ -9113,6 +9164,12 @@ def _execute_approved_staging_canary_locked(
             status="phase-complete",
             stage="unknown-sealed-command",
         )
+    except _ActivationProgressEmissionError as progress_error:
+        _raise_progress_error_after_staging_containment(
+            contract,
+            package_digest=digest,
+            progress_error=progress_error,
+        )
     except BaseException as checkpoint_error:
         try:
             cleanup_durable = _execute_resilient_cleanup(
@@ -9120,6 +9177,8 @@ def _execute_approved_staging_canary_locked(
                 package_digest=digest,
                 originating_failure=type(checkpoint_error).__name__,
             )
+        except _ActivationProgressEmissionError:
+            raise
         except BaseException as cleanup_error:
             raise ActivationPackageError(
                 "final staging checkpoint failed and immediate cleanup failed"

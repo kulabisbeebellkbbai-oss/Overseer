@@ -4037,6 +4037,7 @@ def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
 ) -> None:
     contract = {"canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]}}
     events: list[str] = []
+    original_emit = activation_package_module.emit_activation_progress
     monkeypatch.setattr(
         activation_package_module,
         "_execute_cleanup_sequence",
@@ -4051,19 +4052,29 @@ def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
     monkeypatch.setattr(
         activation_package_module,
         "_write_recovery_state_best_effort",
-        lambda _document: True,
+        lambda document: events.append(f"checkpoint:{document['status']}") or True,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "emit_activation_progress",
+        lambda **kwargs: events.append(f"progress:{kwargs['status']}")
+        or original_emit(**kwargs),
     )
 
     assert activation_package_module._execute_resilient_cleanup(
         contract,
         package_digest="a" * 64,
     ) is True
-    assert events == ["stopped", "sealed:False"]
+    assert events == [
+        "stopped",
+        "sealed:False",
+        "checkpoint:aborted_before_cutover",
+        "progress:evidence-seal-complete",
+    ]
     progress_records = [
         json.loads(line) for line in capsys.readouterr().err.splitlines()
     ]
     assert [record["status"] for record in progress_records] == [
-        "evidence-seal-started",
         "evidence-seal-complete",
     ]
     assert all(record["secretValuesRecorded"] is False for record in progress_records)
@@ -4071,9 +4082,12 @@ def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
 
 def test_resilient_cleanup_checkpoints_evidence_sealing_failure(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     contract = {"canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]}}
     checkpoints: list[dict[str, object]] = []
+    events: list[str] = []
+    original_emit = activation_package_module.emit_activation_progress
     monkeypatch.setattr(
         activation_package_module,
         "_execute_cleanup_sequence",
@@ -4081,6 +4095,7 @@ def test_resilient_cleanup_checkpoints_evidence_sealing_failure(
     )
 
     def fail_sealing(*_args: object, **_kwargs: object) -> dict[str, object]:
+        events.append("seal-failed")
         raise ActivationPackageError("evidence sealing failed")
 
     monkeypatch.setattr(
@@ -4091,7 +4106,15 @@ def test_resilient_cleanup_checkpoints_evidence_sealing_failure(
     monkeypatch.setattr(
         activation_package_module,
         "_write_recovery_state_best_effort",
-        lambda document: checkpoints.append(dict(document)) or True,
+        lambda document: checkpoints.append(dict(document))
+        or events.append(f"checkpoint:{document['status']}")
+        or True,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "emit_activation_progress",
+        lambda **kwargs: events.append(f"progress:{kwargs['status']}")
+        or original_emit(**kwargs),
     )
 
     with pytest.raises(ActivationPackageError, match="evidence sealing failed"):
@@ -4107,6 +4130,76 @@ def test_resilient_cleanup_checkpoints_evidence_sealing_failure(
     assert checkpoints[0]["status"] == "cleanup_evidence_seal_failed"
     assert checkpoints[0]["failure"] == "ActivationPackageError"
     assert checkpoints[0]["secretValuesRecorded"] is False
+    assert events == [
+        "seal-failed",
+        "checkpoint:cleanup_evidence_seal_failed",
+        "progress:evidence-seal-failed",
+    ]
+    progress_records = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [record["status"] for record in progress_records] == [
+        "evidence-seal-failed",
+    ]
+
+
+def test_resilient_cleanup_omits_evidence_progress_without_durable_recovery_state(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    contract = {"canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]}}
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_cleanup_sequence",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: {"sealed": True},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_recovery_state_best_effort",
+        lambda _document: False,
+    )
+
+    assert activation_package_module._execute_resilient_cleanup(
+        contract,
+        package_digest="a" * 64,
+    ) is False
+    assert capsys.readouterr().err == ""
+
+
+def test_resilient_cleanup_omits_failed_evidence_progress_without_durable_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    contract = {"canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]}}
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_cleanup_sequence",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ActivationPackageError("evidence sealing failed")
+        ),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_recovery_state_best_effort",
+        lambda _document: False,
+    )
+
+    with pytest.raises(ActivationPackageError, match="evidence sealing failed"):
+        activation_package_module._execute_resilient_cleanup(
+            contract,
+            package_digest="a" * 64,
+        )
+    assert capsys.readouterr().err == ""
 
 
 def test_current_schema_cleanup_requires_inventoried_canary_evidence(
@@ -8469,6 +8562,114 @@ def test_canary_authorization_failure_preserves_bounded_failure_after_cleanup(
     assert state["failure"] == "ActivationPackageError"
     assert state["secretValuesRecorded"] is False
     assert calls == [["/bin/true", "cleanup"]]
+
+
+def test_authorization_progress_emitter_failure_survives_cleanup_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = ["/bin/true", "run-approved-canary"]
+    package, _contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="6" * 64,
+        staging=[canary],
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_expected_canary_acceptance_command",
+        lambda *_args, **_kwargs: canary,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_canary_acceptance_command_index",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_canary_authorization_boundary_index",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_prepare_canary_authorization_input",
+        lambda _package: b"sealed-authorization-input",
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_read_activation_phase_approval",
+        lambda *_args, **_kwargs: {"packageDigest": "6" * 64},
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(command) or 0,
+    )
+
+    def fail_authorization_complete(**kwargs: object) -> dict[str, object]:
+        if kwargs["status"] == "human-authorization-complete":
+            raise OSError("simulated progress sink failure")
+        return {}
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "emit_activation_progress",
+        fail_authorization_complete,
+    )
+
+    with pytest.raises(ActivationPackageError) as raised:
+        activation_package_module.execute_approved_staging_canary(package)
+
+    assert str(raised.value) == "activation progress could not be emitted"
+    assert calls == [["/bin/true", "cleanup"]]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
+
+
+def test_protected_stage_progress_emitter_failure_survives_containment_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protected_start = [
+        "/usr/bin/systemctl",
+        "start",
+        "overseer-admin-executor.socket",
+    ]
+    package, _contract, state_path = _staging_failure_case(
+        tmp_path,
+        monkeypatch,
+        digest="7" * 64,
+        staging=[protected_start],
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(command) or 0,
+    )
+
+    def fail_protected_completion(**kwargs: object) -> dict[str, object]:
+        if (
+            kwargs["status"] == "stage-complete"
+            and kwargs["stage"] == "canary-socket-start"
+        ):
+            raise OSError("simulated progress sink failure")
+        return {}
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "emit_activation_progress",
+        fail_protected_completion,
+    )
+
+    with pytest.raises(ActivationPackageError) as raised:
+        activation_package_module.execute_approved_staging_canary(package)
+
+    assert str(raised.value) == "activation progress could not be emitted"
+    assert calls == [protected_start, ["/bin/true", "cleanup"]]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "aborted_before_cutover"
 
 
 def test_staging_command_completion_checkpoint_failure_preserves_bounded_failure(

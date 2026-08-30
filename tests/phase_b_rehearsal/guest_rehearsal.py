@@ -93,7 +93,6 @@ _DISPOSABLE_UNITS = (
     "overseer-codex-user-bridge.socket",
     "overseer-codex-user-bridge.service",
     "overseer-admin-executor.socket",
-    "overseer-admin-executor@.service",
     "overseer-api-canary.service",
 )
 _UNITS_MAY_BE_ACTIVE = False

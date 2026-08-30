@@ -256,6 +256,184 @@ def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
     assert result["tempDirectoryCreated"] is False
 
 
+def _run_domain_ownership_validator(module, plan: dict[str, object], root: ET.Element):
+    return subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-S",
+            "-c",
+            module._ownership_validator_python(),
+            plan["vm"]["name"],
+            plan["vm"]["uuid"],
+            plan["vm"]["runId"],
+            "/tmp/owned/overlay.qcow2",
+            "/tmp/owned/seed.iso",
+            "/tmp/owned/serial",
+            str(BASE_IMAGE),
+        ),
+        input=ET.tostring(root, encoding="unicode"),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _libvirt_pipe_console_root(
+    module,
+    *,
+    active: bool = False,
+) -> tuple[dict[str, object], ET.Element]:
+    plan = render(module)["plan"]
+    root = ET.fromstring(
+        plan["domainXml"]
+        .replace("$" + "{OVERLAY}", "/tmp/owned/overlay.qcow2")
+        .replace("$" + "{SEED_ISO}", "/tmp/owned/seed.iso")
+        .replace("$" + "{SERIAL_PIPE}", "/tmp/owned/serial")
+    )
+    serial_target = root.find("./devices/serial/target")
+    console = root.find("./devices/console")
+    assert serial_target is not None and console is not None
+    ET.SubElement(serial_target, "model", {"name": "isa-serial"})
+    console.clear()
+    console.set("type", "pipe")
+    ET.SubElement(console, "source", {"path": "/tmp/owned/serial"})
+    ET.SubElement(console, "target", {"type": "serial", "port": "0"})
+    if active:
+        root.set("id", "7")
+        overlay = next(
+            disk
+            for disk in root.findall("./devices/disk")
+            if disk.attrib["device"] == "disk"
+        )
+        backing = ET.SubElement(overlay, "backingStore", {"type": "file", "index": "1"})
+        ET.SubElement(backing, "format", {"type": "qcow2"})
+        ET.SubElement(backing, "source", {"file": str(BASE_IMAGE)})
+        ET.SubElement(backing, "backingStore")
+    ET.indent(root, space="  ")
+    return plan, root
+
+
+@pytest.mark.parametrize("active", (False, True))
+def test_domain_ownership_validator_accepts_exact_libvirt_pipe_console_normalization(
+    active: bool,
+) -> None:
+    module = load_tool()
+    plan, root = _libvirt_pipe_console_root(module, active=active)
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_domain_ownership_validator_rejects_foreign_libvirt_pipe_console_source() -> None:
+    module = load_tool()
+    plan, root = _libvirt_pipe_console_root(module)
+    source = root.find("./devices/console/source")
+    assert source is not None
+    source.set("path", "/tmp/foreign/serial")
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (("name", "foreign-model"), ("text", "unapproved")),
+)
+def test_domain_ownership_validator_rejects_mutated_libvirt_serial_model(
+    attribute: str,
+    value: str,
+) -> None:
+    module = load_tool()
+    plan, root = _libvirt_pipe_console_root(module)
+    target = root.find("./devices/serial/target")
+    model = root.find("./devices/serial/target/model")
+    assert target is not None and model is not None
+    if attribute == "text":
+        target.text = value
+    else:
+        model.set(attribute, value)
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("model-tail", "console-text", "source-tail", "console-address"),
+)
+def test_domain_ownership_validator_rejects_pipe_console_mixed_content_and_metadata(
+    mutation: str,
+) -> None:
+    module = load_tool()
+    plan, root = _libvirt_pipe_console_root(module)
+    console = root.find("./devices/console")
+    source = root.find("./devices/console/source")
+    model = root.find("./devices/serial/target/model")
+    assert console is not None and source is not None and model is not None
+    if mutation == "model-tail":
+        model.tail = "UNAPPROVED"
+    elif mutation == "console-text":
+        console.text = "UNAPPROVED"
+    elif mutation == "source-tail":
+        source.tail = "UNAPPROVED"
+    else:
+        ET.SubElement(
+            console,
+            "address",
+            {
+                "type": "pci",
+                "domain": "0x0000",
+                "bus": "0x00",
+                "slot": "0x03",
+                "function": "0x0",
+            },
+        )
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode != 0
+
+
+def test_domain_ownership_validator_accepts_whitespace_only_libvirt_model_text() -> None:
+    module = load_tool()
+    plan, root = _libvirt_pipe_console_root(module)
+    model = root.find("./devices/serial/target/model")
+    assert model is not None
+    model.text = " \n "
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "./os/boot",
+        "./clock",
+        "./metadata/{urn:overseer:phase-b-rehearsal}run",
+    ),
+)
+def test_domain_ownership_validator_rejects_text_in_empty_leaf_nodes(path: str) -> None:
+    module = load_tool()
+    plan, root = _libvirt_pipe_console_root(module)
+    node = root.find(path)
+    if path == "./clock" and node is None:
+        node = ET.SubElement(root, "clock", {"offset": "utc"})
+    assert node is not None
+    node.text = "UNAPPROVED"
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode != 0
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     (
@@ -1064,7 +1242,16 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert "$BASE_IMAGE" not in cleanup_line and "$SOURCE_ROOT" not in cleanup_line and "$RUNTIME_SITE" not in cleanup_line
 
 
-def _run_cleanup_harness(script: str, temp_dir: Path, virsh_function: str) -> subprocess.CompletedProcess[str]:
+def _run_cleanup_harness(
+    script: str,
+    temp_dir: Path,
+    virsh_function: str,
+    *,
+    domain_xml: str | None = None,
+    vm_name: str = "overseer-phase-b-rehearsal-54a53bc",
+    vm_uuid: str = "00000000-0000-5000-8000-000000000000",
+    run_id: str = "a" * 64,
+) -> subprocess.CompletedProcess[str]:
     start = script.index("domain_presence() {")
     end = script.index("trap 'cleanup $?' EXIT")
     helpers = script[start:end].replace("/usr/bin/virsh", "virsh")
@@ -1087,18 +1274,20 @@ def _run_cleanup_harness(script: str, temp_dir: Path, virsh_function: str) -> su
     temp_dir.mkdir()
     for name, path in paths.items():
         if name != "SERIAL_PIPE":
-            path.write_text("fixture", encoding="utf-8")
+            content = domain_xml if name == "DOMAIN_XML" and domain_xml is not None else "fixture"
+            path.write_text(content, encoding="utf-8")
     for suffix in (".in", ".out"):
         Path(str(paths["SERIAL_PIPE"]) + suffix).write_text("fixture", encoding="utf-8")
     run_lock = temp_dir.parent / (temp_dir.name + "-lock")
     run_lock.mkdir()
-    (run_lock / "run-id").write_text("a" * 64, encoding="ascii")
+    (run_lock / "run-id").write_text(run_id, encoding="ascii")
     assignments = [
         "set -Eeuo pipefail",
         "LIBVIRT_URI=qemu:///session",
-        "VM_NAME=overseer-phase-b-rehearsal-54a53bc",
-        "VM_UUID=00000000-0000-5000-8000-000000000000",
-        "RUN_ID=" + "a" * 64,
+        f"VM_NAME={shlex.quote(vm_name)}",
+        f"VM_UUID={shlex.quote(vm_uuid)}",
+        f"RUN_ID={shlex.quote(run_id)}",
+        f"BASE_IMAGE={shlex.quote(str(BASE_IMAGE))}",
         "SHUTDOWN_TIMEOUT_SECONDS=1",
         "COLLECTOR_PID=",
         "LOCK_HELD=1",
@@ -1154,6 +1343,49 @@ def test_cleanup_retains_every_artifact_when_libvirt_state_is_unknown(
         "source-manifest.json",
         "runtime-manifest.json",
     }
+
+
+@pytest.mark.parametrize("unsafe_state", ("paused", "crashed", "pmsuspended", "blocked"))
+def test_cleanup_never_mutates_an_owned_domain_in_an_unsafe_state(
+    tmp_path: Path,
+    unsafe_state: str,
+) -> None:
+    module = load_tool()
+    plan, root = _libvirt_pipe_console_root(module, active=True)
+    temp_dir = tmp_path / f"unsafe-{unsafe_state}"
+    calls = tmp_path / f"{unsafe_state}.calls"
+    virsh = (
+        f"virsh() {{ printf '%s\\n' \"$*\" >>{shlex.quote(str(calls))}; "
+        "case \"$*\" in "
+        "*\" list --all --name\") printf '%s\\n' \"$VM_NAME\"; return 0;; "
+        "*\" domuuid \"*) printf '%s\\n' \"$VM_UUID\"; return 0;; "
+        "*\" dumpxml \"*) /usr/bin/cat \"$DOMAIN_XML\"; return 0;; "
+        f"*\" domstate \"*) printf '%s\\n' {shlex.quote(unsafe_state)}; return 0;; "
+        "*\" shutdown \"*) return 9;; "
+        "*) return 9;; esac; }"
+    )
+    domain_xml = (
+        ET.tostring(root, encoding="unicode")
+        .replace("/tmp/owned/overlay.qcow2", str(temp_dir / "overlay.qcow2"))
+        .replace("/tmp/owned/seed.iso", str(temp_dir / "seed.iso"))
+        .replace("/tmp/owned/serial", str(temp_dir / "serial"))
+    )
+
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"],
+        temp_dir,
+        virsh,
+        domain_xml=domain_xml,
+        vm_name=plan["vm"]["name"],
+        vm_uuid=plan["vm"]["uuid"],
+        run_id=plan["vm"]["runId"],
+    )
+
+    assert completed.returncode != 0
+    assert temp_dir.is_dir()
+    observed = calls.read_text(encoding="utf-8")
+    assert " shutdown " not in observed
+    assert " undefine " not in observed
 
 
 def test_cleanup_deletes_exact_artifacts_only_after_authoritative_absence(tmp_path: Path) -> None:

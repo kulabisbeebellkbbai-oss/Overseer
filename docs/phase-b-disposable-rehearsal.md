@@ -120,19 +120,28 @@ marker, disk types/drivers/targets, overlay, ISO, serial pipe/console, and a
 strict domain and device whitelist. The validator accepts only the exact memory,
 CPU, boot, feature, power, emulator, controller, input, audio, balloon, disk,
 serial, and console forms rendered by the plan or deterministically added by
-this libvirt/QEMU version. It permits only bounded generated alias and address
-metadata below those devices. While the domain is active, it also permits only
-the exact detected qcow2 backing chain from the overlay to the pinned leaf base
-image and a generated `/dev/pts/<number>` console source whose path exactly
-matches the console's duplicated `tty` attribute. Both active attestations are
-mandatory whenever libvirt supplies a runtime domain ID. Filesystem shares,
+this libvirt/QEMU version. That normalization may add one exact
+`<model name="isa-serial"/>` child below the owned serial target and may
+represent the serial console as an exact `pipe` console whose source remains
+the approved serial-pipe path. The rendered inactive `pty` console remains
+valid, and an active generated `/dev/pts/<number>` console remains valid only
+when its source exactly matches the console's duplicated `tty` attribute. It
+rejects non-whitespace XML mixed content and permits no generated alias or
+address below the exact pipe console. It permits only bounded generated alias
+and address metadata below the other approved devices. While the domain is
+active, it also permits only the exact detected qcow2 backing chain from the
+overlay to the pinned leaf base image. Both active attestations are mandatory
+whenever libvirt supplies a runtime domain ID.
+Filesystem shares,
 interfaces, host devices,
 channels, QEMU command-line extensions, custom kernels, security-label changes,
 host CPU passthrough, disk authentication, duplicate disks, changed disk
 attributes, and every other unapproved element are rejected. A missing lock,
 same-name foreign domain, UUID/metadata/device mismatch, or unknown libvirt
 state prevents mutation and retains artifacts for an explicitly approved
-recovery.
+recovery. Cleanup mutates only an owned domain reported as running, in
+shutdown, or shut off; paused, crashed, suspended, blocked, and every other
+unexpected state are retained without shutdown or undefine.
 
 The temporary persistent domain has autostart disabled and verified before
 start. Cleanup uses graceful shutdown, confirms inactivity, undefines only the

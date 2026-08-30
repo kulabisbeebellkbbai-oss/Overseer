@@ -1317,8 +1317,11 @@ root_attrs_ok=set(root.attrib)<={"type","id"} and root.get("type")=="kvm" and ("
 active="id" in root.attrib
 root_counts_ok=all(len(root.findall(tag))==1 for tag in ("name","uuid","metadata","memory","currentMemory","vcpu","os","features","on_poweroff","on_reboot","on_crash","devices")) and len(root.findall("cpu"))<=1 and len(root.findall("clock"))<=1
 if not root_attrs_ok or not root_counts_ok or any(item.tag not in root_allowed for item in list(root)): raise SystemExit(1)
+def whitespace_only(value):
+    return value is None or not value.strip()
+if not whitespace_only(root.text) or any(not whitespace_only(item.tail) or list(item) and not whitespace_only(item.text) for item in root.iter()): raise SystemExit(1)
 def leaf_ok(node,attrs,text):
-    return node is not None and node.attrib==attrs and node.text==text and not list(node)
+    return node is not None and node.attrib==attrs and (node.text==text if text is not None else whitespace_only(node.text)) and not list(node)
 name=root.find("name"); uuid=root.find("uuid")
 if not leaf_ok(name,{},sys.argv[1]) or not leaf_ok(uuid,{},sys.argv[2]): raise SystemExit(1)
 def memory_ok(name):
@@ -1328,12 +1331,12 @@ vcpu=root.find("vcpu")
 vcpu_valid=vcpu is not None and vcpu.text=="2" and vcpu.attrib in ({"placement":"static"},{"placement":"static","current":"2"}) and not list(vcpu)
 os_node=root.find("os"); os_children=[] if os_node is None else list(os_node); os_type=None if os_node is None else os_node.find("type"); boots=[] if os_node is None else os_node.findall("boot")
 machine=None if os_type is None else os_type.get("machine")
-os_valid=os_node is not None and os_node.attrib=={} and all(item.tag in {"type","boot"} for item in os_children) and len(os_node.findall("type"))==1 and len(boots)==1 and os_type.text=="hvm" and os_type.attrib in ({"arch":"x86_64"},{"arch":"x86_64","machine":"pc-i440fx-10.0"}) and not list(os_type) and boots[0].attrib=={"dev":"hd"} and not list(boots[0])
+os_valid=os_node is not None and os_node.attrib=={} and all(item.tag in {"type","boot"} for item in os_children) and len(os_node.findall("type"))==1 and len(boots)==1 and os_type.text=="hvm" and os_type.attrib in ({"arch":"x86_64"},{"arch":"x86_64","machine":"pc-i440fx-10.0"}) and not list(os_type) and boots[0].attrib=={"dev":"hd"} and whitespace_only(boots[0].text) and not list(boots[0])
 features=root.find("features"); feature_children=[] if features is None else list(features)
 features_valid=features is not None and features.attrib=={} and len(feature_children)==1 and leaf_ok(feature_children[0],{},None) and feature_children[0].tag=="acpi"
 cpus=root.findall("cpu"); cpu_model=None if not cpus else cpus[0].find("model")
 cpu_valid=not cpus or len(cpus)==1 and cpus[0].attrib=={"mode":"custom","match":"exact","check":"none"} and len(list(cpus[0]))==1 and leaf_ok(cpu_model,{"fallback":"forbid"},"qemu64")
-clocks=root.findall("clock"); clock_valid=not clocks or len(clocks)==1 and clocks[0].attrib=={"offset":"utc"} and not list(clocks[0])
+clocks=root.findall("clock"); clock_valid=not clocks or len(clocks)==1 and clocks[0].attrib=={"offset":"utc"} and whitespace_only(clocks[0].text) and not list(clocks[0])
 power_valid=leaf_ok(root.find("on_poweroff"),{},"destroy") and leaf_ok(root.find("on_reboot"),{},"restart") and leaf_ok(root.find("on_crash"),{},"destroy")
 if not memory_ok("memory") or not memory_ok("currentMemory") or not vcpu_valid or not os_valid or not features_valid or not cpu_valid or not clock_valid or not power_valid: raise SystemExit(1)
 metadata=root.find("./metadata")
@@ -1342,11 +1345,11 @@ marker=markers[0] if len(markers)==1 and markers[0].tag=="{urn:overseer:phase-b-
 devices=root.find("./devices")
 children=[] if devices is None else list(devices)
 allowed={"disk","serial","console","controller","input","memballoon","emulator","audio"}
-if metadata is None or metadata.attrib!={} or marker is None or marker.attrib!={"id":sys.argv[3]} or list(marker) or devices is None or devices.attrib!={} or any(item.tag not in allowed for item in children): raise SystemExit(1)
+if metadata is None or metadata.attrib!={} or marker is None or marker.attrib!={"id":sys.argv[3]} or not whitespace_only(marker.text) or list(marker) or devices is None or devices.attrib!={} or any(item.tag not in allowed for item in children): raise SystemExit(1)
 hex_value=re.compile(r"0x[0-9a-fA-F]+")
 alias_name=re.compile(r"[A-Za-z0-9_.-]{1,128}")
 def generated_child_ok(item):
-    if list(item): return False
+    if list(item) or not whitespace_only(item.text): return False
     if item.tag=="alias": return set(item.attrib)=={"name"} and alias_name.fullmatch(item.get("name", "")) is not None
     if item.tag!="address": return False
     kind=item.get("type")
@@ -1357,7 +1360,7 @@ def generated_child_ok(item):
     return False
 def children_exact(item,required,optional=()):
     tags=[child.tag for child in list(item)]
-    return all(tags.count(tag)==1 for tag in required) and all(tags.count(tag)<=1 for tag in optional) and tags.count("alias")<=1 and tags.count("address")<=1 and all(tag in set(required)|set(optional)|{"alias","address"} for tag in tags) and all(child.tag in set(required)|set(optional) or generated_child_ok(child) for child in list(item))
+    return whitespace_only(item.text) and all(tags.count(tag)==1 for tag in required) and all(tags.count(tag)<=1 for tag in optional) and tags.count("alias")<=1 and tags.count("address")<=1 and all(tag in set(required)|set(optional)|{"alias","address"} for tag in tags) and all(child.tag in set(required)|set(optional) or generated_child_ok(child) for child in list(item))
 disks=root.findall("./devices/disk")
 def backing_store_ok(item):
     if item is None: return True
@@ -1377,11 +1380,14 @@ serial_target=None if serial is None else serial.find("target")
 console=consoles[0] if len(consoles)==1 else None
 console_target=None if console is None else console.find("target")
 console_source=None if console is None else console.find("source")
-serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and children_exact(serial,("source","target")) and leaf_ok(serial_source,{"path":sys.argv[6]},None) and leaf_ok(serial_target,{"type":"isa-serial","port":"0"},None)
+serial_model=None if serial_target is None else serial_target.find("model")
+serial_target_text_valid=serial_target is not None and (serial_target.text is None or not serial_target.text.strip())
+serial_target_valid=serial_target is not None and serial_target.attrib=={"type":"isa-serial","port":"0"} and serial_target_text_valid and ((not list(serial_target)) or len(list(serial_target))==1 and leaf_ok(serial_model,{"name":"isa-serial"},None))
+serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and children_exact(serial,("source","target")) and leaf_ok(serial_source,{"path":sys.argv[6]},None) and serial_target_valid
 tty=None if console is None else console.get("tty"); tty_valid=tty is not None and re.fullmatch(r"/dev/pts/[0-9]+",tty) is not None
-console_attrs_valid=console is not None and (console.attrib=={"type":"pty"} or tty_valid and console.attrib=={"type":"pty","tty":tty})
-console_source_valid=(not active and console_source is None and tty is None) or tty_valid and leaf_ok(console_source,{"path":tty},None)
-console_valid=console_attrs_valid and children_exact(console,("target",),("source",)) and leaf_ok(console_target,{"type":"serial","port":"0"},None) and console_source_valid
+console_pty_valid=console is not None and (console.attrib=={"type":"pty"} or tty_valid and console.attrib=={"type":"pty","tty":tty}) and children_exact(console,("target",),("source",)) and leaf_ok(console_target,{"type":"serial","port":"0"},None) and ((not active and console_source is None and tty is None) or tty_valid and leaf_ok(console_source,{"path":tty},None))
+console_pipe_valid=console is not None and console.attrib=={"type":"pipe"} and [item.tag for item in list(console)]==["source","target"] and leaf_ok(console_source,{"path":sys.argv[6]},None) and leaf_ok(console_target,{"type":"serial","port":"0"},None)
+console_valid=console_pty_valid or console_pipe_valid
 emulators=root.findall("./devices/emulator")
 emulator_valid=not emulators or len(emulators)==1 and leaf_ok(emulators[0],{},"/usr/bin/qemu-system-x86_64")
 inputs=root.findall("./devices/input")
@@ -1513,7 +1519,11 @@ wait_for_inactive() {{
     if verify_domain_ownership; then ownership=0; else ownership=$?; fi
     case "$ownership" in 1) return 0;; 2) return 1;; esac
     if ! state="$(domain_state)"; then return 1; fi
-    [[ "$state" == "shut off" ]] && return 0
+    case "$state" in
+      "shut off") return 0;;
+      "running"|"in shutdown") ;;
+      *) return 1;;
+    esac
     (( SECONDS < deadline )) || return 1
     /usr/bin/sleep 2
   done
@@ -1524,10 +1534,15 @@ shutdown_and_undefine() {{
   if verify_domain_ownership; then ownership=0; else ownership=$?; fi
   case "$ownership" in 1) return 0;; 2) return 1;; esac
   if ! state="$(domain_state)"; then return 1; fi
-  if [[ "$state" != "shut off" ]]; then
-    /usr/bin/virsh --connect "$LIBVIRT_URI" shutdown "$VM_NAME" >/dev/null 2>&1 || return 1
-    wait_for_inactive || return 1
-  fi
+  case "$state" in
+    "shut off") ;;
+    "running")
+      /usr/bin/virsh --connect "$LIBVIRT_URI" shutdown "$VM_NAME" >/dev/null 2>&1 || return 1
+      wait_for_inactive || return 1
+      ;;
+    "in shutdown") wait_for_inactive || return 1;;
+    *) return 1;;
+  esac
   verify_domain_ownership || return 1
   if ! state="$(domain_state)" || [[ "$state" != "shut off" ]]; then return 1; fi
   /usr/bin/virsh --connect "$LIBVIRT_URI" undefine "$VM_NAME" >/dev/null 2>&1 || return 1

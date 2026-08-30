@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import json
 import os
+import shutil
 import stat
 import subprocess
 import xml.etree.ElementTree as ET
@@ -288,8 +289,33 @@ def test_domain_xml_parses_and_has_seed_runtime_source_readonly_without_network(
     assert filesystems["overseer-source"].find("source").attrib["dir"] == str(SOURCE_ROOT)
     assert filesystems["overseer-runtime-site"].find("source").attrib["dir"] == str(RUNTIME_SITE)
     assert all(item.find("readonly") is not None for item in filesystems.values())
+    assert all(item.find("driver").attrib == {"type": "path"} for item in filesystems.values())
     assert root.find("./devices/interface") is None
+    assert root.find("./devices/graphics") is None
     assert root.find("./devices/serial/source").attrib == {"path": "${SERIAL_LOG}", "append": "on"}
+
+
+def test_concrete_domain_xml_passes_installed_libvirt_schema(tmp_path: Path) -> None:
+    validator = shutil.which("virt-xml-validate")
+    if validator is None:
+        pytest.skip("virt-xml-validate is not installed")
+    module = load_tool()
+    xml = render(module)["plan"]["domainXml"]
+    xml = xml.replace("${OVERLAY}", str(tmp_path / "overlay.qcow2"))
+    xml = xml.replace("${SEED_ISO}", str(tmp_path / "seed.iso"))
+    xml = xml.replace("${SERIAL_LOG}", str(tmp_path / "serial.log"))
+    domain_xml = tmp_path / "domain.xml"
+    domain_xml.write_text(xml, encoding="utf-8")
+
+    completed = subprocess.run(
+        (validator, str(domain_xml)),
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_cloud_init_installs_complete_task_two_guest_contract() -> None:

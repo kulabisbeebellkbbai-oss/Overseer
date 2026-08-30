@@ -90,10 +90,13 @@ domain inputs rather than caller assertions.
 ## Final verification
 
 - Commit message: `Repair fail-closed Phase B VM rehearsal`
-- Focused tests: `26 passed in 0.21s`
+- Focused tests after independent schema hardening: `27 passed in 0.24s`
 - In-memory Python compile of tool and tests: clean, no output
 - Future Bash syntax parse with `bash -n`: clean, no output; no future command
   executed
+- Concrete rendered domain XML: installed `virt-xml-validate` passes after
+  removing the invalid 9p driver-name attributes and invalid explicit
+  `graphics type='none'` element caught during independent integration review
 - `git diff --check`: clean, no output
 - Actual preflight: exit `2` with canonical fail-closed dirty-tree rejection;
   it stopped before KVM, image, runtime, or libvirt probes

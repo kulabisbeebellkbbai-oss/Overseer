@@ -274,13 +274,13 @@ def _domain_xml(*, vm_name: str, source_root: Path, runtime_site: Path) -> str:
       <readonly/>
     </disk>
     <filesystem type='mount' accessmode='passthrough'>
-      <driver type='path' name='9p'/>
+      <driver type='path'/>
       <source dir='{source}'/>
       <target dir='{SOURCE_MOUNT_TAG}'/>
       <readonly/>
     </filesystem>
     <filesystem type='mount' accessmode='passthrough'>
-      <driver type='path' name='9p'/>
+      <driver type='path'/>
       <source dir='{runtime}'/>
       <target dir='{RUNTIME_MOUNT_TAG}'/>
       <readonly/>
@@ -290,7 +290,6 @@ def _domain_xml(*, vm_name: str, source_root: Path, runtime_site: Path) -> str:
       <target type='isa-serial' port='0'/>
     </serial>
     <console type='pty'><target type='serial' port='0'/></console>
-    <graphics type='none'/>
   </devices>
 </domain>
 """

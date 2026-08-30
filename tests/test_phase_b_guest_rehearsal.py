@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import stat
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 
 import pytest
 
@@ -352,10 +354,70 @@ def test_production_cleanup_and_rollback_entrypoints_are_required() -> None:
     before = {"artifact": "digest"}
     result = module.run_production_cleanup_and_replay(
         Activation(), contract={"schemaVersion": "contract.v2"}, package_root=Path("/guest/package"),
-        package_digest="a" * 64, snapshot=lambda: dict(before),
+        package_digest="a" * 64, originating_failure="ControlledPreCutoverFailure",
+        snapshot=lambda: dict(before),
     )
     assert result == {"status": "aborted_before_cutover", "replayed": True}
     assert calls == ["cleanup", "rollback"]
+
+
+def test_second_instance_must_observe_a_real_bounded_api_failure(tmp_path: Path) -> None:
+    module = load_guest_module()
+    ledger = tmp_path / "progress.jsonl"
+
+    class Client:
+        def health(self):
+            return {"ok": True, "service": "overseer-api"}
+
+        def execute_admin_change(self, payload):
+            assert payload == {"plan_id": "admin.phase-b-rehearsal.controlled-missing"}
+            raise HTTPError(
+                "http://localhost/admin/execute",
+                404,
+                "Not Found",
+                {},
+                io.BytesIO(b'{"error":"missing record: admin.phase-b-rehearsal.controlled-missing"}'),
+            )
+
+    with pytest.raises(module.ControlledPreCutoverFailure):
+        module.observe_controlled_pre_cutover_failure(Client(), ledger)
+    assert [
+        json.loads(line)["event"]
+        for line in ledger.read_text(encoding="ascii").splitlines()
+    ] == ["controlled-failure-observed"]
+
+
+def test_cleanup_stops_and_rechecks_accepted_executor_instances() -> None:
+    module = load_guest_module()
+    instance = "overseer-admin-executor@0-4242-1.service"
+    active_instances = {instance}
+    stopped: list[str] = []
+
+    def systemctl(*arguments: str, check: bool = True):
+        action = arguments[0]
+        if action == "list-units":
+            output = "".join(
+                f"{unit} loaded active running disposable executor\n"
+                for unit in sorted(active_instances)
+            )
+            return SimpleNamespace(returncode=0, stdout=output, stderr="")
+        unit = arguments[-1]
+        if action == "stop":
+            stopped.append(unit)
+            active_instances.discard(unit)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if action == "is-active":
+            return SimpleNamespace(
+                returncode=0 if unit in active_instances else 3,
+                stdout="active\n" if unit in active_instances else "inactive\n",
+                stderr="",
+            )
+        raise AssertionError(arguments)
+
+    module._UNITS_MAY_BE_ACTIVE = True
+    module.stop_disposable_units(systemctl=systemctl, processes_for_uid=lambda uid: ())
+    assert instance in stopped
+    assert module._UNITS_MAY_BE_ACTIVE is False
 
 
 def test_stop_aggregates_failures_and_keeps_cleanup_needed() -> None:

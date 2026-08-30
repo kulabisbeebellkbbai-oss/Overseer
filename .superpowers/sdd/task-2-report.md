@@ -50,9 +50,18 @@ Repair GREEN:
 50 passed in 0.27s
 ```
 
+The first repair re-review then identified two remaining Important gaps:
+accepted `overseer-admin-executor@*.service` instances were outside the
+cleanup inventory, and the second-pass failure was classified without first
+being induced and observed. Follow-up TDD produced `3 failed, 49 passed`.
+The final implementation now inventories, stops, and rechecks bounded accepted
+executor instances, and makes the healthy second API instance return the exact
+controlled missing-plan rejection before production cleanup begins. Final
+focused GREEN is `52 passed in 0.30s`.
+
 ## Checks
 
-- `pytest -q tests/test_phase_b_guest_rehearsal.py`: 50 passed.
+- `pytest -q tests/test_phase_b_guest_rehearsal.py`: 52 passed.
 - Python compile check for the guest harness and test: passed.
 - `systemd-analyze verify` for the outer one-shot unit: passed.
 - All six rendered child service/socket units were written to a temporary

@@ -107,6 +107,10 @@ class RehearsalError(RuntimeError):
     """Raised for a bounded disposable rehearsal failure."""
 
 
+class ControlledPreCutoverFailure(RehearsalError):
+    """Identify the intentionally observed second-instance API failure."""
+
+
 class StageTracker:
     """Retain the last bounded stage even when a nested operation raises."""
 
@@ -456,6 +460,7 @@ def record_progress(target: Path, event: str) -> None:
         "authorization-complete",
         "systemd-start",
         "canary-service-started",
+        "controlled-failure-observed",
         "evidence-seal-started",
         "evidence-seal-complete",
         "cleanup-complete",
@@ -911,6 +916,7 @@ def run_production_cleanup_and_replay(
     contract: Mapping[str, object],
     package_root: Path,
     package_digest: str,
+    originating_failure: str,
     snapshot,
 ) -> dict[str, object]:
     """Use production cleanup and rollback entry points, then prove no replay mutation."""
@@ -920,7 +926,7 @@ def run_production_cleanup_and_replay(
     durable = activation._execute_resilient_cleanup(
         contract,
         package_digest=package_digest,
-        originating_failure="RehearsalControlledFailure",
+        originating_failure=originating_failure,
         require_canary_evidence=True,
     )
     if durable is not True:
@@ -935,6 +941,29 @@ def run_production_cleanup_and_replay(
     ):
         raise RehearsalError("production rollback replay mutated retained evidence")
     return {"status": "aborted_before_cutover", "replayed": True}
+
+
+def observe_controlled_pre_cutover_failure(client, progress_ledger: Path) -> None:
+    """Require the second real API instance to reject one missing-plan execute."""
+
+    health = client.health()
+    if health.get("ok") is not True or health.get("service") != "overseer-api":
+        raise RehearsalError("second canary instance is not healthy")
+    plan_id = "admin.phase-b-rehearsal.controlled-missing"
+    try:
+        client.execute_admin_change({"plan_id": plan_id})
+    except HTTPError as error:
+        try:
+            body = json.loads(error.read().decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as parse_error:
+            raise RehearsalError("controlled pre-cutover failure response is invalid") from parse_error
+        if error.code != 404 or body != {"error": f"missing record: {plan_id}"}:
+            raise RehearsalError("controlled pre-cutover failure did not match") from error
+        record_progress(progress_ledger, "controlled-failure-observed")
+        raise ControlledPreCutoverFailure(
+            "second canary observed the controlled missing-plan failure"
+        ) from error
+    raise RehearsalError("controlled pre-cutover failure was unexpectedly accepted")
 
 
 def _exercise_real_api(paths: Mapping[str, Path]) -> dict[str, dict[str, bool]]:
@@ -1031,6 +1060,35 @@ def _start_disposable_units() -> None:
     _systemctl("start", "overseer-api-canary.service")
 
 
+def executor_instance_units(*, systemctl=None) -> tuple[str, ...]:
+    """Return a bounded exact inventory of socket-accepted executor instances."""
+
+    systemctl = _systemctl if systemctl is None else systemctl
+    result = systemctl(
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--type=service",
+        "overseer-admin-executor@*.service",
+        check=False,
+    )
+    if int(result.returncode) == 3:
+        return ()
+    if int(result.returncode) != 0 or len(str(result.stdout).encode("utf-8")) > 8192:
+        raise RehearsalError("cleanup executor instance inventory is unavailable")
+    units: list[str] = []
+    pattern = re.compile(r"overseer-admin-executor@[A-Za-z0-9_.:-]{1,128}\.service\Z")
+    for line in str(result.stdout).splitlines():
+        fields = line.split()
+        if not fields or pattern.fullmatch(fields[0]) is None:
+            raise RehearsalError("cleanup executor instance inventory is invalid")
+        units.append(fields[0])
+    if len(units) > 32 or len(set(units)) != len(units):
+        raise RehearsalError("cleanup executor instance inventory exceeds its bound")
+    return tuple(sorted(units))
+
+
 def stop_disposable_units(*, systemctl=None, processes_for_uid=None) -> None:
     """Stop and verify every disposable boundary before clearing cleanup state."""
 
@@ -1038,14 +1096,15 @@ def stop_disposable_units(*, systemctl=None, processes_for_uid=None) -> None:
     systemctl = _systemctl if systemctl is None else systemctl
     processes_for_uid = _processes_for_uid if processes_for_uid is None else processes_for_uid
     failures: list[str] = []
-    for unit in reversed(_DISPOSABLE_UNITS):
+    accepted_instances = executor_instance_units(systemctl=systemctl)
+    targets = (*reversed(_DISPOSABLE_UNITS), *accepted_instances)
+    for unit in targets:
         try:
-            result = systemctl("stop", unit, check=False)
-            if int(result.returncode) != 0:
-                failures.append(unit)
+            systemctl("stop", unit, check=False)
         except (OSError, subprocess.SubprocessError, AttributeError):
             failures.append(unit)
-    for unit in _DISPOSABLE_UNITS:
+    remaining_instances = executor_instance_units(systemctl=systemctl)
+    for unit in (*_DISPOSABLE_UNITS, *accepted_instances, *remaining_instances):
         try:
             result = systemctl("is-active", "--quiet", unit, check=False)
             if int(result.returncode) != 3:
@@ -1349,8 +1408,28 @@ def _run_rehearsal(
 
     tracker.advance("quiescent-stop")
     stop_disposable_units()
+    tracker.advance("canary-start")
     _start_disposable_units()
     _wait_for_canary_socket()
+
+    tracker.advance("canary-acceptance")
+    from overseer.client import OverseerApiClient
+
+    second_client = OverseerApiClient(
+        base_url="http://localhost",
+        auth_token=API_TOKEN,
+        unix_socket_path=str(CANARY_RUNTIME / "api.sock"),
+        expected_server_uid=CANARY_UID,
+    )
+    try:
+        observe_controlled_pre_cutover_failure(
+            second_client,
+            paths["artifacts"] / "progress.jsonl",
+        )
+    except ControlledPreCutoverFailure as controlled_failure:
+        failure_class = type(controlled_failure).__name__
+    else:
+        raise RehearsalError("controlled pre-cutover failure was not observed")
 
     tracker.advance("cleanup")
     from overseer import activation_package
@@ -1368,6 +1447,7 @@ def _run_rehearsal(
         contract=contract,
         package_root=paths["package"],
         package_digest=digest,
+        originating_failure=failure_class,
         snapshot=lambda: _retained_evidence_snapshot(paths["state"]),
     )
     stop_disposable_units()

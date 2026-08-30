@@ -21,13 +21,20 @@ observes loaded credential files, exact socket identity, and bridge/executor
 activation transitions before those controls can pass. It invokes the
 production hidden-input reader through a PTY, checks the real SQLite-sibling
 admin-authority lock created by the API workflow, then starts a second canary
-service instance and injects a controlled pre-cutover failure. Cleanup,
+service instance, confirms its health, and makes it encounter a deterministic
+missing-plan API failure before cutover. The exact bounded rejection is
+recorded before cleanup. Cleanup,
 evidence sealing, durable terminal state, and rollback replay delegate to
 the production `overseer.activation_package` entry points. Only the absent
 owner-package provenance readers are replaced by guest-local adapters; the
 cleanup commands, systemd quiescence, state sealing, runner state, activation
 lock, and replay implementation remain production code. The guest has no
 network address.
+
+Fail-closed cleanup inventories every bounded
+`overseer-admin-executor@*.service` instance created by the `Accept=yes`
+socket, stops it after the listening socket is closed, and rechecks both the
+static units and accepted instances before cleanup-needed state can clear.
 
 The only serial result is framed exactly as:
 

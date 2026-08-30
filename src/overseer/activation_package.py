@@ -6101,6 +6101,7 @@ def _seal_canary_state_from_contract(
     root_descriptor = -1
     state_descriptor = -1
     file_descriptors: list[int] = []
+    validated_descriptors: list[int] = []
     base_names = {
         "overseer.sqlite3",
         "psychlo-bridge.sqlite3",
@@ -6155,7 +6156,12 @@ def _seal_canary_state_from_contract(
         entries = set(os.listdir(state_descriptor))
         if not base_names.issubset(entries) or not entries.issubset(allowed_names):
             raise ActivationPackageError("canary evidence namespace contains an invalid artifact")
-        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         total_size = 0
         for name in sorted(entries):
             descriptor = os.open(name, file_flags, dir_fd=state_descriptor)
@@ -6181,9 +6187,10 @@ def _seal_canary_state_from_contract(
                 or total_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES
             ):
                 raise ActivationPackageError("canary evidence artifact identity is invalid")
+            validated_descriptors.append(descriptor)
         if _processes_for_uid(APPROVED_OVERSEER_UID):
             raise ActivationPackageError("service principal process exists during evidence sealing")
-        for descriptor in file_descriptors:
+        for descriptor in validated_descriptors:
             os.fchown(descriptor, root_uid, root_gid)
             os.fchmod(descriptor, 0o400)
             os.fsync(descriptor)
@@ -6195,7 +6202,7 @@ def _seal_canary_state_from_contract(
         raise ActivationPackageError("canary evidence namespace could not be sealed safely") from error
     finally:
         sync_error: OSError | None = None
-        for descriptor in (*file_descriptors, state_descriptor, root_descriptor):
+        for descriptor in (*validated_descriptors, state_descriptor, root_descriptor):
             if descriptor < 0:
                 continue
             try:
@@ -7603,7 +7610,7 @@ def _cleanup_commands(contract: Mapping[str, object]) -> list[list[str]]:
 
 
 def _cleanup_command_satisfied(command: list[str]) -> bool:
-    if len(command) < 4 or command[:2] != ["/usr/bin/systemctl", "stop"]:
+    if len(command) < 3 or command[:2] != ["/usr/bin/systemctl", "stop"]:
         return False
     for unit in command[2:]:
         returncode, start_error = _command_outcome(

@@ -3893,10 +3893,16 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
         "_activation_root_identity",
         lambda: (os.geteuid(), os.getegid()),
     )
+    inactive_checks: list[list[str]] = []
+
+    def inactive_outcome(command: list[str], **_kwargs: object) -> tuple[int, None]:
+        inactive_checks.append(command)
+        return 3, None
+
     monkeypatch.setattr(
         activation_package_module,
-        "_cleanup_command_satisfied",
-        lambda _command: True,
+        "_command_outcome",
+        inactive_outcome,
     )
     monkeypatch.setattr(
         activation_package_module,
@@ -3912,6 +3918,17 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
         "_processes_for_uid",
         lambda _uid: (),
     )
+    fifo = state_directory / "overseer.sqlite3-wal"
+    fifo.unlink()
+    os.mkfifo(fifo, 0o600)
+    with pytest.raises(ActivationPackageError, match="artifact identity"):
+        activation_package_module._seal_canary_state_from_contract(
+            contract,
+            required=True,
+        )
+    fifo.unlink()
+    fifo.write_bytes(b"overseer.sqlite3-wal")
+    fifo.chmod(0o600)
     result = activation_package_module._seal_canary_state_from_contract(
         contract,
         required=True,
@@ -3921,6 +3938,11 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
     assert state_directory.stat().st_mode & 0o777 == 0o500
     assert sorted(path.name for path in state_directory.iterdir()) == sorted(names)
     assert all(path.stat().st_mode & 0o777 == 0o400 for path in state_directory.iterdir())
+    assert inactive_checks == [
+        ["/usr/bin/systemctl", "is-active", "--quiet", "overseer-api-canary.service"],
+        ["/usr/bin/systemctl", "is-active", "--quiet", "overseer-api-canary.service"],
+        ["/usr/bin/systemctl", "is-active", "--quiet", "overseer-api-canary.service"],
+    ]
 
 
 def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(

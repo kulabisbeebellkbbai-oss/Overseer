@@ -146,7 +146,8 @@ it does not depend on the parent process's in-memory lock registration.
 After either normal canary stop or failure cleanup, the runner confirms the
 unit is inactive and no process carries UID 984, descriptor-reopens only the
 three database names and their bounded WAL, SHM, or journal sidecars, rejects
-links and foreign artifacts, and changes every artifact to root-owned mode
+links and foreign artifacts, opens candidate entries nonblocking so a FIFO or
+other special file cannot stall cleanup, and changes every artifact to root-owned mode
 `0400` plus the namespace to root-owned mode `0500`. The resulting immutable
 package-specific evidence is never reused by another package.
 

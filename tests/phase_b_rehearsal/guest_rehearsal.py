@@ -29,7 +29,7 @@ from urllib.error import HTTPError
 REHEARSAL_ROOT = Path("/var/lib/overseer-phase-b-rehearsal")
 CANARY_UID = 984
 BRIDGE_UID = 1000
-SOURCE_ROOT = Path("/mnt/overseer-source")
+SOURCE_ROOT = Path("/opt/overseer-source")
 GUEST_ETC = Path("/etc/overseer-phase-b-rehearsal")
 GUEST_RUN = Path("/run/overseer-phase-b-rehearsal")
 GUEST_OPT = Path("/opt/overseer-phase-b-rehearsal")

@@ -48,6 +48,7 @@ def test_guest_module_import_is_safe_and_exposes_contract_constants() -> None:
     module = load_guest_module()
 
     assert module.REHEARSAL_ROOT == Path("/var/lib/overseer-phase-b-rehearsal")
+    assert module.SOURCE_ROOT == Path("/opt/overseer-source")
     assert module.CANARY_UID == 984
     assert module.BRIDGE_UID == 1000
     assert module.REQUIRED_CONTROLS == EXPECTED_CONTROLS
@@ -261,7 +262,7 @@ def test_preflight_accepts_only_the_complete_guest_contract() -> None:
 def test_rendered_units_use_real_credentials_and_production_socket_contracts() -> None:
     module = load_guest_module()
     units = module.render_guest_units(
-        source_root=Path("/mnt/overseer-source"),
+        source_root=Path("/opt/overseer-source"),
         python_path=Path("/usr/bin/python3"),
         state_directory=Path("/var/lib/overseer-canary/0123456789abcdef0123456789abcdef"),
     )
@@ -556,3 +557,5 @@ def test_outer_service_allows_only_explicit_guest_and_unit_paths() -> None:
         "LoadCredential=source-commit:/etc/overseer-phase-b-rehearsal/source-commit"
         in service
     )
+    assert "ReadOnlyPaths=/opt/overseer-source" in service
+    assert "ReadOnlyPaths=/usr/local/lib/python3.13/dist-packages" in service

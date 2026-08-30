@@ -1,7 +1,7 @@
 [Unit]
 Description=Disposable Overseer Phase B guest rehearsal
 After=local-fs.target
-ConditionPathIsDirectory=/mnt/overseer-source
+ConditionPathIsDirectory=/opt/overseer-source
 ConditionPathIsDirectory=/opt/overseer-phase-b-rehearsal
 ConditionPathExists=/etc/overseer-phase-b-rehearsal/source-commit
 
@@ -23,7 +23,8 @@ PrivateNetwork=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadOnlyPaths=/mnt/overseer-source
+ReadOnlyPaths=/opt/overseer-source
+ReadOnlyPaths=/usr/local/lib/python3.13/dist-packages
 ReadOnlyPaths=/etc/overseer-phase-b-rehearsal/source-commit
 ReadWritePaths=/etc/overseer-phase-b-rehearsal
 ReadWritePaths=/run/overseer /run/overseer-canary

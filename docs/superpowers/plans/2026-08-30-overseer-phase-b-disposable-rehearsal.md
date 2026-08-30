@@ -6,7 +6,7 @@
 
 **Architecture:** Keep the sealed activation state machine and approval boundaries unchanged. Add bounded JSON progress events around the existing checkpoints, then exercise the real API, root executor, user bridge, UID 984 canary, Unix sockets, systemd credentials, shutdown, lock release, evidence sealing, cleanup, and recovery inside a network-isolated Debian 13 VM. The host-side tooling may prepare and describe the rehearsal, but this implementation phase must not download an image, define or start a VM, import a package, or touch host services.
 
-**Tech Stack:** Python 3.13, pytest, systemd 257, libvirt `qemu:///session`, qcow2 overlays, NoCloud seed ISO, read-only 9p source mount, canonical JSON, SHA-512.
+**Tech Stack:** Python 3.13, pytest, systemd 257, libvirt `qemu:///session`, qcow2 overlays, a NoCloud ISO carrying deterministic tracked-source and bounded-runtime artifacts, canonical JSON, SHA-256, SHA-512.
 
 ## Global Constraints
 
@@ -18,7 +18,7 @@
   host-writable filesystem share. Its persistent definition may exist only
   for the bounded run, must have autostart disabled, and must be explicitly
   undefined after authoritative inactive/absent confirmation.
-- The source checkout may be exposed to the guest only through a read-only 9p mount.
+- The live source checkout, Git metadata, ignored files, bytecode caches, and host runtime must not be exposed to the guest. Only manifest-bound deterministic source/runtime artifacts may cross the read-only NoCloud ISO boundary.
 - Use only throwaway deterministic rehearsal credentials generated inside the guest; never copy owner-package verifiers, API tokens, keys, or human secrets into the VM.
 - The guest must use three distinct identities: root runner, UID/GID 984 canary principal, and UID/GID 1000 bridge owner.
 - The guest must not execute cutover. A rollback exercise may use only harmless disposable transient units and disposable stores inside the VM.
@@ -157,7 +157,7 @@ git commit -m "Add bounded Phase B progress telemetry"
 - Create: `tests/test_phase_b_guest_rehearsal.py`
 
 **Interfaces:**
-- Consumes: read-only source at `/mnt/overseer-source`, the checked-out Python runtime selected by the host preflight, and the host-validated source SHA from a root-owned mode-`0444` artifact through a private mode-`0400` systemd credential copy; it must not resolve guest Git metadata or expose the host gitdir.
+- Consumes: manifest-verified source extracted and bind-remounted read-only at `/opt/overseer-source`, the bounded runtime artifact selected by host preflight, and the host-validated source SHA from a root-owned mode-`0444` artifact through a private mode-`0400` systemd credential copy; it must not receive guest Git metadata or a host gitdir.
 - Produces: one canonical serial-console result with schema `overseer.phase-b-disposable-rehearsal.v1` and status `passed` or `failed`.
 - Produces no host files and requires no network.
 
@@ -192,7 +192,7 @@ Require its result serializer to reject secret-bearing keys and values.
 
 - [ ] **Step 2: Implement deterministic guest provisioning**
 
-The guest script must fail unless PID 1 is systemd, EUID is root, `/mnt/overseer-source` is a read-only mount, no non-loopback network interface is up, UID/GID 984 resolve to `overseer`, and UID/GID 1000 resolve to `god`. It must create all stores, verifiers, API tokens, Ed25519 keys, allowlists, rendered units, and runtime directories below guest-local `/etc`, `/run`, `/opt`, and `/var/lib` paths.
+The guest script must fail unless PID 1 is systemd, EUID is root, `/opt/overseer-source` is a read-only mount, no non-loopback network interface is up, UID/GID 984 resolve to `overseer`, and UID/GID 1000 resolve to `god`. It must create all stores, verifiers, API tokens, Ed25519 keys, allowlists, rendered units, and runtime directories below guest-local `/etc`, `/run`, `/opt`, and `/var/lib` paths.
 
 Use fixed throwaway strings only inside the guest process:
 
@@ -261,7 +261,7 @@ git commit -m "Add disposable Phase B guest rehearsal"
 
 - [ ] **Step 1: Write failing preflight and command-plan tests**
 
-Require `preflight` to reject a dirty tree, a source commit other than the requested full SHA, a missing KVM device, a non-user libvirt URI, missing x86_64 KVM/path-filesystem capability, an existing target VM, a writable source-share specification, any network device, an unverified base image, or runtime imports outside the selected source/runtime roots and Python 3.13 ABI. Require `render-plan` to emit canonical JSON without running subprocesses.
+Require `preflight` to reject a dirty tree, a source commit other than the requested full SHA, a missing KVM device, a non-user libvirt URI, missing x86_64 KVM capability, an existing target VM, unsafe tracked/runtime artifacts, any network device, an unverified base image, unsafe/inexact tools, or runtime imports outside the manifest-selected source/runtime roots and Python 3.13 ABI. Require `render-plan` to emit canonical JSON without running subprocesses.
 
 - [ ] **Step 2: Implement inert `preflight` and `render-plan` subcommands**
 
@@ -275,11 +275,11 @@ vCPUs: 2
 overlay capacity: 8 GiB
 network: none
 autostart: disabled
-source mount: read-only 9p tag overseer-source
-serial log: owner-only file under a fresh mktemp directory
+source/runtime handoff: deterministic manifest-bound ZIP files on the NoCloud ISO; no host filesystem share
+serial log: bounded pipe collector and owner-only file under a fresh mktemp directory
 ```
 
-It must define explicit future commands for checksum verification, qcow2 overlay creation, NoCloud ISO creation, `virsh define --validate`, disabled-autostart verification, start, bounded wait, serial-result extraction, graceful shutdown, authoritative inactive/absent confirmation, undefine, and deletion of only the exact temporary overlay/seed/log directory. The persistent definition is temporary and fail-closed because `virsh define` has no valid `--transient` option. Unknown libvirt state must retain all artifacts. This task must not execute those commands.
+It must define explicit future commands for tracked-only source/runtime archive revalidation, checksum verification, qcow2 overlay creation, NoCloud ISO creation, atomic execution locking, UUID/metadata/device ownership checks, `virsh define --validate`, disabled-autostart verification, start, bounded serial collection, streaming result validation, graceful shutdown, authoritative inactive/absent confirmation, undefine, and deletion of only the exact temporary artifacts. The persistent definition is temporary and fail-closed because `virsh define` has no valid `--transient` option. Foreign ownership or unknown libvirt state must retain all artifacts and the stale lock. This task must not execute those commands.
 
 - [ ] **Step 3: Document the separate approval boundary**
 

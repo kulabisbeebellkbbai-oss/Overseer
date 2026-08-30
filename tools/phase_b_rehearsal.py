@@ -1,25 +1,27 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3.13
 """Preflight and render an inert disposable Phase B rehearsal plan.
 
-``preflight`` performs only read-only checks. ``render-plan`` is pure and
-emits canonical JSON containing data artifacts, including one future Bash
-script. This module has no VM, image, package, or service mutation path.
+``preflight`` performs read-only checks. ``render-plan`` is pure and emits
+canonical JSON containing a separately approved future script. This module has
+no VM, image, package, service, or activation mutation subcommand.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
 import shlex
-import shutil
 import stat
 import subprocess
 import sys
+import uuid
+import zipfile
 from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
@@ -35,16 +37,55 @@ LIBVIRT_URI = "qemu:///session"
 MEMORY_MIB = 2048
 VCPUS = 2
 OVERLAY_GIB = 8
-SOURCE_MOUNT_TAG = "overseer-source"
-RUNTIME_MOUNT_TAG = "overseer-runtime-site"
 DEFAULT_BASE_IMAGE = Path(
     "/var/lib/overseer-phase-b-rehearsal/debian-13-genericcloud-amd64.qcow2"
 )
 DEFAULT_RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
 DEFAULT_TEMP_PARENT = Path("/var/tmp")
-REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v3"
+REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v4"
+ARTIFACT_MANIFEST_SCHEMA = "overseer.rehearsal-artifact-manifest.v1"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
 RESULT_TIMEOUT_SECONDS = 960
+SHUTDOWN_TIMEOUT_SECONDS = 120
+MAX_SERIAL_BYTES = 1024 * 1024
+MAX_SERIAL_LINE_BYTES = 64 * 1024
+MAX_SOURCE_FILES = 2048
+MAX_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_RUNTIME_FILES = 1024
+MAX_RUNTIME_BYTES = 64 * 1024 * 1024
+
+EXACT_TOOLS = {
+    "awk": "/usr/bin/awk",
+    "bash": "/usr/bin/bash",
+    "cat": "/usr/bin/cat",
+    "env": "/usr/bin/env",
+    "genisoimage": "/usr/bin/genisoimage",
+    "git": "/usr/bin/git",
+    "grep": "/usr/bin/grep",
+    "id": "/usr/bin/id",
+    "install": "/usr/bin/install",
+    "mkfifo": "/usr/bin/mkfifo",
+    "mkdir": "/usr/bin/mkdir",
+    "mktemp": "/usr/bin/mktemp",
+    "python": "/usr/bin/python3.13",
+    "qemu-img": "/usr/bin/qemu-img",
+    "rm": "/usr/bin/rm",
+    "rmdir": "/usr/bin/rmdir",
+    "sha256sum": "/usr/bin/sha256sum",
+    "sha512sum": "/usr/bin/sha512sum",
+    "sleep": "/usr/bin/sleep",
+    "stat": "/usr/bin/stat",
+    "timeout": "/usr/bin/timeout",
+    "virsh": "/usr/bin/virsh",
+}
+REQUIRED_TOOLS = tuple(EXACT_TOOLS)
+MINIMAL_ENV = {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1",
+}
 
 TASK_TWO_PLACEHOLDERS = (
     "/etc/systemd/system/overseer-approval-smoke.service",
@@ -79,30 +120,14 @@ REQUIRED_CONTROLS = frozenset(
         "rollbackReplay",
     }
 )
-REQUIRED_TOOLS = (
-    "git",
-    "virsh",
-    "qemu-img",
-    "cloud-localds",
-    "sha256sum",
-    "sha512sum",
-    "mktemp",
-    "timeout",
-    "bash",
-    "awk",
-    "cat",
-    "grep",
-    "install",
-    "rm",
-    "rmdir",
-    "sleep",
-    "python3",
-)
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _HOST_PATH = re.compile(r"/[A-Za-z0-9._/+ \-]+\Z")
+_ARTIFACT_PATH = re.compile(r"[A-Za-z0-9._/+@ \-]+\Z")
 _PYTHON_VERSION = re.compile(r"3\.13\.[0-9]+\Z")
 _PYTHON_ABI = re.compile(r"cpython-313-[A-Za-z0-9_.-]+\Z")
+_RUN_NAMESPACE = uuid.UUID("4c7e2e88-e69b-5a43-9896-ffae89196717")
 
 
 class PreflightError(RuntimeError):
@@ -137,18 +162,264 @@ def _validate_host_path(path: Path, label: str) -> None:
         raise PreflightError(f"{label} path is unsafe")
 
 
+def _safe_artifact_path(value: object) -> str:
+    if not isinstance(value, str) or _ARTIFACT_PATH.fullmatch(value) is None:
+        raise PreflightError("artifact path is unsafe")
+    path = PurePosixPath(value)
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise PreflightError("artifact path is unsafe")
+    return value
+
+
+def _normalized_file_mode(mode: int) -> int:
+    return 0o755 if mode & stat.S_IXUSR else 0o644
+
+
+def _read_regular_file(root: Path, relative: str) -> tuple[bytes, int]:
+    relative = _safe_artifact_path(relative)
+    target = root.joinpath(*PurePosixPath(relative).parts)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as error:
+        raise PreflightError(f"artifact file is unavailable: {relative}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise PreflightError(f"artifact file is not a single-link regular file: {relative}")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        after = os.fstat(descriptor)
+        before_state = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_state = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_state != after_state:
+            raise PreflightError(f"artifact file changed while it was read: {relative}")
+        payload = b"".join(chunks)
+        if len(payload) != before.st_size:
+            raise PreflightError(f"artifact file changed while it was read: {relative}")
+        return payload, _normalized_file_mode(before.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def _archive_bytes(entries: Sequence[tuple[str, int, bytes]]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED, strict_timestamps=True) as archive:
+        for relative, mode, payload in entries:
+            info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.create_system = 3
+            info.external_attr = (mode & 0xFFFF) << 16
+            info.extra = b""
+            info.comment = b""
+            archive.writestr(info, payload)
+    return output.getvalue()
+
+
+def _manifest_from_paths(
+    root: Path,
+    paths: Sequence[str],
+    *,
+    kind: str,
+    max_files: int,
+    max_bytes: int,
+) -> dict[str, object]:
+    unique = sorted(set(paths))
+    if not unique or len(unique) != len(paths) or len(unique) > max_files:
+        raise PreflightError(f"{kind} artifact file inventory is invalid")
+    records: list[dict[str, object]] = []
+    entries: list[tuple[str, int, bytes]] = []
+    total = 0
+    for relative in unique:
+        payload, mode = _read_regular_file(root, relative)
+        total += len(payload)
+        if total > max_bytes:
+            raise PreflightError(f"{kind} artifact exceeds the bounded size")
+        records.append(
+            {
+                "path": relative,
+                "mode": mode,
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        entries.append((relative, mode, payload))
+    archive = _archive_bytes(entries)
+    return {
+        "schemaVersion": ARTIFACT_MANIFEST_SCHEMA,
+        "kind": kind,
+        "fileCount": len(records),
+        "totalBytes": total,
+        "archiveSha256": hashlib.sha256(archive).hexdigest(),
+        "files": records,
+    }
+
+
+def build_source_manifest(root: Path, tracked_paths: Sequence[str]) -> dict[str, object]:
+    """Build a deterministic manifest from Git-tracked regular files only."""
+
+    return _manifest_from_paths(
+        root,
+        tuple(tracked_paths),
+        kind="source",
+        max_files=MAX_SOURCE_FILES,
+        max_bytes=MAX_SOURCE_BYTES,
+    )
+
+
+def build_runtime_manifest(root: Path) -> dict[str, object]:
+    """Build the bounded offline runtime subset required by the guest."""
+
+    cryptography = root / "cryptography"
+    if not cryptography.is_dir() or cryptography.is_symlink():
+        raise PreflightError("runtime cryptography package is unavailable")
+    paths: list[str] = []
+    for candidate in cryptography.rglob("*"):
+        relative = candidate.relative_to(root).as_posix()
+        if "__pycache__" in candidate.parts or candidate.suffix == ".pyc":
+            continue
+        if candidate.is_symlink():
+            raise PreflightError(f"runtime artifact contains a linked file: {relative}")
+        if candidate.is_file():
+            paths.append(relative)
+    backends = sorted(root.glob("_cffi_backend*.so"))
+    if not backends:
+        raise PreflightError("runtime CFFI backend is unavailable")
+    paths.extend(item.relative_to(root).as_posix() for item in backends)
+    return _manifest_from_paths(
+        root,
+        tuple(paths),
+        kind="runtime",
+        max_files=MAX_RUNTIME_FILES,
+        max_bytes=MAX_RUNTIME_BYTES,
+    )
+
+
+def _validate_artifact_manifest(
+    manifest: Mapping[str, object], *, kind: str
+) -> dict[str, object]:
+    record = dict(manifest)
+    if set(record) != {
+        "schemaVersion",
+        "kind",
+        "fileCount",
+        "totalBytes",
+        "archiveSha256",
+        "files",
+    }:
+        raise PreflightError(f"{kind} artifact manifest keys are invalid")
+    files = record.get("files")
+    max_files, max_bytes = (
+        (MAX_SOURCE_FILES, MAX_SOURCE_BYTES)
+        if kind == "source"
+        else (MAX_RUNTIME_FILES, MAX_RUNTIME_BYTES)
+    )
+    if (
+        record.get("schemaVersion") != ARTIFACT_MANIFEST_SCHEMA
+        or record.get("kind") != kind
+        or not isinstance(files, list)
+        or not files
+        or len(files) > max_files
+        or record.get("fileCount") != len(files)
+        or not isinstance(record.get("archiveSha256"), str)
+        or _SHA256.fullmatch(record["archiveSha256"]) is None
+    ):
+        raise PreflightError(f"{kind} artifact manifest is invalid")
+    normalized: list[dict[str, object]] = []
+    total = 0
+    previous = ""
+    for item in files:
+        if not isinstance(item, Mapping) or set(item) != {"path", "mode", "size", "sha256"}:
+            raise PreflightError(f"{kind} artifact manifest is invalid")
+        path = _safe_artifact_path(item.get("path"))
+        size = item.get("size")
+        mode = item.get("mode")
+        digest = item.get("sha256")
+        if (
+            path <= previous
+            or mode not in {0o644, 0o755}
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise PreflightError(f"{kind} artifact manifest is invalid")
+        previous = path
+        total += size
+        normalized.append({"path": path, "mode": mode, "size": size, "sha256": digest})
+    if total > max_bytes or record.get("totalBytes") != total:
+        raise PreflightError(f"{kind} artifact manifest is invalid")
+    record["files"] = normalized
+    return record
+
+
+def build_artifact_archive(root: Path, manifest: Mapping[str, object]) -> bytes:
+    """Revalidate exact content and return its deterministic stored ZIP."""
+
+    kind = manifest.get("kind")
+    if kind not in {"source", "runtime"}:
+        raise PreflightError("artifact manifest kind is invalid")
+    validated = _validate_artifact_manifest(manifest, kind=kind)
+    entries: list[tuple[str, int, bytes]] = []
+    for item in validated["files"]:
+        payload, mode = _read_regular_file(root, item["path"])
+        if (
+            mode != item["mode"]
+            or len(payload) != item["size"]
+            or hashlib.sha256(payload).hexdigest() != item["sha256"]
+        ):
+            raise PreflightError(f"{kind} artifact changed after manifest")
+        entries.append((item["path"], mode, payload))
+    archive = _archive_bytes(entries)
+    if hashlib.sha256(archive).hexdigest() != validated["archiveSha256"]:
+        raise PreflightError(f"{kind} artifact changed after manifest")
+    return archive
+
+
 def _runtime_probe_python() -> str:
     return "\n".join(
         (
-            "import importlib,json,sys,sysconfig",
+            "import importlib,importlib.abc,importlib.machinery,json,sys,sysconfig",
             "from pathlib import Path",
             "sys.dont_write_bytecode=True",
+            "sys.pycache_prefix='/proc/overseer-disabled-bytecode-cache'",
             "source=Path(sys.argv[1]).resolve(strict=True)",
             "runtime=Path(sys.argv[2]).resolve(strict=True)",
+            "source_manifest=json.loads(sys.argv[3])",
+            "runtime_manifest=json.loads(sys.argv[4])",
             "source_modules=(source/'src').resolve(strict=True)",
             "stdlib=Path(sysconfig.get_path('stdlib')).resolve(strict=True)",
             "platstdlib=Path(sysconfig.get_path('platstdlib')).resolve(strict=True)",
             "stdlib_dynamic=(stdlib/'lib-dynload').resolve(strict=True)",
+            "def allowed(root,manifest): return {str((root/item['path']).resolve(strict=True)) for item in manifest['files']}",
+            "allowed_source=allowed(source,source_manifest)",
+            "allowed_runtime=allowed(runtime,runtime_manifest)",
+            "class ManifestFinder(importlib.abc.MetaPathFinder):",
+            " def find_spec(self,fullname,path=None,target=None):",
+            "  spec=importlib.machinery.PathFinder.find_spec(fullname,path,target)",
+            "  if spec is None or spec.origin in (None,'built-in','frozen'): return spec",
+            "  origin=str(Path(spec.origin).resolve(strict=True))",
+            "  if Path(origin).is_relative_to(source) and origin not in allowed_source: raise ImportError('source origin is not manifested')",
+            "  if Path(origin).is_relative_to(runtime) and origin not in allowed_runtime: raise ImportError('runtime origin is not manifested')",
+            "  return spec",
+            "sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder),ManifestFinder())",
             "sys.path[:]=list(dict.fromkeys(map(str,(source_modules,runtime,stdlib,platstdlib,stdlib_dynamic))))",
             "assert sys.version_info[:2] == (3,13)",
             f"names={REQUIRED_IMPORTS!r}",
@@ -159,14 +430,20 @@ def _runtime_probe_python() -> str:
             " expected=runtime if name == 'cryptography' else source_modules",
             " origin.relative_to(expected)",
             " origins[name]=str(origin)",
-            "record={'status':'passed','noBytecode':True,'python':str(Path(sys.executable).resolve()),'pythonVersion':'.'.join(map(str,sys.version_info[:3])),'pythonAbi':sysconfig.get_config_var('SOABI'),'sourceRoot':str(source),'runtimeSite':str(runtime),'imports':origins}",
+            "digest=lambda value: __import__('hashlib').sha256(json.dumps(value,ensure_ascii=True,sort_keys=True,separators=(',',':')).encode()).hexdigest()",
+            "record={'status':'passed','noBytecode':True,'python':str(Path(sys.executable).resolve()),'pythonVersion':'.'.join(map(str,sys.version_info[:3])),'pythonAbi':sysconfig.get_config_var('SOABI'),'sourceRoot':str(source),'runtimeSite':str(runtime),'sourceManifestDigest':digest(source_manifest),'runtimeManifestDigest':digest(runtime_manifest),'imports':origins}",
             "print(json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(',',':')))",
         )
     )
 
 
 def _validate_runtime_probe(
-    probe: Mapping[str, object], *, source_root: Path, runtime_site: Path
+    probe: Mapping[str, object],
+    *,
+    source_root: Path,
+    runtime_site: Path,
+    source_manifest_digest: str,
+    runtime_manifest_digest: str,
 ) -> dict[str, object]:
     record = dict(probe)
     if set(record) != {
@@ -177,15 +454,19 @@ def _validate_runtime_probe(
         "pythonAbi",
         "sourceRoot",
         "runtimeSite",
+        "sourceManifestDigest",
+        "runtimeManifestDigest",
         "imports",
     }:
         raise PreflightError("runtime probe is not the exact passed no-bytecode result")
     if (
         record.get("status") != "passed"
         or record.get("noBytecode") is not True
-        or record.get("python") != "/usr/bin/python3.13"
+        or record.get("python") != EXACT_TOOLS["python"]
         or record.get("sourceRoot") != str(source_root)
         or record.get("runtimeSite") != str(runtime_site)
+        or record.get("sourceManifestDigest") != source_manifest_digest
+        or record.get("runtimeManifestDigest") != runtime_manifest_digest
         or not isinstance(record.get("pythonVersion"), str)
         or _PYTHON_VERSION.fullmatch(record["pythonVersion"]) is None
         or not isinstance(record.get("pythonAbi"), str)
@@ -195,18 +476,18 @@ def _validate_runtime_probe(
     imports = record.get("imports")
     if not isinstance(imports, Mapping) or set(imports) != set(REQUIRED_IMPORTS):
         raise PreflightError("runtime probe is not the exact passed no-bytecode result")
-    normalized_imports: dict[str, str] = {}
+    normalized: dict[str, str] = {}
     for name in REQUIRED_IMPORTS:
-        origin_value = imports.get(name)
-        if not isinstance(origin_value, str):
+        value = imports.get(name)
+        if not isinstance(value, str):
             raise PreflightError("runtime probe is not the exact passed no-bytecode result")
-        origin = Path(origin_value)
+        origin = Path(value)
         _validate_host_path(origin, "runtime probe import")
-        expected_root = runtime_site if name == "cryptography" else source_root / "src"
-        if not origin.is_relative_to(expected_root):
+        expected = runtime_site if name == "cryptography" else source_root / "src"
+        if not origin.is_relative_to(expected):
             raise PreflightError("runtime probe is not the exact passed no-bytecode result")
-        normalized_imports[name] = origin_value
-    record["imports"] = normalized_imports
+        normalized[name] = value
+    record["imports"] = normalized
     return record
 
 
@@ -233,7 +514,7 @@ def _parse_domain_capabilities(value: str) -> dict[str, object]:
     except ElementTree.ParseError as error:
         raise PreflightError("KVM domain capabilities are unavailable") from error
     filesystem = root.find("./devices/filesystem")
-    driver_types = {
+    drivers = {
         item.text
         for item in root.findall("./devices/filesystem/enum[@name='driverType']/value")
     }
@@ -242,7 +523,7 @@ def _parse_domain_capabilities(value: str) -> dict[str, object]:
         or root.findtext("arch") != "x86_64"
         or filesystem is None
         or filesystem.get("supported") != "yes"
-        or "path" not in driver_types
+        or "path" not in drivers
     ):
         raise PreflightError("KVM path filesystem capability is unavailable")
     return _capability_probe_record()
@@ -267,21 +548,22 @@ def _capability_probe_python() -> str:
 
 
 def _read_only_runner(command: tuple[str, ...]) -> str:
-    """Run one explicit read-only probe selected by a symbolic label."""
+    """Run one explicit read-only probe with exact executables and environment."""
 
     label = command[0]
-    env: dict[str, str] | None = None
     if label == "git-status":
-        argv = ("git", "-C", command[1], "status", "--porcelain", "--untracked-files=all")
+        argv = (EXACT_TOOLS["git"], "-C", command[1], "status", "--porcelain", "--untracked-files=all")
     elif label == "git-head":
-        argv = ("git", "-C", command[1], "rev-parse", "HEAD")
+        argv = (EXACT_TOOLS["git"], "-C", command[1], "rev-parse", "HEAD")
+    elif label == "git-files":
+        argv = (EXACT_TOOLS["git"], "-C", command[1], "ls-files", "-z")
     elif label == "libvirt-uri":
-        argv = ("virsh", "--connect", LIBVIRT_URI, "uri")
+        argv = (EXACT_TOOLS["virsh"], "--connect", LIBVIRT_URI, "uri")
     elif label == "domains":
-        argv = ("virsh", "--connect", LIBVIRT_URI, "list", "--all", "--name")
+        argv = (EXACT_TOOLS["virsh"], "--connect", LIBVIRT_URI, "list", "--all", "--name")
     elif label == "domain-capabilities":
         argv = (
-            "virsh",
+            EXACT_TOOLS["virsh"],
             "--connect",
             LIBVIRT_URI,
             "domcapabilities",
@@ -291,10 +573,16 @@ def _read_only_runner(command: tuple[str, ...]) -> str:
             "x86_64",
         )
     elif label == "qemu-img-info":
-        argv = ("qemu-img", "info", "--output=json", "--force-share", command[1])
+        argv = (
+            EXACT_TOOLS["qemu-img"],
+            "info",
+            "--output=json",
+            "--force-share",
+            command[1],
+        )
     elif label == "import-probe":
         argv = (
-            "python3",
+            EXACT_TOOLS["python"],
             "-B",
             "-s",
             "-P",
@@ -303,14 +591,8 @@ def _read_only_runner(command: tuple[str, ...]) -> str:
             _runtime_probe_python(),
             command[1],
             command[2],
-        )
-        env = os.environ.copy()
-        env.update(
-            {
-                "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTHONNOUSERSITE": "1",
-                "LC_ALL": "C",
-            }
+            command[3],
+            command[4],
         )
     else:
         raise PreflightError(f"unsupported preflight probe: {label}")
@@ -320,9 +602,9 @@ def _read_only_runner(command: tuple[str, ...]) -> str:
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
-        env=env,
+        env=MINIMAL_ENV,
     )
-    return completed.stdout.strip()
+    return completed.stdout if label == "git-files" else completed.stdout.strip()
 
 
 def _require_path_state(
@@ -355,90 +637,67 @@ def _require_path_state(
 
 
 def _validate_temp_mode(mode: int) -> None:
-    writable = mode & (stat.S_IWGRP | stat.S_IWOTH)
-    if writable and not mode & stat.S_ISVTX:
+    if mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX:
         raise PreflightError("temporary path permissions are unsafe")
 
 
-def _domain_xml(*, vm_name: str, source_root: Path, runtime_site: Path) -> str:
-    source = escape(str(source_root))
-    runtime = escape(str(runtime_site))
-    return f"""<domain type='kvm'>
-  <name>{escape(vm_name)}</name>
-  <memory unit='MiB'>{MEMORY_MIB}</memory>
-  <currentMemory unit='MiB'>{MEMORY_MIB}</currentMemory>
-  <vcpu placement='static'>{VCPUS}</vcpu>
-  <os><type arch='x86_64'>hvm</type><boot dev='hd'/></os>
-  <features><acpi/></features>
-  <on_poweroff>destroy</on_poweroff>
-  <on_reboot>restart</on_reboot>
-  <on_crash>destroy</on_crash>
-  <devices>
-    <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2'/>
-      <source file='${{OVERLAY}}'/>
-      <target dev='vda' bus='virtio'/>
-    </disk>
-    <disk type='file' device='cdrom'>
-      <driver name='qemu' type='raw'/>
-      <source file='${{SEED_ISO}}'/>
-      <target dev='sda' bus='sata'/>
-      <readonly/>
-    </disk>
-    <filesystem type='mount' accessmode='passthrough'>
-      <driver type='path'/>
-      <source dir='{source}'/>
-      <target dir='{SOURCE_MOUNT_TAG}'/>
-      <readonly/>
-    </filesystem>
-    <filesystem type='mount' accessmode='passthrough'>
-      <driver type='path'/>
-      <source dir='{runtime}'/>
-      <target dir='{RUNTIME_MOUNT_TAG}'/>
-      <readonly/>
-    </filesystem>
-    <serial type='file'>
-      <source path='${{SERIAL_LOG}}' append='on'/>
-      <target type='isa-serial' port='0'/>
-    </serial>
-    <console type='pty'><target type='serial' port='0'/></console>
-  </devices>
-</domain>
-"""
+def _validate_exact_tools(
+    *,
+    tool_exists: Callable[[Path], bool],
+    tool_stat: Callable[[Path], object],
+    tool_access: Callable[[Path, int], bool],
+) -> None:
+    for label, value in EXACT_TOOLS.items():
+        path = Path(value)
+        try:
+            state = tool_stat(path)
+        except OSError as error:
+            raise PreflightError(f"required tooling is missing: {label}") from error
+        if (
+            not tool_exists(path)
+            or not stat.S_ISREG(state.st_mode)
+            or state.st_uid != 0
+            or state.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or getattr(state, "st_nlink", 1) != 1
+            or not tool_access(path, os.R_OK | os.X_OK)
+        ):
+            raise PreflightError(f"required tooling is unsafe or missing: {label}")
 
 
-def _plan_inputs(*, source_root: Path, runtime_site: Path) -> dict[str, object]:
-    xml = _domain_xml(vm_name="overseer-phase-b-rehearsal-0000000", source_root=source_root, runtime_site=runtime_site)
-    root = ElementTree.fromstring(xml)
-    filesystems = {
-        item.find("target").attrib["dir"]: item
-        for item in root.findall("./devices/filesystem")
-    }
-    source_share = filesystems.get(SOURCE_MOUNT_TAG)
-    runtime_share = filesystems.get(RUNTIME_MOUNT_TAG)
-    if (
-        source_share is None
-        or runtime_share is None
-        or source_share.find("readonly") is None
-        or runtime_share.find("readonly") is None
-    ):
-        raise PreflightError("rendered source or runtime share is writable")
-    interfaces = root.findall("./devices/interface")
-    if interfaces:
-        raise PreflightError("rendered plan contains a network device")
+def _manifest_digest(manifest: Mapping[str, object]) -> str:
+    return hashlib.sha256(canonical_json(manifest).encode()).hexdigest()
+
+
+def _run_identity(
+    source_commit: str, source_manifest_digest: str, runtime_manifest_digest: str
+) -> tuple[str, str, str]:
+    material = f"{source_commit}:{source_manifest_digest}:{runtime_manifest_digest}"
+    run_id = hashlib.sha256(material.encode()).hexdigest()
+    vm_uuid = str(uuid.uuid5(_RUN_NAMESPACE, material))
+    vm_name = (
+        f"overseer-phase-b-rehearsal-"
+        f"{source_commit[:12]}-{source_manifest_digest[:12]}"
+    )
+    return run_id, vm_uuid, vm_name
+
+
+def _plan_inputs(
+    *, source_manifest: Mapping[str, object], runtime_manifest: Mapping[str, object]
+) -> dict[str, object]:
     return {
         "networkDevices": [],
-        "sourceMount": {
-            "hostPath": str(source_root),
-            "tag": SOURCE_MOUNT_TAG,
-            "type": "9p",
-            "readOnly": True,
+        "hostFilesystemShares": [],
+        "sourceArtifact": {
+            "isoPath": "source.zip",
+            "manifestPath": "source-manifest.json",
+            "manifest": dict(source_manifest),
+            "manifestDigest": _manifest_digest(source_manifest),
         },
-        "runtimeMount": {
-            "hostPath": str(runtime_site),
-            "tag": RUNTIME_MOUNT_TAG,
-            "type": "9p",
-            "readOnly": True,
+        "runtimeArtifact": {
+            "isoPath": "runtime.zip",
+            "manifestPath": "runtime-manifest.json",
+            "manifest": dict(runtime_manifest),
+            "manifestDigest": _manifest_digest(runtime_manifest),
         },
     }
 
@@ -457,7 +716,13 @@ def preflight(
     path_access: Callable[[Path, int], bool] = os.access,
     is_symlink: Callable[[Path], bool] = lambda path: path.is_symlink(),
     image_sha512: Callable[[Path], str] = sha512_file,
-    which: Callable[[str], str | None] = shutil.which,
+    tool_exists: Callable[[Path], bool] = lambda path: path.exists(),
+    tool_stat: Callable[[Path], object] = lambda path: path.stat(),
+    tool_access: Callable[[Path, int], bool] = os.access,
+    source_manifest_builder: Callable[
+        [Path, Sequence[str]], dict[str, object]
+    ] = build_source_manifest,
+    runtime_manifest_builder: Callable[[Path], dict[str, object]] = build_runtime_manifest,
 ) -> dict[str, object]:
     """Perform only read-only checks and return digest-bindable evidence."""
 
@@ -470,11 +735,16 @@ def preflight(
         (temp_parent, "temporary"),
     ):
         _validate_host_path(path, label)
-
+    if repo_root != source_root:
+        raise PreflightError("source path must be the validated repository root")
     if runner(("git-status", str(repo_root))):
         raise PreflightError("source tree is dirty")
     if runner(("git-head", str(repo_root))) != source_commit:
         raise PreflightError("source commit does not match the requested full SHA")
+    tracked_raw = runner(("git-files", str(repo_root)))
+    if "\n" in tracked_raw and "\0" not in tracked_raw:
+        raise PreflightError("tracked source inventory is not NUL-delimited")
+    tracked = tuple(item for item in tracked_raw.split("\0") if item)
 
     kvm = Path("/dev/kvm")
     _require_path_state(
@@ -534,21 +804,29 @@ def preflight(
     if base_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise PreflightError("base image permissions are unsafe")
     _validate_temp_mode(temp_mode)
+    _validate_exact_tools(
+        tool_exists=tool_exists, tool_stat=tool_stat, tool_access=tool_access
+    )
 
-    missing = [name for name in REQUIRED_TOOLS if which(name) is None]
-    if missing:
-        raise PreflightError("required tooling is missing: " + ",".join(missing))
+    source_manifest = _validate_artifact_manifest(
+        source_manifest_builder(source_root, tracked), kind="source"
+    )
+    runtime_manifest = _validate_artifact_manifest(
+        runtime_manifest_builder(runtime_site), kind="runtime"
+    )
+    source_manifest_digest = _manifest_digest(source_manifest)
+    runtime_manifest_digest = _manifest_digest(runtime_manifest)
+    run_id, vm_uuid, target_name = _run_identity(
+        source_commit, source_manifest_digest, runtime_manifest_digest
+    )
+
     if runner(("libvirt-uri",)) != LIBVIRT_URI:
         raise PreflightError("libvirt URI is not qemu:///session")
-    target_name = f"overseer-phase-b-rehearsal-{source_commit[:7]}"
     domains = {line.strip() for line in runner(("domains",)).splitlines() if line.strip()}
     if target_name in domains:
         raise PreflightError(f"target VM already exists: {target_name}")
-
     capability_probe = _parse_domain_capabilities(runner(("domain-capabilities",)))
-    capability_probe_digest = hashlib.sha256(
-        canonical_json(capability_probe).encode()
-    ).hexdigest()
+    capability_probe_digest = _manifest_digest(capability_probe)
     try:
         image_info = json.loads(runner(("qemu-img-info", str(base_image))))
     except (json.JSONDecodeError, TypeError) as error:
@@ -563,7 +841,15 @@ def preflight(
 
     try:
         probe_output = json.loads(
-            runner(("import-probe", str(source_root), str(runtime_site)))
+            runner(
+                (
+                    "import-probe",
+                    str(source_root),
+                    str(runtime_site),
+                    canonical_json(source_manifest),
+                    canonical_json(runtime_manifest),
+                )
+            )
         )
     except (json.JSONDecodeError, TypeError) as error:
         raise PreflightError("runtime import probe failed") from error
@@ -571,54 +857,127 @@ def preflight(
         raise PreflightError("runtime import probe failed")
     try:
         runtime_probe = _validate_runtime_probe(
-            probe_output, source_root=source_root, runtime_site=runtime_site
+            probe_output,
+            source_root=source_root,
+            runtime_site=runtime_site,
+            source_manifest_digest=source_manifest_digest,
+            runtime_manifest_digest=runtime_manifest_digest,
         )
     except PreflightError as error:
         raise PreflightError("runtime import probe failed") from error
-    probe_digest = hashlib.sha256(canonical_json(runtime_probe).encode()).hexdigest()
-    inputs = _plan_inputs(source_root=source_root, runtime_site=runtime_site)
+    probe_digest = _manifest_digest(runtime_probe)
+    inputs = _plan_inputs(
+        source_manifest=source_manifest, runtime_manifest=runtime_manifest
+    )
     return {
         "status": "passed",
         "sourceCommit": source_commit,
+        "runId": run_id,
         "targetVm": target_name,
+        "targetVmUuid": vm_uuid,
         "libvirtUri": LIBVIRT_URI,
         "baseImageSha512": BASE_IMAGE_SHA512,
         "runtimeProbe": runtime_probe,
         "runtimeProbeDigest": probe_digest,
         "capabilityProbe": capability_probe,
         "capabilityProbeDigest": capability_probe_digest,
+        "sourceManifest": source_manifest,
+        "sourceManifestDigest": source_manifest_digest,
+        "runtimeManifest": runtime_manifest,
+        "runtimeManifestDigest": runtime_manifest_digest,
         "planInputs": inputs,
-        "checkedTools": list(REQUIRED_TOOLS),
+        "checkedTools": dict(EXACT_TOOLS),
         "tempDirectoryCreated": False,
     }
 
 
+def _artifact_extractor_python() -> str:
+    return r"""import hashlib,json,os,stat,sys,zipfile
+from pathlib import Path,PurePosixPath
+
+archive_path,manifest_path,destination,expected_digest=sys.argv[1:]
+manifest=json.loads(Path(manifest_path).read_text(encoding="ascii"))
+canonical=json.dumps(manifest,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+if hashlib.sha256(canonical.encode()).hexdigest()!=expected_digest:
+    raise SystemExit("artifact manifest digest mismatch")
+if set(manifest)!={"schemaVersion","kind","fileCount","totalBytes","archiveSha256","files"}:
+    raise SystemExit("artifact manifest keys invalid")
+archive_bytes=Path(archive_path).read_bytes()
+if hashlib.sha256(archive_bytes).hexdigest()!=manifest["archiveSha256"]:
+    raise SystemExit("artifact archive digest mismatch")
+root=Path(destination)
+if root.exists():
+    if root.is_symlink() or not root.is_dir() or any(root.iterdir()):
+        raise SystemExit("artifact destination is not an empty directory")
+else:
+    root.mkdir(parents=True,exist_ok=False)
+with zipfile.ZipFile(archive_path,"r") as archive:
+    infos=archive.infolist()
+    files=manifest["files"]
+    if len(infos)!=len(files) or [item.filename for item in infos]!=[item["path"] for item in files]:
+        raise SystemExit("artifact archive inventory mismatch")
+    total=0
+    for info,item in zip(infos,files,strict=True):
+        relative=PurePosixPath(item["path"])
+        if relative.is_absolute() or any(part in {"",".",".."} for part in relative.parts):
+            raise SystemExit("artifact archive path invalid")
+        mode=(info.external_attr>>16)&0xFFFF
+        if info.is_dir() or stat.S_IFMT(mode) not in {0,stat.S_IFREG} or (mode&0o777)!=item["mode"]:
+            raise SystemExit("artifact archive mode invalid")
+        payload=archive.read(info)
+        total+=len(payload)
+        if len(payload)!=item["size"] or hashlib.sha256(payload).hexdigest()!=item["sha256"]:
+            raise SystemExit("artifact archive content mismatch")
+        target=root.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True,exist_ok=True)
+        descriptor=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,item["mode"])
+        try:
+            view=memoryview(payload)
+            while view:
+                written=os.write(descriptor,view)
+                view=view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.chmod(target,item["mode"],follow_symlinks=False)
+if total!=manifest["totalBytes"]:
+    raise SystemExit("artifact archive total mismatch")
+"""
+
+
 def _cloud_init(
-    runtime_probe: Mapping[str, object], source_commit: str
+    runtime_probe: Mapping[str, object],
+    source_commit: str,
+    source_manifest_digest: str,
+    runtime_manifest_digest: str,
 ) -> str:
     _require_full_source_commit(source_commit)
     python_abi = runtime_probe["pythonAbi"]
     if not isinstance(python_abi, str) or _PYTHON_ABI.fullmatch(python_abi) is None:
         raise PreflightError("runtime probe Python ABI is invalid")
+    extractor = _artifact_extractor_python()
     lines = [
         "#cloud-config",
         "users: []",
         "disable_root: true",
         "ssh_pwauth: false",
         "ssh_deletekeys: true",
-        "bootcmd:",
-        "  - [mkdir, -p, /mnt/overseer-source]",
-        "  - [mkdir, -p, /mnt/overseer-runtime-site]",
-        "mounts:",
-        "  - [overseer-source, /mnt/overseer-source, 9p, 'trans=virtio,version=9p2000.L,ro,nosuid,nodev,noexec', '0', '0']",
-        "  - [overseer-runtime-site, /mnt/overseer-runtime-site, 9p, 'trans=virtio,version=9p2000.L,ro,nosuid,nodev,noexec', '0', '0']",
         "write_files:",
-        "  - path: /etc/overseer-phase-b-rehearsal/source-commit",
+        "  - path: /usr/local/sbin/overseer-extract-artifacts.py",
         "    owner: root:root",
-        "    permissions: '0444'",
+        "    permissions: '0500'",
         "    content: |",
-        f"      {source_commit}",
     ]
+    lines.extend(f"      {line}" for line in extractor.splitlines())
+    lines.extend(
+        (
+            "  - path: /etc/overseer-phase-b-rehearsal/source-commit",
+            "    owner: root:root",
+            "    permissions: '0444'",
+            "    content: |",
+            f"      {source_commit}",
+        )
+    )
     for path in TASK_TWO_PLACEHOLDERS:
         lines.extend(
             (
@@ -634,20 +993,28 @@ def _cloud_init(
             "runcmd:",
             "  - |",
             "    /usr/bin/bash -ceu '",
-            "      groupadd --gid 984 overseer",
-            "      useradd --uid 984 --gid 984 --no-create-home --shell /usr/sbin/nologin overseer",
-            "      groupadd --gid 1000 god",
-            "      useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash god",
+            "      /usr/bin/install -d -m 0700 /mnt/overseer-seed",
+            "      /usr/bin/mount -o ro LABEL=cidata /mnt/overseer-seed",
+            "      /usr/bin/python3.13 -B -s -P /usr/local/sbin/overseer-extract-artifacts.py /mnt/overseer-seed/source.zip /mnt/overseer-seed/source-manifest.json /opt/overseer-source "
+            + source_manifest_digest,
+            "      /usr/bin/python3.13 -B -s -P /usr/local/sbin/overseer-extract-artifacts.py /mnt/overseer-seed/runtime.zip /mnt/overseer-seed/runtime-manifest.json /usr/local/lib/python3.13/dist-packages "
+            + runtime_manifest_digest,
+            "      /usr/bin/mount --bind /opt/overseer-source /opt/overseer-source",
+            "      /usr/bin/mount -o remount,bind,ro,nosuid,nodev /opt/overseer-source",
+            "      /usr/bin/mount --bind /usr/local/lib/python3.13/dist-packages /usr/local/lib/python3.13/dist-packages",
+            "      /usr/bin/mount -o remount,bind,ro,nosuid,nodev /usr/local/lib/python3.13/dist-packages",
+            "      /usr/sbin/groupadd --gid 984 overseer",
+            "      /usr/sbin/useradd --uid 984 --gid 984 --no-create-home --shell /usr/sbin/nologin overseer",
+            "      /usr/sbin/groupadd --gid 1000 god",
+            "      /usr/sbin/useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash god",
             "      test \"$(getent passwd 984 | cut -d: -f1,3,4)\" = overseer:984:984",
             "      test \"$(getent passwd 1000 | cut -d: -f1,3,4)\" = god:1000:1000",
-            "      install -d -m 0755 /usr/local/lib/python3.13/dist-packages",
-            "      cp -a /mnt/overseer-runtime-site/. /usr/local/lib/python3.13/dist-packages/",
-            f'      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH=/mnt/overseer-source/src /usr/bin/python3 -B -s -P -c "import sys,sysconfig; assert sys.version_info[:2] == (3,13); assert sysconfig.get_config_var(\\"SOABI\\") == \\"{python_abi}\\"; import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor"',
-            "      install -D -m 0755 /mnt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.py /opt/overseer-phase-b-rehearsal/guest_rehearsal.py",
-            "      install -D -m 0644 /mnt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.service /etc/systemd/system/overseer-phase-b-rehearsal.service",
+            f'      PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH=/opt/overseer-source/src /usr/bin/python3.13 -B -s -P -c "import sys,sysconfig; assert sys.version_info[:2] == (3,13); assert sysconfig.get_config_var(\\"SOABI\\") == \\"{python_abi}\\"; import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor"',
+            "      /usr/bin/install -D -m 0755 /opt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.py /opt/overseer-phase-b-rehearsal/guest_rehearsal.py",
+            "      /usr/bin/install -D -m 0644 /opt/overseer-source/tests/phase_b_rehearsal/guest_rehearsal.service /etc/systemd/system/overseer-phase-b-rehearsal.service",
             f"      for placeholder in {placeholders}; do test ! -s \"$placeholder\"; chown root:root \"$placeholder\"; chmod 0644 \"$placeholder\"; done",
-            "      systemctl daemon-reload",
-            "      systemctl start overseer-phase-b-rehearsal.service",
+            "      /usr/bin/systemctl daemon-reload",
+            "      /usr/bin/systemctl start overseer-phase-b-rehearsal.service",
             "    '",
         )
     )
@@ -658,52 +1025,216 @@ def _meta_data(vm_name: str) -> str:
     return f"instance-id: {vm_name}\nlocal-hostname: {vm_name}\n"
 
 
+def _domain_xml(*, vm_name: str, vm_uuid: str, run_id: str) -> str:
+    return f"""<domain type='kvm'>
+  <name>{escape(vm_name)}</name>
+  <uuid>{escape(vm_uuid)}</uuid>
+  <metadata><overseer:run xmlns:overseer='urn:overseer:phase-b-rehearsal' id='{run_id}'/></metadata>
+  <memory unit='MiB'>{MEMORY_MIB}</memory>
+  <currentMemory unit='MiB'>{MEMORY_MIB}</currentMemory>
+  <vcpu placement='static'>{VCPUS}</vcpu>
+  <os><type arch='x86_64'>hvm</type><boot dev='hd'/></os>
+  <features><acpi/></features>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='${{OVERLAY}}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='${{SEED_ISO}}'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+    <serial type='pipe'>
+      <source path='${{SERIAL_PIPE}}'/>
+      <target type='isa-serial' port='0'/>
+    </serial>
+    <console type='pty'><target type='serial' port='0'/></console>
+  </devices>
+</domain>
+"""
+
+
 def _result_validator_python() -> str:
     controls = repr(sorted(REQUIRED_CONTROLS))
-    return f"""import json
-import re
-import sys
-from pathlib import Path
+    return f"""import json,re,sys
 
-begin = "OVERSEER_PHASE_B_REHEARSAL_RESULT_BEGIN"
-end = "OVERSEER_PHASE_B_REHEARSAL_RESULT_END"
-lines = Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict").splitlines()
-begin_indexes = [index for index, line in enumerate(lines) if line == begin]
-end_indexes = [index for index, line in enumerate(lines) if line == end]
-if len(begin_indexes) != 1 or len(end_indexes) != 1:
+MAX_SERIAL_BYTES={MAX_SERIAL_BYTES}
+MAX_SERIAL_LINE_BYTES={MAX_SERIAL_LINE_BYTES}
+begin=b"OVERSEER_PHASE_B_REHEARSAL_RESULT_BEGIN"
+end=b"OVERSEER_PHASE_B_REHEARSAL_RESULT_END"
+total=0
+buffer=b""
+begin_count=0
+end_count=0
+state="before"
+payload=None
+with open(sys.argv[1],"rb",buffering=0) as stream:
+    while True:
+        chunk=stream.read(65536)
+        if not chunk: break
+        total+=len(chunk)
+        if total>MAX_SERIAL_BYTES: raise SystemExit("serial output exceeded the bounded limit")
+        buffer+=chunk
+        if len(buffer)>MAX_SERIAL_LINE_BYTES and b"\\n" not in buffer:
+            raise SystemExit("serial output line exceeded the bounded limit")
+        while b"\\n" in buffer:
+            raw,buffer=buffer.split(b"\\n",1)
+            if len(raw)>MAX_SERIAL_LINE_BYTES: raise SystemExit("serial output line exceeded the bounded limit")
+            raw.decode("utf-8","strict")
+            if raw==begin:
+                begin_count+=1
+                if state!="before": raise SystemExit("exactly one complete sentinel pair is required")
+                state="payload"
+            elif raw==end:
+                end_count+=1
+                if state!="end": raise SystemExit("sentinel pair must frame exactly one JSON line")
+                state="after"
+            elif state=="payload":
+                payload=raw.decode("utf-8","strict")
+                state="end"
+            elif state=="end":
+                raise SystemExit("sentinel pair must frame exactly one JSON line")
+if buffer:
+    if len(buffer)>MAX_SERIAL_LINE_BYTES: raise SystemExit("serial output line exceeded the bounded limit")
+    buffer.decode("utf-8","strict")
+    if buffer in {{begin,end}}: raise SystemExit("exactly one complete sentinel pair is required")
+if begin_count!=1 or end_count!=1 or state!="after" or payload is None:
     raise SystemExit("exactly one complete sentinel pair is required")
-if end_indexes[0] != begin_indexes[0] + 2:
-    raise SystemExit("sentinel pair must frame exactly one JSON line")
-payload = lines[begin_indexes[0] + 1]
-record = json.loads(payload)
-canonical = json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-if canonical != payload:
-    raise SystemExit("result is not canonical JSON")
-if set(record) != {{"schemaVersion", "status", "stage", "controls", "identifiers", "failure"}}:
-    raise SystemExit("result key set is invalid")
-if record.get("schemaVersion") != "{RESULT_SCHEMA}":
-    raise SystemExit("result schema is invalid")
-if record.get("status") != "passed" or record.get("stage") != "phase-complete":
-    raise SystemExit("rehearsal did not pass completely")
-required_controls = {controls}
-controls = record.get("controls")
-if not isinstance(controls, dict) or set(controls) != set(required_controls):
-    raise SystemExit("result controls are incomplete")
-if any(value is not True for value in controls.values()):
-    raise SystemExit("a required control did not pass")
-if record.get("failure") is not None:
-    raise SystemExit("passing result contains failure data")
-identifiers = record.get("identifiers")
-if not isinstance(identifiers, dict):
-    raise SystemExit("identifiers are invalid")
-secret_markers = re.compile(r"(?:secret|token|password|credential|verifier|private[_ -]?key|argv|environment|human[_ -]?input)", re.I)
-for key, value in identifiers.items():
-    if secret_markers.search(str(key)) or secret_markers.search(str(value)):
-        raise SystemExit("result contains a secret marker")
-for forbidden in ("phase-b-rehearsal-admin-secret", "phase-b-rehearsal-roadex-secret", "phase-b-rehearsal-api-token"):
-    if forbidden in payload:
-        raise SystemExit("result contains secret material")
+record=json.loads(payload)
+canonical=json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+if canonical!=payload: raise SystemExit("result is not canonical JSON")
+if set(record)!={{"schemaVersion","status","stage","controls","identifiers","failure"}}: raise SystemExit("result key set is invalid")
+if record.get("schemaVersion")!="{RESULT_SCHEMA}": raise SystemExit("result schema is invalid")
+if record.get("status")!="passed" or record.get("stage")!="phase-complete": raise SystemExit("rehearsal did not pass completely")
+required_controls={controls}
+actual=record.get("controls")
+if not isinstance(actual,dict) or set(actual)!=set(required_controls) or any(value is not True for value in actual.values()): raise SystemExit("result controls are incomplete")
+if record.get("failure") is not None: raise SystemExit("passing result contains failure data")
+identifiers=record.get("identifiers")
+if not isinstance(identifiers,dict): raise SystemExit("identifiers are invalid")
+secret_markers=re.compile(r"(?:secret|token|password|credential|verifier|private[_ -]?key|argv|environment|human[_ -]?input)",re.I)
+for key,value in identifiers.items():
+    if secret_markers.search(str(key)) or secret_markers.search(str(value)): raise SystemExit("result contains a secret marker")
+for forbidden in ("phase-b-rehearsal-admin-secret","phase-b-rehearsal-roadex-secret","phase-b-rehearsal-api-token"):
+    if forbidden in payload: raise SystemExit("result contains secret material")
 print(payload)
+"""
+
+
+def _archive_builder_python() -> str:
+    return r"""import hashlib,io,json,os,stat,sys,zipfile
+from pathlib import Path,PurePosixPath
+root=Path(sys.argv[1])
+manifest=json.loads(sys.argv[2])
+output=Path(sys.argv[3])
+entries=[]
+for item in manifest["files"]:
+    relative=PurePosixPath(item["path"])
+    if relative.is_absolute() or any(part in {"",".",".."} for part in relative.parts): raise SystemExit("artifact path invalid")
+    target=root.joinpath(*relative.parts)
+    fd=os.open(target,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+    try:
+        before=os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1: raise SystemExit("artifact object invalid")
+        chunks=[]
+        while True:
+            block=os.read(fd,1048576)
+            if not block: break
+            chunks.append(block)
+        after=os.fstat(fd)
+    finally:
+        os.close(fd)
+    if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns): raise SystemExit("artifact changed after manifest")
+    payload=b"".join(chunks)
+    mode=0o755 if before.st_mode&stat.S_IXUSR else 0o644
+    if mode!=item["mode"] or len(payload)!=item["size"] or hashlib.sha256(payload).hexdigest()!=item["sha256"]: raise SystemExit("artifact changed after manifest")
+    entries.append((item["path"],mode,payload))
+buffer=io.BytesIO()
+with zipfile.ZipFile(buffer,"w",compression=zipfile.ZIP_STORED,strict_timestamps=True) as archive:
+    for relative,mode,payload in entries:
+        info=zipfile.ZipInfo(relative,date_time=(1980,1,1,0,0,0))
+        info.compress_type=zipfile.ZIP_STORED
+        info.create_system=3
+        info.external_attr=(mode&0xFFFF)<<16
+        info.extra=b""
+        info.comment=b""
+        archive.writestr(info,payload)
+payload=buffer.getvalue()
+if hashlib.sha256(payload).hexdigest()!=manifest["archiveSha256"]: raise SystemExit("artifact changed after manifest")
+fd=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+try:
+    view=memoryview(payload)
+    while view:
+        written=os.write(fd,view)
+        view=view[written:]
+    os.fsync(fd)
+finally:
+    os.close(fd)
+"""
+
+
+def _serial_collector_python() -> str:
+    return r"""import os,select,sys
+pipe,log,status,stop,max_bytes,max_line=sys.argv[1:]
+max_bytes=int(max_bytes);max_line=int(max_line)
+fd=os.open(pipe,os.O_RDWR|os.O_NONBLOCK|os.O_CLOEXEC)
+out=os.open(log,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+total=0
+line=bytearray()
+terminal=None
+def publish(value):
+    global terminal
+    if terminal is None or (value=="overflow" and terminal!="overflow"):
+        temp=status+".tmp"
+        try: os.unlink(temp)
+        except FileNotFoundError: pass
+        with open(temp,"x",encoding="ascii") as stream:
+            stream.write(value+"\\n");stream.flush();os.fsync(stream.fileno())
+        os.replace(temp,status)
+        terminal=value
+try:
+    while True:
+        ready,_,_=select.select([fd],[],[],0.2)
+        if ready:
+            try: block=os.read(fd,65536)
+            except BlockingIOError: block=b""
+            if block:
+                remaining=max_bytes-total
+                if remaining>0:
+                    written=block[:remaining]
+                    os.write(out,written)
+                    total+=len(written)
+                if len(block)>remaining: publish("overflow")
+                for byte in block:
+                    if byte==10:
+                        if bytes(line)==b"OVERSEER_PHASE_B_REHEARSAL_RESULT_END": publish("complete")
+                        line.clear()
+                    elif len(line)<=max_line:
+                        line.append(byte)
+                    if len(line)>max_line: publish("overflow")
+        if os.path.exists(stop): break
+finally:
+    os.fsync(out);os.close(out);os.close(fd)
+"""
+
+
+def _ownership_validator_python() -> str:
+    return r"""import sys
+from xml.etree import ElementTree
+root=ElementTree.fromstring(sys.stdin.read())
+marker=root.find("./metadata/{urn:overseer:phase-b-rehearsal}run")
+disks=root.findall("./devices/disk")
+disk_sources={(item.get("device"),item.find("source").get("file")) for item in disks}
+serial=root.find("./devices/serial")
+serial_source=None if serial is None else serial.find("source")
+if root.findtext("name")!=sys.argv[1] or root.findtext("uuid")!=sys.argv[2] or marker is None or marker.get("id")!=sys.argv[3] or root.findall("./devices/interface") or disk_sources!={("disk",sys.argv[4]),("cdrom",sys.argv[5])} or serial is None or serial.get("type")!="pipe" or serial_source is None or serial_source.get("path")!=sys.argv[6]:
+    raise SystemExit(1)
 """
 
 
@@ -711,8 +1242,12 @@ def _future_script(
     *,
     source_commit: str,
     vm_name: str,
+    vm_uuid: str,
+    run_id: str,
     source_root: Path,
     runtime_site: Path,
+    source_manifest: Mapping[str, object],
+    runtime_manifest: Mapping[str, object],
     runtime_probe: Mapping[str, object],
     runtime_probe_digest: str,
     capability_probe: Mapping[str, object],
@@ -724,14 +1259,21 @@ def _future_script(
     meta_data: str,
 ) -> str:
     validator = _result_validator_python()
-    runtime_probe_json = canonical_json(runtime_probe)
-    capability_probe_json = canonical_json(capability_probe)
+    collector = _serial_collector_python()
+    archive_builder = _archive_builder_python()
+    ownership_validator = _ownership_validator_python()
     runtime_probe_code = _runtime_probe_python()
     capability_probe_code = _capability_probe_python()
-    return f"""#!/usr/bin/env bash
+    source_manifest_json = canonical_json(source_manifest)
+    runtime_manifest_json = canonical_json(runtime_manifest)
+    runtime_probe_json = canonical_json(runtime_probe)
+    capability_probe_json = canonical_json(capability_probe)
+    return f"""#!/usr/bin/bash
 set -Eeuo pipefail
 umask 077
+unset BASH_ENV CDPATH ENV GLOBIGNORE LD_AUDIT LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME PYTHONPATH
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LANG=C
 export LC_ALL=C
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
@@ -739,138 +1281,149 @@ export PYTHONNOUSERSITE=1
 readonly LIBVIRT_URI={shlex.quote(LIBVIRT_URI)}
 readonly SOURCE_COMMIT={shlex.quote(source_commit)}
 readonly VM_NAME={shlex.quote(vm_name)}
+readonly VM_UUID={shlex.quote(vm_uuid)}
+readonly RUN_ID={shlex.quote(run_id)}
 readonly SOURCE_ROOT={shlex.quote(str(source_root))}
 readonly RUNTIME_SITE={shlex.quote(str(runtime_site))}
 readonly BASE_IMAGE={shlex.quote(str(base_image))}
 readonly TEMP_PARENT={shlex.quote(str(temp_parent))}
 readonly EXPECTED_SHA512={shlex.quote(BASE_IMAGE_SHA512)}
+readonly EXPECTED_SOURCE_MANIFEST_JSON={shlex.quote(source_manifest_json)}
+readonly EXPECTED_RUNTIME_MANIFEST_JSON={shlex.quote(runtime_manifest_json)}
 readonly EXPECTED_RUNTIME_PROBE_JSON={shlex.quote(runtime_probe_json)}
 readonly EXPECTED_RUNTIME_PROBE_SHA256={shlex.quote(runtime_probe_digest)}
 readonly EXPECTED_CAPABILITY_PROBE_JSON={shlex.quote(capability_probe_json)}
 readonly EXPECTED_CAPABILITY_PROBE_SHA256={shlex.quote(capability_probe_digest)}
 readonly RESULT_TIMEOUT_SECONDS={RESULT_TIMEOUT_SECONDS}
-readonly SHUTDOWN_TIMEOUT_SECONDS=120
+readonly SHUTDOWN_TIMEOUT_SECONDS={SHUTDOWN_TIMEOUT_SECONDS}
+readonly MAX_SERIAL_BYTES={MAX_SERIAL_BYTES}
+readonly MAX_SERIAL_LINE_BYTES={MAX_SERIAL_LINE_BYTES}
+readonly RUN_LOCK="/run/user/$(/usr/bin/id -u)/overseer-phase-b-rehearsal.lock"
 
 TEMP_DIR=""
 OVERLAY=""
 SEED_ISO=""
+SERIAL_PIPE=""
 SERIAL_LOG=""
+SERIAL_STATUS=""
+SERIAL_STOP=""
+SERIAL_COLLECTOR=""
+COLLECTOR_PID=""
 DOMAIN_XML=""
 USER_DATA=""
 META_DATA=""
+SOURCE_ARCHIVE=""
+RUNTIME_ARCHIVE=""
+SOURCE_MANIFEST_FILE=""
+RUNTIME_MANIFEST_FILE=""
+LOCK_HELD=0
 
 domain_presence() {{
   local names count
-  if ! names="$(virsh --connect "$LIBVIRT_URI" list --all --name 2>/dev/null)"; then
-    return 2
-  fi
-  if ! count="$(printf '%s\n' "$names" | awk -v expected="$VM_NAME" '$0 == expected {{ count++ }} END {{ print count + 0 }}')"; then
-    return 2
-  fi
-  case "$count" in
-    0) return 1 ;;
-    1) return 0 ;;
-    *) return 2 ;;
-  esac
+  if ! names="$(/usr/bin/virsh --connect "$LIBVIRT_URI" list --all --name 2>/dev/null)"; then return 2; fi
+  if ! count="$(printf '%s\\n' "$names" | /usr/bin/awk -v expected="$VM_NAME" '$0 == expected {{ count++ }} END {{ print count + 0 }}')"; then return 2; fi
+  case "$count" in 0) return 1;; 1) return 0;; *) return 2;; esac
+}}
+
+verify_domain_ownership() {{
+  local presence actual_uuid xml
+  verify_lock || return 2
+  if domain_presence; then presence=0; else presence=$?; fi
+  case "$presence" in 1) return 1;; 2) return 2;; esac
+  if ! actual_uuid="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domuuid "$VM_NAME" 2>/dev/null)" || [[ "$actual_uuid" != "$VM_UUID" ]]; then return 2; fi
+  if ! xml="$(/usr/bin/virsh --connect "$LIBVIRT_URI" dumpxml "$VM_NAME" 2>/dev/null)"; then return 2; fi
+  if ! printf '%s' "$xml" | /usr/bin/python3.13 -B -s -P -c {shlex.quote(ownership_validator)} "$VM_NAME" "$VM_UUID" "$RUN_ID" "$OVERLAY" "$SEED_ISO" "$SERIAL_PIPE"; then return 2; fi
+  return 0
 }}
 
 domain_state() {{
-  local state
-  if ! state="$(virsh --connect "$LIBVIRT_URI" domstate "$VM_NAME" 2>/dev/null)"; then
-    return 2
-  fi
-  printf '%s\n' "$state"
+  verify_domain_ownership || return 2
+  /usr/bin/virsh --connect "$LIBVIRT_URI" domstate "$VM_NAME" 2>/dev/null
 }}
 
 wait_for_inactive() {{
-  local deadline=$((SECONDS + SHUTDOWN_TIMEOUT_SECONDS)) presence state
+  local deadline=$((SECONDS + SHUTDOWN_TIMEOUT_SECONDS)) state ownership
   while true; do
-    if domain_presence; then
-      presence=0
-    else
-      presence=$?
-    fi
-    case "$presence" in
-      1) return 0 ;;
-      2) return 1 ;;
-    esac
-    if ! state="$(domain_state)"; then
-      return 1
-    fi
+    if verify_domain_ownership; then ownership=0; else ownership=$?; fi
+    case "$ownership" in 1) return 0;; 2) return 1;; esac
+    if ! state="$(domain_state)"; then return 1; fi
     [[ "$state" == "shut off" ]] && return 0
     (( SECONDS < deadline )) || return 1
-    sleep 2
+    /usr/bin/sleep 2
   done
 }}
 
 shutdown_and_undefine() {{
-  local presence state
-  if domain_presence; then
-    presence=0
-  else
-    presence=$?
-  fi
-  case "$presence" in
-    1) return 0 ;;
-    2) return 1 ;;
-  esac
-  if ! state="$(domain_state)"; then
-    return 1
-  fi
+  local ownership state
+  if verify_domain_ownership; then ownership=0; else ownership=$?; fi
+  case "$ownership" in 1) return 0;; 2) return 1;; esac
+  if ! state="$(domain_state)"; then return 1; fi
   if [[ "$state" != "shut off" ]]; then
-    virsh --connect "$LIBVIRT_URI" shutdown "$VM_NAME" >/dev/null 2>&1 || return 1
+    /usr/bin/virsh --connect "$LIBVIRT_URI" shutdown "$VM_NAME" >/dev/null 2>&1 || return 1
     wait_for_inactive || return 1
   fi
-  if domain_presence; then
-    presence=0
-  else
-    presence=$?
-  fi
-  case "$presence" in
-    1) return 0 ;;
-    2) return 1 ;;
-  esac
-  if ! state="$(domain_state)" || [[ "$state" != "shut off" ]]; then
-    return 1
-  fi
-  virsh --connect "$LIBVIRT_URI" undefine "$VM_NAME" >/dev/null 2>&1 || return 1
-  if domain_presence; then
-    return 1
-  else
-    presence=$?
-  fi
-  [[ "$presence" -eq 1 ]]
+  verify_domain_ownership || return 1
+  if ! state="$(domain_state)" || [[ "$state" != "shut off" ]]; then return 1; fi
+  /usr/bin/virsh --connect "$LIBVIRT_URI" undefine "$VM_NAME" >/dev/null 2>&1 || return 1
+  if domain_presence; then return 1; else ownership=$?; fi
+  [[ "$ownership" -eq 1 ]]
 }}
 
 temp_layout_is_exact() {{
   [[ -n "$TEMP_DIR" ]] &&
   [[ "$OVERLAY" == "$TEMP_DIR/overlay.qcow2" ]] &&
   [[ "$SEED_ISO" == "$TEMP_DIR/seed.iso" ]] &&
+  [[ "$SERIAL_PIPE" == "$TEMP_DIR/serial" ]] &&
   [[ "$SERIAL_LOG" == "$TEMP_DIR/serial.log" ]] &&
+  [[ "$SERIAL_STATUS" == "$TEMP_DIR/serial.status" ]] &&
+  [[ "$SERIAL_STOP" == "$TEMP_DIR/serial.stop" ]] &&
+  [[ "$SERIAL_COLLECTOR" == "$TEMP_DIR/serial-collector.py" ]] &&
   [[ "$DOMAIN_XML" == "$TEMP_DIR/domain.xml" ]] &&
   [[ "$USER_DATA" == "$TEMP_DIR/user-data" ]] &&
-  [[ "$META_DATA" == "$TEMP_DIR/meta-data" ]]
+  [[ "$META_DATA" == "$TEMP_DIR/meta-data" ]] &&
+  [[ "$SOURCE_ARCHIVE" == "$TEMP_DIR/source.zip" ]] &&
+  [[ "$RUNTIME_ARCHIVE" == "$TEMP_DIR/runtime.zip" ]] &&
+  [[ "$SOURCE_MANIFEST_FILE" == "$TEMP_DIR/source-manifest.json" ]] &&
+  [[ "$RUNTIME_MANIFEST_FILE" == "$TEMP_DIR/runtime-manifest.json" ]]
+}}
+
+stop_collector() {{
+  if [[ -n "$COLLECTOR_PID" ]]; then
+    : >"$SERIAL_STOP"
+    wait "$COLLECTOR_PID" 2>/dev/null || true
+    COLLECTOR_PID=""
+  fi
+}}
+
+verify_lock() {{
+  (( LOCK_HELD == 1 )) &&
+  [[ -f "$RUN_LOCK/run-id" ]] &&
+  [[ "$(<"$RUN_LOCK/run-id")" == "$RUN_ID" ]]
+}}
+
+release_lock() {{
+  if (( LOCK_HELD == 1 )); then
+    verify_lock || return 1
+    /usr/bin/rm -f -- "$RUN_LOCK/run-id"
+    /usr/bin/rmdir -- "$RUN_LOCK" || return 1
+    LOCK_HELD=0
+  fi
 }}
 
 cleanup() {{
-  local original_status="${{1:-1}}"
-  local cleanup_status=0 confirmed_absent=0
+  local original_status="${{1:-1}}" cleanup_status=0 confirmed_absent=0
   trap - EXIT INT TERM
   set +e
-  if shutdown_and_undefine; then
-    confirmed_absent=1
-  else
-    cleanup_status=1
-  fi
+  stop_collector
+  if shutdown_and_undefine; then confirmed_absent=1; else cleanup_status=1; fi
   if (( confirmed_absent == 1 )) && temp_layout_is_exact; then
-    rm -f -- "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$SERIAL_LOG"
-    rmdir -- "$TEMP_DIR" || cleanup_status=1
+    /usr/bin/rm -f -- "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$SERIAL_LOG" "$SERIAL_STATUS" "$SERIAL_STOP" "$SERIAL_COLLECTOR" "$SERIAL_PIPE.in" "$SERIAL_PIPE.out" "$SOURCE_ARCHIVE" "$RUNTIME_ARCHIVE" "$SOURCE_MANIFEST_FILE" "$RUNTIME_MANIFEST_FILE"
+    /usr/bin/rmdir -- "$TEMP_DIR" || cleanup_status=1
   elif [[ -n "$TEMP_DIR" ]]; then
-    printf '%s\n' 'cleanup retained exact temporary artifacts because the domain was not confirmed inactive' >&2
+    printf '%s\\n' 'cleanup retained exact temporary artifacts because domain ownership/state was not confirmed' >&2
   fi
-  if (( original_status == 0 && cleanup_status != 0 )); then
-    original_status=1
-  fi
+  if (( confirmed_absent == 1 )); then release_lock || cleanup_status=1; fi
+  if (( original_status == 0 && cleanup_status != 0 )); then original_status=1; fi
   exit "$original_status"
 }}
 
@@ -878,74 +1431,98 @@ trap 'cleanup $?' EXIT
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
 
-[[ "$LIBVIRT_URI" == "qemu:///session" ]]
-[[ "$VM_NAME" == {shlex.quote(vm_name)} ]]
-[[ "$SOURCE_ROOT" == {shlex.quote(str(source_root))} ]]
-[[ "$RUNTIME_SITE" == {shlex.quote(str(runtime_site))} ]]
-[[ "$BASE_IMAGE" == {shlex.quote(str(base_image))} ]]
-[[ "$TEMP_PARENT" == {shlex.quote(str(temp_parent))} ]]
+if ! /usr/bin/mkdir "$RUN_LOCK" 2>/dev/null; then
+  printf '%s\\n' 'another Phase B rehearsal owns the execution lock' >&2
+  exit 1
+fi
+LOCK_HELD=1
+printf '%s' "$RUN_ID" >"$RUN_LOCK/run-id"
+
 if domain_presence; then
-  printf '%s\n' 'target VM already exists at future execution boundary' >&2
+  printf '%s\\n' 'target VM already exists at future execution boundary' >&2
   exit 1
 else
   presence=$?
-  if [[ "$presence" -ne 1 ]]; then
-    printf '%s\n' 'libvirt domain inventory is unavailable at future execution boundary' >&2
-    exit 1
-  fi
+  [[ "$presence" -eq 1 ]] || {{ printf '%s\\n' 'libvirt domain inventory is unavailable at future execution boundary' >&2; exit 1; }}
 fi
-[[ "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
-[[ -z "$(git -C "$SOURCE_ROOT" status --porcelain --untracked-files=all)" ]]
-ACTUAL_RUNTIME_PROBE_JSON="$(python3 -B -s -P -S -c {shlex.quote(runtime_probe_code)} "$SOURCE_ROOT" "$RUNTIME_SITE")"
+[[ "$(/usr/bin/git -C "$SOURCE_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+[[ -z "$(/usr/bin/git -C "$SOURCE_ROOT" status --porcelain --untracked-files=all)" ]]
+ACTUAL_RUNTIME_PROBE_JSON="$(/usr/bin/python3.13 -B -s -P -S -c {shlex.quote(runtime_probe_code)} "$SOURCE_ROOT" "$RUNTIME_SITE" "$EXPECTED_SOURCE_MANIFEST_JSON" "$EXPECTED_RUNTIME_MANIFEST_JSON")"
 [[ "$ACTUAL_RUNTIME_PROBE_JSON" == "$EXPECTED_RUNTIME_PROBE_JSON" ]]
-[[ "$(printf '%s' "$ACTUAL_RUNTIME_PROBE_JSON" | sha256sum | awk '{{print $1}}')" == "$EXPECTED_RUNTIME_PROBE_SHA256" ]]
-ACTUAL_CAPABILITY_PROBE_JSON="$(virsh --connect "$LIBVIRT_URI" domcapabilities --virttype kvm --arch x86_64 | python3 -B -s -P -S -c {shlex.quote(capability_probe_code)})"
+[[ "$(printf '%s' "$ACTUAL_RUNTIME_PROBE_JSON" | /usr/bin/sha256sum | /usr/bin/awk '{{print $1}}')" == "$EXPECTED_RUNTIME_PROBE_SHA256" ]]
+ACTUAL_CAPABILITY_PROBE_JSON="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domcapabilities --virttype kvm --arch x86_64 | /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(capability_probe_code)})"
 [[ "$ACTUAL_CAPABILITY_PROBE_JSON" == "$EXPECTED_CAPABILITY_PROBE_JSON" ]]
-[[ "$(printf '%s' "$ACTUAL_CAPABILITY_PROBE_JSON" | sha256sum | awk '{{print $1}}')" == "$EXPECTED_CAPABILITY_PROBE_SHA256" ]]
+[[ "$(printf '%s' "$ACTUAL_CAPABILITY_PROBE_JSON" | /usr/bin/sha256sum | /usr/bin/awk '{{print $1}}')" == "$EXPECTED_CAPABILITY_PROBE_SHA256" ]]
 
-TEMP_DIR="$(mktemp -d -p "$TEMP_PARENT" overseer-phase-b-rehearsal.XXXXXX)"
+TEMP_DIR="$(/usr/bin/mktemp -d -p "$TEMP_PARENT" overseer-phase-b-rehearsal.XXXXXX)"
 OVERLAY="$TEMP_DIR/overlay.qcow2"
 SEED_ISO="$TEMP_DIR/seed.iso"
+SERIAL_PIPE="$TEMP_DIR/serial"
 SERIAL_LOG="$TEMP_DIR/serial.log"
+SERIAL_STATUS="$TEMP_DIR/serial.status"
+SERIAL_STOP="$TEMP_DIR/serial.stop"
+SERIAL_COLLECTOR="$TEMP_DIR/serial-collector.py"
 DOMAIN_XML="$TEMP_DIR/domain.xml"
 USER_DATA="$TEMP_DIR/user-data"
 META_DATA="$TEMP_DIR/meta-data"
+SOURCE_ARCHIVE="$TEMP_DIR/source.zip"
+RUNTIME_ARCHIVE="$TEMP_DIR/runtime.zip"
+SOURCE_MANIFEST_FILE="$TEMP_DIR/source-manifest.json"
+RUNTIME_MANIFEST_FILE="$TEMP_DIR/runtime-manifest.json"
 temp_layout_is_exact
-install -m 0600 /dev/null "$SERIAL_LOG"
-install -m 0600 /dev/null "$USER_DATA"
-install -m 0600 /dev/null "$META_DATA"
-install -m 0600 /dev/null "$DOMAIN_XML"
 
-printf '%s  %s\n' "$EXPECTED_SHA512" "$BASE_IMAGE" | sha512sum --check -
-qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMAGE" "$OVERLAY" {OVERLAY_GIB}G
+/usr/bin/install -m 0600 /dev/null "$USER_DATA"
+/usr/bin/install -m 0600 /dev/null "$META_DATA"
+/usr/bin/install -m 0600 /dev/null "$DOMAIN_XML"
+/usr/bin/install -m 0600 /dev/null "$SOURCE_MANIFEST_FILE"
+/usr/bin/install -m 0600 /dev/null "$RUNTIME_MANIFEST_FILE"
+/usr/bin/install -m 0600 /dev/null "$SERIAL_COLLECTOR"
+printf '%s' "$EXPECTED_SOURCE_MANIFEST_JSON" >"$SOURCE_MANIFEST_FILE"
+printf '%s' "$EXPECTED_RUNTIME_MANIFEST_JSON" >"$RUNTIME_MANIFEST_FILE"
+/usr/bin/python3.13 -B -s -P -c {shlex.quote(archive_builder)} "$SOURCE_ROOT" "$EXPECTED_SOURCE_MANIFEST_JSON" "$SOURCE_ARCHIVE"
+/usr/bin/python3.13 -B -s -P -c {shlex.quote(archive_builder)} "$RUNTIME_SITE" "$EXPECTED_RUNTIME_MANIFEST_JSON" "$RUNTIME_ARCHIVE"
+/usr/bin/cat >"$SERIAL_COLLECTOR" <<'PY_SERIAL_COLLECTOR'
+{collector}PY_SERIAL_COLLECTOR
 
-cat >"$USER_DATA" <<'CLOUD_INIT'
+printf '%s  %s\\n' "$EXPECTED_SHA512" "$BASE_IMAGE" | /usr/bin/sha512sum --check -
+/usr/bin/qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMAGE" "$OVERLAY" {OVERLAY_GIB}G
+/usr/bin/cat >"$USER_DATA" <<'CLOUD_INIT'
 {cloud_init}CLOUD_INIT
-cat >"$META_DATA" <<'META_DATA'
+/usr/bin/cat >"$META_DATA" <<'META_DATA'
 {meta_data}META_DATA
-cloud-localds --disk-format=iso9660 "$SEED_ISO" "$USER_DATA" "$META_DATA"
+/usr/bin/genisoimage -quiet -output "$SEED_ISO" -volid cidata -joliet -rock -graft-points "user-data=$USER_DATA" "meta-data=$META_DATA" "source.zip=$SOURCE_ARCHIVE" "runtime.zip=$RUNTIME_ARCHIVE" "source-manifest.json=$SOURCE_MANIFEST_FILE" "runtime-manifest.json=$RUNTIME_MANIFEST_FILE"
 
-cat >"$DOMAIN_XML" <<DOMAIN_XML
+/usr/bin/mkfifo -m 0600 "$SERIAL_PIPE.in" "$SERIAL_PIPE.out"
+/usr/bin/python3.13 -B -s -P "$SERIAL_COLLECTOR" "$SERIAL_PIPE.out" "$SERIAL_LOG" "$SERIAL_STATUS" "$SERIAL_STOP" "$MAX_SERIAL_BYTES" "$MAX_SERIAL_LINE_BYTES" &
+COLLECTOR_PID=$!
+
+/usr/bin/cat >"$DOMAIN_XML" <<DOMAIN_XML
 {domain_xml}DOMAIN_XML
-virsh --connect "$LIBVIRT_URI" define --validate "$DOMAIN_XML"
-virsh --connect "$LIBVIRT_URI" autostart --disable "$VM_NAME"
-virsh --connect "$LIBVIRT_URI" dominfo "$VM_NAME" | awk -F: '/^Autostart/ {{gsub(/[[:space:]]/, "", $2); print $2}}' | grep -qx disable
-virsh --connect "$LIBVIRT_URI" start "$VM_NAME"
+verify_lock
+/usr/bin/virsh --connect "$LIBVIRT_URI" define --validate "$DOMAIN_XML"
+verify_domain_ownership
+/usr/bin/virsh --connect "$LIBVIRT_URI" autostart --disable "$VM_NAME"
+/usr/bin/virsh --connect "$LIBVIRT_URI" dominfo "$VM_NAME" | /usr/bin/awk -F: '/^Autostart/ {{gsub(/[[:space:]]/, "", $2); print $2}}' | /usr/bin/grep -qx disable
+verify_domain_ownership
+/usr/bin/virsh --connect "$LIBVIRT_URI" start "$VM_NAME"
 
-if ! timeout --foreground "${{RESULT_TIMEOUT_SECONDS}}s" bash -c '
-  serial_log="$1"
-  while ! grep -Fq "OVERSEER_PHASE_B_REHEARSAL_RESULT_END" "$serial_log"; do
-    sleep 2
-  done
-' bash "$SERIAL_LOG"; then
-  printf '%s\n' 'bounded rehearsal result wait expired' >&2
+if ! /usr/bin/timeout --foreground "${{RESULT_TIMEOUT_SECONDS}}s" /usr/bin/bash -c '
+  status="$1"
+  while [[ ! -s "$status" ]]; do /usr/bin/sleep 1; done
+' /usr/bin/bash "$SERIAL_STATUS"; then
+  printf '%s\\n' 'bounded rehearsal result wait expired' >&2
   exit 1
 fi
-
-python3 -B -s -P - "$SERIAL_LOG" <<'PY_RESULT_VALIDATOR'
-{validator}PY_RESULT_VALIDATOR
-
+SERIAL_RESULT="$(<"$SERIAL_STATUS")"
+if [[ "$SERIAL_RESULT" == "overflow" ]]; then
+  printf '%s\\n' 'serial output exceeded the bounded limit' >&2
+  exit 1
+fi
+[[ "$SERIAL_RESULT" == "complete" ]]
 shutdown_and_undefine
+stop_collector
+/usr/bin/python3.13 -B -s -P - "$SERIAL_LOG" <<'PY_RESULT_VALIDATOR'
+{validator}PY_RESULT_VALIDATOR
 """
 
 
@@ -954,6 +1531,8 @@ def render_plan(
     source_commit: str,
     source_root: Path,
     runtime_site: Path,
+    source_manifest: Mapping[str, object],
+    runtime_manifest: Mapping[str, object],
     runtime_probe: Mapping[str, object],
     capability_probe: Mapping[str, object],
     base_image: Path = DEFAULT_BASE_IMAGE,
@@ -969,30 +1548,48 @@ def render_plan(
         (temp_parent, "temporary"),
     ):
         _validate_host_path(path, label)
+    validated_source_manifest = _validate_artifact_manifest(source_manifest, kind="source")
+    validated_runtime_manifest = _validate_artifact_manifest(runtime_manifest, kind="runtime")
+    source_manifest_digest = _manifest_digest(validated_source_manifest)
+    runtime_manifest_digest = _manifest_digest(validated_runtime_manifest)
     validated_probe = _validate_runtime_probe(
-        runtime_probe, source_root=source_root, runtime_site=runtime_site
+        runtime_probe,
+        source_root=source_root,
+        runtime_site=runtime_site,
+        source_manifest_digest=source_manifest_digest,
+        runtime_manifest_digest=runtime_manifest_digest,
     )
-    probe_digest = hashlib.sha256(canonical_json(validated_probe).encode()).hexdigest()
-    validated_capability_probe = _validate_capability_probe(capability_probe)
-    capability_probe_digest = hashlib.sha256(
-        canonical_json(validated_capability_probe).encode()
-    ).hexdigest()
-    vm_name = f"overseer-phase-b-rehearsal-{source_commit[:7]}"
-    cloud_init = _cloud_init(validated_probe, source_commit)
+    probe_digest = _manifest_digest(validated_probe)
+    validated_capability = _validate_capability_probe(capability_probe)
+    capability_digest = _manifest_digest(validated_capability)
+    run_id, vm_uuid, vm_name = _run_identity(
+        source_commit, source_manifest_digest, runtime_manifest_digest
+    )
+    cloud_init = _cloud_init(
+        validated_probe,
+        source_commit,
+        source_manifest_digest,
+        runtime_manifest_digest,
+    )
     meta_data = _meta_data(vm_name)
-    domain_xml = _domain_xml(
-        vm_name=vm_name, source_root=source_root, runtime_site=runtime_site
+    domain_xml = _domain_xml(vm_name=vm_name, vm_uuid=vm_uuid, run_id=run_id)
+    inputs = _plan_inputs(
+        source_manifest=validated_source_manifest,
+        runtime_manifest=validated_runtime_manifest,
     )
-    inputs = _plan_inputs(source_root=source_root, runtime_site=runtime_site)
     script = _future_script(
         source_commit=source_commit,
         vm_name=vm_name,
+        vm_uuid=vm_uuid,
+        run_id=run_id,
         source_root=source_root,
         runtime_site=runtime_site,
+        source_manifest=validated_source_manifest,
+        runtime_manifest=validated_runtime_manifest,
         runtime_probe=validated_probe,
         runtime_probe_digest=probe_digest,
-        capability_probe=validated_capability_probe,
-        capability_probe_digest=capability_probe_digest,
+        capability_probe=validated_capability,
+        capability_probe_digest=capability_digest,
         base_image=base_image,
         temp_parent=temp_parent,
         domain_xml=domain_xml,
@@ -1011,38 +1608,53 @@ def render_plan(
         "libvirtUri": LIBVIRT_URI,
         "vm": {
             "name": vm_name,
+            "uuid": vm_uuid,
+            "runId": run_id,
             "memoryMiB": MEMORY_MIB,
             "vcpus": VCPUS,
             "overlayGiB": OVERLAY_GIB,
             "network": "none",
             "autostart": False,
-            "lifecycle": "temporary-persistent-explicit-undefine",
+            "lifecycle": "temporary-persistent-owned-explicit-undefine",
         },
-        "sourceMount": inputs["sourceMount"],
-        "runtimeSite": inputs["runtimeMount"],
-        "networkDevices": inputs["networkDevices"],
+        "sourceArtifact": inputs["sourceArtifact"],
+        "runtimeArtifact": inputs["runtimeArtifact"],
+        "hostFilesystemShares": [],
+        "networkDevices": [],
         "tempParent": str(temp_parent),
         "serialLog": {
             "directory": "<fresh-mktemp-dir>",
             "path": "$TEMP_DIR/serial.log",
             "mode": "0600",
-            "writer": "libvirt-append-only",
+            "transport": "bounded-pipe-collector",
+            "maxBytes": MAX_SERIAL_BYTES,
+            "maxLineBytes": MAX_SERIAL_LINE_BYTES,
         },
         "runtimeProbe": validated_probe,
         "runtimeProbeDigest": probe_digest,
-        "capabilityProbe": validated_capability_probe,
-        "capabilityProbeDigest": capability_probe_digest,
+        "capabilityProbe": validated_capability,
+        "capabilityProbeDigest": capability_digest,
         "taskTwoPlaceholders": list(TASK_TWO_PLACEHOLDERS),
         "cloudInit": cloud_init,
         "metaData": meta_data,
         "domainXml": domain_xml,
         "futureScript": script,
         "futureScriptSha256": hashlib.sha256(script.encode()).hexdigest(),
+        "executionEnvironment": dict(MINIMAL_ENV),
+        "executionCommand": [
+            EXACT_TOOLS["env"],
+            "-i",
+            *(f"{key}={value}" for key, value in sorted(MINIMAL_ENV.items())),
+            EXACT_TOOLS["bash"],
+            "<approved-future-script>",
+        ],
         "approvalBoundary": "planDigest",
         "exclusions": ["package import", "host service action", "Phase B", "cutover"],
     }
-    digest = hashlib.sha256(canonical_json(plan).encode()).hexdigest()
-    return {"plan": plan, "planDigest": digest}
+    return {
+        "plan": plan,
+        "planDigest": hashlib.sha256(canonical_json(plan).encode()).hexdigest(),
+    }
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1057,9 +1669,21 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("--base-image", type=Path, default=DEFAULT_BASE_IMAGE)
         sub.add_argument("--temp-parent", type=Path, default=DEFAULT_TEMP_PARENT)
     preflight_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    render_parser.add_argument("--source-manifest-json", required=True)
+    render_parser.add_argument("--runtime-manifest-json", required=True)
     render_parser.add_argument("--runtime-probe-json", required=True)
     render_parser.add_argument("--capability-probe-json", required=True)
     return parser
+
+
+def _json_object(value: str, label: str) -> dict[str, object]:
+    try:
+        record = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise PreflightError(f"{label} JSON is invalid") from error
+    if not isinstance(record, dict):
+        raise PreflightError(f"{label} JSON is invalid")
+    return record
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1075,24 +1699,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 temp_parent=args.temp_parent,
             )
         else:
-            try:
-                runtime_probe = json.loads(args.runtime_probe_json)
-            except json.JSONDecodeError as error:
-                raise PreflightError("runtime probe JSON is invalid") from error
-            if not isinstance(runtime_probe, dict):
-                raise PreflightError("runtime probe JSON is invalid")
-            try:
-                capability_probe = json.loads(args.capability_probe_json)
-            except json.JSONDecodeError as error:
-                raise PreflightError("capability probe JSON is invalid") from error
-            if not isinstance(capability_probe, dict):
-                raise PreflightError("capability probe JSON is invalid")
             result = render_plan(
                 source_commit=args.source_commit,
                 source_root=args.source_root,
                 runtime_site=args.runtime_site,
-                runtime_probe=runtime_probe,
-                capability_probe=capability_probe,
+                source_manifest=_json_object(args.source_manifest_json, "source manifest"),
+                runtime_manifest=_json_object(args.runtime_manifest_json, "runtime manifest"),
+                runtime_probe=_json_object(args.runtime_probe_json, "runtime probe"),
+                capability_probe=_json_object(args.capability_probe_json, "capability probe"),
                 base_image=args.base_image,
                 temp_parent=args.temp_parent,
             )

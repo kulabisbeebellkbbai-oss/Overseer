@@ -2,7 +2,7 @@
 
 `guest_rehearsal.py` is the guest-side half of the disposable Phase B
 rehearsal. Importing it is inert. Its `main()` entry point first requires a
-root process, systemd as PID 1, a read-only `/mnt/overseer-source` mount, no
+root process, systemd as PID 1, a read-only `/opt/overseer-source` mount, no
 up non-loopback interface, and the `overseer` (984) and `god` (1000)
 identities. Any failed preflight stops before guest-local provisioning.
 
@@ -12,13 +12,15 @@ admin-ticket private key through systemd `LoadCredential=`. The rendered
 units use Overseer's production Unix paths under `/run/overseer` and
 `/run/overseer-canary`. The copied canary namespace is handed to UID/GID 984
 before startup; the root executor state remains under
-`/var/lib/overseer-executor`. The source checkout is consumed from
-`/mnt/overseer-source`; it is never written. The guest does not follow the
-checkout's `.git` metadata because a linked-worktree pointer can reference an
-absolute host-only gitdir. Instead, cloud-init supplies the already validated,
+`/var/lib/overseer-executor`. The guest consumes a tracked-only source archive
+from the read-only NoCloud ISO. Cloud-init verifies its manifest, archive
+digest, exact entries, modes, sizes, and per-file hashes before extracting it
+to `/opt/overseer-source` and bind-remounting that tree read-only. Ignored
+files, bytecode caches, secrets, `.git`, and linked-worktree pointers are not
+included. Cloud-init separately supplies the already validated,
 plan-digest-bound 40-character source commit in a root-owned, single-link,
-mode-`0444` artifact. The outer unit makes that one file read-only, and the
-guest receives a private mode-`0400` systemd `LoadCredential=` copy. It
+mode-`0444` artifact. The outer unit makes both inputs read-only, and the guest
+receives a private mode-`0400` systemd `LoadCredential=` copy. It
 verifies the copy's inode, ownership, mode, link count, size, and identity
 before provisioning.
 
@@ -88,8 +90,9 @@ whole systemd unit directory. The harness rejects non-empty, linked,
 non-regular, incorrectly owned, or incorrectly mode-set placeholders before
 filling them.
 
-The later disposable VM orchestrator may install those placeholders, copy
-this script and outer unit into the guest, expose the checkout as a read-only
-9p mount tagged `overseer-source`, run the outer one-shot unit, collect the
-serial sentinels, and let the guest power off. Those operations are
-intentionally not performed by this task or by the source-level tests.
+The later disposable VM orchestrator may install those placeholders, include
+the deterministic source and bounded runtime archives on the NoCloud ISO, run
+the outer one-shot unit, collect the serial sentinels through a bounded pipe,
+and let the guest power off. It does not expose a live host checkout or runtime
+filesystem. Those operations are intentionally not performed by this task or
+by the source-level tests.

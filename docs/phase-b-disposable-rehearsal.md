@@ -124,7 +124,8 @@ this libvirt/QEMU version. It permits only bounded generated alias and address
 metadata below those devices. While the domain is active, it also permits only
 the exact detected qcow2 backing chain from the overlay to the pinned leaf base
 image and a generated `/dev/pts/<number>` console source whose path exactly
-matches the console's duplicated `tty` attribute. Filesystem shares,
+matches the console's duplicated `tty` attribute. Both active attestations are
+mandatory whenever libvirt supplies a runtime domain ID. Filesystem shares,
 interfaces, host devices,
 channels, QEMU command-line extensions, custom kernels, security-label changes,
 host CPU passthrough, disk authentication, duplicate disks, changed disk

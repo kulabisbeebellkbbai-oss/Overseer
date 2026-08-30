@@ -1314,6 +1314,7 @@ from xml.etree import ElementTree
 root=ElementTree.fromstring(sys.stdin.read())
 root_allowed={"name","uuid","metadata","memory","currentMemory","vcpu","os","features","cpu","clock","on_poweroff","on_reboot","on_crash","devices"}
 root_attrs_ok=set(root.attrib)<={"type","id"} and root.get("type")=="kvm" and ("id" not in root.attrib or root.get("id").isdigit())
+active="id" in root.attrib
 root_counts_ok=all(len(root.findall(tag))==1 for tag in ("name","uuid","metadata","memory","currentMemory","vcpu","os","features","on_poweroff","on_reboot","on_crash","devices")) and len(root.findall("cpu"))<=1 and len(root.findall("clock"))<=1
 if not root_attrs_ok or not root_counts_ok or any(item.tag not in root_allowed for item in list(root)): raise SystemExit(1)
 def leaf_ok(node,attrs,text):
@@ -1365,7 +1366,7 @@ def backing_store_ok(item):
 def disk_ok(item,device,path,driver_type,target,bus,readonly):
     driver=item.find("driver");source=item.find("source");target_node=item.find("target");backing=item.find("backingStore")
     readonly_node=item.find("readonly")
-    backing_allowed=device=="disk" and backing_store_ok(backing) or backing is None
+    backing_allowed=(device=="disk" and backing_store_ok(backing) and (not active or backing is not None)) or (device!="disk" and backing is None)
     return item.attrib=={"type":"file","device":device} and children_exact(item,("driver","source","target"),("readonly","backingStore")) and leaf_ok(driver,{"name":"qemu","type":driver_type},None) and leaf_ok(source,{"file":path},None) and leaf_ok(target_node,{"dev":target,"bus":bus},None) and (readonly_node is not None)==readonly and (readonly_node is None or leaf_ok(readonly_node,{},None)) and backing_allowed
 disk_valid=len(disks)==2 and any(disk_ok(item,"disk",sys.argv[4],"qcow2","vda","virtio",False) for item in disks) and any(disk_ok(item,"cdrom",sys.argv[5],"raw","sda","sata",True) for item in disks)
 serials=root.findall("./devices/serial")
@@ -1379,7 +1380,7 @@ console_source=None if console is None else console.find("source")
 serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and children_exact(serial,("source","target")) and leaf_ok(serial_source,{"path":sys.argv[6]},None) and leaf_ok(serial_target,{"type":"isa-serial","port":"0"},None)
 tty=None if console is None else console.get("tty"); tty_valid=tty is not None and re.fullmatch(r"/dev/pts/[0-9]+",tty) is not None
 console_attrs_valid=console is not None and (console.attrib=={"type":"pty"} or tty_valid and console.attrib=={"type":"pty","tty":tty})
-console_source_valid=console_source is None and tty is None or tty_valid and leaf_ok(console_source,{"path":tty},None)
+console_source_valid=(not active and console_source is None and tty is None) or tty_valid and leaf_ok(console_source,{"path":tty},None)
 console_valid=console_attrs_valid and children_exact(console,("target",),("source",)) and leaf_ok(console_target,{"type":"serial","port":"0"},None) and console_source_valid
 emulators=root.findall("./devices/emulator")
 emulator_valid=not emulators or len(emulators)==1 and leaf_ok(emulators[0],{},"/usr/bin/qemu-system-x86_64")

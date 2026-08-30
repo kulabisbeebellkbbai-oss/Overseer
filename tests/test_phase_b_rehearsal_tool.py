@@ -712,6 +712,8 @@ def test_domain_xml_parses_and_has_seed_only_no_host_share_with_owned_pipe_seria
         "metadata-extra",
         "wrong-backing",
         "wrong-console-tty",
+        "active-missing-backing",
+        "active-missing-pty",
     ),
 )
 def test_domain_ownership_validator_rejects_unapproved_devices(
@@ -766,10 +768,23 @@ def test_domain_ownership_validator_rejects_unapproved_devices(
         ET.SubElement(backing, "format", {"type": "qcow2"})
         ET.SubElement(backing, "source", {"file": "/tmp/unapproved-base.qcow2"})
         ET.SubElement(backing, "backingStore")
-    else:
+    elif mutation == "wrong-console-tty":
         console = devices.find("console")
         console.set("tty", "/dev/pts/7")
         ET.SubElement(console, "source", {"path": "/dev/pts/8"})
+    elif mutation == "active-missing-backing":
+        root.set("id", "7")
+        console = devices.find("console")
+        console.set("tty", "/dev/pts/7")
+        ET.SubElement(console, "source", {"path": "/dev/pts/7"})
+    else:
+        root.set("id", "7")
+        backing = ET.SubElement(
+            devices.findall("disk")[0], "backingStore", {"type": "file", "index": "1"}
+        )
+        ET.SubElement(backing, "format", {"type": "qcow2"})
+        ET.SubElement(backing, "source", {"file": str(BASE_IMAGE)})
+        ET.SubElement(backing, "backingStore")
     completed = subprocess.run(
         (
             sys.executable,
@@ -840,6 +855,7 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
     )
     devices = root.find("./devices")
     assert devices is not None
+    root.set("id", "7")
     ET.SubElement(devices, "emulator").text = "/usr/bin/qemu-system-x86_64"
     ET.SubElement(devices, "controller", {"type": "pci", "index": "0", "model": "pci-root"})
     ET.SubElement(devices, "controller", {"type": "usb", "index": "0", "model": "piix3-uhci"})

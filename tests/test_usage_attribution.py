@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import queue
 import sqlite3
 import base64
 from pathlib import Path
@@ -500,12 +501,18 @@ def test_corrupt_persisted_receipt_fails_closed_on_restart(tmp_path: Path):
         _ledger(path)
 
 
-def _cross_process_emit(path: str, ready, result_queue) -> None:
+def _cross_process_emit(path: str, ready, result_queue, sender_queue) -> None:
     ledger = _ledger(Path(path))
-    producer = UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload))
+
+    def sender(_kind: str, _message_id: str, payload: dict) -> dict:
+        sender_queue.put(os.getpid())
+        return _delivery_response(payload)
+
+    producer = UsageSnapshotProducer(ledger, sender=sender)
     ready.wait(10)
     try:
-        result_queue.put(producer.emit("observation-20260812", policy_version="2026-08-13")["replay"])
+        result = producer.emit("observation-20260812", policy_version="2026-08-13")
+        result_queue.put((result["replay"], result["state"], result["delivered"]))
     except Exception as error:  # pragma: no cover - assertion reports child failure
         result_queue.put(f"error:{error}")
 
@@ -516,15 +523,27 @@ def test_cross_process_delivery_intent_has_one_winner(tmp_path: Path):
     ledger.record_provider_observation(_observation())
     ledger.record_execution_receipt(_receipt())
     ready = multiprocessing.Event()
-    queue = multiprocessing.Queue()
-    processes = [multiprocessing.Process(target=_cross_process_emit, args=(str(path), ready, queue)) for _ in range(2)]
+    result_queue = multiprocessing.Queue()
+    sender_queue = multiprocessing.Queue()
+    processes = [
+        multiprocessing.Process(
+            target=_cross_process_emit,
+            args=(str(path), ready, result_queue, sender_queue),
+        )
+        for _ in range(2)
+    ]
     for process in processes:
         process.start()
     ready.set()
-    results = [queue.get(timeout=10) for _ in processes]
+    results = [result_queue.get(timeout=10) for _ in processes]
     for process in processes:
         process.join(timeout=10)
-    assert sorted(results) == [False, True]
+    sender_pid = sender_queue.get(timeout=10)
+    with pytest.raises(queue.Empty):
+        sender_queue.get(timeout=0.2)
+    assert sender_pid in {process.pid for process in processes}
+    assert results.count((False, "delivered", True)) == 1
+    assert all(result in {(False, "sending", False), (False, "delivered", True), (True, "delivered", True)} for result in results)
 
 
 def test_unexpired_delivery_lease_excludes_second_sender(tmp_path: Path):

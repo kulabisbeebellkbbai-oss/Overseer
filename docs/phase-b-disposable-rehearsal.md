@@ -1,75 +1,117 @@
 # Disposable Phase B rehearsal: inert host preparation
 
-This document describes the host-side preparation implemented by Task 3. It
-does not authorize or perform a rehearsal. `tools/phase_b_rehearsal.py` has
-two subcommands:
+Task 3 prepares data for a separately approved disposable VM rehearsal. It
+does not perform the rehearsal. `preflight` runs read-only checks and
+`render-plan` is a pure canonical JSON renderer. Neither subcommand downloads
+an image, creates an overlay or ISO, changes a VM, imports or executes a
+package, invokes Phase B, or changes a host service.
+
+The image is pinned exactly:
 
 ```text
-preflight    read-only checks only; it never creates the temporary directory
-render-plan  pure canonical JSON rendering; it never runs a subprocess
-```
-
-The pinned Debian cloud image is:
-
-```text
-https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+URL: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
 SHA-512: 184761b0dad0f9ace02f9298050ca96ce3caa39a461a47706d47ff9698b59933918b91b40177fbd4d392f6446af8b4d18ecb94caca988169b19641606bf34003
 ```
 
-The rendered plan uses `qemu:///session`, VM name
-`overseer-phase-b-rehearsal-<source7>`, 2048 MiB, two vCPUs, an 8 GiB qcow2
-overlay, no network interface, and disabled autostart. The checkout is a
-read-only 9p filesystem tagged `overseer-source`. The future serial log is
-created mode `0600` below a newly created `mktemp -d` directory.
+## Read-only preflight
 
-The NoCloud artifact contains the six exact empty Task 2 placeholders,
-individually owned by `root:root` with mode `0644`:
+Preflight fails closed unless all of these conditions hold:
 
-```text
-/etc/systemd/system/overseer-approval-smoke.service
-/etc/systemd/system/overseer-api-canary.service
-/etc/systemd/system/overseer-admin-executor.socket
-/etc/systemd/system/overseer-admin-executor@.service
-/etc/systemd/system/overseer-codex-user-bridge.socket
-/etc/systemd/system/overseer-codex-user-bridge.service
-```
+- the repository is clean and its full SHA is the requested source commit;
+- `/dev/kvm` is a character device readable and writable by the caller;
+- `qemu:///session` is the reported URI, supports an x86_64 KVM domain, and
+  has no domain with the exact target name;
+- source, runtime-site, base-image, and temporary-parent paths use the
+  conservative absolute host-path grammar and have safe types, permissions,
+  and caller access;
+- a sticky `1777` `/var/tmp` is accepted as the parent for a fresh owner-only
+  `mktemp -d`; non-sticky shared-writable parents are rejected;
+- the base image has the pinned SHA-512 and read-only `qemu-img info
+  --output=json --force-share` identifies it as qcow2;
+- every future host tool is present, including Bash, `awk`, `cat`, `grep`,
+  `install`, `rm`, `rmdir`, `sleep`, `python3`, and `timeout`;
+- a `python3 -B -s -P` no-bytecode probe imports `cryptography`,
+  `overseer.cli`, `overseer.user_bridge`, and `overseer.admin_executor` using
+  the selected source and runtime-site paths; and
+- the exact rendered domain inputs contain no network interface and expose
+  both 9p shares read-only.
 
-The future command list is descriptive output only. It includes pinned
-SHA-512 verification, qcow2 overlay creation, NoCloud seed creation,
-transient definition and start, bounded serial wait, exact sentinel
-extraction, graceful shutdown, undefine, and removal of only the exact
-overlay, seed ISO, serial log, and now-empty temporary directory. It contains
-no image download, package import, host-service action, Phase B launcher, or
-cutover command.
+The default offline dependency source is
+`/usr/lib/python3/dist-packages`. Preflight returns the complete bounded
+runtime-probe record and its digest. It does not create the future temporary
+directory.
 
-## Approval boundary
+## Rendered data and approval digest
 
-The `planDigest` is SHA-256 over the canonical JSON of the inner `plan`
-object. It is a separate, explicit approval boundary: an operator must
-approve that exact digest after reviewing the complete rendered plan. The
-future image download (if the approved image is not already present), KVM
-use, VM definition/start, and temporary-artifact cleanup additionally require
-one exact Dax resource claim. Approval of this source implementation or of a
-different digest does not authorize those actions.
+`render-plan` requires the exact passed runtime-probe JSON returned by
+preflight. The selected runtime-site path, complete probe record, probe
+digest, source commit, pinned image, domain XML, cloud-init, and canonical
+future Bash script are all covered by `planDigest`. That digest is the
+separate explicit user-approval boundary.
 
-Package import, host service action, Phase B, and cutover remain explicitly
-excluded. No owner-package verifier, token, key, or human secret belongs in
-the guest or in the plan.
+The domain shape is fixed to `qemu:///session`,
+`overseer-phase-b-rehearsal-<source7>`, 2048 MiB, two vCPUs, an 8 GiB
+overlay, no network interface, and disabled autostart. It has:
 
-## Verification
+- a qcow2 overlay disk;
+- the NoCloud seed as a read-only CD-ROM;
+- a read-only 9p source share tagged `overseer-source`;
+- a read-only 9p runtime share tagged `overseer-runtime-site`; and
+- a libvirt-appended serial file created mode `0600` below a fresh future
+  `mktemp` directory.
 
-The source-level test suite injects all preflight readers/runners and proves
-that rendering cannot execute a subprocess and that preflight's default
-runner exposes only read-only Git and libvirt probes. The intended checks are:
+The future lifecycle deliberately uses a temporary persistent definition:
+the script writes concrete domain XML under the exact temporary directory,
+runs `virsh define --validate`, explicitly disables and verifies autostart,
+starts the domain, gracefully shuts it down if still active, confirms it is
+inactive, and then undefines it. This is temporary because successful and
+partial-failure paths explicitly undefine the persistent definition; it is
+chosen because `virsh define` has no valid `--transient` option and the
+persistent form provides enforceable autostart state.
+
+The one rendered future Bash script is data only. It uses `set -Eeuo
+pipefail`, `umask 077`, a fixed path/locale, exact immutable variables, and
+EXIT/INT/TERM cleanup. Cleanup attempts only graceful shutdown, undefines
+only after confirmed inactivity, and then removes only the six exact files
+inside the validated temporary directory: domain XML, user-data, meta-data,
+overlay, seed ISO, and serial log. It uses no recursive deletion and never
+deletes the base image, source, runtime site, or another directory.
+
+The script never redirects `virsh console` into the serial file. It polls the
+libvirt-written serial log for up to 960 seconds, exceeding Task 2's
+15-minute service start timeout. Success requires exactly one complete
+begin/end sentinel pair framing exactly one canonical JSON line. The result
+must use schema `overseer.phase-b-disposable-rehearsal.v1`, have status
+`passed` and stage `phase-complete`, contain exactly all required controls set
+to true, and contain no failure or secret-bearing identifiers.
+
+## Guest installation contract
+
+Cloud-init disables default users; creates exact `overseer` UID/GID 984 and
+`god` UID/GID 1000 identities; mounts both 9p shares read-only; copies the
+offline runtime into `/usr/local/lib/python3.13/dist-packages`; installs
+`guest_rehearsal.py` and the outer one-shot unit; creates and revalidates the
+six exact empty root-owned mode `0644` child-unit placeholders; runs
+`systemctl daemon-reload`; and starts only the guest-local outer one-shot.
+
+## Approval boundary and exclusions
+
+Future image download, KVM use, VM definition/start, and exact temporary-file
+cleanup require one exact Dax resource claim plus explicit approval of the
+rendered `planDigest`. Approval of source code, an older plan, or a different
+digest is not authority to execute it.
+
+Package import, host service action, the Phase B launcher, Phase B itself,
+and cutover remain excluded. No owner-package secret, token, key, verifier,
+or human input is included in the rendered data.
+
+## Source-only verification
 
 ```bash
-pytest -q tests/test_phase_b_rehearsal_tool.py
-python3 -B -s -P tools/phase_b_rehearsal.py preflight --source-commit "$(git rev-parse HEAD)"
-python3 -B -s -P tools/phase_b_rehearsal.py render-plan --source-commit "$(git rev-parse HEAD)"
-virsh --connect qemu:///session list --all
+PYTHONDONTWRITEBYTECODE=1 pytest -q -p no:cacheprovider tests/test_phase_b_rehearsal_tool.py
+python3 -B -c 'from pathlib import Path; compile(Path("tools/phase_b_rehearsal.py").read_text(), "tools/phase_b_rehearsal.py", "exec")'
+git diff --check
 ```
 
-The preflight invocation is expected to reject a dirty checkout or any other
-missing precondition. A rejected preflight is evidence of fail-closed
-behavior, not permission to continue. Neither command creates a VM or the
-future temporary directory.
+The future script may be passed to `bash -n` for syntax parsing only. It must
+not be executed without the separate claim and exact digest approval.

@@ -38,6 +38,7 @@ from typing import Callable, Mapping
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from .admin_authority import admin_authority_lock_path
 from .approval_auth import (
     create_approval_document,
     load_approval_verifier,
@@ -6069,12 +6070,13 @@ def _canary_state_paths_from_contract(
     return paths
 
 
-def _seal_canary_state_from_contract(
+def _inspect_canary_state_from_contract(
     contract: Mapping[str, object],
     *,
     required: bool,
+    seal: bool,
 ) -> dict[str, object]:
-    """Make a stopped canary namespace root-owned read-only evidence."""
+    """Validate stopped canary evidence and optionally root-seal it."""
 
     paths = _canary_state_paths_from_contract(contract)
     if paths is None:
@@ -6107,7 +6109,9 @@ def _seal_canary_state_from_contract(
         "psychlo-bridge.sqlite3",
         "roadex-relay.sqlite3",
     }
+    authority_lock_name = admin_authority_lock_path(paths["store"]).name
     allowed_names = set(base_names)
+    allowed_names.add(authority_lock_name)
     for base in base_names:
         allowed_names.update(f"{base}{suffix}" for suffix in ("-wal", "-shm", "-journal"))
     try:
@@ -6131,13 +6135,17 @@ def _seal_canary_state_from_contract(
             | getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_NOFOLLOW", 0)
         )
-        state_descriptor = os.open(state_directory, flags)
+        instance = state_directory.name
+        state_descriptor = os.open(instance, flags, dir_fd=root_descriptor)
         opened_state = os.fstat(state_descriptor)
-        lexical_state = state_directory.lstat()
+        lexical_state = os.stat(
+            instance,
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
         state_owner = (opened_state.st_uid, opened_state.st_gid)
         if (
-            state_directory.is_symlink()
-            or not stat.S_ISDIR(opened_state.st_mode)
+            not stat.S_ISDIR(opened_state.st_mode)
             or not stat.S_ISDIR(lexical_state.st_mode)
             or (opened_state.st_dev, opened_state.st_ino)
             != (lexical_state.st_dev, lexical_state.st_ino)
@@ -6150,6 +6158,13 @@ def _seal_canary_state_from_contract(
             or (
                 stat.S_IMODE(opened_state.st_mode) == 0o500
                 and state_owner != (root_uid, root_gid)
+            )
+            or (
+                not seal
+                and (
+                    state_owner != (root_uid, root_gid)
+                    or stat.S_IMODE(opened_state.st_mode) != 0o500
+                )
             )
         ):
             raise ActivationPackageError("canary evidence namespace identity is invalid")
@@ -6183,33 +6198,81 @@ def _seal_canary_state_from_contract(
                 }
                 or mode not in {0o600, 0o400}
                 or (mode == 0o400 and owner != (root_uid, root_gid))
+                or (not seal and (owner != (root_uid, root_gid) or mode != 0o400))
+                or (name == authority_lock_name and opened.st_size != 0)
                 or opened.st_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES
                 or total_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES
             ):
                 raise ActivationPackageError("canary evidence artifact identity is invalid")
+            if name == authority_lock_name:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise ActivationPackageError(
+                        "canary authority lock is active during evidence sealing"
+                    ) from error
+                locked = os.fstat(descriptor)
+                lexical_locked = os.stat(
+                    name,
+                    dir_fd=state_descriptor,
+                    follow_symlinks=False,
+                )
+                locked_owner = (locked.st_uid, locked.st_gid)
+                locked_mode = stat.S_IMODE(locked.st_mode)
+                if (
+                    not stat.S_ISREG(locked.st_mode)
+                    or not stat.S_ISREG(lexical_locked.st_mode)
+                    or (locked.st_dev, locked.st_ino)
+                    != (lexical_locked.st_dev, lexical_locked.st_ino)
+                    or locked.st_nlink != 1
+                    or lexical_locked.st_nlink != 1
+                    or locked.st_size != 0
+                    or locked_owner
+                    not in {
+                        (root_uid, root_gid),
+                        (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID),
+                    }
+                    or locked_mode not in {0o600, 0o400}
+                    or (
+                        locked_mode == 0o400
+                        and locked_owner != (root_uid, root_gid)
+                    )
+                    or (
+                        not seal
+                        and (
+                            locked_owner != (root_uid, root_gid)
+                            or locked_mode != 0o400
+                        )
+                    )
+                ):
+                    raise ActivationPackageError(
+                        "canary evidence artifact identity is invalid"
+                    )
             validated_descriptors.append(descriptor)
         if _processes_for_uid(APPROVED_OVERSEER_UID):
             raise ActivationPackageError("service principal process exists during evidence sealing")
-        for descriptor in validated_descriptors:
-            os.fchown(descriptor, root_uid, root_gid)
-            os.fchmod(descriptor, 0o400)
-            os.fsync(descriptor)
-        os.fchown(state_descriptor, root_uid, root_gid)
-        os.fchmod(state_descriptor, 0o500)
-        os.fsync(state_descriptor)
-        os.fsync(root_descriptor)
+        if seal:
+            for descriptor in validated_descriptors:
+                os.fchown(descriptor, root_uid, root_gid)
+                os.fchmod(descriptor, 0o400)
+                os.fsync(descriptor)
+            os.fchown(state_descriptor, root_uid, root_gid)
+            os.fchmod(state_descriptor, 0o500)
+            os.fsync(state_descriptor)
+            os.fsync(root_descriptor)
     except OSError as error:
         raise ActivationPackageError("canary evidence namespace could not be sealed safely") from error
     finally:
         sync_error: OSError | None = None
-        for descriptor in (*validated_descriptors, state_descriptor, root_descriptor):
-            if descriptor < 0:
-                continue
-            try:
-                os.fsync(descriptor)
-            except OSError as error:
-                if sync_error is None:
-                    sync_error = error
+        if seal:
+            for descriptor in (*validated_descriptors, state_descriptor, root_descriptor):
+                if descriptor < 0:
+                    continue
+                try:
+                    os.fsync(descriptor)
+                except OSError as error:
+                    if sync_error is None:
+                        sync_error = error
         for descriptor in (*file_descriptors, state_descriptor, root_descriptor, parent_descriptor):
             if descriptor >= 0:
                 os.close(descriptor)
@@ -6223,6 +6286,22 @@ def _seal_canary_state_from_contract(
         "stateDirectory": str(state_directory),
         "artifactCount": len(file_descriptors),
     }
+
+
+def _seal_canary_state_from_contract(
+    contract: Mapping[str, object],
+    *,
+    required: bool,
+) -> dict[str, object]:
+    return _inspect_canary_state_from_contract(contract, required=required, seal=True)
+
+
+def _verify_sealed_canary_state_from_contract(
+    contract: Mapping[str, object],
+    *,
+    required: bool,
+) -> dict[str, object]:
+    return _inspect_canary_state_from_contract(contract, required=required, seal=False)
 
 
 def handoff_start_canary(
@@ -7732,7 +7811,18 @@ def _execute_resilient_cleanup(
         originating_failure = error.failure
     except BaseException:
         _execute_emergency_cleanup_sequence(contract)
-    _seal_canary_state_from_contract(contract, required=False)
+    try:
+        _seal_canary_state_from_contract(contract, required=False)
+    except BaseException:
+        _write_recovery_state_best_effort(
+            _runner_state(
+                package_digest=package_digest,
+                status="cleanup_evidence_seal_failed",
+                phase="staging_cleanup",
+                failure=originating_failure,
+            )
+        )
+        raise
     return _write_recovery_state_best_effort(
         _runner_state(
             package_digest=package_digest,
@@ -9055,6 +9145,8 @@ def _execute_approved_rollback_locked(
     if state.get("status") == "rolled_back":
         return {"status": "rolled_back", "packageDigest": digest, "replayed": True}
     if state.get("status") == "aborted_before_cutover":
+        if _canary_state_paths_from_contract(contract) is not None:
+            _verify_sealed_canary_state_from_contract(contract, required=True)
         return {
             "status": "aborted_before_cutover",
             "packageDigest": digest,

@@ -3868,10 +3868,13 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
         "roadex-relay.sqlite3",
         "overseer.sqlite3-wal",
         "roadex-relay.sqlite3-shm",
+        ".overseer.sqlite3.admin-authority.lock",
     )
     for name in names:
         path = state_directory / name
-        path.write_bytes(name.encode("ascii"))
+        path.write_bytes(
+            b"" if name == ".overseer.sqlite3.admin-authority.lock" else name.encode("ascii")
+        )
         path.chmod(0o600)
     contract = {
         "canary": {
@@ -3929,6 +3932,66 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
     fifo.unlink()
     fifo.write_bytes(b"overseer.sqlite3-wal")
     fifo.chmod(0o600)
+    authority_lock = state_directory / ".overseer.sqlite3.admin-authority.lock"
+    authority_lock.write_bytes(b"unexpected lock payload")
+    with pytest.raises(ActivationPackageError, match="artifact identity"):
+        activation_package_module._seal_canary_state_from_contract(
+            contract,
+            required=True,
+        )
+    authority_lock.write_bytes(b"")
+    unexpected = state_directory / "unexpected-artifact"
+    unexpected.write_bytes(b"")
+    unexpected.chmod(0o600)
+    with pytest.raises(ActivationPackageError, match="invalid artifact"):
+        activation_package_module._seal_canary_state_from_contract(
+            contract,
+            required=True,
+        )
+    unexpected.unlink()
+    hardlink = tmp_path / "authority-lock-hardlink"
+    os.link(authority_lock, hardlink)
+    with pytest.raises(ActivationPackageError, match="artifact identity"):
+        activation_package_module._seal_canary_state_from_contract(
+            contract,
+            required=True,
+        )
+    hardlink.unlink()
+    held_descriptor = os.open(authority_lock, os.O_RDWR)
+    try:
+        fcntl.flock(held_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ActivationPackageError, match="authority lock is active"):
+            activation_package_module._seal_canary_state_from_contract(
+                contract,
+                required=True,
+            )
+    finally:
+        fcntl.flock(held_descriptor, fcntl.LOCK_UN)
+        os.close(held_descriptor)
+    real_flock = activation_package_module.fcntl.flock
+    lock_mutated = False
+
+    def mutate_lock_before_sealing(descriptor: int, operation: int) -> None:
+        nonlocal lock_mutated
+        if operation == fcntl.LOCK_EX | fcntl.LOCK_NB and not lock_mutated:
+            writer = os.open(authority_lock, os.O_WRONLY)
+            try:
+                os.write(writer, b"raced")
+            finally:
+                os.close(writer)
+            lock_mutated = True
+        real_flock(descriptor, operation)
+
+    activation_package_module.fcntl.flock = mutate_lock_before_sealing
+    try:
+        with pytest.raises(ActivationPackageError, match="artifact identity"):
+            activation_package_module._seal_canary_state_from_contract(
+                contract,
+                required=True,
+            )
+    finally:
+        activation_package_module.fcntl.flock = real_flock
+    authority_lock.write_bytes(b"")
     result = activation_package_module._seal_canary_state_from_contract(
         contract,
         required=True,
@@ -3938,11 +4001,33 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
     assert state_directory.stat().st_mode & 0o777 == 0o500
     assert sorted(path.name for path in state_directory.iterdir()) == sorted(names)
     assert all(path.stat().st_mode & 0o777 == 0o400 for path in state_directory.iterdir())
+    before_verification = {
+        path.name: (
+            path.stat().st_mode,
+            path.stat().st_uid,
+            path.stat().st_gid,
+            path.stat().st_ctime_ns,
+        )
+        for path in (state_directory, *state_directory.iterdir())
+    }
+    verified = activation_package_module._verify_sealed_canary_state_from_contract(
+        contract,
+        required=True,
+    )
+    after_verification = {
+        path.name: (
+            path.stat().st_mode,
+            path.stat().st_uid,
+            path.stat().st_gid,
+            path.stat().st_ctime_ns,
+        )
+        for path in (state_directory, *state_directory.iterdir())
+    }
+    assert verified["sealed"] is True
+    assert after_verification == before_verification
     assert inactive_checks == [
-        ["/usr/bin/systemctl", "is-active", "--quiet", "overseer-api-canary.service"],
-        ["/usr/bin/systemctl", "is-active", "--quiet", "overseer-api-canary.service"],
-        ["/usr/bin/systemctl", "is-active", "--quiet", "overseer-api-canary.service"],
-    ]
+        ["/usr/bin/systemctl", "is-active", "--quiet", "overseer-api-canary.service"]
+    ] * 9
 
 
 def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
@@ -3972,6 +4057,181 @@ def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
         package_digest="a" * 64,
     ) is True
     assert events == ["stopped", "sealed:False"]
+
+
+def test_resilient_cleanup_checkpoints_evidence_sealing_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = {"canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]}}
+    checkpoints: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_cleanup_sequence",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def fail_sealing(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise ActivationPackageError("evidence sealing failed")
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_seal_canary_state_from_contract",
+        fail_sealing,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_recovery_state_best_effort",
+        lambda document: checkpoints.append(dict(document)) or True,
+    )
+
+    with pytest.raises(ActivationPackageError, match="evidence sealing failed"):
+        activation_package_module._execute_resilient_cleanup(
+            contract,
+            package_digest="a" * 64,
+            originating_failure="ActivationPackageError",
+        )
+
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["packageDigest"] == "a" * 64
+    assert checkpoints[0]["phase"] == "staging_cleanup"
+    assert checkpoints[0]["status"] == "cleanup_evidence_seal_failed"
+    assert checkpoints[0]["failure"] == "ActivationPackageError"
+    assert checkpoints[0]["secretValuesRecorded"] is False
+
+
+def test_staging_rollback_recovers_and_revalidates_sealed_authority_lock_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "d" * 64
+    package = tmp_path / "package"
+    package.mkdir()
+    tmp_path.chmod(0o755)
+    canary_root = tmp_path / "overseer-canary"
+    instance = "cd" * activation_package_module.CANARY_INSTANCE_BYTES
+    state_directory = canary_root / instance
+    canary_root.mkdir(mode=0o711)
+    state_directory.mkdir(mode=0o700)
+    for name in (
+        "overseer.sqlite3",
+        "psychlo-bridge.sqlite3",
+        "roadex-relay.sqlite3",
+    ):
+        path = state_directory / name
+        path.write_bytes(name.encode("ascii"))
+        path.chmod(0o600)
+    authority_lock = state_directory / ".overseer.sqlite3.admin-authority.lock"
+    authority_lock.write_bytes(b"")
+    authority_lock.chmod(0o600)
+    cleanup = ["/bin/true", "cleanup"]
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "account": {
+            "user": "overseer",
+            "uid": os.geteuid(),
+            "group": "overseer",
+            "gid": os.getegid(),
+        },
+        "sourceStore": {"uid": os.geteuid(), "gid": os.getegid()},
+        "stagingAndCanaryCommands": [["/bin/true", "staging"]],
+        "cutoverCommands": [["/bin/true", "cutover"]],
+        "rollbackCommands": [["/bin/true", "rollback"]],
+        "canary": {
+            "canaryInstanceId": instance,
+            "stateDirectory": str(state_directory),
+            "store": str(state_directory / "overseer.sqlite3"),
+            "psychloBridgeDatabase": str(state_directory / "psychlo-bridge.sqlite3"),
+            "roadexRelayDatabase": str(state_directory / "roadex-relay.sqlite3"),
+            "preserveFailedStateForEvidence": True,
+            "ownershipHandoffCommand": "handoff-start-canary",
+            "requiresNoExistingServicePrincipalProcesses": True,
+            "failureCleanupCommands": [cleanup],
+        },
+    }
+    state_path = tmp_path / "executor" / "activation-state.json"
+    lock_path = tmp_path / "executor" / "activation.lock"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval_for_rollback",
+        lambda _package: {"packageDigest": digest},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_activation_state_path", lambda: state_path)
+    monkeypatch.setattr(activation_package_module, "_activation_lock_path", lambda: lock_path)
+    monkeypatch.setattr(activation_package_module, "CANARY_STATE_ROOT", canary_root)
+    monkeypatch.setattr(activation_package_module, "APPROVED_OVERSEER_UID", os.geteuid())
+    monkeypatch.setattr(activation_package_module, "APPROVED_OVERSEER_GID", os.getegid())
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validated_command_outcome",
+        lambda *_args, **_kwargs: (0, None),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_command_outcome",
+        lambda *_args, **_kwargs: (3, None),
+    )
+    monkeypatch.setattr(activation_package_module, "_processes_for_uid", lambda _uid: ())
+    activation_package_module._write_activation_state(
+        activation_package_module._runner_state(
+            package_digest=digest,
+            status="cleanup_evidence_seal_failed",
+            phase="staging_cleanup",
+            failure="ActivationPackageError",
+        )
+    )
+
+    assert activation_package_module.execute_approved_rollback(package) == {
+        "status": "aborted_before_cutover",
+        "packageDigest": digest,
+        "replayed": False,
+    }
+    recovered_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert recovered_state["status"] == "aborted_before_cutover"
+    assert recovered_state["phase"] == "staging_cleanup"
+    assert recovered_state["failure"] == "ActivationPackageError"
+    assert recovered_state["secretValuesRecorded"] is False
+    assert state_directory.stat().st_mode & 0o777 == 0o500
+    assert all(path.stat().st_mode & 0o777 == 0o400 for path in state_directory.iterdir())
+
+    state_directory.chmod(0o700)
+    unexpected = state_directory / "unexpected-after-seal"
+    unexpected.write_bytes(b"")
+    unexpected.chmod(0o400)
+    state_directory.chmod(0o500)
+    with pytest.raises(ActivationPackageError, match="invalid artifact"):
+        activation_package_module.execute_approved_rollback(package)
+    state_directory.chmod(0o700)
+    unexpected.unlink()
+    state_directory.chmod(0o500)
+    before_replay = {
+        path.name: path.stat().st_ctime_ns
+        for path in (state_directory, *state_directory.iterdir())
+    }
+    assert activation_package_module.execute_approved_rollback(package) == {
+        "status": "aborted_before_cutover",
+        "packageDigest": digest,
+        "replayed": True,
+    }
+    after_replay = {
+        path.name: path.stat().st_ctime_ns
+        for path in (state_directory, *state_directory.iterdir())
+    }
+    assert after_replay == before_replay
 
 
 def test_canary_health_retry_handles_an_initially_missing_unix_socket(

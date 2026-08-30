@@ -645,7 +645,22 @@ def test_domain_xml_parses_and_has_seed_only_no_host_share_with_owned_pipe_seria
 
 @pytest.mark.parametrize(
     "mutation",
-    ("filesystem", "hostdev", "channel", "duplicate-disk", "changed-driver"),
+    (
+        "filesystem",
+        "hostdev",
+        "channel",
+        "duplicate-disk",
+        "changed-driver",
+        "emulator",
+        "evdev",
+        "qemu-commandline",
+        "kernel",
+        "seclabel",
+        "disk-auth",
+        "serial-protocol",
+        "host-cpu",
+        "metadata-extra",
+    ),
 )
 def test_domain_ownership_validator_rejects_unapproved_devices(
     mutation: str,
@@ -668,8 +683,30 @@ def test_domain_ownership_validator_rejects_unapproved_devices(
         ET.SubElement(devices, "channel", {"type": "unix"})
     elif mutation == "duplicate-disk":
         devices.append(ET.fromstring(ET.tostring(devices.findall("disk")[0])))
-    else:
+    elif mutation == "changed-driver":
         devices.findall("disk")[0].find("driver").set("type", "raw")
+    elif mutation == "emulator":
+        ET.SubElement(devices, "emulator").text = "/tmp/unapproved-emulator"
+    elif mutation == "evdev":
+        input_node = ET.SubElement(devices, "input", {"type": "evdev"})
+        ET.SubElement(input_node, "source", {"dev": "/dev/input/event0"})
+    elif mutation == "qemu-commandline":
+        commandline = ET.SubElement(
+            root, "{http://libvirt.org/schemas/domain/qemu/1.0}commandline"
+        )
+        ET.SubElement(commandline, "{http://libvirt.org/schemas/domain/qemu/1.0}arg", {"value": "-netdev"})
+    elif mutation == "kernel":
+        ET.SubElement(root.find("os"), "kernel").text = "/tmp/unapproved-kernel"
+    elif mutation == "seclabel":
+        ET.SubElement(root, "seclabel", {"type": "none"})
+    elif mutation == "disk-auth":
+        ET.SubElement(devices.findall("disk")[0], "auth", {"username": "unapproved"})
+    elif mutation == "serial-protocol":
+        ET.SubElement(devices.find("serial"), "protocol", {"type": "raw"})
+    elif mutation == "host-cpu":
+        ET.SubElement(root, "cpu", {"mode": "host-passthrough"})
+    else:
+        ET.SubElement(root.find("metadata"), "unapproved")
     completed = subprocess.run(
         (
             sys.executable,
@@ -720,6 +757,91 @@ def test_domain_ownership_validator_accepts_only_the_rendered_device_contract() 
             "/tmp/owned/serial",
         ),
         input=xml,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = ET.fromstring(
+        plan["domainXml"]
+        .replace("${OVERLAY}", "/tmp/owned/overlay.qcow2")
+        .replace("${SEED_ISO}", "/tmp/owned/seed.iso")
+        .replace("${SERIAL_PIPE}", "/tmp/owned/serial")
+    )
+    devices = root.find("./devices")
+    assert devices is not None
+    ET.SubElement(devices, "emulator").text = "/usr/bin/qemu-system-x86_64"
+    ET.SubElement(devices, "controller", {"type": "pci", "index": "0", "model": "pci-root"})
+    ET.SubElement(devices, "controller", {"type": "usb", "index": "0", "model": "piix3-uhci"})
+    ET.SubElement(devices, "controller", {"type": "sata", "index": "0"})
+    ET.SubElement(devices, "input", {"type": "mouse", "bus": "ps2"})
+    ET.SubElement(devices, "input", {"type": "keyboard", "bus": "ps2"})
+    ET.SubElement(devices, "audio", {"id": "1", "type": "none"})
+    balloon = ET.SubElement(devices, "memballoon", {"model": "virtio"})
+    ET.SubElement(
+        balloon,
+        "address",
+        {
+            "type": "pci",
+            "domain": "0x0000",
+            "bus": "0x00",
+            "slot": "0x03",
+            "function": "0x0",
+        },
+    )
+    ET.SubElement(balloon, "alias", {"name": "balloon0"})
+    disks = devices.findall("disk")
+    ET.SubElement(
+        disks[0],
+        "address",
+        {
+            "type": "pci",
+            "domain": "0x0000",
+            "bus": "0x00",
+            "slot": "0x02",
+            "function": "0x0",
+        },
+    )
+    ET.SubElement(disks[0], "alias", {"name": "virtio-disk0"})
+    ET.SubElement(
+        disks[1],
+        "address",
+        {"type": "drive", "controller": "0", "bus": "0", "target": "0", "unit": "0"},
+    )
+    serial = devices.find("serial")
+    console = devices.find("console")
+    assert serial is not None and console is not None
+    ET.SubElement(serial, "address", {"type": "isa", "iobase": "0x3f8", "irq": "4"})
+    ET.SubElement(serial, "alias", {"name": "serial0"})
+    ET.SubElement(console, "alias", {"name": "serial0"})
+    os_type = root.find("./os/type")
+    assert os_type is not None
+    os_type.set("machine", "pc-i440fx-10.0")
+    cpu = ET.SubElement(root, "cpu", {"mode": "custom", "match": "exact", "check": "none"})
+    ET.SubElement(cpu, "model", {"fallback": "forbid"}).text = "qemu64"
+    ET.SubElement(root, "clock", {"offset": "utc"})
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-S",
+            "-c",
+            module._ownership_validator_python(),
+            plan["vm"]["name"],
+            plan["vm"]["uuid"],
+            plan["vm"]["runId"],
+            "/tmp/owned/overlay.qcow2",
+            "/tmp/owned/seed.iso",
+            "/tmp/owned/serial",
+        ),
+        input=ET.tostring(root, encoding="unicode"),
         check=False,
         capture_output=True,
         text=True,
@@ -785,6 +907,10 @@ def test_cloud_init_installs_complete_task_two_guest_contract() -> None:
         "systemctl start overseer-phase-b-rehearsal.service",
     ):
         assert required in cloud
+    assert cloud.count("/usr/bin/python3.13 -B -s -P -S /usr/local/sbin/overseer-extract-artifacts.py") == 2
+    probe = module._runtime_probe_python()
+    assert "os.memfd_create" in probe
+    assert "F_ADD_SEALS" in probe and "F_SEAL_WRITE" in probe
     for path in module.TASK_TWO_PLACEHOLDERS:
         entry = cloud[cloud.index(f"path: {path}") :]
         assert "owner: root:root" in entry[:160]

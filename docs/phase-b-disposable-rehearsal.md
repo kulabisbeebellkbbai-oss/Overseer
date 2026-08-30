@@ -33,9 +33,11 @@ Preflight fails closed unless:
 - `/usr/bin/python3.13 -B -s -P -S` imports the four required modules through a
   manifest-enforcing finder. Every source loader opens with `O_NOFOLLOW`,
   revalidates stable descriptor metadata, mode, size, and SHA-256, then compiles
-  those verified bytes directly; native loaders verify before module creation
-  and execution. The probe redirects `sys.pycache_prefix` to an inaccessible
-  location, so ignored adjacent bytecode is not eligible.
+  those verified bytes directly. Native loaders copy the exact verified bytes
+  into a sealed anonymous file, then create and execute the extension from that
+  immutable descriptor, closing the path-reopen race. The probe redirects
+  `sys.pycache_prefix` to an inaccessible location, so ignored adjacent
+  bytecode is not eligible.
 
 Every probe uses an absolute executable and this exact minimal environment:
 
@@ -93,6 +95,9 @@ prove the `cryptography` and `_cffi_backend` origins are under the extracted
 runtime and all Overseer origins are under the extracted source. The outer and
 child units pin `/usr/bin/python3.13 -B -s -P -S` and both exact import roots,
 so system site-packages, `.pth`, `sitecustomize`, and user sites are ineligible.
+Every host-side embedded Python helper, including archive construction,
+ownership validation, serial collection, and result validation, uses the same
+`-S` isolation.
 
 ## Owned VM lifecycle
 
@@ -109,9 +114,14 @@ The future script acquires an atomic per-user rehearsal lock and never removes a
 stale or foreign lock. Before start, shutdown, or undefine, it requires the lock
 marker and parses `virsh dumpxml` to revalidate the exact name, UUID, sole run
 marker, disk types/drivers/targets, overlay, ISO, serial pipe/console, and a
-strict device whitelist. Filesystem shares, interfaces, host devices, channels,
-duplicate disks, changed disk attributes, and every other unapproved device are
-rejected. A missing lock,
+strict domain and device whitelist. The validator accepts only the exact memory,
+CPU, boot, feature, power, emulator, controller, input, audio, balloon, disk,
+serial, and console forms rendered by the plan or deterministically added by
+this libvirt/QEMU version. It permits only bounded generated alias and address
+metadata below those devices. Filesystem shares, interfaces, host devices,
+channels, QEMU command-line extensions, custom kernels, security-label changes,
+host CPU passthrough, disk authentication, duplicate disks, changed disk
+attributes, and every other unapproved element are rejected. A missing lock,
 same-name foreign domain, UUID/metadata/device mismatch, or unknown libvirt
 state prevents mutation and retains artifacts for an explicitly approved
 recovery.

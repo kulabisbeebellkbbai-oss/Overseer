@@ -407,7 +407,7 @@ def build_artifact_archive(root: Path, manifest: Mapping[str, object]) -> bytes:
 def _runtime_probe_python() -> str:
     return "\n".join(
         (
-            "import hashlib,importlib,importlib.abc,importlib.machinery,json,os,stat,sys,sysconfig",
+            "import fcntl,hashlib,importlib,importlib.abc,importlib.machinery,json,os,stat,sys,sysconfig",
             "from pathlib import Path",
             "sys.dont_write_bytecode=True",
             "sys.pycache_prefix='/proc/overseer-disabled-bytecode-cache'",
@@ -443,14 +443,27 @@ def _runtime_probe_python() -> str:
             " def __init__(self,origin,record): self.origin=origin; self.record=record",
             " def create_module(self,spec): return None",
             " def exec_module(self,module): exec(compile(read_verified(self.origin,self.record),self.origin,'exec',dont_inherit=True),module.__dict__)",
-            "class ManifestDelegatingLoader(importlib.abc.Loader):",
-            " def __init__(self,delegate,origin,record): self.delegate=delegate; self.origin=origin; self.record=record",
+            "class ManifestNativeLoader(importlib.abc.Loader):",
+            " def __init__(self,fullname,origin,record):",
+            "  self.fullname=fullname; self.origin=origin; self.fd=os.memfd_create('overseer-manifested-native',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)",
+            "  payload=read_verified(origin,record)",
+            "  view=memoryview(payload)",
+            "  while view:",
+            "   written=os.write(self.fd,view); view=view[written:]",
+            "  os.lseek(self.fd,0,os.SEEK_SET)",
+            "  fcntl.fcntl(self.fd,fcntl.F_ADD_SEALS,fcntl.F_SEAL_WRITE|fcntl.F_SEAL_GROW|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_SEAL)",
+            "  self.sealed_origin=f'/proc/self/fd/{self.fd}'",
+            "  self.delegate=importlib.machinery.ExtensionFileLoader(fullname,self.sealed_origin)",
+            " def _delegate(self,spec,method,*args):",
+            "  loader,origin=spec.loader,spec.origin; spec.loader,spec.origin=self.delegate,self.sealed_origin",
+            "  try: return getattr(self.delegate,method)(spec,*args) if method=='create_module' else getattr(self.delegate,method)(*args)",
+            "  finally: spec.loader,spec.origin=loader,origin",
             " def create_module(self,spec):",
-            "  read_verified(self.origin,self.record)",
-            "  create=getattr(self.delegate,'create_module',None)",
-            "  return None if create is None else create(spec)",
-            " def exec_module(self,module): read_verified(self.origin,self.record); self.delegate.exec_module(module)",
-            " def __getattr__(self,name): return getattr(self.delegate,name)",
+            "  return self._delegate(spec,'create_module')",
+            " def exec_module(self,module):",
+            "  spec=module.__spec__; self._delegate(spec,'exec_module',module); module.__file__=self.origin; os.close(self.fd); self.fd=-1",
+            " def __del__(self):",
+            "  if getattr(self,'fd',-1)>=0: os.close(self.fd)",
             "class ManifestFinder(importlib.abc.MetaPathFinder):",
             " def find_spec(self,fullname,path=None,target=None):",
             "  spec=importlib.machinery.PathFinder.find_spec(fullname,path,target)",
@@ -459,7 +472,7 @@ def _runtime_probe_python() -> str:
             "  record=allowed_source.get(origin) if Path(origin).is_relative_to(source) else allowed_runtime.get(origin) if Path(origin).is_relative_to(runtime) else None",
             "  if Path(origin).is_relative_to(source) and record is None: raise ImportError('source origin is not manifested')",
             "  if Path(origin).is_relative_to(runtime) and record is None: raise ImportError('runtime origin is not manifested')",
-            "  if record is not None: spec.loader=ManifestSourceLoader(origin,record) if origin.endswith(('.py','.pyw')) else ManifestDelegatingLoader(spec.loader,origin,record)",
+            "  if record is not None: spec.loader=ManifestSourceLoader(origin,record) if origin.endswith(('.py','.pyw')) else ManifestNativeLoader(fullname,origin,record)",
             "  return spec",
             "sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder),ManifestFinder())",
             "sys.path[:]=list(dict.fromkeys(map(str,(source_modules,runtime,stdlib,platstdlib,stdlib_dynamic))))",
@@ -1059,9 +1072,9 @@ def _cloud_init(
             "    /usr/bin/bash -ceu '",
             "      /usr/bin/install -d -m 0700 /mnt/overseer-seed",
             "      /usr/bin/mount -o ro LABEL=cidata /mnt/overseer-seed",
-            "      /usr/bin/python3.13 -B -s -P /usr/local/sbin/overseer-extract-artifacts.py /mnt/overseer-seed/source.zip /mnt/overseer-seed/source-manifest.json /opt/overseer-source "
+            "      /usr/bin/python3.13 -B -s -P -S /usr/local/sbin/overseer-extract-artifacts.py /mnt/overseer-seed/source.zip /mnt/overseer-seed/source-manifest.json /opt/overseer-source "
             + source_manifest_digest,
-            "      /usr/bin/python3.13 -B -s -P /usr/local/sbin/overseer-extract-artifacts.py /mnt/overseer-seed/runtime.zip /mnt/overseer-seed/runtime-manifest.json /usr/local/lib/python3.13/dist-packages "
+            "      /usr/bin/python3.13 -B -s -P -S /usr/local/sbin/overseer-extract-artifacts.py /mnt/overseer-seed/runtime.zip /mnt/overseer-seed/runtime-manifest.json /usr/local/lib/python3.13/dist-packages "
             + runtime_manifest_digest,
             "      /usr/bin/mount --bind /opt/overseer-source /opt/overseer-source",
             "      /usr/bin/mount -o remount,bind,ro,nosuid,nodev /opt/overseer-source",
@@ -1291,20 +1304,59 @@ finally:
 
 
 def _ownership_validator_python() -> str:
-    return r"""import sys
+    return r"""import re,sys
 from xml.etree import ElementTree
 root=ElementTree.fromstring(sys.stdin.read())
+root_allowed={"name","uuid","metadata","memory","currentMemory","vcpu","os","features","cpu","clock","on_poweroff","on_reboot","on_crash","devices"}
+root_attrs_ok=set(root.attrib)<={"type","id"} and root.get("type")=="kvm" and ("id" not in root.attrib or root.get("id").isdigit())
+root_counts_ok=all(len(root.findall(tag))==1 for tag in ("name","uuid","metadata","memory","currentMemory","vcpu","os","features","on_poweroff","on_reboot","on_crash","devices")) and len(root.findall("cpu"))<=1 and len(root.findall("clock"))<=1
+if not root_attrs_ok or not root_counts_ok or any(item.tag not in root_allowed for item in list(root)): raise SystemExit(1)
+def leaf_ok(node,attrs,text):
+    return node is not None and node.attrib==attrs and node.text==text and not list(node)
+name=root.find("name"); uuid=root.find("uuid")
+if not leaf_ok(name,{},sys.argv[1]) or not leaf_ok(uuid,{},sys.argv[2]): raise SystemExit(1)
+def memory_ok(name):
+    node=root.find(name)
+    return node is not None and node.attrib in ({"unit":"MiB"},{"unit":"KiB"}) and node.text==("2048" if node.get("unit")=="MiB" else "2097152") and not list(node)
+vcpu=root.find("vcpu")
+vcpu_valid=vcpu is not None and vcpu.text=="2" and vcpu.attrib in ({"placement":"static"},{"placement":"static","current":"2"}) and not list(vcpu)
+os_node=root.find("os"); os_children=[] if os_node is None else list(os_node); os_type=None if os_node is None else os_node.find("type"); boots=[] if os_node is None else os_node.findall("boot")
+machine=None if os_type is None else os_type.get("machine")
+os_valid=os_node is not None and os_node.attrib=={} and all(item.tag in {"type","boot"} for item in os_children) and len(os_node.findall("type"))==1 and len(boots)==1 and os_type.text=="hvm" and os_type.attrib in ({"arch":"x86_64"},{"arch":"x86_64","machine":"pc-i440fx-10.0"}) and not list(os_type) and boots[0].attrib=={"dev":"hd"} and not list(boots[0])
+features=root.find("features"); feature_children=[] if features is None else list(features)
+features_valid=features is not None and features.attrib=={} and len(feature_children)==1 and leaf_ok(feature_children[0],{},None) and feature_children[0].tag=="acpi"
+cpus=root.findall("cpu"); cpu_model=None if not cpus else cpus[0].find("model")
+cpu_valid=not cpus or len(cpus)==1 and cpus[0].attrib=={"mode":"custom","match":"exact","check":"none"} and len(list(cpus[0]))==1 and leaf_ok(cpu_model,{"fallback":"forbid"},"qemu64")
+clocks=root.findall("clock"); clock_valid=not clocks or len(clocks)==1 and clocks[0].attrib=={"offset":"utc"} and not list(clocks[0])
+power_valid=leaf_ok(root.find("on_poweroff"),{},"destroy") and leaf_ok(root.find("on_reboot"),{},"restart") and leaf_ok(root.find("on_crash"),{},"destroy")
+if not memory_ok("memory") or not memory_ok("currentMemory") or not vcpu_valid or not os_valid or not features_valid or not cpu_valid or not clock_valid or not power_valid: raise SystemExit(1)
 metadata=root.find("./metadata")
 markers=[] if metadata is None else list(metadata)
 marker=markers[0] if len(markers)==1 and markers[0].tag=="{urn:overseer:phase-b-rehearsal}run" else None
 devices=root.find("./devices")
 children=[] if devices is None else list(devices)
-allowed={"disk","serial","console","controller","input","memballoon","emulator"}
-if devices is None or any(item.tag not in allowed for item in children): raise SystemExit(1)
+allowed={"disk","serial","console","controller","input","memballoon","emulator","audio"}
+if metadata is None or metadata.attrib!={} or marker is None or marker.attrib!={"id":sys.argv[3]} or list(marker) or devices is None or devices.attrib!={} or any(item.tag not in allowed for item in children): raise SystemExit(1)
+hex_value=re.compile(r"0x[0-9a-fA-F]+")
+alias_name=re.compile(r"[A-Za-z0-9_.-]{1,128}")
+def generated_child_ok(item):
+    if list(item): return False
+    if item.tag=="alias": return set(item.attrib)=={"name"} and alias_name.fullmatch(item.get("name", "")) is not None
+    if item.tag!="address": return False
+    kind=item.get("type")
+    if kind=="pci":
+        return set(item.attrib) in ({"type","domain","bus","slot","function"},{"type","domain","bus","slot","function","multifunction"}) and all(hex_value.fullmatch(item.get(key,"")) is not None for key in ("domain","bus","slot","function")) and item.get("multifunction") in {None,"on","off"}
+    if kind=="drive": return set(item.attrib)=={"type","controller","bus","target","unit"} and all(item.get(key,"").isdigit() for key in ("controller","bus","target","unit"))
+    if kind=="isa": return set(item.attrib)=={"type","iobase","irq"} and hex_value.fullmatch(item.get("iobase","")) is not None and item.get("irq","").isdigit()
+    return False
+def children_exact(item,required,optional=()):
+    tags=[child.tag for child in list(item)]
+    return all(tags.count(tag)==1 for tag in required) and all(tags.count(tag)<=1 for tag in optional) and tags.count("alias")<=1 and tags.count("address")<=1 and all(tag in set(required)|set(optional)|{"alias","address"} for tag in tags) and all(child.tag in set(required)|set(optional) or generated_child_ok(child) for child in list(item))
 disks=root.findall("./devices/disk")
 def disk_ok(item,device,path,driver_type,target,bus,readonly):
     driver=item.find("driver");source=item.find("source");target_node=item.find("target")
-    return item.attrib=={"type":"file","device":device} and driver is not None and driver.attrib=={"name":"qemu","type":driver_type} and source is not None and source.attrib=={"file":path} and target_node is not None and target_node.attrib=={"dev":target,"bus":bus} and (item.find("readonly") is not None)==readonly
+    readonly_node=item.find("readonly")
+    return item.attrib=={"type":"file","device":device} and children_exact(item,("driver","source","target"),("readonly",)) and leaf_ok(driver,{"name":"qemu","type":driver_type},None) and leaf_ok(source,{"file":path},None) and leaf_ok(target_node,{"dev":target,"bus":bus},None) and (readonly_node is not None)==readonly and (readonly_node is None or leaf_ok(readonly_node,{},None))
 disk_valid=len(disks)==2 and any(disk_ok(item,"disk",sys.argv[4],"qcow2","vda","virtio",False) for item in disks) and any(disk_ok(item,"cdrom",sys.argv[5],"raw","sda","sata",True) for item in disks)
 serials=root.findall("./devices/serial")
 consoles=root.findall("./devices/console")
@@ -1313,9 +1365,22 @@ serial_source=None if serial is None else serial.find("source")
 serial_target=None if serial is None else serial.find("target")
 console=consoles[0] if len(consoles)==1 else None
 console_target=None if console is None else console.find("target")
-serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and serial_source is not None and serial_source.attrib=={"path":sys.argv[6]} and serial_target is not None and serial_target.attrib=={"type":"isa-serial","port":"0"}
-console_valid=console is not None and console.get("type")=="pty" and console_target is not None and console_target.attrib=={"type":"serial","port":"0"}
-if root.findtext("name")!=sys.argv[1] or root.findtext("uuid")!=sys.argv[2] or marker is None or marker.attrib!={"id":sys.argv[3]} or not disk_valid or not serial_valid or not console_valid:
+serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and children_exact(serial,("source","target")) and leaf_ok(serial_source,{"path":sys.argv[6]},None) and leaf_ok(serial_target,{"type":"isa-serial","port":"0"},None)
+console_valid=console is not None and console.attrib=={"type":"pty"} and children_exact(console,("target",)) and leaf_ok(console_target,{"type":"serial","port":"0"},None)
+emulators=root.findall("./devices/emulator")
+emulator_valid=not emulators or len(emulators)==1 and leaf_ok(emulators[0],{},"/usr/bin/qemu-system-x86_64")
+inputs=root.findall("./devices/input")
+input_forms={(item.get("type"),item.get("bus")) for item in inputs}
+inputs_valid=len(inputs)==len(input_forms) and input_forms<={("mouse","ps2"),("keyboard","ps2")} and all(item.attrib=={"type":item.get("type"),"bus":"ps2"} and children_exact(item,()) for item in inputs)
+controllers=root.findall("./devices/controller")
+controller_forms={(item.get("type"),item.get("index"),item.get("model")) for item in controllers}
+controller_allowed={("pci","0","pci-root"),("usb","0","piix3-uhci"),("sata","0",None)}
+controllers_valid=len(controllers)==len(controller_forms) and controller_forms<=controller_allowed and all(set(item.attrib)==({"type","index"} if item.get("model") is None else {"type","index","model"}) and children_exact(item,()) for item in controllers)
+balloons=root.findall("./devices/memballoon")
+balloons_valid=not balloons or len(balloons)==1 and balloons[0].attrib=={"model":"virtio"} and children_exact(balloons[0],())
+audios=root.findall("./devices/audio")
+audios_valid=not audios or len(audios)==1 and audios[0].attrib=={"id":"1","type":"none"} and children_exact(audios[0],())
+if not disk_valid or not serial_valid or not console_valid or not emulator_valid or not inputs_valid or not controllers_valid or not balloons_valid or not audios_valid:
     raise SystemExit(1)
 """
 
@@ -1418,7 +1483,7 @@ verify_domain_ownership() {{
   case "$presence" in 1) return 1;; 2) return 2;; esac
   if ! actual_uuid="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domuuid "$VM_NAME" 2>/dev/null)" || [[ "$actual_uuid" != "$VM_UUID" ]]; then return 2; fi
   if ! xml="$(/usr/bin/virsh --connect "$LIBVIRT_URI" dumpxml "$VM_NAME" 2>/dev/null)"; then return 2; fi
-  if ! printf '%s' "$xml" | /usr/bin/python3.13 -B -s -P -c {shlex.quote(ownership_validator)} "$VM_NAME" "$VM_UUID" "$RUN_ID" "$OVERLAY" "$SEED_ISO" "$SERIAL_PIPE"; then return 2; fi
+  if ! printf '%s' "$xml" | /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(ownership_validator)} "$VM_NAME" "$VM_UUID" "$RUN_ID" "$OVERLAY" "$SEED_ISO" "$SERIAL_PIPE"; then return 2; fi
   return 0
 }}
 
@@ -1565,8 +1630,8 @@ temp_layout_is_exact
 /usr/bin/install -m 0600 /dev/null "$SERIAL_COLLECTOR"
 printf '%s' "$EXPECTED_SOURCE_MANIFEST_JSON" >"$SOURCE_MANIFEST_FILE"
 printf '%s' "$EXPECTED_RUNTIME_MANIFEST_JSON" >"$RUNTIME_MANIFEST_FILE"
-/usr/bin/python3.13 -B -s -P -c {shlex.quote(archive_builder)} "$SOURCE_ROOT" "$EXPECTED_SOURCE_MANIFEST_JSON" "$SOURCE_ARCHIVE"
-/usr/bin/python3.13 -B -s -P -c {shlex.quote(archive_builder)} "$RUNTIME_SITE" "$EXPECTED_RUNTIME_MANIFEST_JSON" "$RUNTIME_ARCHIVE"
+/usr/bin/python3.13 -B -s -P -S -c {shlex.quote(archive_builder)} "$SOURCE_ROOT" "$EXPECTED_SOURCE_MANIFEST_JSON" "$SOURCE_ARCHIVE"
+/usr/bin/python3.13 -B -s -P -S -c {shlex.quote(archive_builder)} "$RUNTIME_SITE" "$EXPECTED_RUNTIME_MANIFEST_JSON" "$RUNTIME_ARCHIVE"
 /usr/bin/cat >"$SERIAL_COLLECTOR" <<'PY_SERIAL_COLLECTOR'
 {collector}PY_SERIAL_COLLECTOR
 
@@ -1579,7 +1644,7 @@ printf '%s  %s\\n' "$EXPECTED_SHA512" "$BASE_IMAGE" | /usr/bin/sha512sum --check
 /usr/bin/genisoimage -quiet -output "$SEED_ISO" -volid cidata -joliet -rock -graft-points "user-data=$USER_DATA" "meta-data=$META_DATA" "source.zip=$SOURCE_ARCHIVE" "runtime.zip=$RUNTIME_ARCHIVE" "source-manifest.json=$SOURCE_MANIFEST_FILE" "runtime-manifest.json=$RUNTIME_MANIFEST_FILE"
 
 /usr/bin/mkfifo -m 0600 "$SERIAL_PIPE.in" "$SERIAL_PIPE.out"
-/usr/bin/python3.13 -B -s -P "$SERIAL_COLLECTOR" "$SERIAL_PIPE.out" "$SERIAL_LOG" "$SERIAL_STATUS" "$SERIAL_STOP" "$MAX_SERIAL_BYTES" "$MAX_SERIAL_LINE_BYTES" &
+/usr/bin/python3.13 -B -s -P -S "$SERIAL_COLLECTOR" "$SERIAL_PIPE.out" "$SERIAL_LOG" "$SERIAL_STATUS" "$SERIAL_STOP" "$MAX_SERIAL_BYTES" "$MAX_SERIAL_LINE_BYTES" &
 COLLECTOR_PID=$!
 
 /usr/bin/cat >"$DOMAIN_XML" <<DOMAIN_XML
@@ -1613,7 +1678,7 @@ if [[ "$SERIAL_RESULT" == "overflow" ]]; then
   exit 1
 fi
 [[ "$SERIAL_RESULT" == "complete" ]]
-/usr/bin/python3.13 -B -s -P - "$SERIAL_LOG" <<'PY_RESULT_VALIDATOR'
+/usr/bin/python3.13 -B -s -P -S - "$SERIAL_LOG" <<'PY_RESULT_VALIDATOR'
 {validator}PY_RESULT_VALIDATOR
 """
 

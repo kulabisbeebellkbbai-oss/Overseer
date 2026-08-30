@@ -44,5 +44,5 @@
 | 1. Add bounded Phase B progress telemetry | Complete (`c5fa4d4`, `0b619d9`) | Re-reviewed; spec compliant and quality approved; no remaining findings |
 | 2. Build the disposable guest rehearsal | Complete (`ef87688`, `88ad2c9`, `deb1340`, `ee7dc1e`, `5ecb64e`) | Re-reviewed; spec compliant and quality approved; no remaining findings |
 | 3. Prepare the fail-closed VM orchestrator | Complete (`54a53bc`, `d2c0ff9`, `4c2ad9a`, `abfee48`, `29fc5aa`) | Re-reviewed; spec compliant and quality approved; no remaining findings |
-| 4. Verify and independently review the source implementation | In progress | Implementation re-review approved `66dc0ff`; Daybreak findings for pre-import hash enforcement, strict device ownership, and `-S` guest isolation repaired; focused/targeted/full verification and final Daybreak re-review pending |
+| 4. Verify and independently review the source implementation | In progress | Prior re-review findings repaired with sealed native loading, exact domain/device ownership, and universal embedded-Python `-S` isolation; focused and cross-layer verification passed, while the clean full suite and final Terra/Daybreak re-review remain pending |
 | 5. Prepare, but do not execute, the privileged rehearsal approval | Pending | Pending |

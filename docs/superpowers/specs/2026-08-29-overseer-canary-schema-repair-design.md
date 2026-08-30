@@ -18,6 +18,12 @@ reject a migrated store that lacks canary-critical tables. Finally, successful
 cleanup overwrites the bounded originating failure classification with `null`,
 making terminal diagnosis depend on transient terminal or journal output.
 
+A later replacement-package run exposed a second independent defect: the
+fixed canary database pathname could retain SQLite sidecars from an earlier
+failed package. The replacement therefore also requires a fresh opaque
+package namespace and must not transfer that namespace to the service account
+until all bounded verification is complete.
+
 ## Scope and boundaries
 
 This repair will:
@@ -28,6 +34,9 @@ This repair will:
   tables required by mandatory canary controls;
 - preserve a bounded originating failure classification through staging
   cleanup and terminal `aborted_before_cutover` state;
+- stage each canary in a new no-replace root-owned namespace, reject stale or
+  oversized SQLite artifacts before hashing, and couple the final ownership
+  handoff directly to the exact canary service start;
 - add regression tests for each behavior;
 - run implementation review, final security review, and full project/package
   verification;
@@ -112,6 +121,28 @@ cleanup failure already recorded by the current implementation. Raw exception
 messages, subprocess output, verifier input, approval tokens, and credentials
 will never be written to runner state.
 
+### Canary namespace and ownership handoff
+
+Preparation seals a random 128-bit hexadecimal canary instance identifier.
+Phase B creates `/var/lib/overseer-canary/<instance-id>` with no-replace
+semantics and copies the authority database plus the two empty integration
+databases into it. The parent, namespace, and database files remain root-owned
+through installed-artifact and SQLite verification. Expected migration size is
+loaded from digest-bound report evidence and checked, together with the
+approved package-size ceiling and non-sparse allocation, before any target
+hash or integrity scan. The two auxiliary databases must be single-link,
+zero-length regular files before their hashes are read.
+
+The sealed startup suffix contains `handoff-start-canary` instead of a direct
+`systemctl start` command. After the local hidden verifier prompts, that
+primitive proves the active runner command and inherited lock, rejects any
+existing process carrying the dedicated UID, descriptor-opens the exact
+root-owned namespace and three expected files, rechecks the process boundary,
+transfers only those objects to UID/GID 984, fsyncs the resulting metadata, and
+immediately starts only `overseer-api-canary.service`. A failed or completed
+namespace is retained as immutable package-specific evidence and is never
+reused by another package.
+
 ### Error handling and retry behavior
 
 The failed package remains terminal and non-resumable. The repair does not add
@@ -141,6 +172,11 @@ Tests will be written and observed failing before production changes.
 5. Focused store and activation-package suites will run before the complete
    project suite. Package generation will then run from a clean committed
    worktree, followed by an independent full-tree package verification.
+6. Namespace regressions will prove stale fixed-path sidecars cannot enter a
+   new package, namespace reuse fails closed, all database sidecars and link
+   substitutions are rejected, target size is rejected before hashing, and an
+   existing UID 984 process blocks the sealed ownership handoff and service
+   start.
 
 ## Security review criteria
 

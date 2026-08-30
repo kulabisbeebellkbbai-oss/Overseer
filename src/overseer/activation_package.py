@@ -3272,7 +3272,12 @@ def _copy_open_regular_to_new_path(
             os.close(target_descriptor)
 
 
-def _stream_hash_regular(path: Path, *, label: str) -> dict[str, object]:
+def _stream_hash_regular(
+    path: Path,
+    *,
+    label: str,
+    expected_size: int | None = None,
+) -> dict[str, object]:
     """Hash one regular file while binding its complete descriptor identity."""
 
     try:
@@ -3281,6 +3286,8 @@ def _stream_hash_regular(path: Path, *, label: str) -> dict[str, object]:
         raise ActivationPackageError(f"{label} could not be inspected") from error
     if path.is_symlink() or not stat.S_ISREG(before.st_mode):
         raise ActivationPackageError(f"{label} must be a regular file, not a symlink")
+    if expected_size is not None and before.st_size != expected_size:
+        raise ActivationPackageError(f"{label} has an unexpected size")
     descriptor = os.open(
         path,
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -3297,6 +3304,8 @@ def _stream_hash_regular(path: Path, *, label: str) -> dict[str, object]:
             before.st_size,
         ):
             raise ActivationPackageError(f"{label} changed while opening")
+        if expected_size is not None and opened.st_size != expected_size:
+            raise ActivationPackageError(f"{label} has an unexpected size")
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
@@ -4136,7 +4145,12 @@ def render_activation_contract(
             "overseer-codex-user-bridge.socket",
             "overseer-admin-executor.socket",
         ],
-        ["/usr/bin/systemctl", "start", "overseer-api-canary.service"],
+        [
+            *activation_python,
+            "handoff-start-canary",
+            "--package-root",
+            str(execution_package),
+        ],
         [
             "/usr/bin/curl",
             "--fail",
@@ -4387,6 +4401,8 @@ def render_activation_contract(
             "psychloBridgeDatabase": str(canary_paths["psychloBridgeDatabase"]),
             "roadexRelayDatabase": str(canary_paths["roadexRelayDatabase"]),
             "preserveFailedStateForEvidence": True,
+            "ownershipHandoffCommand": "handoff-start-canary",
+            "requiresNoExistingServicePrincipalProcesses": True,
             "unixSocket": str(CANARY_API_SOCKET),
             "serverPeerUid": overseer_uid,
             "allowedClientUid": 0,
@@ -4452,6 +4468,8 @@ def _sealed_migration_artifact_evidence(
     path: Path,
     *,
     expected_uid: int,
+    expected_gid: int | None = None,
+    expected_size: int | None = None,
     counted_tables: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     metadata = _validate_store_artifact(
@@ -4459,6 +4477,15 @@ def _sealed_migration_artifact_evidence(
         label="sealed migration artifact",
         expected_uid=expected_uid,
     )
+    if expected_gid is not None and metadata.st_gid != expected_gid:
+        raise ActivationPackageError("sealed migration artifact has an unexpected group")
+    if expected_size is not None:
+        if expected_size < 0 or expected_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES:
+            raise ActivationPackageError("sealed migration artifact expected size is invalid")
+        if metadata.st_size != expected_size:
+            raise ActivationPackageError("sealed migration artifact has an unexpected size")
+        if metadata.st_blocks * 512 < expected_size:
+            raise ActivationPackageError("sealed migration artifact must not be sparse")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -4477,6 +4504,8 @@ def _sealed_migration_artifact_evidence(
         opened = os.fstat(descriptor)
         if identity(opened) != identity(metadata):
             raise ActivationPackageError("sealed migration artifact changed while opening")
+        if expected_size is not None and opened.st_size != expected_size:
+            raise ActivationPackageError("sealed migration artifact has an unexpected size")
         digest = hashlib.sha256()
         size = 0
         while True:
@@ -5375,6 +5404,8 @@ def _validate_canary_contract_layout(
         "psychloBridgeDatabase": str(paths["psychloBridgeDatabase"]),
         "roadexRelayDatabase": str(paths["roadexRelayDatabase"]),
         "preserveFailedStateForEvidence": True,
+        "ownershipHandoffCommand": "handoff-start-canary",
+        "requiresNoExistingServicePrincipalProcesses": True,
     }
     if any(canary.get(name) != value for name, value in expected.items()):
         raise ActivationPackageError("activation canary state contract drifted")
@@ -5482,9 +5513,22 @@ def _ensure_canary_state_root() -> tuple[int, int]:
             raise ActivationPackageError("canary state root identity or mode is invalid")
         return parent_descriptor, root_descriptor
     except BaseException:
+        sync_error: OSError | None = None
+        for descriptor in (root_descriptor, parent_descriptor):
+            if descriptor < 0:
+                continue
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                if sync_error is None:
+                    sync_error = error
         if root_descriptor >= 0:
             os.close(root_descriptor)
         os.close(parent_descriptor)
+        if sync_error is not None:
+            raise ActivationPackageError(
+                "canary state root failure evidence could not be made durable"
+            ) from sync_error
         raise
 
 
@@ -5536,7 +5580,8 @@ def _copy_canary_store_at(
                 view = view[written:]
         if copied != opened_source.st_size:
             raise ActivationPackageError("canary store copy was truncated")
-        os.fchown(target_descriptor, APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
+        root_uid, root_gid = _activation_root_identity()
+        os.fchown(target_descriptor, root_uid, root_gid)
         os.fchmod(target_descriptor, 0o600)
         os.fsync(target_descriptor)
         if _metadata_identity(os.fstat(source_descriptor)) != _metadata_identity(source_metadata):
@@ -5544,9 +5589,18 @@ def _copy_canary_store_at(
     except OSError as error:
         raise ActivationPackageError("canary store could not be staged safely") from error
     finally:
+        sync_error: OSError | None = None
         if target_descriptor >= 0:
+            try:
+                os.fsync(target_descriptor)
+            except OSError as error:
+                sync_error = error
             os.close(target_descriptor)
         os.close(source_descriptor)
+        if sync_error is not None:
+            raise ActivationPackageError(
+                "failed canary store copy could not be made durable"
+            ) from sync_error
 
 
 def _create_empty_canary_database_at(
@@ -5566,14 +5620,24 @@ def _create_empty_canary_database_at(
             0o600,
             dir_fd=target_directory_descriptor,
         )
-        os.fchown(descriptor, APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
+        root_uid, root_gid = _activation_root_identity()
+        os.fchown(descriptor, root_uid, root_gid)
         os.fchmod(descriptor, 0o600)
         os.fsync(descriptor)
     except OSError as error:
         raise ActivationPackageError("disposable canary database could not be created safely") from error
     finally:
+        sync_error: OSError | None = None
         if descriptor >= 0:
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                sync_error = error
             os.close(descriptor)
+        if sync_error is not None:
+            raise ActivationPackageError(
+                "failed disposable canary database could not be made durable"
+            ) from sync_error
 
 
 def _expected_canary_migration_evidence(
@@ -5612,6 +5676,7 @@ def _verify_staged_canary_store(
     contract: Mapping[str, object],
     *,
     expected_package_digest: str | None = None,
+    pre_handoff: bool = False,
 ) -> dict[str, object]:
     paths = _validate_canary_contract_layout(
         package,
@@ -5623,6 +5688,25 @@ def _verify_staged_canary_store(
     root_descriptor = -1
     state_descriptor = -1
     state_directory = Path(str(paths["stateDirectory"]))
+    expected_uid = root_uid if pre_handoff else APPROVED_OVERSEER_UID
+    expected_gid = root_gid if pre_handoff else APPROVED_OVERSEER_GID
+    if expected_package_digest is None:
+        source_evidence = _sealed_migration_artifact_evidence(
+            package / "private" / "migration" / "rehearsal-migrated.sqlite3",
+            expected_uid=package.lstat().st_uid,
+        )
+        expected_evidence = {
+            name: source_evidence[name]
+            for name in ("sha256", "size", "integrityCheck")
+        }
+    else:
+        expected_evidence = _expected_canary_migration_evidence(
+            package,
+            expected_package_digest=expected_package_digest,
+        )
+    expected_size = int(expected_evidence["size"])
+    if expected_size > MAX_APPROVED_PACKAGE_IMPORT_BYTES:
+        raise ActivationPackageError("staged canary store expected size exceeds the approved bound")
     try:
         parent_descriptor = _open_verified_directory(
             CANARY_STATE_ROOT.parent,
@@ -5640,8 +5724,8 @@ def _verify_staged_canary_store(
         )
         state_descriptor = _open_verified_directory(
             state_directory,
-            expected_uid=APPROVED_OVERSEER_UID,
-            expected_gid=APPROVED_OVERSEER_GID,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
             expected_mode=0o700,
             label="package-bound canary state directory",
         )
@@ -5653,36 +5737,45 @@ def _verify_staged_canary_store(
         entries = sorted(os.listdir(state_descriptor))
         if entries != expected_entries:
             raise ActivationPackageError("unexpected canary SQLite artifact exists before startup")
-        target_evidence = _sealed_migration_artifact_evidence(
-            Path(str(paths["store"])),
-            expected_uid=APPROVED_OVERSEER_UID,
+        target_path = Path(str(paths["store"]))
+        target_metadata = _validate_store_artifact(
+            target_path,
+            label="staged canary store",
+            expected_uid=expected_uid,
         )
-        if expected_package_digest is None:
-            source_evidence = _sealed_migration_artifact_evidence(
-                package / "private" / "migration" / "rehearsal-migrated.sqlite3",
-                expected_uid=package.lstat().st_uid,
-            )
-            expected_evidence = {
-                name: source_evidence[name]
-                for name in ("sha256", "size", "integrityCheck")
-            }
-        else:
-            expected_evidence = _expected_canary_migration_evidence(
-                package,
-                expected_package_digest=expected_package_digest,
-            )
+        if target_metadata.st_gid != expected_gid:
+            raise ActivationPackageError("staged canary store has an unexpected group")
+        if target_metadata.st_size != expected_size:
+            raise ActivationPackageError("staged canary store has an unexpected size")
+        if target_metadata.st_blocks * 512 < expected_size:
+            raise ActivationPackageError("staged canary store must not be sparse")
+        target_evidence = _sealed_migration_artifact_evidence(
+            target_path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            expected_size=expected_size,
+        )
         if any(target_evidence.get(name) != value for name, value in expected_evidence.items()):
             raise ActivationPackageError("staged canary store content or SQLite evidence drifted")
         _require_canary_store_schema(target_evidence.get("schema"))
         for name in ("psychloBridgeDatabase", "roadexRelayDatabase"):
-            disposable = _stream_hash_regular(
-                Path(str(paths[name])),
+            disposable_path = Path(str(paths[name]))
+            disposable_metadata = _validate_store_artifact(
+                disposable_path,
                 label="empty disposable canary database",
+                expected_uid=expected_uid,
+            )
+            if disposable_metadata.st_gid != expected_gid or disposable_metadata.st_size != 0:
+                raise ActivationPackageError("disposable canary database is not pristine")
+            disposable = _stream_hash_regular(
+                disposable_path,
+                label="empty disposable canary database",
+                expected_size=0,
             )
             if (
                 disposable["size"] != 0
-                or disposable["uid"] != APPROVED_OVERSEER_UID
-                or disposable["gid"] != APPROVED_OVERSEER_GID
+                or disposable["uid"] != expected_uid
+                or disposable["gid"] != expected_gid
                 or disposable["mode"] != "0600"
                 or disposable["links"] != 1
             ):
@@ -5695,6 +5788,7 @@ def _verify_staged_canary_store(
             "sha256": str(target_evidence["sha256"]),
             "size": int(target_evidence["size"]),
             "sidecarFree": True,
+            "handoffRequired": pre_handoff,
         }
     finally:
         for descriptor in (state_descriptor, root_descriptor, parent_descriptor):
@@ -5784,12 +5878,8 @@ def stage_canary_store(
             "roadex-relay.sqlite3",
         ]:
             raise ActivationPackageError("unexpected canary SQLite artifact appeared during staging")
-        os.fchown(state_descriptor, APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
-        os.fchmod(state_descriptor, 0o700)
-        os.fsync(state_descriptor)
         os.fsync(root_descriptor)
     finally:
-        had_error = sys.exc_info()[0] is not None
         sync_error: OSError | None = None
         for descriptor in (state_descriptor, root_descriptor):
             if descriptor < 0:
@@ -5802,13 +5892,184 @@ def stage_canary_store(
         for descriptor in (state_descriptor, root_descriptor, parent_descriptor):
             if descriptor >= 0:
                 os.close(descriptor)
-        if sync_error is not None and not had_error:
+        if sync_error is not None:
             raise ActivationPackageError("canary staging evidence could not be made durable") from sync_error
     return _verify_staged_canary_store(
         package,
         contract,
         expected_package_digest=expected_digest,
+        pre_handoff=True,
     )
+
+
+def _processes_for_uid(uid: int) -> tuple[int, ...]:
+    """Return processes carrying the dedicated UID in any credential slot."""
+
+    if uid < 0:
+        raise ActivationPackageError("service principal UID is invalid")
+    matches: list[int] = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError as error:
+        raise ActivationPackageError("service principal processes could not be inspected") from error
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            lines = (entry / "status").read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ActivationPackageError(
+                "service principal process credentials could not be inspected"
+            ) from error
+        uid_line = next((line for line in lines if line.startswith("Uid:")), None)
+        if uid_line is None:
+            raise ActivationPackageError("service principal process credentials are incomplete")
+        try:
+            process_uids = tuple(int(value) for value in uid_line.split()[1:])
+        except ValueError as error:
+            raise ActivationPackageError("service principal process credentials are invalid") from error
+        if len(process_uids) != 4:
+            raise ActivationPackageError("service principal process credentials are invalid")
+        if uid in process_uids:
+            matches.append(int(entry.name))
+    return tuple(sorted(matches))
+
+
+def _handoff_canary_state(paths: Mapping[str, Path | str]) -> None:
+    """Transfer one root-owned verified namespace to the dedicated principal."""
+
+    root_uid, root_gid = _activation_root_identity()
+    parent_descriptor = -1
+    root_descriptor = -1
+    state_descriptor = -1
+    file_descriptors: list[int] = []
+    expected_names = (
+        "overseer.sqlite3",
+        "psychlo-bridge.sqlite3",
+        "roadex-relay.sqlite3",
+    )
+    try:
+        parent_descriptor = _open_verified_directory(
+            CANARY_STATE_ROOT.parent,
+            expected_uid=root_uid,
+            expected_gid=root_gid,
+            expected_mode=0o755,
+            label="canary state root parent",
+        )
+        root_descriptor = _open_verified_directory(
+            CANARY_STATE_ROOT,
+            expected_uid=root_uid,
+            expected_gid=root_gid,
+            expected_mode=0o711,
+            label="canary state root",
+        )
+        state_descriptor = _open_verified_directory(
+            Path(str(paths["stateDirectory"])),
+            expected_uid=root_uid,
+            expected_gid=root_gid,
+            expected_mode=0o700,
+            label="package-bound canary state directory",
+        )
+        if tuple(sorted(os.listdir(state_descriptor))) != expected_names:
+            raise ActivationPackageError("canary ownership handoff found unexpected state")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        for name in expected_names:
+            try:
+                descriptor = os.open(name, flags, dir_fd=state_descriptor)
+                file_descriptors.append(descriptor)
+                lexical = os.stat(name, dir_fd=state_descriptor, follow_symlinks=False)
+            except OSError as error:
+                raise ActivationPackageError(
+                    "canary ownership handoff artifact could not be opened safely"
+                ) from error
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(lexical.st_mode)
+                or (opened.st_dev, opened.st_ino) != (lexical.st_dev, lexical.st_ino)
+                or opened.st_uid != root_uid
+                or opened.st_gid != root_gid
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+            ):
+                raise ActivationPackageError("canary ownership handoff artifact is invalid")
+        running = _processes_for_uid(APPROVED_OVERSEER_UID)
+        if running:
+            raise ActivationPackageError("service principal process exists before canary handoff")
+        for descriptor in file_descriptors:
+            os.fchown(descriptor, APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        os.fchown(state_descriptor, APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
+        os.fchmod(state_descriptor, 0o700)
+        os.fsync(state_descriptor)
+        os.fsync(root_descriptor)
+    except OSError as error:
+        raise ActivationPackageError("canary ownership handoff failed safely") from error
+    finally:
+        sync_error: OSError | None = None
+        for descriptor in (*file_descriptors, state_descriptor, root_descriptor):
+            if descriptor < 0:
+                continue
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                if sync_error is None:
+                    sync_error = error
+        for descriptor in (*file_descriptors, state_descriptor, root_descriptor, parent_descriptor):
+            if descriptor >= 0:
+                os.close(descriptor)
+        if sync_error is not None:
+            raise ActivationPackageError(
+                "canary ownership handoff evidence could not be made durable"
+            ) from sync_error
+
+
+def handoff_start_canary(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Narrow the verified-state race and start the exact canary unit."""
+
+    _require_root_activation()
+    package = Path(package_root).resolve()
+    contract, _lock_descriptor = _require_active_phase_command(
+        package,
+        phase="staging-canary",
+        command_name="handoff-start-canary",
+        expected_options={"--package-root": str(package)},
+    )
+    active_state = _load_activation_state()
+    expected_digest = active_state.get("packageDigest") if isinstance(active_state, Mapping) else None
+    if (
+        not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+        or set(expected_digest) - _HEX
+    ):
+        raise ActivationPackageError("active canary handoff package digest is unavailable")
+    paths = _validate_canary_contract_layout(
+        package,
+        contract,
+        expected_package_digest=expected_digest,
+    )
+    _verify_staged_canary_store(
+        package,
+        contract,
+        expected_package_digest=expected_digest,
+        pre_handoff=True,
+    )
+    if _processes_for_uid(APPROVED_OVERSEER_UID):
+        raise ActivationPackageError("service principal process exists before canary handoff")
+    _handoff_canary_state(paths)
+    start_command = ["/usr/bin/systemctl", "start", "overseer-api-canary.service"]
+    if _execute_contract_command(start_command) != 0:
+        raise ActivationPackageError("canary service failed to start after ownership handoff")
+    return {
+        "started": True,
+        "packageDigest": expected_digest,
+        "stateDirectory": str(paths["stateDirectory"]),
+    }
 
 
 def _validate_contract_principal_binding(contract: Mapping[str, object]) -> None:
@@ -6517,6 +6778,7 @@ def verify_approved_staging(
         package,
         contract,
         expected_package_digest=digest,
+        pre_handoff=True,
     )
     return {
         "verified": True,
@@ -8040,11 +8302,16 @@ def _canary_authorization_boundary_index(
         "overseer-codex-user-bridge.socket",
         "overseer-admin-executor.socket",
     ]
-    service_start = [
-        "/usr/bin/systemctl",
-        "start",
-        "overseer-api-canary.service",
-    ]
+    service_start: list[str] = []
+    if 0 <= canary_command_index < len(commands):
+        canary_command = commands[canary_command_index]
+        if canary_command.count("run-approved-canary") == 1:
+            command_index = canary_command.index("run-approved-canary")
+            service_start = [
+                *canary_command[:command_index],
+                "handoff-start-canary",
+                *canary_command[command_index + 1 :],
+            ]
     health_check = [
         "/usr/bin/curl",
         "--fail",
@@ -8091,6 +8358,7 @@ def _canary_authorization_boundary_index(
         for command in commands[: max(boundary, 0)]
         if (
             any(argument in protected_unit_names for argument in command)
+            or "handoff-start-canary" in command
             or (
                 command
                 and PurePosixPath(command[0]).name == "systemctl"
@@ -8694,6 +8962,11 @@ def _main(argv: list[str] | None = None) -> int:
         help="publish a new package-bound canary SQLite state directory",
     )
     canary_store.add_argument("--package-root", required=True)
+    canary_handoff = commands.add_parser(
+        "handoff-start-canary",
+        help="transfer verified canary state and immediately start the exact canary unit",
+    )
+    canary_handoff.add_argument("--package-root", required=True)
     record_approval = commands.add_parser(
         "record-activation-approval",
         help="record a root-owned approval for one exact sealed package digest",
@@ -8937,6 +9210,12 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "handoff-start-canary":
+        result = handoff_start_canary(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "record-activation-approval":
         result = record_activation_approval(
             _validate_existing_package_destination(args.package_root),
@@ -9064,6 +9343,7 @@ __all__ = [
     "execute_approved_staging_canary",
     "ensure_dedicated_principal",
     "finalize_activation_package",
+    "handoff_start_canary",
     "prepare_final_store_migration",
     "recover_activation_approval_import",
     "record_activation_approval",

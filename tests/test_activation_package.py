@@ -3130,9 +3130,13 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
     canary_start_index = next(
         index
         for index, command in enumerate(staging_commands)
-        if command[-2:] == ["start", "overseer-api-canary.service"]
+        if "handoff-start-canary" in command
     )
     assert canary_stage_index < staging_verify_index < canary_start_index
+    assert all(
+        command != ["/usr/bin/systemctl", "start", "overseer-api-canary.service"]
+        for command in staging_commands
+    )
     canary_command_index = next(
         index for index, command in enumerate(staging_commands) if "run-approved-canary" in command
     )
@@ -3158,6 +3162,8 @@ def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_p
         "psychloBridgeDatabase": str(canary_state / "psychlo-bridge.sqlite3"),
         "roadexRelayDatabase": str(canary_state / "roadex-relay.sqlite3"),
         "preserveFailedStateForEvidence": True,
+        "ownershipHandoffCommand": "handoff-start-canary",
+        "requiresNoExistingServicePrincipalProcesses": True,
         "unixSocket": "/run/overseer-canary/api.sock",
         "serverPeerUid": 984,
         "allowedClientUid": 0,
@@ -3338,6 +3344,8 @@ def test_canary_store_staging_uses_new_release_bound_directory_and_rejects_reuse
             "psychloBridgeDatabase": str(state_directory / "psychlo-bridge.sqlite3"),
             "roadexRelayDatabase": str(state_directory / "roadex-relay.sqlite3"),
             "preserveFailedStateForEvidence": True,
+            "ownershipHandoffCommand": "handoff-start-canary",
+            "requiresNoExistingServicePrincipalProcesses": True,
         },
     }
     monkeypatch.setattr(activation_package_module, "CANARY_STATE_ROOT", canary_root)
@@ -3424,6 +3432,8 @@ def test_staged_canary_store_verification_rejects_sqlite_sidecars_and_hash_drift
             "psychloBridgeDatabase": str(state_directory / "psychlo-bridge.sqlite3"),
             "roadexRelayDatabase": str(state_directory / "roadex-relay.sqlite3"),
             "preserveFailedStateForEvidence": True,
+            "ownershipHandoffCommand": "handoff-start-canary",
+            "requiresNoExistingServicePrincipalProcesses": True,
         },
     }
     monkeypatch.setattr(activation_package_module, "CANARY_STATE_ROOT", canary_root)
@@ -3480,11 +3490,33 @@ def test_staged_canary_store_verification_rejects_sqlite_sidecars_and_hash_drift
 
     roadex_database.unlink()
     os.link(psychlo_database, roadex_database)
-    with pytest.raises(ActivationPackageError, match="pristine"):
+    with pytest.raises(ActivationPackageError, match="pristine|single-link"):
         activation_package_module._verify_staged_canary_store(package, contract)
     roadex_database.unlink()
     roadex_database.write_bytes(b"")
     roadex_database.chmod(0o600)
+
+    real_stream_hash = activation_package_module._stream_hash_regular
+
+    def reject_auxiliary_hash(path: Path, **kwargs: object) -> dict[str, object]:
+        if path == psychlo_database:
+            pytest.fail("nonempty auxiliary database must be rejected before hashing")
+        return real_stream_hash(path, **kwargs)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_stream_hash_regular",
+        reject_auxiliary_hash,
+    )
+    psychlo_database.write_bytes(b"oversized")
+    with pytest.raises(ActivationPackageError, match="pristine"):
+        activation_package_module._verify_staged_canary_store(package, contract)
+    psychlo_database.write_bytes(b"")
+    monkeypatch.setattr(
+        activation_package_module,
+        "_stream_hash_regular",
+        real_stream_hash,
+    )
 
     drifted_contract = json.loads(json.dumps(contract))
     drifted_contract["canary"]["store"] = str(tmp_path / "overseer-canary.sqlite3")
@@ -3493,7 +3525,19 @@ def test_staged_canary_store_verification_rejects_sqlite_sidecars_and_hash_drift
 
     with store.open("ab") as target:
         target.write(b"drift")
-    with pytest.raises(ActivationPackageError, match="canary store.*drift|SQLite"):
+    real_evidence = activation_package_module._sealed_migration_artifact_evidence
+
+    def reject_target_hash(path: Path, **kwargs: object) -> dict[str, object]:
+        if path == store:
+            pytest.fail("drifted target must be rejected by size before hashing")
+        return real_evidence(path, **kwargs)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_migration_artifact_evidence",
+        reject_target_hash,
+    )
+    with pytest.raises(ActivationPackageError, match="size"):
         activation_package_module._verify_staged_canary_store(package, contract)
 
 
@@ -3529,6 +3573,8 @@ def test_failed_canary_store_copy_fsyncs_the_preserved_instance_directory(
             "psychloBridgeDatabase": str(state_directory / "psychlo-bridge.sqlite3"),
             "roadexRelayDatabase": str(state_directory / "roadex-relay.sqlite3"),
             "preserveFailedStateForEvidence": True,
+            "ownershipHandoffCommand": "handoff-start-canary",
+            "requiresNoExistingServicePrincipalProcesses": True,
         },
     }
     monkeypatch.setattr(activation_package_module, "CANARY_STATE_ROOT", canary_root)
@@ -3574,6 +3620,171 @@ def test_failed_canary_store_copy_fsyncs_the_preserved_instance_directory(
 
     assert state_directory.is_dir()
     assert state_directory.stat().st_ino in synced_inodes
+
+
+def test_failed_partial_canary_copy_fsyncs_the_target_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.sqlite3"
+    source.write_bytes(b"canary-copy-evidence")
+    source.chmod(0o600)
+    destination = tmp_path / "destination"
+    destination.mkdir(mode=0o700)
+    directory_descriptor = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+    synced_inodes: set[int] = set()
+    real_write = os.write
+    real_fsync = os.fsync
+    writes = 0
+
+    def partial_then_fail(descriptor: int, value: object) -> int:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            return real_write(descriptor, memoryview(value)[:1])
+        raise OSError("simulated interrupted target write")
+
+    def tracked_fsync(descriptor: int) -> None:
+        synced_inodes.add(os.fstat(descriptor).st_ino)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "write", partial_then_fail)
+    monkeypatch.setattr(os, "fsync", tracked_fsync)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    try:
+        with pytest.raises(ActivationPackageError, match="staged safely"):
+            activation_package_module._copy_canary_store_at(
+                source,
+                expected_source_uid=os.geteuid(),
+                target_directory_descriptor=directory_descriptor,
+                target_name="overseer.sqlite3",
+            )
+    finally:
+        os.close(directory_descriptor)
+
+    target = destination / "overseer.sqlite3"
+    assert target.stat().st_size == 1
+    assert target.stat().st_ino in synced_inodes
+
+
+def test_canary_handoff_refuses_existing_service_process_then_starts_exact_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, manifest, _source = _prepared_package(tmp_path)
+    tmp_path.chmod(0o755)
+    canary_root = tmp_path / "overseer-canary"
+    canary_instance_id = json.loads(
+        (package / "public/canary-instance.json").read_text(encoding="utf-8")
+    )["canaryInstanceId"]
+    state_directory = canary_root / canary_instance_id
+    paths = {
+        "canaryInstanceId": canary_instance_id,
+        "stateDirectory": state_directory,
+        "store": state_directory / "overseer.sqlite3",
+        "psychloBridgeDatabase": state_directory / "psychlo-bridge.sqlite3",
+        "roadexRelayDatabase": state_directory / "roadex-relay.sqlite3",
+    }
+    canary_root.mkdir(mode=0o711)
+    state_directory.mkdir(mode=0o700)
+    shutil.copyfile(
+        package / "private/migration/rehearsal-migrated.sqlite3",
+        paths["store"],
+    )
+    for path in (
+        paths["store"],
+        paths["psychloBridgeDatabase"],
+        paths["roadexRelayDatabase"],
+    ):
+        selected = Path(path)
+        if not selected.exists():
+            selected.write_bytes(b"")
+        selected.chmod(0o600)
+    contract = {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(package.resolve()),
+        "releaseRoot": str(manifest["releaseRoot"]),
+        "account": {
+            "user": "overseer",
+            "uid": os.geteuid(),
+            "group": "overseer",
+            "gid": os.getegid(),
+        },
+        "sourceStore": {"uid": os.geteuid(), "gid": os.getegid()},
+        "canary": {
+            "canaryInstanceId": canary_instance_id,
+            "stateDirectory": str(state_directory),
+            "store": str(paths["store"]),
+            "psychloBridgeDatabase": str(paths["psychloBridgeDatabase"]),
+            "roadexRelayDatabase": str(paths["roadexRelayDatabase"]),
+            "preserveFailedStateForEvidence": True,
+            "ownershipHandoffCommand": "handoff-start-canary",
+            "requiresNoExistingServicePrincipalProcesses": True,
+        },
+    }
+    monkeypatch.setattr(activation_package_module, "CANARY_STATE_ROOT", canary_root)
+    monkeypatch.setattr(activation_package_module, "APPROVED_OVERSEER_UID", os.geteuid())
+    monkeypatch.setattr(activation_package_module, "APPROVED_OVERSEER_GID", os.getegid())
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_active_phase_command",
+        lambda *_args, **_kwargs: (contract, 29),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_state",
+        lambda: {"packageDigest": "a" * 64},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_canary_contract_layout",
+        lambda *_args, **_kwargs: paths,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_verify_staged_canary_store",
+        lambda *_args, **_kwargs: {"verified": True},
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command: calls.append(command) or 0,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda _uid: (12345,),
+        raising=False,
+    )
+
+    with pytest.raises(ActivationPackageError, match="service principal process"):
+        activation_package_module.handoff_start_canary(package)
+    assert calls == []
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda _uid: (),
+        raising=False,
+    )
+    result = activation_package_module.handoff_start_canary(package)
+
+    assert result["started"] is True
+    assert calls == [["/usr/bin/systemctl", "start", "overseer-api-canary.service"]]
 
 
 def test_canary_health_retry_handles_an_initially_missing_unix_socket(
@@ -5175,9 +5386,12 @@ def test_delayed_human_authorization_precedes_timed_canary_start(
         str(package.resolve()),
     ]
     canary_start = [
-        "/usr/bin/systemctl",
-        "start",
-        "overseer-api-canary.service",
+        "/opt/overseer/python",
+        "-m",
+        "overseer.activation_package",
+        "handoff-start-canary",
+        "--package-root",
+        str(package.resolve()),
     ]
     canary_resources_start = [
         "/usr/bin/systemctl",

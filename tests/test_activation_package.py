@@ -4033,6 +4033,7 @@ def test_canary_evidence_seal_requires_quiescence_and_root_seals_sidecars(
 
 def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     contract = {"canary": {"failureCleanupCommands": [["/bin/true", "cleanup"]]}}
     events: list[str] = []
@@ -4058,6 +4059,14 @@ def test_resilient_cleanup_seals_canary_evidence_after_stopping_units(
         package_digest="a" * 64,
     ) is True
     assert events == ["stopped", "sealed:False"]
+    progress_records = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines()
+    ]
+    assert [record["status"] for record in progress_records] == [
+        "evidence-seal-started",
+        "evidence-seal-complete",
+    ]
+    assert all(record["secretValuesRecorded"] is False for record in progress_records)
 
 
 def test_resilient_cleanup_checkpoints_evidence_sealing_failure(
@@ -5890,6 +5899,7 @@ def test_phase_bounded_activation_runner_stops_for_cutover_approval(
 def test_delayed_human_authorization_precedes_timed_canary_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     digest = "b" * 64
     package = tmp_path / "package"
@@ -6097,6 +6107,25 @@ def test_delayed_human_authorization_precedes_timed_canary_start(
     state_bytes = state_path.read_bytes()
     assert admin_secret.encode() not in state_bytes
     assert roadex_secret.encode() not in state_bytes
+    progress_output = capsys.readouterr().err
+    progress_records = [json.loads(line) for line in progress_output.splitlines()]
+    progress_statuses = [record["status"] for record in progress_records]
+    required_statuses = [
+        "phase-started",
+        "waiting-for-human-authorization",
+        "human-authorization-complete",
+        "stage-started",
+        "stage-complete",
+        "evidence-seal-started",
+        "evidence-seal-complete",
+        "phase-complete",
+    ]
+    cursor = 0
+    for status in required_statuses:
+        cursor = progress_statuses.index(status, cursor) + 1
+    assert admin_secret not in progress_output
+    assert roadex_secret not in progress_output
+    assert all(record["secretValuesRecorded"] is False for record in progress_records)
     assert all(
         admin_secret not in argument
         for command in contract["stagingAndCanaryCommands"]

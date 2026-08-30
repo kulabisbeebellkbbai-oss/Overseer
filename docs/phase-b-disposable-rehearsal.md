@@ -55,6 +55,14 @@ the separate explicit user-approval boundary. Immediately before creating
 any temporary artifact, the future script reruns both probes and requires
 byte-identical canonical records and matching SHA-256 digests.
 
+The guest never invokes Git through the mounted checkout. Linked worktrees
+store an absolute host-only gitdir pointer in `.git`, which is intentionally
+not exposed to the guest. Cloud-init therefore writes the already validated
+and plan-bound source SHA to a root-owned, single-link, mode-`0444`
+`/etc/overseer-phase-b-rehearsal/source-commit` artifact. The outer unit makes
+that file read-only, loads a private mode-`0400` systemd credential copy, and
+the guest validates the copy before provisioning.
+
 The domain shape is fixed to `qemu:///session`,
 `overseer-phase-b-rehearsal-<source7>`, 2048 MiB, two vCPUs, an 8 GiB
 overlay, no network interface, and disabled autostart. It has:

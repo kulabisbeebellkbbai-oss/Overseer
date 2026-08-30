@@ -34,6 +34,9 @@ GUEST_ETC = Path("/etc/overseer-phase-b-rehearsal")
 GUEST_RUN = Path("/run/overseer-phase-b-rehearsal")
 GUEST_OPT = Path("/opt/overseer-phase-b-rehearsal")
 GUEST_SYSTEMD = Path("/etc/systemd/system")
+SOURCE_COMMIT_ARTIFACT = Path(
+    "/run/credentials/overseer-phase-b-rehearsal.service/source-commit"
+)
 CANARY_STATE_ROOT = Path("/var/lib/overseer-canary")
 EXECUTOR_STATE_ROOT = Path("/var/lib/overseer-executor")
 OVERSEER_RUNTIME = Path("/run/overseer")
@@ -344,7 +347,7 @@ def preflight(
     source_root: Path | None = None,
     proc_root: Path | None = None,
     sys_root: Path | None = None,
-) -> None:
+) -> str:
     """Fail closed unless the process is root in the intended isolated guest."""
 
     global _PREFLIGHT_PASSED
@@ -354,7 +357,65 @@ def preflight(
     validate_preflight_snapshot(
         _preflight_snapshot(source_root=source_root, proc_root=proc_root, sys_root=sys_root)
     )
+    source_commit = _read_source_commit_artifact(SOURCE_COMMIT_ARTIFACT)
     _PREFLIGHT_PASSED = True
+    return source_commit
+
+
+def _read_source_commit_artifact(
+    path: Path,
+    *,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+) -> str:
+    """Read one root-owned, immutable, plan-bound source identity."""
+
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise PreflightError("source commit artifact is unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_owner_uid
+        or metadata.st_gid != expected_owner_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o400
+        or metadata.st_nlink != 1
+        or metadata.st_size != 41
+    ):
+        raise PreflightError("source commit artifact metadata is invalid")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise PreflightError("source commit artifact could not be opened") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+            or opened.st_uid != metadata.st_uid
+            or opened.st_gid != metadata.st_gid
+            or opened.st_mode != metadata.st_mode
+            or opened.st_nlink != metadata.st_nlink
+            or opened.st_size != metadata.st_size
+        ):
+            raise PreflightError("source commit artifact changed during open")
+        blocks: list[bytes] = []
+        total = 0
+        while total < 42:
+            block = os.read(descriptor, 42 - total)
+            if not block:
+                break
+            blocks.append(block)
+            total += len(block)
+        data = b"".join(blocks)
+        if len(data) != 41:
+            raise PreflightError("source commit artifact length is invalid")
+    finally:
+        os.close(descriptor)
+    if re.fullmatch(rb"[0-9a-f]{40}\n", data) is None:
+        raise PreflightError("source commit artifact identity is invalid")
+    return data[:-1].decode("ascii")
 
 
 def _safe_path(path: Path) -> Path:
@@ -697,9 +758,13 @@ def render_guest_units(
     }
 
 
-def _provision(paths: Mapping[str, Path], *, source: Path) -> dict[str, str]:
+def _provision(
+    paths: Mapping[str, Path], *, source: Path, source_commit: str
+) -> dict[str, str]:
     """Create only deterministic guest-local stores, credentials, and units."""
 
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        raise RehearsalError("source commit identity is invalid")
     config = paths["etc"]
     canary = paths["state"]
     source_path = source.resolve()
@@ -757,28 +822,10 @@ def _provision(paths: Mapping[str, Path], *, source: Path) -> dict[str, str]:
     for name, content in units.items():
         _write_precreated_unit(GUEST_SYSTEMD / name, content.encode("utf-8"))
     return {
-        "sourceCommit": _source_commit(source),
+        "sourceCommit": source_commit,
         "canaryInstanceId": canary.name,
         "packageId": "disposable",
     }
-
-
-def _source_commit(source: Path) -> str:
-    try:
-        completed = subprocess.run(
-            ("/usr/bin/git", "-C", str(source), "rev-parse", "HEAD"),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RehearsalError("source commit could not be identified") from error
-    commit = completed.stdout.strip()
-    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
-        raise RehearsalError("source commit identity is invalid")
-    return commit
-
 
 def _systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -1364,11 +1411,13 @@ def _run_rehearsal(
 ) -> tuple[str, dict[str, bool], dict[str, str]]:
     if os.environ.get("OVERSEER_PHASE_B_GUEST") != "1":
         raise PreflightError("disposable guest marker is unavailable")
-    preflight()
+    source_commit = preflight()
     paths = _guest_paths()
     _progress(paths, "phase-started")
     tracker.advance("provisioning")
-    identifiers = _provision(paths, source=SOURCE_ROOT)
+    identifiers = _provision(
+        paths, source=SOURCE_ROOT, source_commit=source_commit
+    )
     evidence = {
         control: {"observed": False} for control in REQUIRED_CONTROLS
     }

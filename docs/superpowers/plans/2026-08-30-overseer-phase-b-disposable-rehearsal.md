@@ -157,7 +157,7 @@ git commit -m "Add bounded Phase B progress telemetry"
 - Create: `tests/test_phase_b_guest_rehearsal.py`
 
 **Interfaces:**
-- Consumes: read-only source at `/mnt/overseer-source` and the checked-out Python runtime selected by the host preflight.
+- Consumes: read-only source at `/mnt/overseer-source`, the checked-out Python runtime selected by the host preflight, and the host-validated source SHA from a root-owned mode-`0444` artifact through a private mode-`0400` systemd credential copy; it must not resolve guest Git metadata or expose the host gitdir.
 - Produces: one canonical serial-console result with schema `overseer.phase-b-disposable-rehearsal.v1` and status `passed` or `failed`.
 - Produces no host files and requires no network.
 

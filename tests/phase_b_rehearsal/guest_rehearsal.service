@@ -3,6 +3,7 @@ Description=Disposable Overseer Phase B guest rehearsal
 After=local-fs.target
 ConditionPathIsDirectory=/mnt/overseer-source
 ConditionPathIsDirectory=/opt/overseer-phase-b-rehearsal
+ConditionPathExists=/etc/overseer-phase-b-rehearsal/source-commit
 
 [Service]
 Type=oneshot
@@ -11,6 +12,7 @@ Group=root
 WorkingDirectory=/opt/overseer-phase-b-rehearsal
 Environment=OVERSEER_PHASE_B_GUEST=1
 Environment=PYTHONDONTWRITEBYTECODE=1
+LoadCredential=source-commit:/etc/overseer-phase-b-rehearsal/source-commit
 ExecStart=/usr/bin/python3 -s -P /opt/overseer-phase-b-rehearsal/guest_rehearsal.py
 StandardOutput=journal+console
 StandardError=journal
@@ -22,6 +24,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/mnt/overseer-source
+ReadOnlyPaths=/etc/overseer-phase-b-rehearsal/source-commit
 ReadWritePaths=/etc/overseer-phase-b-rehearsal
 ReadWritePaths=/run/overseer /run/overseer-canary
 ReadWritePaths=/var/lib/overseer-canary /var/lib/overseer-executor /var/lib/overseer-phase-b-rehearsal

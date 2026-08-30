@@ -403,6 +403,9 @@ def test_cloud_init_installs_complete_task_two_guest_contract() -> None:
         "/usr/local/lib/python3.13/dist-packages",
         EXPECTED_PYTHON_ABI,
         "import cryptography; import overseer.cli; import overseer.user_bridge; import overseer.admin_executor",
+        "/etc/overseer-phase-b-rehearsal/source-commit",
+        SOURCE_COMMIT,
+        "permissions: '0444'",
         "guest_rehearsal.py",
         "guest_rehearsal.service",
         "systemctl daemon-reload",
@@ -414,6 +417,12 @@ def test_cloud_init_installs_complete_task_two_guest_contract() -> None:
         assert "owner: root:root" in entry[:160]
         assert "permissions: '0644'" in entry[:160]
         assert "content: ''" in entry[:160]
+    source_commit_entry = cloud[
+        cloud.index("path: /etc/overseer-phase-b-rehearsal/source-commit") :
+    ]
+    assert "owner: root:root" in source_commit_entry[:220]
+    assert "permissions: '0444'" in source_commit_entry[:220]
+    assert f"content: |\n      {SOURCE_COMMIT}\n" in source_commit_entry[:220]
 
 
 def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cleanup() -> None:

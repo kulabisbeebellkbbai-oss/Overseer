@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -60,6 +61,66 @@ def test_import_boundary_does_not_spawn_systemd_or_other_processes(
 
     monkeypatch.setattr(subprocess, "run", fail_if_spawned)
     load_guest_module()
+
+
+def test_source_commit_artifact_replaces_unreachable_worktree_gitdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_guest_module()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / ".git").write_text(
+        "gitdir: /host-only/Overseer/.git/worktrees/approval-smoke-v1-1-6\n",
+        encoding="ascii",
+    )
+    artifact = tmp_path / "source-commit"
+    commit = "a" * 40
+    artifact.write_text(commit + "\n", encoding="ascii")
+    artifact.chmod(0o400)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("source commit lookup spawned Git"),
+    )
+
+    observed = module._read_source_commit_artifact(
+        artifact,
+        expected_owner_uid=os.geteuid(),
+        expected_owner_gid=os.getegid(),
+    )
+
+    assert observed == commit
+    assert "source_commit" in inspect.signature(module._provision).parameters
+    assert "/usr/bin/git" not in GUEST_SCRIPT.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("case", ("mode", "hardlink", "symlink", "content"))
+def test_source_commit_artifact_rejects_unsafe_metadata_or_identity(
+    tmp_path: Path, case: str
+) -> None:
+    module = load_guest_module()
+    artifact = tmp_path / "source-commit"
+    artifact.write_text("b" * 40 + "\n", encoding="ascii")
+    artifact.chmod(0o400)
+    if case == "mode":
+        artifact.chmod(0o644)
+    elif case == "hardlink":
+        os.link(artifact, tmp_path / "second-link")
+    elif case == "symlink":
+        target = tmp_path / "real-source-commit"
+        artifact.rename(target)
+        artifact.symlink_to(target)
+    elif case == "content":
+        artifact.chmod(0o644)
+        artifact.write_text("G" * 40 + "\n", encoding="ascii")
+        artifact.chmod(0o400)
+
+    with pytest.raises(module.PreflightError, match="source commit artifact"):
+        module._read_source_commit_artifact(
+            artifact,
+            expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
+        )
 
 
 def test_result_serializer_emits_one_bounded_canonical_record() -> None:
@@ -484,3 +545,14 @@ def test_outer_service_allows_only_explicit_guest_and_unit_paths() -> None:
     ):
         assert path in service
     assert "ReadWritePaths=/etc/systemd/system\n" not in service
+    assert (
+        "ConditionPathExists=/etc/overseer-phase-b-rehearsal/source-commit"
+        in service
+    )
+    assert (
+        "ReadOnlyPaths=/etc/overseer-phase-b-rehearsal/source-commit" in service
+    )
+    assert (
+        "LoadCredential=source-commit:/etc/overseer-phase-b-rehearsal/source-commit"
+        in service
+    )

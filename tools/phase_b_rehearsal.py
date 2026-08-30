@@ -593,7 +593,10 @@ def preflight(
     }
 
 
-def _cloud_init(runtime_probe: Mapping[str, object]) -> str:
+def _cloud_init(
+    runtime_probe: Mapping[str, object], source_commit: str
+) -> str:
+    _require_full_source_commit(source_commit)
     python_abi = runtime_probe["pythonAbi"]
     if not isinstance(python_abi, str) or _PYTHON_ABI.fullmatch(python_abi) is None:
         raise PreflightError("runtime probe Python ABI is invalid")
@@ -610,6 +613,11 @@ def _cloud_init(runtime_probe: Mapping[str, object]) -> str:
         "  - [overseer-source, /mnt/overseer-source, 9p, 'trans=virtio,version=9p2000.L,ro,nosuid,nodev,noexec', '0', '0']",
         "  - [overseer-runtime-site, /mnt/overseer-runtime-site, 9p, 'trans=virtio,version=9p2000.L,ro,nosuid,nodev,noexec', '0', '0']",
         "write_files:",
+        "  - path: /etc/overseer-phase-b-rehearsal/source-commit",
+        "    owner: root:root",
+        "    permissions: '0444'",
+        "    content: |",
+        f"      {source_commit}",
     ]
     for path in TASK_TWO_PLACEHOLDERS:
         lines.extend(
@@ -970,7 +978,7 @@ def render_plan(
         canonical_json(validated_capability_probe).encode()
     ).hexdigest()
     vm_name = f"overseer-phase-b-rehearsal-{source_commit[:7]}"
-    cloud_init = _cloud_init(validated_probe)
+    cloud_init = _cloud_init(validated_probe, source_commit)
     meta_data = _meta_data(vm_name)
     domain_xml = _domain_xml(
         vm_name=vm_name, source_root=source_root, runtime_site=runtime_site

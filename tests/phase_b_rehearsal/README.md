@@ -13,7 +13,14 @@ units use Overseer's production Unix paths under `/run/overseer` and
 `/run/overseer-canary`. The copied canary namespace is handed to UID/GID 984
 before startup; the root executor state remains under
 `/var/lib/overseer-executor`. The source checkout is consumed from
-`/mnt/overseer-source`; it is never written.
+`/mnt/overseer-source`; it is never written. The guest does not follow the
+checkout's `.git` metadata because a linked-worktree pointer can reference an
+absolute host-only gitdir. Instead, cloud-init supplies the already validated,
+plan-digest-bound 40-character source commit in a root-owned, single-link,
+mode-`0444` artifact. The outer unit makes that one file read-only, and the
+guest receives a private mode-`0400` systemd `LoadCredential=` copy. It
+verifies the copy's inode, ownership, mode, link count, size, and identity
+before provisioning.
 
 The unit starts the real source API and client path over a Unix socket, the
 socket-activated user bridge and root executor, and the UID-984 canary. It
@@ -70,6 +77,11 @@ root-owned `0644` placeholders:
 /etc/systemd/system/overseer-codex-user-bridge.socket
 /etc/systemd/system/overseer-codex-user-bridge.service
 ```
+
+Cloud-init must also create
+`/etc/overseer-phase-b-rehearsal/source-commit` as a root-owned, mode-`0444`
+file containing the exact host-validated source SHA and one newline. It is
+input data, not a writable placeholder or credential.
 
 The sandbox grants write access to those files individually, never to the
 whole systemd unit directory. The harness rejects non-empty, linked,

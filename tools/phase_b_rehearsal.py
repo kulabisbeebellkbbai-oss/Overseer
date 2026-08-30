@@ -419,7 +419,8 @@ def _runtime_probe_python() -> str:
             "stdlib=Path(sysconfig.get_path('stdlib')).resolve(strict=True)",
             "platstdlib=Path(sysconfig.get_path('platstdlib')).resolve(strict=True)",
             "stdlib_dynamic=(stdlib/'lib-dynload').resolve(strict=True)",
-            "def allowed(root,manifest): return {str((root/item['path']).resolve(strict=True)):item for item in manifest['files']}",
+            "def lexical(value): return os.path.abspath(os.path.normpath(os.fspath(value)))",
+            "def allowed(root,manifest): return {lexical(root/item['path']):item for item in manifest['files']}",
             "allowed_source=allowed(source,source_manifest)",
             "allowed_runtime=allowed(runtime,runtime_manifest)",
             "def read_verified(origin,record):",
@@ -468,10 +469,12 @@ def _runtime_probe_python() -> str:
             " def find_spec(self,fullname,path=None,target=None):",
             "  spec=importlib.machinery.PathFinder.find_spec(fullname,path,target)",
             "  if spec is None or spec.origin in (None,'built-in','frozen'): return spec",
-            "  origin=str(Path(spec.origin).resolve(strict=True))",
-            "  record=allowed_source.get(origin) if Path(origin).is_relative_to(source) else allowed_runtime.get(origin) if Path(origin).is_relative_to(runtime) else None",
-            "  if Path(origin).is_relative_to(source) and record is None: raise ImportError('source origin is not manifested')",
-            "  if Path(origin).is_relative_to(runtime) and record is None: raise ImportError('runtime origin is not manifested')",
+            "  origin=lexical(spec.origin)",
+            "  in_source=Path(origin).is_relative_to(source)",
+            "  in_runtime=Path(origin).is_relative_to(runtime)",
+            "  record=allowed_source.get(origin) if in_source else allowed_runtime.get(origin) if in_runtime else None",
+            "  if in_source and record is None: raise ImportError('source origin is not manifested')",
+            "  if in_runtime and record is None: raise ImportError('runtime origin is not manifested')",
             "  if record is not None: spec.loader=ManifestSourceLoader(origin,record) if origin.endswith(('.py','.pyw')) else ManifestNativeLoader(fullname,origin,record)",
             "  return spec",
             "sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder),ManifestFinder())",
@@ -910,6 +913,8 @@ def preflight(
         raise PreflightError("base image qcow2 metadata is unavailable") from error
     if not isinstance(image_info, dict) or image_info.get("format") != "qcow2":
         raise PreflightError("base image is not qcow2")
+    if any(key in image_info for key in ("backing-filename", "full-backing-filename")):
+        raise PreflightError("base image must not have a backing file")
     try:
         if image_sha512(base_image).lower() != BASE_IMAGE_SHA512:
             raise PreflightError("base image SHA-512 is unverified")
@@ -1353,10 +1358,15 @@ def children_exact(item,required,optional=()):
     tags=[child.tag for child in list(item)]
     return all(tags.count(tag)==1 for tag in required) and all(tags.count(tag)<=1 for tag in optional) and tags.count("alias")<=1 and tags.count("address")<=1 and all(tag in set(required)|set(optional)|{"alias","address"} for tag in tags) and all(child.tag in set(required)|set(optional) or generated_child_ok(child) for child in list(item))
 disks=root.findall("./devices/disk")
+def backing_store_ok(item):
+    if item is None: return True
+    children=list(item); terminal=item.find("backingStore"); format_node=item.find("format"); source=item.find("source")
+    return item.attrib in ({"type":"file"},{"type":"file","index":"1"}) and len(children)==3 and {child.tag for child in children}=={"format","source","backingStore"} and leaf_ok(format_node,{"type":"qcow2"},None) and leaf_ok(source,{"file":sys.argv[7]},None) and leaf_ok(terminal,{},None)
 def disk_ok(item,device,path,driver_type,target,bus,readonly):
-    driver=item.find("driver");source=item.find("source");target_node=item.find("target")
+    driver=item.find("driver");source=item.find("source");target_node=item.find("target");backing=item.find("backingStore")
     readonly_node=item.find("readonly")
-    return item.attrib=={"type":"file","device":device} and children_exact(item,("driver","source","target"),("readonly",)) and leaf_ok(driver,{"name":"qemu","type":driver_type},None) and leaf_ok(source,{"file":path},None) and leaf_ok(target_node,{"dev":target,"bus":bus},None) and (readonly_node is not None)==readonly and (readonly_node is None or leaf_ok(readonly_node,{},None))
+    backing_allowed=device=="disk" and backing_store_ok(backing) or backing is None
+    return item.attrib=={"type":"file","device":device} and children_exact(item,("driver","source","target"),("readonly","backingStore")) and leaf_ok(driver,{"name":"qemu","type":driver_type},None) and leaf_ok(source,{"file":path},None) and leaf_ok(target_node,{"dev":target,"bus":bus},None) and (readonly_node is not None)==readonly and (readonly_node is None or leaf_ok(readonly_node,{},None)) and backing_allowed
 disk_valid=len(disks)==2 and any(disk_ok(item,"disk",sys.argv[4],"qcow2","vda","virtio",False) for item in disks) and any(disk_ok(item,"cdrom",sys.argv[5],"raw","sda","sata",True) for item in disks)
 serials=root.findall("./devices/serial")
 consoles=root.findall("./devices/console")
@@ -1365,8 +1375,12 @@ serial_source=None if serial is None else serial.find("source")
 serial_target=None if serial is None else serial.find("target")
 console=consoles[0] if len(consoles)==1 else None
 console_target=None if console is None else console.find("target")
+console_source=None if console is None else console.find("source")
 serial_valid=serial is not None and serial.attrib=={"type":"pipe"} and children_exact(serial,("source","target")) and leaf_ok(serial_source,{"path":sys.argv[6]},None) and leaf_ok(serial_target,{"type":"isa-serial","port":"0"},None)
-console_valid=console is not None and console.attrib=={"type":"pty"} and children_exact(console,("target",)) and leaf_ok(console_target,{"type":"serial","port":"0"},None)
+tty=None if console is None else console.get("tty"); tty_valid=tty is not None and re.fullmatch(r"/dev/pts/[0-9]+",tty) is not None
+console_attrs_valid=console is not None and (console.attrib=={"type":"pty"} or tty_valid and console.attrib=={"type":"pty","tty":tty})
+console_source_valid=console_source is None and tty is None or tty_valid and leaf_ok(console_source,{"path":tty},None)
+console_valid=console_attrs_valid and children_exact(console,("target",),("source",)) and leaf_ok(console_target,{"type":"serial","port":"0"},None) and console_source_valid
 emulators=root.findall("./devices/emulator")
 emulator_valid=not emulators or len(emulators)==1 and leaf_ok(emulators[0],{},"/usr/bin/qemu-system-x86_64")
 inputs=root.findall("./devices/input")
@@ -1483,7 +1497,7 @@ verify_domain_ownership() {{
   case "$presence" in 1) return 1;; 2) return 2;; esac
   if ! actual_uuid="$(/usr/bin/virsh --connect "$LIBVIRT_URI" domuuid "$VM_NAME" 2>/dev/null)" || [[ "$actual_uuid" != "$VM_UUID" ]]; then return 2; fi
   if ! xml="$(/usr/bin/virsh --connect "$LIBVIRT_URI" dumpxml "$VM_NAME" 2>/dev/null)"; then return 2; fi
-  if ! printf '%s' "$xml" | /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(ownership_validator)} "$VM_NAME" "$VM_UUID" "$RUN_ID" "$OVERLAY" "$SEED_ISO" "$SERIAL_PIPE"; then return 2; fi
+  if ! printf '%s' "$xml" | /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(ownership_validator)} "$VM_NAME" "$VM_UUID" "$RUN_ID" "$OVERLAY" "$SEED_ISO" "$SERIAL_PIPE" "$BASE_IMAGE"; then return 2; fi
   return 0
 }}
 

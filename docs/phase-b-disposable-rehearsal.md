@@ -24,7 +24,8 @@ Preflight fails closed unless:
   absolute names, safe object types, safe permissions, and required access;
 - every host tool exists at its exact `/usr/bin` path as a root-owned regular,
   single-link, non-group/other-writable executable;
-- the pinned image checksum and qcow2 metadata pass;
+- the pinned image checksum and qcow2 metadata pass, and the base is a leaf
+  image with no backing file;
 - a deterministic source manifest covers only NUL-delimited Git-tracked,
   single-link regular files and remains within the source file/byte bounds;
 - a deterministic runtime manifest covers only the `cryptography` package and
@@ -35,9 +36,11 @@ Preflight fails closed unless:
   revalidates stable descriptor metadata, mode, size, and SHA-256, then compiles
   those verified bytes directly. Native loaders copy the exact verified bytes
   into a sealed anonymous file, then create and execute the extension from that
-  immutable descriptor, closing the path-reopen race. The probe redirects
-  `sys.pycache_prefix` to an inaccessible location, so ignored adjacent
-  bytecode is not eligible.
+  immutable descriptor, closing the path-reopen race. Module origins are
+  classified by their lexical manifest path before any symlink resolution, so
+  a replaced manifest path reaches the `O_NOFOLLOW` verifier and cannot escape
+  to Python's original loader. The probe redirects `sys.pycache_prefix` to an
+  inaccessible location, so ignored adjacent bytecode is not eligible.
 
 Every probe uses an absolute executable and this exact minimal environment:
 
@@ -118,7 +121,11 @@ strict domain and device whitelist. The validator accepts only the exact memory,
 CPU, boot, feature, power, emulator, controller, input, audio, balloon, disk,
 serial, and console forms rendered by the plan or deterministically added by
 this libvirt/QEMU version. It permits only bounded generated alias and address
-metadata below those devices. Filesystem shares, interfaces, host devices,
+metadata below those devices. While the domain is active, it also permits only
+the exact detected qcow2 backing chain from the overlay to the pinned leaf base
+image and a generated `/dev/pts/<number>` console source whose path exactly
+matches the console's duplicated `tty` attribute. Filesystem shares,
+interfaces, host devices,
 channels, QEMU command-line extensions, custom kernels, security-label changes,
 host CPU passthrough, disk authentication, duplicate disks, changed disk
 attributes, and every other unapproved element are rejected. A missing lock,

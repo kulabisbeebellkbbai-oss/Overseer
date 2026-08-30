@@ -269,6 +269,7 @@ def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
         ("traversal-image", "base image path"),
         ("unsafe-temp", "temporary path"),
         ("raw-image", "qcow2"),
+        ("backed-image", "backing"),
         ("failed-import", "import probe"),
         ("missing-filesystem", "filesystem"),
         ("missing-path-driver", "filesystem"),
@@ -303,6 +304,12 @@ def test_preflight_rejects_unsafe_kvm_path_image_runtime_and_tool_states(case: s
         values["temp_parent"] = Path("/tmp/unsafe;path")
     elif case == "raw-image":
         values["runner"] = lambda command: '{"format":"raw"}' if command[0] == "qemu-img-info" else original_runner(command)
+    elif case == "backed-image":
+        values["runner"] = lambda command: (
+            '{"format":"qcow2","backing-filename":"/tmp/unapproved-base"}'
+            if command[0] == "qemu-img-info"
+            else original_runner(command)
+        )
     elif case == "failed-import":
         values["runner"] = lambda command: '{"status":"failed"}' if command[0] == "import-probe" else original_runner(command)
     elif case == "missing-filesystem":
@@ -586,6 +593,49 @@ def test_import_probe_rejects_manifested_path_replacement_before_execution(
     assert not marker.exists()
 
 
+def test_import_probe_rejects_manifested_symlink_escape_before_execution(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    source = tmp_path / "source"
+    package = source / "src/overseer"
+    runtime = tmp_path / "runtime"
+    cryptography = runtime / "cryptography"
+    package.mkdir(parents=True)
+    cryptography.mkdir(parents=True)
+    for relative in ("__init__.py", "cli.py", "user_bridge.py", "admin_executor.py"):
+        (package / relative).write_text("VALUE = 'approved'\n", encoding="utf-8")
+    (cryptography / "__init__.py").write_text("VALUE = 'approved'\n", encoding="utf-8")
+    (runtime / "_cffi_backend.cpython-313-x86_64-linux-gnu.so").write_bytes(b"fixture")
+    tracked = tuple(
+        f"src/overseer/{name}"
+        for name in ("__init__.py", "admin_executor.py", "cli.py", "user_bridge.py")
+    )
+    source_manifest = module.build_source_manifest(source, tracked)
+    runtime_manifest = module.build_runtime_manifest(runtime)
+    marker = tmp_path / "symlink-escape-executed"
+    escaped = tmp_path / "escaped-cli.py"
+    escaped.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    (package / "cli.py").unlink()
+    (package / "cli.py").symlink_to(escaped)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        module._read_only_runner(
+            (
+                "import-probe",
+                str(source),
+                str(runtime),
+                module.canonical_json(source_manifest),
+                module.canonical_json(runtime_manifest),
+            )
+        )
+
+    assert not marker.exists()
+
+
 def test_render_plan_is_pure_canonical_and_probe_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     module = load_tool()
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("render ran subprocess"))
@@ -660,6 +710,8 @@ def test_domain_xml_parses_and_has_seed_only_no_host_share_with_owned_pipe_seria
         "serial-protocol",
         "host-cpu",
         "metadata-extra",
+        "wrong-backing",
+        "wrong-console-tty",
     ),
 )
 def test_domain_ownership_validator_rejects_unapproved_devices(
@@ -705,8 +757,19 @@ def test_domain_ownership_validator_rejects_unapproved_devices(
         ET.SubElement(devices.find("serial"), "protocol", {"type": "raw"})
     elif mutation == "host-cpu":
         ET.SubElement(root, "cpu", {"mode": "host-passthrough"})
-    else:
+    elif mutation == "metadata-extra":
         ET.SubElement(root.find("metadata"), "unapproved")
+    elif mutation == "wrong-backing":
+        backing = ET.SubElement(
+            devices.findall("disk")[0], "backingStore", {"type": "file", "index": "1"}
+        )
+        ET.SubElement(backing, "format", {"type": "qcow2"})
+        ET.SubElement(backing, "source", {"file": "/tmp/unapproved-base.qcow2"})
+        ET.SubElement(backing, "backingStore")
+    else:
+        console = devices.find("console")
+        console.set("tty", "/dev/pts/7")
+        ET.SubElement(console, "source", {"path": "/dev/pts/8"})
     completed = subprocess.run(
         (
             sys.executable,
@@ -722,6 +785,7 @@ def test_domain_ownership_validator_rejects_unapproved_devices(
             "/tmp/owned/overlay.qcow2",
             "/tmp/owned/seed.iso",
             "/tmp/owned/serial",
+            str(BASE_IMAGE),
         ),
         input=ET.tostring(root, encoding="unicode"),
         check=False,
@@ -755,6 +819,7 @@ def test_domain_ownership_validator_accepts_only_the_rendered_device_contract() 
             "/tmp/owned/overlay.qcow2",
             "/tmp/owned/seed.iso",
             "/tmp/owned/serial",
+            str(BASE_IMAGE),
         ),
         input=xml,
         check=False,
@@ -808,6 +873,10 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
         },
     )
     ET.SubElement(disks[0], "alias", {"name": "virtio-disk0"})
+    backing = ET.SubElement(disks[0], "backingStore", {"type": "file", "index": "1"})
+    ET.SubElement(backing, "format", {"type": "qcow2"})
+    ET.SubElement(backing, "source", {"file": str(BASE_IMAGE)})
+    ET.SubElement(backing, "backingStore")
     ET.SubElement(
         disks[1],
         "address",
@@ -818,6 +887,8 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
     assert serial is not None and console is not None
     ET.SubElement(serial, "address", {"type": "isa", "iobase": "0x3f8", "irq": "4"})
     ET.SubElement(serial, "alias", {"name": "serial0"})
+    console.set("tty", "/dev/pts/7")
+    ET.SubElement(console, "source", {"path": "/dev/pts/7"})
     ET.SubElement(console, "alias", {"name": "serial0"})
     os_type = root.find("./os/type")
     assert os_type is not None
@@ -840,6 +911,7 @@ def test_domain_ownership_validator_accepts_exact_libvirt_auto_devices() -> None
             "/tmp/owned/overlay.qcow2",
             "/tmp/owned/seed.iso",
             "/tmp/owned/serial",
+            str(BASE_IMAGE),
         ),
         input=ET.tostring(root, encoding="unicode"),
         check=False,

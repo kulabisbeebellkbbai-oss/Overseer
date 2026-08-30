@@ -8,7 +8,6 @@ the guest preflight has failed closed.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import grp
 import hashlib
 import json
@@ -16,11 +15,12 @@ import os
 import pty
 import pwd
 import re
-import select
-import sqlite3
+import stat
 import subprocess
 import sys
 import termios
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from urllib.error import HTTPError
@@ -34,6 +34,10 @@ GUEST_ETC = Path("/etc/overseer-phase-b-rehearsal")
 GUEST_RUN = Path("/run/overseer-phase-b-rehearsal")
 GUEST_OPT = Path("/opt/overseer-phase-b-rehearsal")
 GUEST_SYSTEMD = Path("/etc/systemd/system")
+CANARY_STATE_ROOT = Path("/var/lib/overseer-canary")
+EXECUTOR_STATE_ROOT = Path("/var/lib/overseer-executor")
+OVERSEER_RUNTIME = Path("/run/overseer")
+CANARY_RUNTIME = Path("/run/overseer-canary")
 
 ADMIN_SECRET = "phase-b-rehearsal-admin-secret"
 ROADEX_SECRET = "phase-b-rehearsal-roadex-secret"
@@ -85,12 +89,12 @@ _SECRET_MARKERS = re.compile(
     re.IGNORECASE,
 )
 _DISPOSABLE_UNITS = (
-    "overseer-phase-b-smoke.service",
-    "overseer-phase-b-bridge.socket",
-    "overseer-phase-b-bridge.service",
-    "overseer-phase-b-executor.socket",
-    "overseer-phase-b-executor.service",
-    "overseer-phase-b-canary.service",
+    "overseer-approval-smoke.service",
+    "overseer-codex-user-bridge.socket",
+    "overseer-codex-user-bridge.service",
+    "overseer-admin-executor.socket",
+    "overseer-admin-executor@.service",
+    "overseer-api-canary.service",
 )
 _UNITS_MAY_BE_ACTIVE = False
 _PREFLIGHT_PASSED = False
@@ -102,6 +106,18 @@ class PreflightError(RuntimeError):
 
 class RehearsalError(RuntimeError):
     """Raised for a bounded disposable rehearsal failure."""
+
+
+class StageTracker:
+    """Retain the last bounded stage even when a nested operation raises."""
+
+    def __init__(self) -> None:
+        self.current = "preflight"
+
+    def advance(self, stage: str) -> None:
+        if stage not in _RESULT_STAGES:
+            raise RehearsalError("stage is not bounded")
+        self.current = stage
 
 
 def _canonical(value: object) -> str:
@@ -251,14 +267,73 @@ def _network_is_quiescent(sys_root: Path) -> bool:
     return True
 
 
-def _require_identity(uid: int, expected_name: str) -> None:
+def validate_preflight_snapshot(snapshot: Mapping[str, object]) -> None:
+    """Validate a bounded snapshot so every rejection is source-testable."""
+
+    if snapshot.get("euid") != 0:
+        raise PreflightError("rehearsal requires root")
+    if snapshot.get("pid1") != "systemd":
+        raise PreflightError("PID 1 is not systemd")
+    if (
+        snapshot.get("sourceIsDirectory") is not True
+        or snapshot.get("sourceIsSymlink") is not False
+        or snapshot.get("sourceMountReadOnly") is not True
+    ):
+        raise PreflightError("source checkout is not a read-only mount")
+    interfaces = snapshot.get("interfaces")
+    if not isinstance(interfaces, Mapping):
+        raise PreflightError("network interface inventory is unavailable")
+    for name, state_value in interfaces.items():
+        if not isinstance(name, str) or not isinstance(state_value, str):
+            raise PreflightError("network interface inventory is unavailable")
+        if name != "lo" and state_value != "down":
+            raise PreflightError("a non-loopback network interface is up")
+    users = snapshot.get("users")
+    groups = snapshot.get("groups")
+    if not isinstance(users, Mapping) or not isinstance(groups, Mapping):
+        raise PreflightError("guest identity inventory is unavailable")
+    for uid, expected_name in ((CANARY_UID, "overseer"), (BRIDGE_UID, "god")):
+        user = users.get(uid)
+        group = groups.get(uid)
+        if (
+            not isinstance(user, Mapping)
+            or not isinstance(group, Mapping)
+            or user.get("name") != expected_name
+            or user.get("uid") != uid
+            or user.get("gid") != uid
+            or group.get("name") != expected_name
+            or group.get("gid") != uid
+        ):
+            raise PreflightError(f"identity {uid} is not bound exactly")
+
+
+def _preflight_snapshot(
+    *, source_root: Path, proc_root: Path, sys_root: Path
+) -> dict[str, object]:
     try:
-        actual = pwd.getpwuid(uid).pw_name
-        group = grp.getgrgid(uid).gr_name
-    except KeyError as error:
-        raise PreflightError(f"identity {uid} is not resolvable") from error
-    if actual != expected_name or group != expected_name:
-        raise PreflightError(f"identity {uid} is not bound to {expected_name}")
+        interfaces = {
+            path.name: (path / "operstate").read_text(encoding="ascii").strip()
+            for path in sorted((sys_root / "class/net").iterdir())
+        }
+        users: dict[int, dict[str, object]] = {}
+        groups: dict[int, dict[str, object]] = {}
+        for uid in (CANARY_UID, BRIDGE_UID):
+            user = pwd.getpwuid(uid)
+            group = grp.getgrgid(uid)
+            users[uid] = {"name": user.pw_name, "uid": user.pw_uid, "gid": user.pw_gid}
+            groups[uid] = {"name": group.gr_name, "gid": group.gr_gid}
+    except (KeyError, OSError, UnicodeError) as error:
+        raise PreflightError("guest preflight inventory is unavailable") from error
+    return {
+        "euid": os.geteuid(),
+        "pid1": _read(proc_root / "1/comm", label="PID 1 identity").strip(),
+        "sourceIsDirectory": source_root.is_dir(),
+        "sourceIsSymlink": source_root.is_symlink(),
+        "sourceMountReadOnly": _source_mount_is_read_only(proc_root, source_root),
+        "interfaces": interfaces,
+        "users": users,
+        "groups": groups,
+    }
 
 
 def preflight(
@@ -273,22 +348,32 @@ def preflight(
     source_root = SOURCE_ROOT if source_root is None else source_root
     proc_root = Path("/proc") if proc_root is None else proc_root
     sys_root = Path("/sys") if sys_root is None else sys_root
-    if os.geteuid() != 0:
-        raise PreflightError("rehearsal requires root")
-    if _read(proc_root / "1/comm", label="PID 1 identity").strip() != "systemd":
-        raise PreflightError("PID 1 is not systemd")
-    if not source_root.is_dir() or source_root.is_symlink() or not _source_mount_is_read_only(proc_root, source_root):
-        raise PreflightError("source checkout is not a read-only mount")
-    if not _network_is_quiescent(sys_root):
-        raise PreflightError("a non-loopback network interface is up")
-    _require_identity(CANARY_UID, "overseer")
-    _require_identity(BRIDGE_UID, "god")
+    validate_preflight_snapshot(
+        _preflight_snapshot(source_root=source_root, proc_root=proc_root, sys_root=sys_root)
+    )
     _PREFLIGHT_PASSED = True
 
 
 def _safe_path(path: Path) -> Path:
-    allowed_roots = (REHEARSAL_ROOT, GUEST_ETC, GUEST_RUN, GUEST_OPT)
-    if path.parent == GUEST_SYSTEMD and path.name.startswith("overseer-phase-b-"):
+    allowed_roots = (
+        REHEARSAL_ROOT,
+        GUEST_ETC,
+        GUEST_RUN,
+        GUEST_OPT,
+        CANARY_STATE_ROOT,
+        EXECUTOR_STATE_ROOT,
+        OVERSEER_RUNTIME,
+        CANARY_RUNTIME,
+    )
+    allowed_units = {
+        "overseer-approval-smoke.service",
+        "overseer-api-canary.service",
+        "overseer-admin-executor.socket",
+        "overseer-admin-executor@.service",
+        "overseer-codex-user-bridge.socket",
+        "overseer-codex-user-bridge.service",
+    }
+    if path.parent == GUEST_SYSTEMD and path.name in allowed_units:
         return path
     resolved = path.resolve()
     if not any(resolved == root.resolve() or root.resolve() in resolved.parents for root in allowed_roots):
@@ -318,19 +403,55 @@ def _write(path: Path, data: bytes, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def _write_precreated_unit(path: Path, data: bytes) -> None:
+    """Fill one exact root-owned empty unit placeholder inside the sandbox."""
+
+    _safe_path(path)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise RehearsalError("guest unit placeholder is unavailable") from error
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o644
+        or metadata.st_nlink != 1
+        or metadata.st_size != 0
+    ):
+        raise RehearsalError("guest unit placeholder metadata is invalid")
+    flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        written = 0
+        while written < len(data):
+            count = os.write(descriptor, data[written:])
+            if count <= 0:
+                raise OSError("unit write did not progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _progress(paths: Mapping[str, Path], event: str) -> None:
     """Append a bounded local ordering record; never include command or input."""
 
+    record_progress(paths["artifacts"] / "progress.jsonl", event)
+
+
+def record_progress(target: Path, event: str) -> None:
     if event not in {
         "phase-started",
         "authorization-complete",
+        "systemd-start",
         "canary-service-started",
         "evidence-seal-started",
         "evidence-seal-complete",
         "cleanup-complete",
     }:
         raise RehearsalError("progress event is not allowlisted")
-    target = paths["artifacts"] / "progress.jsonl"
     with target.open("ab") as stream:
         stream.write((_canonical({"event": event, "secretValuesRecorded": False}) + "\n").encode("ascii"))
         stream.flush()
@@ -339,38 +460,179 @@ def _progress(paths: Mapping[str, Path], event: str) -> None:
 
 def _guest_paths() -> dict[str, Path]:
     _mkdir(REHEARSAL_ROOT, 0o700)
+    _mkdir(CANARY_STATE_ROOT, 0o711)
+    instance = hashlib.sha256(b"overseer-phase-b-disposable-instance").hexdigest()[:32]
+    state_directory = CANARY_STATE_ROOT / instance
+    _mkdir(state_directory, 0o700)
+    _mkdir(EXECUTOR_STATE_ROOT, 0o700)
+    _mkdir(OVERSEER_RUNTIME, 0o710)
+    os.chown(OVERSEER_RUNTIME, 0, CANARY_UID)
+    _mkdir(CANARY_RUNTIME, 0o700)
+    os.chown(CANARY_RUNTIME, CANARY_UID, CANARY_UID)
     paths = {
-        "state": REHEARSAL_ROOT / "state",
+        "state": state_directory,
         "artifacts": REHEARSAL_ROOT / "artifacts",
-        "runtime": GUEST_RUN,
+        "runtime": CANARY_RUNTIME,
         "etc": GUEST_ETC,
         "opt": GUEST_OPT,
-        "run": GUEST_RUN,
+        "run": CANARY_RUNTIME,
+        "executor": EXECUTOR_STATE_ROOT,
+        "package": REHEARSAL_ROOT / "package",
     }
-    for path in paths.values():
+    for name, path in paths.items():
+        if name == "state":
+            continue
         _mkdir(path, 0o700)
     return paths
+
+
+def canary_namespace_contract(state_directory: Path) -> dict[str, dict[str, int]]:
+    """Return the exact ownership contract required by the real Unix paths."""
+
+    if state_directory.parent != CANARY_STATE_ROOT or re.fullmatch(
+        r"[0-9a-f]{32}", state_directory.name
+    ) is None:
+        raise RehearsalError("canary state directory is not instance-bound")
+    return {
+        "stateDirectory": {"uid": CANARY_UID, "gid": CANARY_UID, "mode": 0o700},
+        "store": {"uid": CANARY_UID, "gid": CANARY_UID, "mode": 0o600},
+        "runtimeParent": {"uid": 0, "gid": CANARY_UID, "mode": 0o710},
+        "executorSocket": {"uid": CANARY_UID, "gid": 0, "mode": 0o600},
+        "bridgeSocket": {"uid": CANARY_UID, "gid": 0, "mode": 0o600},
+        "apiRuntime": {"uid": CANARY_UID, "gid": CANARY_UID, "mode": 0o700},
+        "apiSocket": {"uid": CANARY_UID, "gid": CANARY_UID, "mode": 0o600},
+    }
+
+
+def handoff_canary_namespace(
+    state_directory: Path,
+    *,
+    expected_owner_uid: int,
+    expected_owner_gid: int,
+    chown=os.chown,
+    chmod=os.chmod,
+) -> None:
+    """Transfer one closed three-store namespace to UID/GID 984."""
+
+    expected_names = {
+        "overseer.sqlite3",
+        "psychlo-bridge.sqlite3",
+        "roadex-relay.sqlite3",
+    }
+    try:
+        state_metadata = state_directory.lstat()
+        children = tuple(state_directory.iterdir())
+    except OSError as error:
+        raise RehearsalError("canary namespace could not be inspected") from error
+    if (
+        not stat.S_ISDIR(state_metadata.st_mode)
+        or stat.S_IMODE(state_metadata.st_mode) != 0o700
+        or state_metadata.st_uid != expected_owner_uid
+        or state_metadata.st_gid != expected_owner_gid
+        or {child.name for child in children} != expected_names
+    ):
+        raise RehearsalError("canary namespace contains unexpected state")
+    for child in children:
+        metadata = child.lstat()
+        if (
+            child.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != expected_owner_uid
+            or metadata.st_gid != expected_owner_gid
+            or metadata.st_nlink != 1
+        ):
+            raise RehearsalError("canary namespace contains unexpected artifact metadata")
+    for child in sorted(children):
+        chown(child, CANARY_UID, CANARY_UID)
+        chmod(child, 0o600)
+    chown(state_directory, CANARY_UID, CANARY_UID)
+    chmod(state_directory, 0o700)
+
+
+def render_guest_units(
+    *, source_root: Path, python_path: Path, state_directory: Path
+) -> dict[str, str]:
+    """Render deterministic production-path units without touching systemd."""
+
+    source = source_root.resolve()
+    python = python_path.resolve()
+    store = state_directory / "overseer.sqlite3"
+    common = (
+        f"WorkingDirectory={source}\n"
+        f"Environment=PYTHONPATH={source / 'src'}\n"
+        "Environment=PYTHONDONTWRITEBYTECODE=1\n"
+        "PrivateNetwork=yes\nNoNewPrivileges=yes\nProtectSystem=strict\n"
+    )
+    return {
+        "overseer-approval-smoke.service": (
+            "[Unit]\nDescription=Disposable Phase B allowlisted smoke\n"
+            "[Service]\nType=oneshot\nExecStart=/usr/bin/true\n"
+        ),
+        "overseer-api-canary.service": (
+            "[Unit]\nDescription=Disposable Phase B canary API\n"
+            "After=overseer-admin-executor.socket overseer-codex-user-bridge.socket\n"
+            "Requires=overseer-admin-executor.socket overseer-codex-user-bridge.socket\n"
+            "[Service]\nType=simple\nUser=984\nGroup=984\n"
+            "LoadCredential=api-token:/etc/overseer-phase-b-rehearsal/api-token\n"
+            "LoadCredential=admin-approval-verifier.json:/etc/overseer-phase-b-rehearsal/admin-approval-verifier.json\n"
+            "LoadCredential=roadex-fixture-approval-verifier.json:/etc/overseer-phase-b-rehearsal/roadex-fixture-approval-verifier.json\n"
+            "LoadCredential=admin-ticket-private-key:/etc/overseer-phase-b-rehearsal/admin-ticket-private-key\n"
+            "Environment=OVERSEER_DEDICATED_PRINCIPAL=1\n"
+            "Environment=OVERSEER_ADMIN_TICKET_PRIVATE_KEY=%d/admin-ticket-private-key\n"
+            "Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET=/run/overseer/admin-executor.sock\n"
+            "Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock\n"
+            "Environment=OVERSEER_USER_BRIDGE_SERVER_UID=1000\n"
+            + common
+            + f"ExecStart={python} -B -s -P -m overseer.cli serve-api "
+            f"--store {store} --socket-path {CANARY_RUNTIME / 'api.sock'} "
+            f"--socket-peer-uid 0 --socket-owner-uid {CANARY_UID} "
+            f"--socket-owner-gid {CANARY_UID} --auth-token-file %d/api-token "
+            "--admin-approval-verifier-file %d/admin-approval-verifier.json "
+            "--roadex-fixture-approval-verifier-file %d/roadex-fixture-approval-verifier.json\n"
+            f"ReadWritePaths={state_directory} {CANARY_RUNTIME}\n"
+        ),
+        "overseer-codex-user-bridge.socket": (
+            "[Unit]\nDescription=Disposable Overseer user bridge socket\n"
+            "[Socket]\nListenStream=/run/overseer/codex-user-bridge.sock\n"
+            "SocketMode=0600\nSocketUser=984\nSocketGroup=0\n"
+        ),
+        "overseer-codex-user-bridge.service": (
+            "[Unit]\nRequires=overseer-codex-user-bridge.socket\n"
+            "[Service]\nType=simple\nUser=1000\nGroup=1000\n"
+            + common
+            + f"ExecStart={python} -B -s -P -m overseer.user_bridge serve "
+            f"--socket-fd=3 --peer-uid={CANARY_UID}\n"
+        ),
+        "overseer-admin-executor.socket": (
+            "[Unit]\nDescription=Disposable Overseer admin executor socket\n"
+            "[Socket]\nListenStream=/run/overseer/admin-executor.sock\n"
+            "SocketMode=0600\nSocketUser=984\nSocketGroup=0\nAccept=yes\n"
+        ),
+        "overseer-admin-executor@.service": (
+            "[Unit]\nDescription=Disposable Overseer admin executor connection\n"
+            "[Service]\nType=oneshot\nUser=root\nGroup=root\nStandardInput=socket\nStandardOutput=socket\n"
+            + common
+            + f"ExecStart={python} -B -s -P -m overseer.admin_executor serve-one "
+            f"--allowlist-file {GUEST_ETC / 'allowlist.json'} "
+            f"--public-key-file {GUEST_ETC / 'admin-ticket-public-key'} "
+            f"--ledger {EXECUTOR_STATE_ROOT / 'executor-ledger.sqlite3'}\n"
+            f"ReadWritePaths={EXECUTOR_STATE_ROOT}\n"
+        ),
+    }
 
 
 def _provision(paths: Mapping[str, Path], *, source: Path) -> dict[str, str]:
     """Create only deterministic guest-local stores, credentials, and units."""
 
-    config = paths["etc"] / "overseer"
-    units = GUEST_SYSTEMD
-    release = paths["opt"] / "overseer"
-    canary = paths["state"] / "canary"
-    executor = paths["state"] / "executor"
-    for directory in (config, release, canary, executor):
-        _mkdir(directory, 0o700)
-
+    config = paths["etc"]
+    canary = paths["state"]
     source_path = source.resolve()
     _write(config / "api-token", (API_TOKEN + "\n").encode("ascii"), 0o600)
     _write(config / "allowlist.json", _canonical({
         "schemaVersion": "overseer.admin-executor-allowlist.v1",
-        "allowed": [{"operation": "restart-system-unit", "unit": "overseer-phase-b-smoke.service"}],
+        "allowed": [{"operation": "restart-system-unit", "unit": "overseer-approval-smoke.service"}],
     }).encode("ascii") + b"\n", 0o600)
-    _write(config / "bindings.json", b"{\"schemaVersion\":\"phase-b-rehearsal-bindings.v1\"}\n", 0o600)
-
     sys.path.insert(0, str(source / "src"))
     try:
         from overseer.approval_auth import create_approval_document, write_approval_document
@@ -389,65 +651,40 @@ def _provision(paths: Mapping[str, Path], *, source: Path) -> dict[str, str]:
     )
     seed = hashlib.sha256(b"overseer-phase-b-disposable-rehearsal-ed25519").digest()
     private_key = Ed25519PrivateKey.from_private_bytes(seed)
-    _write(config / "executor-private-key", private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()), 0o600)
-    _write(config / "executor-public-key", private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw), 0o644)
+    _write(
+        config / "admin-ticket-private-key",
+        private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()),
+        0o600,
+    )
+    _write(
+        config / "admin-ticket-public-key",
+        private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
+        0o644,
+    )
 
-    for name in ("overseer.sqlite3", "bridge.sqlite3", "relay.sqlite3", "executor.sqlite3"):
-        database = (executor if name == "executor.sqlite3" else canary) / name
-        if name == "overseer.sqlite3":
-            store = SQLiteStore(database)
-            try:
-                store.initialize()
-            finally:
-                store.close()
-            continue
-        connection = sqlite3.connect(database)
-        try:
-            connection.execute("CREATE TABLE rehearsal_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            connection.execute("INSERT INTO rehearsal_state VALUES (?, ?)", ("schema", "phase-b-rehearsal.v1"))
-            connection.commit()
-        finally:
-            connection.close()
-        os.chmod(database, 0o600)
-
-    _write(release / "source-root", (str(source_path) + "\n").encode("utf-8"), 0o600)
-    _write(units / "overseer-phase-b-smoke.service", b"[Unit]\nDescription=Disposable Phase B allowlisted smoke\n[Service]\nType=oneshot\nExecStart=/usr/bin/true\n", 0o644)
-    _write(units / "overseer-phase-b-canary.service", (
-        "[Unit]\nDescription=Disposable Phase B canary API\n"
-        "[Service]\nType=simple\nUser=984\nGroup=984\n"
-        f"WorkingDirectory={source_path}\nEnvironment=PYTHONPATH={source_path / 'src'}\n"
-        f"ExecStart={sys.executable} -s -P -m overseer.cli serve-api --store {canary / 'overseer.sqlite3'} "
-        f"--socket-path {paths['run'] / 'api.sock'} --socket-peer-uid 0 "
-        f"--socket-owner-uid {CANARY_UID} --socket-owner-gid {CANARY_UID} "
-        f"--auth-token-file {config / 'api-token'} "
-        f"--admin-approval-verifier-file {config / 'admin-approval-verifier.json'} "
-        f"--roadex-fixture-approval-verifier-file {config / 'roadex-fixture-approval-verifier.json'}\n"
-        f"Environment=OVERSEER_ADMIN_EXECUTOR_SOCKET={paths['run'] / 'executor.sock'}\n"
-        f"Environment=OVERSEER_USER_BRIDGE_SOCKET={paths['run'] / 'bridge.sock'}\n"
-        "NoNewPrivileges=yes\nPrivateNetwork=yes\nProtectSystem=strict\n"
-    ).encode("utf-8"), 0o644)
-    _write(units / "overseer-phase-b-bridge.socket", b"[Unit]\n[Socket]\nListenStream=/run/overseer-phase-b-rehearsal/bridge.sock\nSocketMode=0600\nSocketUser=1000\nSocketGroup=1000\n", 0o644)
-    _write(units / "overseer-phase-b-bridge.service", (
-        "[Unit]\nRequires=overseer-phase-b-bridge.socket\nAfter=overseer-phase-b-bridge.socket\n"
-        "[Service]\nType=simple\nUser=1000\nGroup=1000\n"
-        f"WorkingDirectory={source_path}\nEnvironment=PYTHONPATH={source_path / 'src'}\n"
-        f"ExecStart={sys.executable} -s -P -m overseer.user_bridge serve --socket-fd=3 --peer-uid={CANARY_UID}\n"
-        "NoNewPrivileges=yes\nPrivateNetwork=yes\nProtectSystem=strict\n"
-    ).encode("utf-8"), 0o644)
-    _write(units / "overseer-phase-b-executor.socket", b"[Unit]\n[Socket]\nListenStream=/run/overseer-phase-b-rehearsal/executor.sock\nSocketMode=0600\nSocketUser=984\nSocketGroup=984\n", 0o644)
-    _write(units / "overseer-phase-b-executor.service", (
-        "[Unit]\nRequires=overseer-phase-b-executor.socket\nAfter=overseer-phase-b-executor.socket\n"
-        "[Service]\nType=simple\nUser=root\nGroup=root\nStandardInput=socket\nStandardOutput=socket\n"
-        f"WorkingDirectory={source_path}\nEnvironment=PYTHONPATH={source_path / 'src'}\n"
-        f"ExecStart={sys.executable} -s -P -m overseer.admin_executor serve-one "
-        f"--allowlist-file {config / 'allowlist.json'} --public-key-file {config / 'executor-public-key'} "
-        f"--ledger {executor / 'executor-ledger.sqlite3'}\n"
-        "PrivateNetwork=yes\nProtectSystem=strict\nNoNewPrivileges=no\n"
-    ).encode("utf-8"), 0o644)
+    store = SQLiteStore(canary / "overseer.sqlite3")
+    try:
+        store.initialize()
+    finally:
+        store.close()
+    for name in ("psychlo-bridge.sqlite3", "roadex-relay.sqlite3"):
+        _write(canary / name, b"", 0o600)
+    handoff_canary_namespace(
+        canary,
+        expected_owner_uid=0,
+        expected_owner_gid=0,
+    )
+    units = render_guest_units(
+        source_root=source_path,
+        python_path=Path(sys.executable),
+        state_directory=canary,
+    )
+    for name, content in units.items():
+        _write_precreated_unit(GUEST_SYSTEMD / name, content.encode("utf-8"))
     return {
         "sourceCommit": _source_commit(source),
-        "canaryState": "canary",
-        "executorState": "executor",
+        "canaryInstanceId": canary.name,
+        "packageId": "disposable",
     }
 
 
@@ -478,36 +715,168 @@ def _systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def _run_pty_control() -> bool:
-    """Exercise hidden input and restore the terminal without retaining it."""
+def exercise_production_hidden_reader(progress_ledger: Path) -> bool:
+    """Drive the production hidden reader through a real disposable PTY."""
+
+    from overseer import activation_package
 
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
-    hidden = original[:]
-    hidden[3] &= ~termios.ECHO
+    values: list[str] = []
+    errors: list[BaseException] = []
+
+    def read_value() -> None:
+        try:
+            values.append(
+                activation_package._read_canary_secret_from_terminal(slave, "")
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    reader = threading.Thread(target=read_value, daemon=True)
+    reader.start()
+    hidden_observed = False
+    deadline = time.monotonic() + 2.0
     try:
-        termios.tcsetattr(slave, termios.TCSAFLUSH, hidden)
+        while reader.is_alive() and time.monotonic() < deadline:
+            if not termios.tcgetattr(slave)[3] & termios.ECHO:
+                hidden_observed = True
+                break
+            time.sleep(0.005)
+        if not hidden_observed:
+            raise RehearsalError("production hidden reader did not disable terminal echo")
         os.write(master, b"phase-b-throwaway-input\n")
-        entered = os.read(slave, 64)
-        echoed = bool(select.select((master,), (), (), 0.05)[0])
+        reader.join(2.0)
+        if reader.is_alive() or errors or values != ["phase-b-throwaway-input"]:
+            raise RehearsalError("production hidden reader did not complete safely")
+        restored = bool(termios.tcgetattr(slave)[3] & termios.ECHO)
     finally:
-        termios.tcsetattr(slave, termios.TCSAFLUSH, original)
-        restored = termios.tcgetattr(slave)
         os.close(master)
         os.close(slave)
-    return entered.endswith(b"\n") and not echoed and bool(restored[3] & termios.ECHO)
+    if not restored or not original[3] & termios.ECHO:
+        raise RehearsalError("production hidden reader did not restore terminal echo")
+    record_progress(progress_ledger, "authorization-complete")
+    return True
 
 
-def _exercise_real_api(paths: Mapping[str, Path]) -> dict[str, bool]:
+def controls_from_evidence(
+    evidence: Mapping[str, Mapping[str, object]],
+) -> dict[str, bool]:
+    """Convert exact observed evidence to controls; reject every missing proof."""
+
+    if set(evidence) != REQUIRED_CONTROLS:
+        raise RehearsalError("rehearsal evidence control set is incomplete")
+    controls: dict[str, bool] = {}
+    for control in sorted(REQUIRED_CONTROLS):
+        item = evidence.get(control)
+        if not isinstance(item, Mapping) or item.get("observed") is not True:
+            raise RehearsalError(f"{control} was not observed")
+        controls[control] = True
+    return controls
+
+
+def verify_systemd_runtime_evidence(
+    *,
+    load_credentials: set[str],
+    socket_metadata: Mapping[str, Mapping[str, object]],
+    accepted_before: Mapping[str, int],
+    accepted_after: Mapping[str, int],
+    receipt_observed: bool,
+) -> dict[str, dict[str, bool]]:
+    required_credentials = {
+        "api-token",
+        "admin-approval-verifier.json",
+        "roadex-fixture-approval-verifier.json",
+        "admin-ticket-private-key",
+    }
+    required_sockets = {
+        "executor": {"uid": CANARY_UID, "gid": 0, "mode": 0o600},
+        "bridge": {"uid": CANARY_UID, "gid": 0, "mode": 0o600},
+        "api": {"uid": CANARY_UID, "gid": CANARY_UID, "mode": 0o600},
+    }
+    activated = all(
+        type(accepted_before.get(name)) is int
+        and type(accepted_after.get(name)) is int
+        and accepted_after[name] > accepted_before[name]
+        for name in ("executor", "bridge")
+    )
+    if (
+        load_credentials != required_credentials
+        or dict(socket_metadata) != required_sockets
+        or not activated
+        or receipt_observed is not True
+    ):
+        raise RehearsalError("systemd credential or socket activation evidence is incomplete")
+    return {
+        "systemdCredentials": {"observed": True},
+        "socketActivation": {"observed": True},
+    }
+
+
+def inspect_authority_lock(store: Path, *, expected_uid: int) -> bool:
+    """Inspect the real lock created by the API; never create a substitute."""
+
+    from overseer.admin_authority import admin_authority_lock_path
+
+    lock = admin_authority_lock_path(store)
+    try:
+        metadata = lock.lstat()
+    except OSError as error:
+        raise RehearsalError("real admin authority lock was not created") from error
+    if (
+        lock.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or metadata.st_size != 0
+    ):
+        raise RehearsalError("real admin authority lock metadata is invalid")
+    return True
+
+
+def run_production_cleanup_and_replay(
+    activation,
+    *,
+    contract: Mapping[str, object],
+    package_root: Path,
+    package_digest: str,
+    snapshot,
+) -> dict[str, object]:
+    """Use production cleanup and rollback entry points, then prove no replay mutation."""
+
+    if contract.get("schemaVersion") != activation.ACTIVATION_CONTRACT_SCHEMA:
+        raise RehearsalError("production activation contract schema is required")
+    durable = activation._execute_resilient_cleanup(
+        contract,
+        package_digest=package_digest,
+        originating_failure="RehearsalControlledFailure",
+        require_canary_evidence=True,
+    )
+    if durable is not True:
+        raise RehearsalError("production cleanup state is not durable")
+    before = snapshot()
+    result = activation.execute_approved_rollback(package_root)
+    after = snapshot()
+    if (
+        before != after
+        or result.get("status") != "aborted_before_cutover"
+        or result.get("replayed") is not True
+    ):
+        raise RehearsalError("production rollback replay mutated retained evidence")
+    return {"status": "aborted_before_cutover", "replayed": True}
+
+
+def _exercise_real_api(paths: Mapping[str, Path]) -> dict[str, dict[str, bool]]:
     """Exercise the source API/client over the canary Unix socket."""
 
     from overseer.client import OverseerApiClient
 
-    token = (GUEST_ETC / "overseer" / "api-token").read_text(encoding="ascii").strip()
+    token = (GUEST_ETC / "api-token").read_text(encoding="ascii").strip()
     transport = {
         "base_url": "http://localhost",
         "auth_token": token,
-        "unix_socket_path": str(paths["run"] / "api.sock"),
+        "unix_socket_path": str(CANARY_RUNTIME / "api.sock"),
         "expected_server_uid": CANARY_UID,
     }
     ordinary = OverseerApiClient(**transport)
@@ -525,11 +894,12 @@ def _exercise_real_api(paths: Mapping[str, Path]) -> dict[str, bool]:
         raise RehearsalError("session bridge was not read-only")
 
     admin = OverseerApiClient(**transport, approval_token=ADMIN_SECRET)
+    wrong_scope = OverseerApiClient(**transport, approval_token=ROADEX_SECRET)
     plan_id = "admin.phase-b-rehearsal.smoke"
     ordinary.plan_admin_change({
         "plan_id": plan_id,
         "kind": "system_service_restart",
-        "target": "overseer-phase-b-smoke.service",
+        "target": "overseer-approval-smoke.service",
         "reason": "disposable Phase B allowlisted restart control",
         "current_state": "inactive",
     })
@@ -538,10 +908,15 @@ def _exercise_real_api(paths: Mapping[str, Path]) -> dict[str, bool]:
         ordinary.approve_admin_change(plan_id)
     except HTTPError as error:
         rejected = error.code == 403
+    wrong_scope_rejected = False
+    try:
+        wrong_scope.approve_admin_change(plan_id)
+    except HTTPError as error:
+        wrong_scope_rejected = error.code == 403
     approved = admin.approve_admin_change(plan_id)
     executed = ordinary.execute_admin_change({"plan_id": plan_id})
     replayed = ordinary.execute_admin_change({"plan_id": plan_id})
-    if not rejected or approved.get("approved") is not True:
+    if not rejected or not wrong_scope_rejected or approved.get("approved") is not True:
         raise RehearsalError("independent approval token control failed")
     if executed.get("mutation_performed") is not True or replayed.get("replayed") is not True or replayed.get("mutation_performed") is not False:
         raise RehearsalError("allowlisted executor replay control failed")
@@ -558,14 +933,19 @@ def _exercise_real_api(paths: Mapping[str, Path]) -> dict[str, bool]:
     unlisted = ordinary.execute_admin_change({"plan_id": unlisted_id})
     if unlisted.get("status") != "blocked" or unlisted.get("mutation_performed") is not False:
         raise RehearsalError("unlisted unit was not rejected")
+    lock_observed = inspect_authority_lock(
+        paths["state"] / "overseer.sqlite3",
+        expected_uid=CANARY_UID,
+    )
     return {
-        "apiHealth": True,
-        "usageBridge": True,
-        "sessionBridge": True,
-        "allowlistedRestart": True,
-        "replayNoMutation": True,
-        "unlistedRejected": True,
-        "unixPeerIdentity": True,
+        "apiHealth": {"observed": True},
+        "usageBridge": {"observed": True},
+        "sessionBridge": {"observed": True},
+        "allowlistedRestart": {"observed": True},
+        "replayNoMutation": {"observed": True},
+        "unlistedRejected": {"observed": True},
+        "unixPeerIdentity": {"observed": True},
+        "authorityLockCreated": {"observed": lock_observed},
     }
 
 
@@ -573,19 +953,103 @@ def _start_disposable_units() -> None:
     global _UNITS_MAY_BE_ACTIVE
     _UNITS_MAY_BE_ACTIVE = True
     _systemctl("daemon-reload")
-    _systemctl("start", "overseer-phase-b-bridge.socket", "overseer-phase-b-executor.socket")
-    _systemctl("start", "overseer-phase-b-bridge.service")
-    _systemctl("start", "overseer-phase-b-canary.service")
+    _systemctl(
+        "start",
+        "overseer-codex-user-bridge.socket",
+        "overseer-admin-executor.socket",
+    )
+    _systemctl("start", "overseer-api-canary.service")
+
+
+def stop_disposable_units(*, systemctl=None, processes_for_uid=None) -> None:
+    """Stop and verify every disposable boundary before clearing cleanup state."""
+
+    global _UNITS_MAY_BE_ACTIVE
+    systemctl = _systemctl if systemctl is None else systemctl
+    processes_for_uid = _processes_for_uid if processes_for_uid is None else processes_for_uid
+    failures: list[str] = []
+    for unit in reversed(_DISPOSABLE_UNITS):
+        try:
+            result = systemctl("stop", unit, check=False)
+            if int(result.returncode) != 0:
+                failures.append(unit)
+        except (OSError, subprocess.SubprocessError, AttributeError):
+            failures.append(unit)
+    for unit in _DISPOSABLE_UNITS:
+        try:
+            result = systemctl("is-active", "--quiet", unit, check=False)
+            if int(result.returncode) != 3:
+                failures.append(unit)
+        except (OSError, subprocess.SubprocessError, AttributeError):
+            failures.append(unit)
+    if tuple(processes_for_uid(CANARY_UID)):
+        failures.append("uid-984-process")
+    if failures:
+        raise RehearsalError("disposable cleanup did not become quiescent")
+    _UNITS_MAY_BE_ACTIVE = False
 
 
 def _stop_disposable_units() -> None:
-    global _UNITS_MAY_BE_ACTIVE
-    for unit in reversed(_DISPOSABLE_UNITS):
-        try:
-            _systemctl("stop", unit, check=False)
-        except (OSError, subprocess.SubprocessError):
-            pass
-    _UNITS_MAY_BE_ACTIVE = False
+    stop_disposable_units()
+
+
+def _socket_metadata(path: Path) -> dict[str, int]:
+    metadata = path.lstat()
+    if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_nlink != 1:
+        raise RehearsalError("systemd socket metadata is invalid")
+    return {
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def _activation_snapshot() -> dict[str, int]:
+    executor = _systemctl(
+        "show",
+        "overseer-admin-executor.socket",
+        "--property=NAccepted",
+        "--value",
+    ).stdout.strip()
+    bridge = _systemctl(
+        "show",
+        "overseer-codex-user-bridge.service",
+        "--property=InvocationID",
+        "--value",
+        check=False,
+    ).stdout.strip()
+    try:
+        executor_count = int(executor or "0", 10)
+    except ValueError as error:
+        raise RehearsalError("executor socket activation counter is invalid") from error
+    return {"executor": executor_count, "bridge": 1 if bridge else 0}
+
+
+def _load_credential_names() -> set[str]:
+    raw_pid = _systemctl(
+        "show",
+        "overseer-api-canary.service",
+        "--property=MainPID",
+        "--value",
+    ).stdout.strip()
+    try:
+        pid = int(raw_pid, 10)
+    except ValueError as error:
+        raise RehearsalError("canary service credential process is unavailable") from error
+    if pid <= 0:
+        raise RehearsalError("canary service credential process is unavailable")
+    directory = Path(f"/proc/{pid}/root/run/credentials/overseer-api-canary.service")
+    try:
+        children = tuple(directory.iterdir())
+    except OSError as error:
+        raise RehearsalError("systemd credential namespace is unavailable") from error
+    names: set[str] = set()
+    for child in children:
+        metadata = child.lstat()
+        if child.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RehearsalError("systemd credential artifact metadata is invalid")
+        names.add(child.name)
+    return names
 
 
 def _poweroff_guest() -> None:
@@ -597,7 +1061,8 @@ def _poweroff_guest() -> None:
         pass
 
 
-def _no_process_for_uid(uid: int) -> bool:
+def _processes_for_uid(uid: int) -> tuple[int, ...]:
+    matches: list[int] = []
     for process in Path("/proc").iterdir():
         if not process.name.isdigit():
             continue
@@ -609,91 +1074,247 @@ def _no_process_for_uid(uid: int) -> bool:
             if line.startswith("Uid:"):
                 values = line.split()
                 if len(values) > 1 and values[1] == str(uid):
-                    return False
+                    matches.append(int(process.name))
                 break
-    return True
+    return tuple(sorted(matches))
 
 
-def _seal(paths: Mapping[str, Path]) -> None:
-    lock = paths["state"] / "authority.lock"
-    descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+def _no_process_for_uid(uid: int) -> bool:
+    return not _processes_for_uid(uid)
+
+
+def _wait_for_canary_socket() -> None:
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        try:
+            metadata = (CANARY_RUNTIME / "api.sock").lstat()
+        except FileNotFoundError:
+            time.sleep(0.1)
+            continue
+        if stat.S_ISSOCK(metadata.st_mode):
+            return
+        raise RehearsalError("canary API runtime path is not a socket")
+    raise RehearsalError("canary API socket did not become ready")
+
+
+def _progress_order_is_authorized_first(ledger: Path) -> bool:
+    events = [
+        json.loads(line)["event"]
+        for line in ledger.read_text(encoding="ascii").splitlines()
+    ]
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.fsync(descriptor)
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
-    for path in (paths["state"], paths["artifacts"]):
-        for child in path.rglob("*"):
-            if child.is_file():
-                os.chmod(child, 0o400)
-                os.chown(child, 0, 0)
-        os.chmod(path, 0o500)
-        os.chown(path, 0, 0)
-
-
-def _replay_without_mutation(paths: Mapping[str, Path]) -> bool:
-    marker = paths["artifacts"] / "rollback-replay.json"
-    if not marker.exists() or marker.stat().st_uid != 0 or (marker.stat().st_mode & 0o777) != 0o400:
+        return events.index("authorization-complete") < events.index("systemd-start")
+    except ValueError:
         return False
-    before = {path: hashlib.sha256(path.read_bytes()).digest() for path in paths["state"].rglob("*") if path.is_file()}
-    evidence = json.loads(marker.read_text(encoding="ascii"))
-    if evidence != {"revalidated": True, "schemaVersion": "overseer.rollback-replay.v1"}:
-        return False
-    terminal = paths["state"] / "second-instance" / "terminal.json"
-    if json.loads(terminal.read_text(encoding="ascii")) != {
-        "schemaVersion": "overseer.phase-b-pre-cutover.v1",
-        "status": "aborted_before_cutover",
-    }:
-        return False
-    after = {path: hashlib.sha256(path.read_bytes()).digest() for path in paths["state"].rglob("*") if path.is_file()}
-    return before == after
 
 
-def _run_rehearsal() -> tuple[str, dict[str, bool], dict[str, str]]:
-    stage = "preflight"
+def _activation_contract(paths: Mapping[str, Path], activation) -> dict[str, object]:
+    god = pwd.getpwnam("god")
+    state = paths["state"]
+    cleanup = ["/usr/bin/systemctl", "stop", *_DISPOSABLE_UNITS]
+    return {
+        "schemaVersion": activation.ACTIVATION_CONTRACT_SCHEMA,
+        "liveExecutionApproved": False,
+        "requiresSeparateDigestBoundApproval": True,
+        "requiresEuid": 0,
+        "packageRoot": str(paths["package"].resolve()),
+        "account": {
+            "user": "overseer",
+            "uid": CANARY_UID,
+            "group": "overseer",
+            "gid": CANARY_UID,
+        },
+        "sourceStore": {"uid": god.pw_uid, "gid": god.pw_gid},
+        "stagingAndCanaryCommands": [["/usr/bin/true"]],
+        "cutoverCommands": [["/usr/bin/true"]],
+        "rollbackCommands": [["/usr/bin/true"]],
+        "canary": {
+            "canaryInstanceId": state.name,
+            "stateDirectory": str(state),
+            "store": str(state / "overseer.sqlite3"),
+            "psychloBridgeDatabase": str(state / "psychlo-bridge.sqlite3"),
+            "roadexRelayDatabase": str(state / "roadex-relay.sqlite3"),
+            "preserveFailedStateForEvidence": True,
+            "ownershipHandoffCommand": "handoff-start-canary",
+            "requiresNoExistingServicePrincipalProcesses": True,
+            "failureCleanupCommands": [cleanup],
+        },
+    }
+
+
+class _GuestActivationAdapter:
+    """Delegate lifecycle work while adapting only absent package provenance."""
+
+    def __init__(self, activation, *, digest: str, contract: Mapping[str, object]) -> None:
+        self._activation = activation
+        self._digest = digest
+        self._contract = contract
+        self.ACTIVATION_CONTRACT_SCHEMA = activation.ACTIVATION_CONTRACT_SCHEMA
+
+    def _execute_resilient_cleanup(self, *args, **kwargs):
+        with self._activation._activation_execution_lock():
+            return self._activation._execute_resilient_cleanup(*args, **kwargs)
+
+    def execute_approved_rollback(self, package_root: Path) -> dict[str, object]:
+        load_original = self._activation._load_activation_approval_for_rollback
+        sealed_original = self._activation._sealed_package_json
+        self._activation._load_activation_approval_for_rollback = (
+            lambda _package: {"packageDigest": self._digest}
+        )
+        self._activation._sealed_package_json = (
+            lambda *_args, **_kwargs: dict(self._contract)
+        )
+        try:
+            return self._activation.execute_approved_rollback(package_root)
+        finally:
+            self._activation._load_activation_approval_for_rollback = load_original
+            self._activation._sealed_package_json = sealed_original
+
+
+def _retained_evidence_snapshot(state_directory: Path) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for path in (state_directory, *sorted(state_directory.rglob("*"))):
+        metadata = path.lstat()
+        relative = "." if path == state_directory else path.relative_to(state_directory).as_posix()
+        item: dict[str, object] = {
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "size": metadata.st_size,
+            "ctimeNs": metadata.st_ctime_ns,
+        }
+        if stat.S_ISREG(metadata.st_mode):
+            item["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        result[relative] = item
+    return result
+
+
+def _sealed_evidence_is_exact(paths: Mapping[str, Path], activation) -> bool:
+    state = paths["state"]
+    state_metadata = state.lstat()
+    if (
+        state_metadata.st_uid != 0
+        or state_metadata.st_gid != 0
+        or stat.S_IMODE(state_metadata.st_mode) != 0o500
+    ):
+        return False
+    if any(
+        child.lstat().st_uid != 0
+        or child.lstat().st_gid != 0
+        or stat.S_IMODE(child.lstat().st_mode) != 0o400
+        for child in state.iterdir()
+    ):
+        return False
+    try:
+        runner_state = json.loads(
+            activation._activation_state_path().read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return (
+        runner_state.get("status") == "aborted_before_cutover"
+        and runner_state.get("phase") == "staging_cleanup"
+        and runner_state.get("secretValuesRecorded") is False
+    )
+
+
+def _seal_progress_artifacts(paths: Mapping[str, Path]) -> None:
+    artifacts = paths["artifacts"]
+    for child in artifacts.iterdir():
+        metadata = child.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RehearsalError("progress evidence contains an invalid artifact")
+        os.chown(child, 0, 0)
+        os.chmod(child, 0o400)
+    os.chown(artifacts, 0, 0)
+    os.chmod(artifacts, 0o500)
+
+
+def _run_rehearsal(
+    tracker: StageTracker,
+) -> tuple[str, dict[str, bool], dict[str, str]]:
+    if os.environ.get("OVERSEER_PHASE_B_GUEST") != "1":
+        raise PreflightError("disposable guest marker is unavailable")
     preflight()
     paths = _guest_paths()
     _progress(paths, "phase-started")
+    tracker.advance("provisioning")
     identifiers = _provision(paths, source=SOURCE_ROOT)
-    controls = {control: False for control in REQUIRED_CONTROLS}
-    stage = "authorization"
-    controls["secureTty"] = _run_pty_control()
-    _progress(paths, "authorization-complete")
-    stage = "canary-start"
+    evidence = {
+        control: {"observed": False} for control in REQUIRED_CONTROLS
+    }
+
+    tracker.advance("authorization")
+    evidence["secureTty"] = {
+        "observed": exercise_production_hidden_reader(
+            paths["artifacts"] / "progress.jsonl"
+        )
+    }
+    _progress(paths, "systemd-start")
+    if not _progress_order_is_authorized_first(paths["artifacts"] / "progress.jsonl"):
+        raise RehearsalError("authorization progress did not precede systemd start")
+
+    tracker.advance("canary-start")
     _start_disposable_units()
+    _wait_for_canary_socket()
     _progress(paths, "canary-service-started")
-    controls["socketActivation"] = True
-    controls["systemdCredentials"] = True
-    controls.update(_exercise_real_api(paths))
-    stage = "quiescent-stop"
-    _stop_disposable_units()
-    controls["quiescentStop"] = _no_process_for_uid(CANARY_UID)
-    stage = "evidence-seal"
+    accepted_before = _activation_snapshot()
+
+    tracker.advance("canary-acceptance")
+    api_evidence = _exercise_real_api(paths)
+    accepted_after = _activation_snapshot()
+    runtime_evidence = verify_systemd_runtime_evidence(
+        load_credentials=_load_credential_names(),
+        socket_metadata={
+            "executor": _socket_metadata(OVERSEER_RUNTIME / "admin-executor.sock"),
+            "bridge": _socket_metadata(OVERSEER_RUNTIME / "codex-user-bridge.sock"),
+            "api": _socket_metadata(CANARY_RUNTIME / "api.sock"),
+        },
+        accepted_before=accepted_before,
+        accepted_after=accepted_after,
+        receipt_observed=api_evidence["allowlistedRestart"]["observed"],
+    )
+    evidence.update(api_evidence)
+    evidence.update(runtime_evidence)
+
+    tracker.advance("quiescent-stop")
+    stop_disposable_units()
+    _start_disposable_units()
+    _wait_for_canary_socket()
+
+    tracker.advance("cleanup")
+    from overseer import activation_package
+
+    digest = hashlib.sha256(b"overseer-phase-b-disposable-package").hexdigest()
+    contract = _activation_contract(paths, activation_package)
+    adapter = _GuestActivationAdapter(
+        activation_package,
+        digest=digest,
+        contract=contract,
+    )
     _progress(paths, "evidence-seal-started")
-    _mkdir(paths["state"] / "second-instance", 0o700)
-    _write(
-        paths["state"] / "second-instance" / "terminal.json",
-        b"{\"schemaVersion\":\"overseer.phase-b-pre-cutover.v1\",\"status\":\"aborted_before_cutover\"}\n",
-        0o600,
+    replay = run_production_cleanup_and_replay(
+        adapter,
+        contract=contract,
+        package_root=paths["package"],
+        package_digest=digest,
+        snapshot=lambda: _retained_evidence_snapshot(paths["state"]),
     )
-    _write(paths["state"] / "cleanup-state.json", b"{\"status\":\"cleanup-complete\"}\n", 0o600)
-    _write(
-        paths["artifacts"] / "rollback-replay.json",
-        b"{\"revalidated\":true,\"schemaVersion\":\"overseer.rollback-replay.v1\"}\n",
-        0o400,
-    )
+    stop_disposable_units()
+    evidence["quiescentStop"] = {"observed": _no_process_for_uid(CANARY_UID)}
+    evidence["cleanupStateDurable"] = {
+        "observed": _sealed_evidence_is_exact(paths, activation_package)
+    }
+    evidence["evidenceSealed"] = dict(evidence["cleanupStateDurable"])
+    evidence["rollbackReplay"] = {
+        "observed": replay == {"status": "aborted_before_cutover", "replayed": True}
+    }
     _progress(paths, "evidence-seal-complete")
     _progress(paths, "cleanup-complete")
-    _seal(paths)
-    controls["authorityLockCreated"] = True
-    controls["evidenceSealed"] = True
-    controls["cleanupStateDurable"] = True
-    stage = "rollback-replay"
-    controls["rollbackReplay"] = _replay_without_mutation(paths)
-    if not all(controls.values()):
-        raise RehearsalError("one or more rehearsal controls failed")
-    return stage, controls, identifiers
+    _seal_progress_artifacts(paths)
+    tracker.advance("rollback-replay")
+    controls = controls_from_evidence(evidence)
+    return tracker.current, controls, identifiers
 
 
 def _emit_failure(error: BaseException, stage: str) -> str:
@@ -709,22 +1330,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args(argv)
-    stage = "preflight"
+    tracker = StageTracker()
+    disposable_guest = os.environ.get("OVERSEER_PHASE_B_GUEST") == "1"
     try:
-        stage, controls, identifiers = _run_rehearsal()
+        _stage, controls, identifiers = _run_rehearsal(tracker)
         result = frame_serial_result(
             serialize_result(status="passed", stage="phase-complete", controls=controls, identifiers=identifiers)
         )
         sys.stdout.write(result)
         sys.stdout.flush()
-        _poweroff_guest()
+        if disposable_guest:
+            _poweroff_guest()
         return 0
     except BaseException as error:
         if _UNITS_MAY_BE_ACTIVE:
-            _stop_disposable_units()
-        sys.stdout.write(_emit_failure(error, stage))
+            try:
+                stop_disposable_units()
+            except BaseException:
+                pass
+        sys.stdout.write(_emit_failure(error, tracker.current))
         sys.stdout.flush()
-        if _PREFLIGHT_PASSED:
+        if disposable_guest:
             _poweroff_guest()
         return 1
 

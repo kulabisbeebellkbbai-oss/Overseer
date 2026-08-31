@@ -15,13 +15,14 @@ import os
 import pty
 import pwd
 import re
+import signal
 import stat
 import subprocess
 import sys
 import termios
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -50,6 +51,10 @@ API_TOKEN = "phase-b-rehearsal-api-token"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
 RESULT_BEGIN = "OVERSEER_PHASE_B_REHEARSAL_RESULT_BEGIN"
 RESULT_END = "OVERSEER_PHASE_B_REHEARSAL_RESULT_END"
+SERVICE_ENTRY_MARKER = "OVERSEER_PHASE_B_REHEARSAL_SERVICE_STARTED"
+PROGRESS_PREFIX = "OVERSEER_PHASE_B_REHEARSAL_PROGRESS"
+PROGRESS_SCHEMA = "overseer.phase-b-rehearsal-progress.v1"
+GUEST_WATCHDOG_SECONDS = 780
 
 REQUIRED_CONTROLS = frozenset(
     {
@@ -115,15 +120,21 @@ class ControlledPreCutoverFailure(RehearsalError):
     """Identify the intentionally observed second-instance API failure."""
 
 
+class GuestWatchdogExpired(RehearsalError):
+    """Raised when the guest process exceeds its bounded execution budget."""
+
+
 class StageTracker:
     """Retain the last bounded stage even when a nested operation raises."""
 
-    def __init__(self) -> None:
+    def __init__(self, emitter: Callable[[str], object] | None = None) -> None:
         self.current = "preflight"
+        self._emitter = _emit_progress_line if emitter is None else emitter
 
     def advance(self, stage: str) -> None:
         if stage not in _RESULT_STAGES:
             raise RehearsalError("stage is not bounded")
+        self._emitter(serialize_progress(stage))
         self.current = stage
 
 
@@ -136,6 +147,27 @@ def _reject_secret_text(value: str, *, field: str) -> None:
         raise ValueError(f"secret-bearing {field} is not serializable")
     if _SECRET_MARKERS.search(value):
         raise ValueError(f"secret-bearing {field} is not serializable")
+
+
+def serialize_progress(stage: str) -> str:
+    """Return one canonical, bounded, secret-free progress line."""
+
+    if not isinstance(stage, str):
+        raise ValueError("stage is invalid")
+    _reject_secret_text(stage, field="stage")
+    if stage not in _RESULT_STAGES:
+        raise ValueError("stage is not bounded")
+    record = {
+        "schemaVersion": PROGRESS_SCHEMA,
+        "secretValuesRecorded": False,
+        "stage": stage,
+    }
+    return f"{PROGRESS_PREFIX} " + _canonical(record) + "\n"
+
+
+def _emit_progress_line(line: str) -> None:
+    sys.stdout.write(line)
+    sys.stdout.flush()
 
 
 def _validate_identifiers(identifiers: object) -> dict[str, str]:
@@ -1525,6 +1557,11 @@ def _emit_failure(error: BaseException, stage: str) -> str:
     return frame_serial_result(serialize_result(status="failed", stage=stage, failure=failure, controls=controls))
 
 
+def _guest_watchdog_handler(signum: int, frame: object) -> None:
+    del signum, frame
+    raise GuestWatchdogExpired("guest watchdog expired")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the guest-only rehearsal and emit exactly one bounded result."""
 
@@ -1532,7 +1569,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.parse_args(argv)
     tracker = StageTracker()
     disposable_guest = os.environ.get("OVERSEER_PHASE_B_GUEST") == "1"
+    previous_alarm_handler = signal.signal(signal.SIGALRM, _guest_watchdog_handler)
     try:
+        signal.alarm(GUEST_WATCHDOG_SECONDS)
         _stage, controls, identifiers = _run_rehearsal(tracker)
         result = frame_serial_result(
             serialize_result(status="passed", stage="phase-complete", controls=controls, identifiers=identifiers)
@@ -1543,16 +1582,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             _poweroff_guest()
         return 0
     except BaseException as error:
-        if _UNITS_MAY_BE_ACTIVE:
-            try:
-                stop_disposable_units()
-            except BaseException:
-                pass
-        sys.stdout.write(_emit_failure(error, tracker.current))
-        sys.stdout.flush()
-        if disposable_guest:
-            _poweroff_guest()
+        try:
+            sys.stdout.write(_emit_failure(error, tracker.current))
+            sys.stdout.flush()
+        finally:
+            if _UNITS_MAY_BE_ACTIVE:
+                try:
+                    stop_disposable_units()
+                except BaseException:
+                    pass
+            if disposable_guest:
+                _poweroff_guest()
         return 1
+    finally:
+        try:
+            signal.alarm(0)
+        finally:
+            signal.signal(signal.SIGALRM, previous_alarm_handler)
 
 
 if __name__ == "__main__":

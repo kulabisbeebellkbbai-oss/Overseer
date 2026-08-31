@@ -46,3 +46,15 @@
 | 3. Prepare the fail-closed VM orchestrator | Complete (`54a53bc`, `d2c0ff9`, `4c2ad9a`, `abfee48`, `29fc5aa`) | Re-reviewed; spec compliant and quality approved; no remaining findings |
 | 4. Verify and independently review the source implementation | Complete (`feffdde`) | Focused `126 passed`, cross-layer `393 passed`, full `2850 passed, 31 skipped`; final Terra and Daybreak reviews approved with no findings |
 | 5. Prepare, but do not execute, the privileged rehearsal approval | Pending | Pending |
+
+## Phase B timeout and diagnostic evidence repair
+
+- Plan: `docs/superpowers/plans/2026-08-31-phase-b-timeout-evidence-repair.md`
+- Branch: `fix/approval-smoke-v1-1-6`
+- Execution boundary: implementation, testing, review, and replacement package preparation only; VM lifecycle, launcher execution, package import, host service action, Phase B, and cutover remain prohibited
+
+| Task | Status | Review |
+| --- | --- | --- |
+| 1. Add guest entry, progress, and watchdog contracts | Complete | Terra ordinary review approved after output-before-cleanup and broken-serial cleanup fixes; focused `68 passed`, systemd unit verification passed |
+| 2. Split host clocks and retain sanitized timeout evidence | In progress | Pending |
+| 3. Verify, review, and prepare the inert replacement package | Pending | Pending |

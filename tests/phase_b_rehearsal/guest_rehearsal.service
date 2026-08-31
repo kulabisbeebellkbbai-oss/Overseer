@@ -14,6 +14,7 @@ Environment=OVERSEER_PHASE_B_GUEST=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=/opt/overseer-source/src:/usr/local/lib/python3.13/dist-packages
 LoadCredential=source-commit:/etc/overseer-phase-b-rehearsal/source-commit
+ExecStartPre=/usr/bin/printf '%%s\n' 'OVERSEER_PHASE_B_REHEARSAL_SERVICE_STARTED'
 ExecStart=/usr/bin/python3.13 -B -s -P -S /opt/overseer-phase-b-rehearsal/guest_rehearsal.py
 StandardOutput=journal+console
 StandardError=journal

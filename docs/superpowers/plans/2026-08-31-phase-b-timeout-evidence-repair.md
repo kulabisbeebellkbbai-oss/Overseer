@@ -31,14 +31,14 @@ before any future execution.
 - Modify: `tests/phase_b_rehearsal/guest_rehearsal.service`
 - Modify: `tests/test_phase_b_guest_rehearsal.py`
 
-- [ ] Add failing tests for the fixed service-entry marker, canonical bounded
+- [x] Add failing tests for the fixed service-entry marker, canonical bounded
   progress serializer, allowlisted stage emission, secret rejection, 780-second
   process watchdog, and 900-second systemd hard stop.
-- [ ] Run the focused guest tests and record the expected failures.
-- [ ] Implement progress emission in `StageTracker`, the service-entry marker,
+- [x] Run the focused guest tests and record the expected failures.
+- [x] Implement progress emission in `StageTracker`, the service-entry marker,
   and an inert-on-import watchdog installed only by `main`.
-- [ ] Run the focused guest suite and require it to pass.
-- [ ] Commit the task after independent review approves it.
+- [x] Run the focused guest suite and require it to pass.
+- [x] Commit the task after independent review approves it.
 
 ### Task 2: Split host clocks and retain sanitized timeout evidence
 
@@ -75,4 +75,3 @@ before any future execution.
   non-executed/non-imported state.
 - [ ] Stop and request separate digest-bound authority. Do not execute the
   launcher, import a package, alter services, run Phase B, or cut over.
-

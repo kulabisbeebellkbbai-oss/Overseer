@@ -5,6 +5,7 @@ import inspect
 import io
 import json
 import os
+import signal
 import stat
 import subprocess
 from pathlib import Path
@@ -515,6 +516,237 @@ def test_stage_tracker_retains_provisioning_across_exception() -> None:
     except module.RehearsalError:
         pass
     assert tracker.current == "provisioning"
+
+
+def test_service_entry_marker_is_fixed_and_runs_as_execstartpre() -> None:
+    module = load_guest_module()
+    service = (GUEST_SCRIPT.parent / "guest_rehearsal.service").read_text(encoding="utf-8")
+
+    assert module.SERVICE_ENTRY_MARKER == "OVERSEER_PHASE_B_REHEARSAL_SERVICE_STARTED"
+    assert (
+        "ExecStartPre=/usr/bin/printf '%%s\\n' 'OVERSEER_PHASE_B_REHEARSAL_SERVICE_STARTED'"
+        in service
+    )
+    assert "ExecStart=/usr/bin/printf" not in service
+
+
+def test_progress_serializer_emits_one_canonical_bounded_record() -> None:
+    module = load_guest_module()
+
+    encoded = module.serialize_progress("canary-acceptance")
+    prefix, payload = encoded.split(" ", 1)
+    record = json.loads(payload)
+
+    assert prefix == "OVERSEER_PHASE_B_REHEARSAL_PROGRESS"
+    assert set(record) == {"schemaVersion", "secretValuesRecorded", "stage"}
+    assert record == {
+        "schemaVersion": "overseer.phase-b-rehearsal-progress.v1",
+        "secretValuesRecorded": False,
+        "stage": "canary-acceptance",
+    }
+    assert encoded == (
+        "OVERSEER_PHASE_B_REHEARSAL_PROGRESS "
+        '{"schemaVersion":"overseer.phase-b-rehearsal-progress.v1",'
+        '"secretValuesRecorded":false,"stage":"canary-acceptance"}\n'
+    )
+
+
+def test_stage_tracker_emits_only_allowlisted_progress_without_secret_fields() -> None:
+    module = load_guest_module()
+    emitted: list[str] = []
+    tracker = module.StageTracker(emitter=emitted.append)
+
+    for stage in sorted(module._RESULT_STAGES):
+        tracker.advance(stage)
+
+    assert len(emitted) == len(module._RESULT_STAGES)
+    assert all(line.startswith("OVERSEER_PHASE_B_REHEARSAL_PROGRESS ") for line in emitted)
+    assert all(
+        set(json.loads(line.split(" ", 1)[1]))
+        == {"schemaVersion", "secretValuesRecorded", "stage"}
+        for line in emitted
+    )
+    with pytest.raises(module.RehearsalError, match="bounded"):
+        tracker.advance("raw verifier output")
+    with pytest.raises(ValueError, match="secret"):
+        module.serialize_progress("phase-b-rehearsal-api-token")
+
+
+def test_watchdog_is_inert_on_import_and_installed_only_by_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(signal, "signal", lambda *args: calls.append(args))
+    monkeypatch.setattr(signal, "alarm", lambda *args: calls.append(args))
+    module = load_guest_module()
+
+    assert calls == []
+    assert module.GUEST_WATCHDOG_SECONDS == 780
+    with pytest.raises(module.GuestWatchdogExpired):
+        module._guest_watchdog_handler(signal.SIGALRM, None)
+
+
+def test_main_installs_cancels_and_restores_watchdog_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_guest_module()
+    calls: list[tuple[object, ...]] = []
+    previous_handler = object()
+
+    def fake_signal(*args: object) -> object:
+        calls.append(args)
+        return previous_handler
+
+    monkeypatch.setattr(signal, "signal", fake_signal)
+    monkeypatch.setattr(signal, "alarm", lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        module,
+        "_run_rehearsal",
+        lambda tracker: (_ for _ in ()).throw(module.PreflightError("bad")),
+    )
+
+    assert module.main([]) == 1
+    assert calls[0] == (signal.SIGALRM, module._guest_watchdog_handler)
+    assert calls[1] == (module.GUEST_WATCHDOG_SECONDS,)
+    assert calls[2] == (0,)
+    assert calls[3] == (signal.SIGALRM, previous_handler)
+
+
+def test_main_catches_watchdog_expiry_at_alarm_install_boundary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = load_guest_module()
+    previous_handler = object()
+    ran_rehearsal: list[bool] = []
+
+    monkeypatch.setattr(signal, "signal", lambda *args: previous_handler)
+
+    def expire_immediately(seconds: int) -> int:
+        if seconds:
+            module._guest_watchdog_handler(signal.SIGALRM, None)
+        return 0
+
+    monkeypatch.setattr(signal, "alarm", expire_immediately)
+    monkeypatch.setattr(
+        module,
+        "_run_rehearsal",
+        lambda tracker: ran_rehearsal.append(True),
+    )
+
+    assert module.main([]) == 1
+    assert ran_rehearsal == []
+    output = capsys.readouterr().out
+    assert '"failure":"GuestWatchdogExpired"' in output
+    assert '"stage":"preflight"' in output
+
+
+def test_main_flushes_watchdog_failure_before_potentially_stalled_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_guest_module()
+    output = io.StringIO()
+    cleanup_observations: list[str] = []
+    module._UNITS_MAY_BE_ACTIVE = True
+    monkeypatch.setattr(module.sys, "stdout", output)
+    monkeypatch.setattr(signal, "signal", lambda *args: object())
+    monkeypatch.setattr(signal, "alarm", lambda seconds: 0)
+    monkeypatch.setattr(
+        module,
+        "_run_rehearsal",
+        lambda tracker: (_ for _ in ()).throw(module.GuestWatchdogExpired("expired")),
+    )
+
+    def observe_cleanup(**kwargs: object) -> None:
+        del kwargs
+        cleanup_observations.append(output.getvalue())
+
+    monkeypatch.setattr(module, "stop_disposable_units", observe_cleanup)
+
+    assert module.main([]) == 1
+    assert len(cleanup_observations) == 1
+    assert '"failure":"GuestWatchdogExpired"' in cleanup_observations[0]
+    assert cleanup_observations[0].endswith(
+        "OVERSEER_PHASE_B_REHEARSAL_RESULT_END\n"
+    )
+
+
+@pytest.mark.parametrize("failure_point", ("write", "flush"))
+def test_main_still_cleans_up_and_powers_off_when_failure_output_breaks(
+    monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    module = load_guest_module()
+    actions: list[str] = []
+
+    class BrokenOutput(io.StringIO):
+        def write(self, value: str) -> int:
+            if failure_point == "write":
+                raise OSError("broken serial write")
+            return super().write(value)
+
+        def flush(self) -> None:
+            if failure_point == "flush":
+                raise OSError("broken serial flush")
+            super().flush()
+
+    module._UNITS_MAY_BE_ACTIVE = True
+    monkeypatch.setenv("OVERSEER_PHASE_B_GUEST", "1")
+    monkeypatch.setattr(module.sys, "stdout", BrokenOutput())
+    monkeypatch.setattr(signal, "signal", lambda *args: object())
+    monkeypatch.setattr(signal, "alarm", lambda seconds: 0)
+    monkeypatch.setattr(
+        module,
+        "_run_rehearsal",
+        lambda tracker: (_ for _ in ()).throw(module.GuestWatchdogExpired("expired")),
+    )
+    monkeypatch.setattr(
+        module, "stop_disposable_units", lambda **kwargs: actions.append("cleanup")
+    )
+    monkeypatch.setattr(module, "_poweroff_guest", lambda: actions.append("poweroff"))
+
+    with pytest.raises(OSError, match=f"broken serial {failure_point}"):
+        module.main([])
+    assert actions == ["cleanup", "poweroff"]
+
+
+def test_main_cancels_and_restores_watchdog_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_guest_module()
+    calls: list[tuple[object, ...]] = []
+    previous_handler = object()
+
+    def fake_signal(*args: object) -> object:
+        calls.append(args)
+        return previous_handler
+
+    monkeypatch.setattr(signal, "signal", fake_signal)
+    monkeypatch.setattr(signal, "alarm", lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        module,
+        "_run_rehearsal",
+        lambda tracker: (
+            "phase-complete",
+            {control: True for control in EXPECTED_CONTROLS},
+            {"runId": "fixture"},
+        ),
+    )
+
+    assert module.main([]) == 0
+    assert calls == [
+        (signal.SIGALRM, module._guest_watchdog_handler),
+        (module.GUEST_WATCHDOG_SECONDS,),
+        (0,),
+        (signal.SIGALRM, previous_handler),
+    ]
+
+
+def test_guest_service_keeps_fifteen_minute_hard_stop_after_watchdog_margin() -> None:
+    module = load_guest_module()
+    service = (GUEST_SCRIPT.parent / "guest_rehearsal.service").read_text(encoding="utf-8")
+
+    assert module.GUEST_WATCHDOG_SECONDS == 780
+    assert "TimeoutStartSec=15min" in service
+    assert 900 - module.GUEST_WATCHDOG_SECONDS == 120
 
 
 def test_guest_marker_powers_off_after_any_main_error(monkeypatch: pytest.MonkeyPatch) -> None:

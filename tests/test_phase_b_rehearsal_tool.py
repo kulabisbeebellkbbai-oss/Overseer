@@ -459,6 +459,48 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
     assert all(Path(value).is_absolute() for value in module.EXACT_TOOLS.values())
 
 
+def test_runtime_artifact_paths_accept_pinned_root_owned_system_runtime(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    descriptor = module._open_nofollow_directory(
+        RUNTIME_SITE,
+        label="runtime artifact root",
+    )
+    try:
+        identity = module._root_directory_identity(
+            descriptor,
+            allowed_uids=frozenset({0, os.geteuid()}),
+        )
+    finally:
+        os.close(descriptor)
+
+    assert identity == (RUNTIME_SITE.stat().st_dev, RUNTIME_SITE.stat().st_ino)
+    manifest = module.build_runtime_manifest(RUNTIME_SITE)
+    archive = module.build_artifact_archive(RUNTIME_SITE, manifest)
+    output = tmp_path / "runtime.zip"
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-c",
+            module._archive_builder_python(),
+            str(RUNTIME_SITE),
+            module.canonical_json(manifest),
+            str(output),
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert output.read_bytes() == archive
+
+
 def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
     module = load_tool()
     result = module.preflight(**valid_preflight_kwargs(module))

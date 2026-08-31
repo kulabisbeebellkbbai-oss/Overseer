@@ -1310,19 +1310,32 @@ def _read_regular_file_at(
         os.close(descriptor)
 
 
-def _root_directory_identity(descriptor: int) -> tuple[int, int]:
+def _root_directory_identity(
+    descriptor: int, *, allowed_uids: frozenset[int] | None = None
+) -> tuple[int, int]:
+    if allowed_uids is None:
+        allowed_uids = frozenset({os.geteuid()})
     state = os.fstat(descriptor)
-    if not stat.S_ISDIR(state.st_mode) or state.st_uid != os.geteuid():
+    if (
+        not stat.S_ISDIR(state.st_mode)
+        or state.st_uid not in allowed_uids
+    ):
         raise PreflightError("artifact root directory object is unsafe")
     return state.st_dev, state.st_ino
 
 
-def _verify_artifact_root(root: Path, descriptor: int, identity: tuple[int, int]) -> None:
-    if _root_directory_identity(descriptor) != identity:
+def _verify_artifact_root(
+    root: Path,
+    descriptor: int,
+    identity: tuple[int, int],
+    *,
+    allowed_uids: frozenset[int] | None = None,
+) -> None:
+    if _root_directory_identity(descriptor, allowed_uids=allowed_uids) != identity:
         raise PreflightError("artifact root directory changed while it was read")
     reopened = _open_nofollow_directory(root, label="artifact root directory")
     try:
-        if _root_directory_identity(reopened) != identity:
+        if _root_directory_identity(reopened, allowed_uids=allowed_uids) != identity:
             raise PreflightError("artifact root directory changed while it was read")
     finally:
         os.close(reopened)
@@ -1364,8 +1377,15 @@ def _manifest_from_paths(
     unique = sorted(set(paths))
     if not unique or len(unique) != len(paths) or len(unique) > max_files:
         raise PreflightError(f"{kind} artifact file inventory is invalid")
+    allowed_uids = (
+        frozenset({os.geteuid()})
+        if kind == "source"
+        else frozenset({0, os.geteuid()})
+    )
     root_descriptor = _open_nofollow_directory(root, label=f"{kind} artifact root")
-    root_identity = _root_directory_identity(root_descriptor)
+    root_identity = _root_directory_identity(
+        root_descriptor, allowed_uids=allowed_uids
+    )
     try:
         records: list[dict[str, object]] = []
         entries: list[tuple[str, int, bytes]] = []
@@ -1384,7 +1404,12 @@ def _manifest_from_paths(
                 }
             )
             entries.append((relative, mode, payload))
-        _verify_artifact_root(root, root_descriptor, root_identity)
+        _verify_artifact_root(
+            root,
+            root_descriptor,
+            root_identity,
+            allowed_uids=allowed_uids,
+        )
     finally:
         os.close(root_descriptor)
     archive = _archive_bytes(entries)
@@ -1504,8 +1529,15 @@ def build_artifact_archive(root: Path, manifest: Mapping[str, object]) -> bytes:
     if kind not in {"source", "runtime"}:
         raise PreflightError("artifact manifest kind is invalid")
     validated = _validate_artifact_manifest(manifest, kind=kind)
+    allowed_uids = (
+        frozenset({os.geteuid()})
+        if kind == "source"
+        else frozenset({0, os.geteuid()})
+    )
     root_descriptor = _open_nofollow_directory(root, label=f"{kind} artifact root")
-    root_identity = _root_directory_identity(root_descriptor)
+    root_identity = _root_directory_identity(
+        root_descriptor, allowed_uids=allowed_uids
+    )
     try:
         entries: list[tuple[str, int, bytes]] = []
         for item in validated["files"]:
@@ -1517,7 +1549,12 @@ def build_artifact_archive(root: Path, manifest: Mapping[str, object]) -> bytes:
             ):
                 raise PreflightError(f"{kind} artifact changed after manifest")
             entries.append((item["path"], mode, payload))
-        _verify_artifact_root(root, root_descriptor, root_identity)
+        _verify_artifact_root(
+            root,
+            root_descriptor,
+            root_identity,
+            allowed_uids=allowed_uids,
+        )
     finally:
         os.close(root_descriptor)
     archive = _archive_bytes(entries)
@@ -2618,6 +2655,9 @@ from pathlib import Path,PurePosixPath
 root=Path(os.path.abspath(sys.argv[1]))
 manifest=json.loads(sys.argv[2])
 output=Path(os.path.abspath(sys.argv[3]))
+kind=manifest.get("kind")
+if kind not in {"source","runtime"}: raise SystemExit("artifact kind invalid")
+allowed_uids={os.geteuid()} if kind=="source" else {0,os.geteuid()}
 DIR_FLAGS=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_DIRECTORY
 def open_root(path):
     parts=Path(os.path.abspath(path)).parts[1:]
@@ -2640,6 +2680,8 @@ def open_relative(root_fd,relative):
         os.close(parent)
 root_fd=open_root(root)
 root_state=os.fstat(root_fd)
+def root_safe(value): return stat.S_ISDIR(value.st_mode) and value.st_uid in allowed_uids and not value.st_mode&(stat.S_IWGRP|stat.S_IWOTH)
+if not root_safe(root_state): raise SystemExit("artifact root unsafe")
 entries=[]
 for item in manifest["files"]:
     relative=PurePosixPath(item["path"])
@@ -2665,7 +2707,7 @@ after_root=os.fstat(root_fd)
 reopened_root=open_root(root)
 try: reopened_root_state=os.fstat(reopened_root)
 finally: os.close(reopened_root)
-if (root_state.st_dev,root_state.st_ino)!=(after_root.st_dev,after_root.st_ino) or (root_state.st_dev,root_state.st_ino)!=(reopened_root_state.st_dev,reopened_root_state.st_ino): raise SystemExit("artifact root changed after manifest")
+if not root_safe(after_root) or not root_safe(reopened_root_state) or (root_state.st_dev,root_state.st_ino)!=(after_root.st_dev,after_root.st_ino) or (root_state.st_dev,root_state.st_ino)!=(reopened_root_state.st_dev,reopened_root_state.st_ino): raise SystemExit("artifact root changed after manifest")
 os.close(root_fd)
 buffer=io.BytesIO()
 with zipfile.ZipFile(buffer,"w",compression=zipfile.ZIP_STORED,strict_timestamps=True) as archive:

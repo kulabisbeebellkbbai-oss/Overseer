@@ -22,6 +22,10 @@ Preflight fails closed unless:
   collision-resistant target VM name is absent;
 - source, runtime, image, and temporary-parent paths have conservative
   absolute names, safe object types, safe permissions, and required access;
+- the exact caller session runtime directory is `/run/user/<caller-uid>`, is a
+  non-linked directory owned by that caller with mode `0700`, and is bound to
+  every libvirt probe and the separately approved execution as
+  `XDG_RUNTIME_DIR`;
 - every host tool exists at its exact `/usr/bin` path as a root-owned regular,
   single-link, non-group/other-writable executable;
 - the pinned image checksum and qcow2 metadata pass, and the base is a leaf
@@ -54,6 +58,7 @@ GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_NOSYSTEM=1
 GIT_OPTIONAL_LOCKS=0
 GIT_TERMINAL_PROMPT=0
+XDG_RUNTIME_DIR=/run/user/<caller-uid>
 ```
 
 `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PYTHONPATH`, `PYTHONHOME`, `BASH_ENV`, and
@@ -64,13 +69,15 @@ helper or refresh the index during the read-only probe.
 
 ## Immutable host-to-guest handoff
 
-The v4 plan has no host filesystem share. It binds canonical source and runtime
+The v6 plan has no host filesystem share. It binds canonical source and runtime
 manifests, their SHA-256 digests, deterministic stored-ZIP digests, the runtime
 probe, KVM capability probe, source commit, domain XML, cloud-init, and future
 script under `planDigest`.
 
 The separately approved future script rechecks Git identity and cleanliness,
-reruns the manifest-enforced import probe, and builds both ZIP files using
+revalidates the exact private caller runtime directory before installing its
+lock or contacting libvirt, reruns the manifest-enforced import probe, and
+builds both ZIP files using
 `O_NOFOLLOW`, descriptor metadata checks, per-file size/hash checks, and
 deterministic ZIP metadata. A changed, linked, hard-linked, added, or omitted
 artifact file fails before VM definition. Ignored bytecode, `.git`, and local
@@ -132,6 +139,12 @@ and address metadata below the other approved devices. While the domain is
 active, it also permits only the exact detected qcow2 backing chain from the
 overlay to the pinned leaf base image. Both active attestations are mandatory
 whenever libvirt supplies a runtime domain ID.
+Across inactive and active ownership attestations, the validator accepts the
+rendered EFI form or only the exact state-independent libvirt canonicalization
+observed immediately after definition: the two ordered disabled firmware
+features `enrolled-keys` and `secure-boot`, `format='raw'` on the loader, and
+`templateFormat='raw' format='raw'` on NVRAM. Mixed, reordered, enabled,
+extended, or differently formatted EFI forms are rejected.
 Filesystem shares,
 interfaces, host devices,
 channels, QEMU command-line extensions, custom kernels, security-label changes,

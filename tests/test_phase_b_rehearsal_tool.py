@@ -23,6 +23,11 @@ TOOL = Path(__file__).parents[1] / "tools" / "phase_b_rehearsal.py"
 ACTIVE_DUMPXML_FIXTURE = (
     Path(__file__).parent / "fixtures" / "phase_b_rehearsal_active_dumpxml.xml"
 )
+INACTIVE_EFI_DUMPXML_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "phase_b_rehearsal_inactive_efi_dumpxml.xml"
+)
 SOURCE_COMMIT = "54a53bc34078c42a4303d6fe4de7e517a9e8f44b"
 SOURCE_ROOT = Path("/home/god/Documents/Codex Workspace/Overseer/source")
 RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
@@ -31,6 +36,7 @@ FIRMWARE_CODE = Path("/usr/share/OVMF/OVMF_CODE_4M.fd")
 FIRMWARE_VARS_TEMPLATE = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
 MACHINE_TYPE = "pc-i440fx-10.0"
 TEMP_PARENT = Path("/var/tmp")
+SESSION_RUNTIME_DIR = Path(f"/run/user/{os.geteuid()}")
 EXPECTED_IMPORTS = (
     "cryptography",
     "overseer.cli",
@@ -195,6 +201,7 @@ def fake_stat(path: Path) -> SimpleNamespace:
         FIRMWARE_CODE: stat.S_IFREG | 0o644,
         FIRMWARE_VARS_TEMPLATE: stat.S_IFREG | 0o644,
         TEMP_PARENT: stat.S_IFDIR | 0o1777,
+        SESSION_RUNTIME_DIR: stat.S_IFDIR | 0o700,
     }
     firmware_paths = {FIRMWARE_CODE, FIRMWARE_VARS_TEMPLATE}
     return SimpleNamespace(
@@ -243,6 +250,7 @@ def valid_preflight_kwargs(module) -> dict[str, object]:
             FIRMWARE_CODE,
             FIRMWARE_VARS_TEMPLATE,
             TEMP_PARENT,
+            SESSION_RUNTIME_DIR,
         },
         "path_stat": fake_stat,
         "path_access": lambda path, mode: True,
@@ -273,7 +281,9 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
     )
     assert module.DEFAULT_RUNTIME_SITE == RUNTIME_SITE
     assert module.MACHINE_TYPE == MACHINE_TYPE
-    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v5"
+    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v6"
+    assert module.SESSION_RUNTIME_DIR == SESSION_RUNTIME_DIR
+    assert module.MINIMAL_ENV["XDG_RUNTIME_DIR"] == str(SESSION_RUNTIME_DIR)
     assert module.MAX_SERIAL_BYTES == 1024 * 1024
     assert module.MAX_SERIAL_LINE_BYTES == 64 * 1024
     assert module.EXACT_TOOLS["python"] == "/usr/bin/python3.13"
@@ -299,6 +309,51 @@ def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
     assert result["planInputs"]["sourceArtifact"]["manifest"] == artifact_manifest("source")
     assert result["planInputs"]["runtimeArtifact"]["manifest"] == artifact_manifest("runtime")
     assert result["tempDirectoryCreated"] is False
+    assert result["sessionRuntimeDirectory"] == str(SESSION_RUNTIME_DIR)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("missing", "linked", "wrong-owner", "unsafe-mode"),
+)
+def test_preflight_rejects_unsafe_session_runtime_before_any_probe(case: str) -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    calls: list[tuple[str, ...]] = []
+    original_runner = values["runner"]
+    values["runner"] = lambda command: calls.append(command) or original_runner(command)
+    if case == "missing":
+        original_exists = values["path_exists"]
+        values["path_exists"] = lambda path: path != SESSION_RUNTIME_DIR and original_exists(path)
+    elif case == "linked":
+        values["is_symlink"] = lambda path: path == SESSION_RUNTIME_DIR
+    else:
+        original_stat = values["path_stat"]
+
+        def path_stat(path: Path):
+            state = original_stat(path)
+            if path != SESSION_RUNTIME_DIR:
+                return state
+            if case == "wrong-owner":
+                return SimpleNamespace(
+                    st_mode=state.st_mode,
+                    st_uid=os.geteuid() + 1,
+                    st_gid=state.st_gid,
+                    st_nlink=1,
+                )
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o750,
+                st_uid=state.st_uid,
+                st_gid=state.st_gid,
+                st_nlink=1,
+            )
+
+        values["path_stat"] = path_stat
+
+    with pytest.raises(module.PreflightError, match="session runtime"):
+        module.preflight(**values)
+
+    assert calls == []
 
 
 @pytest.mark.parametrize("machine", ("", "pc-i440fx-9.2"))
@@ -427,6 +482,95 @@ def _captured_active_dumpxml_root(
         os_node.insert(list(os_node).index(boot), loader)
         os_node.insert(list(os_node).index(boot), nvram)
     return root
+
+
+def _captured_inactive_efi_dumpxml_root(plan: dict[str, object]) -> ET.Element:
+    xml = INACTIVE_EFI_DUMPXML_FIXTURE.read_text(encoding="utf-8")
+    replacements = {
+        "${VM_NAME}": str(plan["vm"]["name"]),
+        "${VM_UUID}": str(plan["vm"]["uuid"]),
+        "${RUN_ID}": str(plan["vm"]["runId"]),
+        "${OVERLAY}": "/tmp/owned/overlay.qcow2",
+        "${SEED_ISO}": "/tmp/owned/seed.iso",
+        "${SERIAL_PIPE}": "/tmp/owned/serial",
+        "${NVRAM}": "/tmp/owned/nvram.fd",
+    }
+    for placeholder, value in replacements.items():
+        xml = xml.replace(placeholder, value)
+    return ET.fromstring(xml)
+
+
+def test_domain_ownership_validator_accepts_observed_inactive_efi_normalization() -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = _captured_inactive_efi_dumpxml_root(plan)
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_domain_ownership_validator_accepts_canonical_efi_during_active_attestation() -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = _captured_active_dumpxml_root(plan, with_uefi=True)
+    os_node = root.find("./os")
+    loader = root.find("./os/loader")
+    nvram = root.find("./os/nvram")
+    assert os_node is not None and loader is not None and nvram is not None
+    firmware = ET.Element("firmware")
+    ET.SubElement(firmware, "feature", {"enabled": "no", "name": "enrolled-keys"})
+    ET.SubElement(firmware, "feature", {"enabled": "no", "name": "secure-boot"})
+    os_node.insert(list(os_node).index(loader), firmware)
+    loader.set("format", "raw")
+    nvram.set("templateFormat", "raw")
+    nvram.set("format", "raw")
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "enrolled-keys-enabled",
+        "secure-boot-enabled",
+        "extra-firmware-feature",
+        "reordered-firmware-features",
+        "loader-format",
+        "nvram-format",
+        "nvram-template-format",
+    ),
+)
+def test_domain_ownership_validator_rejects_mutated_inactive_efi_normalization(
+    mutation: str,
+) -> None:
+    module = load_tool()
+    plan = render(module)["plan"]
+    root = _captured_inactive_efi_dumpxml_root(plan)
+    firmware = root.find("./os/firmware")
+    loader = root.find("./os/loader")
+    nvram = root.find("./os/nvram")
+    assert firmware is not None and loader is not None and nvram is not None
+    if mutation == "enrolled-keys-enabled":
+        firmware.find("./feature[@name='enrolled-keys']").set("enabled", "yes")
+    elif mutation == "secure-boot-enabled":
+        firmware.find("./feature[@name='secure-boot']").set("enabled", "yes")
+    elif mutation == "extra-firmware-feature":
+        ET.SubElement(firmware, "feature", {"enabled": "no", "name": "unknown"})
+    elif mutation == "reordered-firmware-features":
+        firmware[:] = list(reversed(list(firmware)))
+    elif mutation == "loader-format":
+        loader.set("format", "qcow2")
+    elif mutation == "nvram-format":
+        nvram.set("format", "qcow2")
+    else:
+        nvram.set("templateFormat", "qcow2")
+
+    completed = _run_domain_ownership_validator(module, plan, root)
+
+    assert completed.returncode != 0
 
 
 def test_domain_ownership_validator_accepts_captured_active_libvirt_normalization() -> None:
@@ -1076,7 +1220,7 @@ def test_render_plan_is_pure_canonical_and_probe_bound(monkeypatch: pytest.Monke
 
     rendered = render(module)
     plan = rendered["plan"]
-    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v5"
+    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v6"
     assert module.canonical_json(rendered) == json.dumps(rendered, sort_keys=True, separators=(",", ":"))
     assert rendered["planDigest"] == hashlib.sha256(module.canonical_json(plan).encode()).hexdigest()
     assert plan["sourceArtifact"]["manifest"] == artifact_manifest("source")
@@ -1099,6 +1243,11 @@ def test_render_plan_is_pure_canonical_and_probe_bound(monkeypatch: pytest.Monke
         "/usr/bin/bash",
         "<approved-future-script>",
     ]
+    assert plan["sessionRuntimeDirectory"] == str(SESSION_RUNTIME_DIR)
+    assert plan["executionEnvironment"]["XDG_RUNTIME_DIR"] == str(
+        SESSION_RUNTIME_DIR
+    )
+    assert f"XDG_RUNTIME_DIR={SESSION_RUNTIME_DIR}" in plan["executionCommand"]
 
 
 def test_domain_xml_parses_and_has_seed_only_no_host_share_with_owned_pipe_serial() -> None:
@@ -1456,6 +1605,18 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert script.startswith("#!/usr/bin/bash\nset -Eeuo pipefail\numask 077\n")
     assert "export PATH=/usr/sbin:/usr/bin:/sbin:/bin" in script
     assert "export LC_ALL=C" in script
+    assert f"export XDG_RUNTIME_DIR={SESSION_RUNTIME_DIR}" in script
+    assert 'readonly RUN_LOCK="$XDG_RUNTIME_DIR/overseer-phase-b-rehearsal.lock"' in script
+    assert "validate_session_runtime()" in script
+    assert '[[ "$XDG_RUNTIME_DIR" == "$EXPECTED_SESSION_RUNTIME_DIR" ]]' in script
+    assert '[[ -d "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" ]]' in script
+    assert "/usr/bin/stat -Lc '%u:%a' -- \"$XDG_RUNTIME_DIR\"" in script
+    assert script.index("validate_session_runtime\n") < script.index(
+        'if ! /usr/bin/mkdir "$RUN_LOCK"'
+    )
+    assert script.index("validate_session_runtime\n") < script.rindex(
+        "if domain_presence; then"
+    )
     assert "trap 'cleanup $?\' EXIT" in script
     assert "trap 'cleanup 130' INT" in script
     assert "trap 'cleanup 143' TERM" in script

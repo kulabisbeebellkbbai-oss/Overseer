@@ -47,7 +47,8 @@ FIRMWARE_VARS_TEMPLATE = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
 FIRMWARE_VARS_SHA256 = "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e"
 DEFAULT_RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
 DEFAULT_TEMP_PARENT = Path("/var/tmp")
-REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v5"
+SESSION_RUNTIME_DIR = Path("/run/user") / str(os.geteuid())
+REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v6"
 ARTIFACT_MANIFEST_SCHEMA = "overseer.rehearsal-artifact-manifest.v1"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
 RESULT_TIMEOUT_SECONDS = 960
@@ -94,6 +95,7 @@ MINIMAL_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONNOUSERSITE": "1",
+    "XDG_RUNTIME_DIR": str(SESSION_RUNTIME_DIR),
 }
 
 TASK_TWO_PLACEHOLDERS = (
@@ -775,6 +777,34 @@ def _validate_temp_mode(mode: int) -> None:
         raise PreflightError("temporary path permissions are unsafe")
 
 
+def _validate_session_runtime_directory(
+    *,
+    path_exists: Callable[[Path], bool],
+    path_stat: Callable[[Path], object],
+    path_access: Callable[[Path, int], bool],
+    is_symlink: Callable[[Path], bool],
+) -> None:
+    """Bind libvirt probes and execution to this caller's private user session."""
+
+    expected = Path("/run/user") / str(os.geteuid())
+    if SESSION_RUNTIME_DIR != expected:
+        raise PreflightError("session runtime path is not the exact caller path")
+    if not path_exists(expected) or is_symlink(expected):
+        raise PreflightError("session runtime directory is missing or linked")
+    try:
+        state = path_stat(expected)
+    except OSError as error:
+        raise PreflightError("session runtime directory state is unavailable") from error
+    if not stat.S_ISDIR(state.st_mode):
+        raise PreflightError("session runtime path is not a directory object")
+    if state.st_uid != os.geteuid():
+        raise PreflightError("session runtime directory ownership is unsafe")
+    if stat.S_IMODE(state.st_mode) != 0o700:
+        raise PreflightError("session runtime directory permissions are unsafe")
+    if not path_access(expected, os.R_OK | os.W_OK | os.X_OK):
+        raise PreflightError("session runtime directory is not caller-accessible")
+
+
 def _validate_exact_tools(
     *,
     tool_exists: Callable[[Path], bool],
@@ -870,10 +900,17 @@ def preflight(
         (FIRMWARE_CODE, "firmware code"),
         (FIRMWARE_VARS_TEMPLATE, "firmware variables template"),
         (temp_parent, "temporary"),
+        (SESSION_RUNTIME_DIR, "session runtime"),
     ):
         _validate_host_path(path, label)
     if repo_root != source_root:
         raise PreflightError("source path must be the validated repository root")
+    _validate_session_runtime_directory(
+        path_exists=path_exists,
+        path_stat=path_stat,
+        path_access=path_access,
+        is_symlink=is_symlink,
+    )
     if runner(("git-status", str(repo_root))):
         raise PreflightError("source tree is dirty")
     if runner(("git-head", str(repo_root))) != source_commit:
@@ -1074,6 +1111,7 @@ def preflight(
         "runtimeManifestDigest": runtime_manifest_digest,
         "planInputs": inputs,
         "checkedTools": dict(EXACT_TOOLS),
+        "sessionRuntimeDirectory": str(SESSION_RUNTIME_DIR),
         "tempDirectoryCreated": False,
     }
 
@@ -1471,8 +1509,12 @@ def memory_ok(name):
     return node is not None and node.attrib in ({"unit":"MiB"},{"unit":"KiB"}) and node.text==("2048" if node.get("unit")=="MiB" else "2097152") and not list(node)
 vcpu=root.find("vcpu")
 vcpu_valid=vcpu is not None and vcpu.text=="2" and vcpu.attrib in ({"placement":"static"},{"placement":"static","current":"2"}) and not list(vcpu)
-os_node=root.find("os"); os_children=[] if os_node is None else list(os_node); os_type=None if os_node is None else os_node.find("type"); loaders=[] if os_node is None else os_node.findall("loader"); nvrams=[] if os_node is None else os_node.findall("nvram"); boots=[] if os_node is None else os_node.findall("boot")
-os_valid=os_node is not None and os_node.attrib=={"firmware":"efi"} and [item.tag for item in os_children]==["type","loader","nvram","boot"] and len(os_node.findall("type"))==1 and len(loaders)==1 and len(nvrams)==1 and len(boots)==1 and os_type.text=="hvm" and os_type.attrib=={"arch":"x86_64","machine":sys.argv[11]} and not list(os_type) and leaf_ok(loaders[0],{"readonly":"yes","secure":"no","type":"pflash"},sys.argv[9]) and leaf_ok(nvrams[0],{"template":sys.argv[10]},sys.argv[8]) and boots[0].attrib=={"dev":"hd"} and whitespace_only(boots[0].text) and not list(boots[0])
+os_node=root.find("os"); os_children=[] if os_node is None else list(os_node); os_type=None if os_node is None else os_node.find("type"); firmwares=[] if os_node is None else os_node.findall("firmware"); loaders=[] if os_node is None else os_node.findall("loader"); nvrams=[] if os_node is None else os_node.findall("nvram"); boots=[] if os_node is None else os_node.findall("boot")
+firmware_children=[] if not firmwares else list(firmwares[0])
+rendered_efi=[item.tag for item in os_children]==["type","loader","nvram","boot"] and not firmwares and leaf_ok(loaders[0],{"readonly":"yes","secure":"no","type":"pflash"},sys.argv[9]) and leaf_ok(nvrams[0],{"template":sys.argv[10]},sys.argv[8])
+canonical_firmware=len(firmwares)==1 and firmwares[0].attrib=={} and [item.tag for item in firmware_children]==["feature","feature"] and leaf_ok(firmware_children[0],{"enabled":"no","name":"enrolled-keys"},None) and leaf_ok(firmware_children[1],{"enabled":"no","name":"secure-boot"},None)
+canonical_efi=[item.tag for item in os_children]==["type","firmware","loader","nvram","boot"] and canonical_firmware and leaf_ok(loaders[0],{"readonly":"yes","secure":"no","type":"pflash","format":"raw"},sys.argv[9]) and leaf_ok(nvrams[0],{"template":sys.argv[10],"templateFormat":"raw","format":"raw"},sys.argv[8])
+os_valid=os_node is not None and os_node.attrib=={"firmware":"efi"} and len(os_node.findall("type"))==1 and len(loaders)==1 and len(nvrams)==1 and len(boots)==1 and os_type.text=="hvm" and os_type.attrib=={"arch":"x86_64","machine":sys.argv[11]} and not list(os_type) and (rendered_efi or canonical_efi) and boots[0].attrib=={"dev":"hd"} and whitespace_only(boots[0].text) and not list(boots[0])
 features=root.find("features"); feature_children=[] if features is None else list(features)
 features_valid=features is not None and features.attrib=={} and len(feature_children)==1 and leaf_ok(feature_children[0],{},None) and feature_children[0].tag=="acpi"
 cpus=root.findall("cpu"); cpu_model=None if not cpus else cpus[0].find("model")
@@ -1603,6 +1645,7 @@ export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_OPTIONAL_LOCKS=0
 export GIT_TERMINAL_PROMPT=0
+export XDG_RUNTIME_DIR={shlex.quote(str(SESSION_RUNTIME_DIR))}
 
 readonly LIBVIRT_URI={shlex.quote(LIBVIRT_URI)}
 readonly MACHINE_TYPE={shlex.quote(MACHINE_TYPE)}
@@ -1629,7 +1672,8 @@ readonly RESULT_TIMEOUT_SECONDS={RESULT_TIMEOUT_SECONDS}
 readonly SHUTDOWN_TIMEOUT_SECONDS={SHUTDOWN_TIMEOUT_SECONDS}
 readonly MAX_SERIAL_BYTES={MAX_SERIAL_BYTES}
 readonly MAX_SERIAL_LINE_BYTES={MAX_SERIAL_LINE_BYTES}
-readonly RUN_LOCK="/run/user/$(/usr/bin/id -u)/overseer-phase-b-rehearsal.lock"
+readonly EXPECTED_SESSION_RUNTIME_DIR={shlex.quote(str(SESSION_RUNTIME_DIR))}
+readonly RUN_LOCK="$XDG_RUNTIME_DIR/overseer-phase-b-rehearsal.lock"
 
 TEMP_DIR=""
 OVERLAY=""
@@ -1652,6 +1696,19 @@ LOCK_HELD=0
 
 validate_firmware_runtime() {{
   /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(firmware_validator)} "$FIRMWARE_CODE" "$FIRMWARE_CODE_SHA256" "$FIRMWARE_VARS_TEMPLATE" "$FIRMWARE_VARS_SHA256"
+}}
+
+validate_session_runtime() {{
+  local actual
+  if [[ "$XDG_RUNTIME_DIR" == "$EXPECTED_SESSION_RUNTIME_DIR" ]] &&
+     [[ -d "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" ]] &&
+     actual="$(/usr/bin/stat -Lc '%u:%a' -- "$XDG_RUNTIME_DIR")" &&
+     [[ "$actual" == "$(/usr/bin/id -u):700" ]] &&
+     [[ -r "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" && -x "$XDG_RUNTIME_DIR" ]]; then
+    return 0
+  fi
+  printf '%s\n' 'session runtime directory is not the exact private caller directory' >&2
+  return 1
 }}
 
 domain_presence() {{
@@ -1782,6 +1839,8 @@ cleanup() {{
 trap 'cleanup $?' EXIT
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
+
+validate_session_runtime
 
 if ! /usr/bin/mkdir "$RUN_LOCK" 2>/dev/null; then
   printf '%s\\n' 'another Phase B rehearsal owns the execution lock' >&2
@@ -2008,6 +2067,7 @@ def render_plan(
         "domainXml": domain_xml,
         "futureScript": script,
         "futureScriptSha256": hashlib.sha256(script.encode()).hexdigest(),
+        "sessionRuntimeDirectory": str(SESSION_RUNTIME_DIR),
         "executionEnvironment": dict(MINIMAL_ENV),
         "executionCommand": [
             EXACT_TOOLS["env"],

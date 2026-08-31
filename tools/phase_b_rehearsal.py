@@ -1,14 +1,16 @@
 #!/usr/bin/python3.13
 """Preflight and render an inert disposable Phase B rehearsal plan.
 
-``preflight`` performs read-only checks. ``render-plan`` is pure and emits
-canonical JSON containing a separately approved future script. This module has
+``preflight`` performs read-only checks. ``render-plan`` revalidates the exact
+owner against the authoritative local registry, then emits canonical JSON
+containing a separately approved future script. This module has
 no VM, image, package, service, or activation mutation subcommand.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import io
 import json
@@ -47,8 +49,10 @@ FIRMWARE_VARS_TEMPLATE = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
 FIRMWARE_VARS_SHA256 = "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e"
 DEFAULT_RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
 DEFAULT_TEMP_PARENT = Path("/var/tmp")
+DEFAULT_CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
 SESSION_RUNTIME_DIR = Path("/run/user") / str(os.geteuid())
-REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v6"
+REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v8"
+OWNER_BINDING_SCHEMA = "overseer.phase-b-rehearsal-owner-binding.v2"
 ARTIFACT_MANIFEST_SCHEMA = "overseer.rehearsal-artifact-manifest.v1"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
 RESULT_TIMEOUT_SECONDS = 960
@@ -59,6 +63,10 @@ MAX_SOURCE_FILES = 2048
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_FILES = 1024
 MAX_RUNTIME_BYTES = 64 * 1024 * 1024
+MAX_CODEX_PROJECTS_REGISTRY_BYTES = 8 * 1024 * 1024
+MAX_CODEX_EXECUTABLE_BYTES = 536870912
+MAX_PROCESS_CMDLINE_BYTES = 65536
+MAX_PROCESS_ANCESTORS = 128
 
 EXACT_TOOLS = {
     "awk": "/usr/bin/awk",
@@ -82,6 +90,7 @@ EXACT_TOOLS = {
     "sleep": "/usr/bin/sleep",
     "stat": "/usr/bin/stat",
     "timeout": "/usr/bin/timeout",
+    "tmux": "/usr/bin/tmux",
     "virsh": "/usr/bin/virsh",
 }
 REQUIRED_TOOLS = tuple(EXACT_TOOLS)
@@ -138,7 +147,60 @@ _HOST_PATH = re.compile(r"/[A-Za-z0-9._/+ \-]+\Z")
 _ARTIFACT_PATH = re.compile(r"[A-Za-z0-9._/+@ \-]+\Z")
 _PYTHON_VERSION = re.compile(r"3\.13\.[0-9]+\Z")
 _PYTHON_ABI = re.compile(r"cpython-313-[A-Za-z0-9_.-]+\Z")
+_CODEX_EXECUTABLE_PATH = re.compile(
+    r"/home/god/\.codex/packages/standalone/releases/"
+    r"[0-9]+\.[0-9]+\.[0-9]+-x86_64-unknown-linux-musl/bin/codex\Z"
+)
 _RUN_NAMESPACE = uuid.UUID("4c7e2e88-e69b-5a43-9896-ffae89196717")
+_CODEX_REGISTRY_FIELDS = (
+    "conversation_id",
+    "label",
+    "project",
+    "command",
+    "launcher",
+    "created_at",
+    "updated_at",
+    "source",
+    "notes",
+)
+_OWNER_BINDING_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "status",
+        "conversationId",
+        "project",
+        "ownerProjectToplevel",
+        "sourceRoot",
+        "gitCommonDirectory",
+        "ownerProjectDevice",
+        "ownerProjectInode",
+        "sourceRootDevice",
+        "sourceRootInode",
+        "gitCommonDirectoryDevice",
+        "gitCommonDirectoryInode",
+        "registry",
+        "registryDevice",
+        "registryInode",
+        "registryRow",
+        "registrySha256",
+        "registryRowDigest",
+        "launcherDevice",
+        "launcherInode",
+        "launcherSha256",
+        "codexExecutable",
+        "codexExecutableDevice",
+        "codexExecutableInode",
+        "codexExecutableSha256",
+        "codexArgv",
+        "bindingDigest",
+    }
+)
+_OWNER_REGISTRY_ROW_KEYS = frozenset(
+    {"conversationId", "project", "command", "launcher"}
+)
+_REPOSITORY_IDENTITY_KEYS = frozenset(
+    {"topLevel", "device", "inode", "commonDirectory", "commonDevice", "commonInode"}
+)
 _GIT_SAFE_FLAGS = (
     "--no-optional-locks",
     "-c",
@@ -177,6 +239,990 @@ def _require_full_source_commit(source_commit: str) -> None:
         raise PreflightError("source commit must be a lowercase full 40-character SHA")
 
 
+def _require_exact_conversation_id(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise PreflightError(f"{label} conversation id is invalid")
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as error:
+        raise PreflightError(f"{label} conversation id is invalid") from error
+    if str(parsed) != value:
+        raise PreflightError(f"{label} conversation id is invalid")
+    return value
+
+
+def _open_codex_projects_registry(path: Path) -> int:
+    _validate_host_path(path, "Codex projects registry")
+    parts = path.parts[1:]
+    if not parts:
+        raise PreflightError("Codex projects registry path is unsafe")
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | cloexec | nofollow | getattr(os, "O_DIRECTORY", 0)
+    parent_descriptor = -1
+    try:
+        parent_descriptor = os.open("/", directory_flags)
+        for component in parts[:-1]:
+            next_descriptor = os.open(component, directory_flags, dir_fd=parent_descriptor)
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        return os.open(
+            parts[-1], os.O_RDONLY | cloexec | nofollow, dir_fd=parent_descriptor
+        )
+    except OSError as error:
+        raise PreflightError("Codex projects registry is unavailable") from error
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _open_nofollow_directory(path: Path, *, label: str) -> int:
+    _validate_host_path(path, label)
+    parts = path.parts[1:]
+    if not parts:
+        raise PreflightError(f"{label} path is unsafe")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    parent_descriptor = -1
+    try:
+        parent_descriptor = os.open("/", flags)
+        for component in parts:
+            next_descriptor = os.open(component, flags, dir_fd=parent_descriptor)
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        descriptor = parent_descriptor
+        parent_descriptor = -1
+        return descriptor
+    except OSError as error:
+        raise PreflightError(f"{label} is unavailable or linked") from error
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _git_at_directory_descriptor(
+    descriptor: int, *arguments: str, preserve_output: bool = False
+) -> str:
+    completed = subprocess.run(
+        (
+            EXACT_TOOLS["git"],
+            *_GIT_SAFE_FLAGS,
+            "-C",
+            f"/proc/self/fd/{descriptor}",
+            *arguments,
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        env=MINIMAL_ENV,
+        pass_fds=(descriptor,),
+    )
+    return completed.stdout if preserve_output else completed.stdout.strip()
+
+
+def _read_only_repository_identity(path: Path) -> dict[str, object]:
+    descriptor = _open_nofollow_directory(path, label="repository path")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid != os.geteuid():
+            raise PreflightError("repository path object is unsafe")
+        if _git_at_directory_descriptor(descriptor, "rev-parse", "--show-prefix"):
+            raise PreflightError("repository path is not the Git worktree top level")
+        common_directory = Path(
+            _git_at_directory_descriptor(
+                descriptor,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        _validate_host_path(common_directory, "Git common directory")
+        common_descriptor = _open_nofollow_directory(
+            common_directory, label="Git common directory"
+        )
+        try:
+            common_state = os.fstat(common_descriptor)
+            repeated_common = Path(
+                _git_at_directory_descriptor(
+                    descriptor,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                )
+            )
+            repeated_descriptor = _open_nofollow_directory(
+                common_directory, label="Git common directory"
+            )
+            try:
+                repeated_common_state = os.fstat(repeated_descriptor)
+            finally:
+                os.close(repeated_descriptor)
+        finally:
+            os.close(common_descriptor)
+        after = os.fstat(descriptor)
+        reopened_descriptor = _open_nofollow_directory(path, label="repository path")
+        try:
+            reopened = os.fstat(reopened_descriptor)
+        finally:
+            os.close(reopened_descriptor)
+        directory_identity = (before.st_dev, before.st_ino)
+        if (
+            repeated_common != common_directory
+            or (common_state.st_dev, common_state.st_ino)
+            != (repeated_common_state.st_dev, repeated_common_state.st_ino)
+            or directory_identity != (after.st_dev, after.st_ino)
+            or directory_identity != (reopened.st_dev, reopened.st_ino)
+        ):
+            raise PreflightError("repository identity changed during the read-only probe")
+        return {
+            "topLevel": str(path),
+            "device": before.st_dev,
+            "inode": before.st_ino,
+            "commonDirectory": str(common_directory),
+            "commonDevice": common_state.st_dev,
+            "commonInode": common_state.st_ino,
+        }
+    except subprocess.CalledProcessError as error:
+        raise PreflightError("repository identity probe failed") from error
+    finally:
+        os.close(descriptor)
+
+
+def _read_only_source_git_state(path: Path) -> dict[str, str]:
+    descriptor = _open_nofollow_directory(path, label="source Git state repository")
+    identity = _root_directory_identity(descriptor)
+    try:
+        status = _git_at_directory_descriptor(
+            descriptor, "status", "--porcelain", "--untracked-files=all"
+        )
+        head = _git_at_directory_descriptor(descriptor, "rev-parse", "HEAD")
+        files = _git_at_directory_descriptor(
+            descriptor, "ls-files", "-z", preserve_output=True
+        )
+        if _root_directory_identity(descriptor) != identity:
+            raise PreflightError("source Git state repository changed while probed")
+        reopened = _open_nofollow_directory(path, label="source Git state repository")
+        try:
+            if _root_directory_identity(reopened) != identity:
+                raise PreflightError("source Git state repository changed while probed")
+        finally:
+            os.close(reopened)
+        return {"status": status, "head": head, "files": files}
+    except subprocess.CalledProcessError as error:
+        raise PreflightError("source Git state probe failed") from error
+    finally:
+        os.close(descriptor)
+
+
+def _read_codex_projects_registry(path: Path) -> bytes:
+    descriptor = _open_codex_projects_registry(path)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or before.st_size > MAX_CODEX_PROJECTS_REGISTRY_BYTES
+        ):
+            raise PreflightError("Codex projects registry object is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(descriptor, min(1024 * 1024, MAX_CODEX_PROJECTS_REGISTRY_BYTES + 1 - total))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+            if total > MAX_CODEX_PROJECTS_REGISTRY_BYTES:
+                raise PreflightError("Codex projects registry exceeds the bounded size")
+        after = os.fstat(descriptor)
+        before_state = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_state = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        payload = b"".join(chunks)
+        if before_state != after_state or len(payload) != before.st_size:
+            raise PreflightError("Codex projects registry changed while it was read")
+        pathname_descriptor = _open_codex_projects_registry(path)
+        try:
+            pathname_state = os.fstat(pathname_descriptor)
+        finally:
+            os.close(pathname_descriptor)
+        pathname_identity = (
+            pathname_state.st_dev,
+            pathname_state.st_ino,
+            pathname_state.st_size,
+            pathname_state.st_mtime_ns,
+            pathname_state.st_ctime_ns,
+        )
+        if (
+            pathname_identity != after_state
+            or not stat.S_ISREG(pathname_state.st_mode)
+            or pathname_state.st_nlink != 1
+            or pathname_state.st_uid != os.geteuid()
+            or pathname_state.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise PreflightError(
+                "Codex projects registry changed or was replaced after it was read"
+            )
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _codex_registry_object_identity(path: Path) -> dict[str, int]:
+    descriptor = _open_codex_projects_registry(path)
+    try:
+        state = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(state.st_mode)
+            or state.st_uid != os.geteuid()
+            or state.st_nlink != 1
+            or state.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise PreflightError("Codex projects registry object is unsafe")
+        return {"device": state.st_dev, "inode": state.st_ino}
+    finally:
+        os.close(descriptor)
+
+
+def _open_nofollow_regular_path(path: Path, *, label: str) -> int:
+    _validate_host_path(path, label)
+    parts = path.parts[1:]
+    if not parts:
+        raise PreflightError(f"{label} path is unsafe")
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | cloexec | nofollow | getattr(os, "O_DIRECTORY", 0)
+    parent_descriptor = -1
+    try:
+        parent_descriptor = os.open("/", directory_flags)
+        for component in parts[:-1]:
+            next_descriptor = os.open(component, directory_flags, dir_fd=parent_descriptor)
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        return os.open(
+            parts[-1], os.O_RDONLY | cloexec | nofollow, dir_fd=parent_descriptor
+        )
+    except OSError as error:
+        raise PreflightError(f"{label} is unavailable or linked") from error
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _read_launcher_evidence(
+    path: Path, *, conversation_id: str, project: Path, command: str
+) -> dict[str, object]:
+    descriptor = _open_nofollow_regular_path(path, label="registered owner launcher")
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or not before.st_mode & stat.S_IXUSR
+            or before.st_size > 65536
+        ):
+            raise PreflightError("registered owner launcher object is unsafe")
+        payload = b""
+        while len(payload) <= 65536:
+            block = os.read(descriptor, min(65537 - len(payload), 65536))
+            if not block:
+                break
+            payload += block
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or len(payload) != before.st_size
+        ):
+            raise PreflightError("registered owner launcher changed while read")
+    finally:
+        os.close(descriptor)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PreflightError("registered owner launcher encoding is invalid") from error
+    lines = text.splitlines()
+    if lines[:3] != ["#!/usr/bin/env bash", "set -euo pipefail", ""] or len(lines) != 4:
+        raise PreflightError("registered owner launcher content is invalid")
+    try:
+        outer = shlex.split(lines[3])
+    except ValueError as error:
+        raise PreflightError("registered owner launcher content is invalid") from error
+    if outer != [
+        "exec",
+        "/usr/bin/tmux",
+        "new-session",
+        "-A",
+        "-s",
+        command,
+        "-c",
+        str(project),
+        f"/home/god/.local/bin/codex-memory-session resume {conversation_id} --cd '{project}'",
+    ]:
+        raise PreflightError("registered owner launcher content is invalid")
+    return {
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _read_bounded_proc_file(
+    process_descriptor: int, name: str, *, limit: int
+) -> bytes:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=process_descriptor,
+    )
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(descriptor, min(65536, limit + 1 - total))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+            if total > limit:
+                raise PreflightError("owner process metadata exceeds its bound")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _parse_process_stat(payload: bytes, *, expected_pid: int) -> tuple[int, int]:
+    marker = payload.rfind(b") ")
+    if marker < 1:
+        raise PreflightError("owner process metadata is invalid")
+    try:
+        parsed_pid = int(payload[: payload.index(b" ")])
+        fields = payload[marker + 2 :].split()
+        parent_pid = int(fields[1])
+        start_time = int(fields[19])
+    except (IndexError, ValueError) as error:
+        raise PreflightError("owner process metadata is invalid") from error
+    if parsed_pid != expected_pid or parent_pid < 0 or start_time <= 0:
+        raise PreflightError("owner process metadata is invalid")
+    return parent_pid, start_time
+
+
+def _read_process_snapshot(pid: int, *, include_executable: bool) -> dict[str, object]:
+    if pid <= 0:
+        raise PreflightError("owner process ancestry is invalid")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        process_descriptor = os.open(f"/proc/{pid}", flags)
+    except OSError as error:
+        raise PreflightError("owner process ancestry is unavailable") from error
+    try:
+        process_state = os.fstat(process_descriptor)
+        if not stat.S_ISDIR(process_state.st_mode) or process_state.st_uid != os.geteuid():
+            raise PreflightError("owner process ancestry is unsafe")
+        before_stat = _read_bounded_proc_file(process_descriptor, "stat", limit=65536)
+        parent_pid, start_time = _parse_process_stat(before_stat, expected_pid=pid)
+        cmdline_payload = _read_bounded_proc_file(
+            process_descriptor, "cmdline", limit=MAX_PROCESS_CMDLINE_BYTES
+        )
+        try:
+            argv = [
+                item.decode("utf-8")
+                for item in cmdline_payload.split(b"\0")
+                if item
+            ]
+        except UnicodeDecodeError as error:
+            raise PreflightError("owner process command line is invalid") from error
+        snapshot: dict[str, object] = {
+            "pid": pid,
+            "parentPid": parent_pid,
+            "startTime": start_time,
+            "argv": argv,
+        }
+        try:
+            executable_path = Path(os.readlink("exe", dir_fd=process_descriptor))
+            executable_descriptor = os.open(
+                "exe",
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=process_descriptor,
+            )
+        except OSError as error:
+            raise PreflightError("owner process executable is unavailable") from error
+        try:
+            _validate_host_path(executable_path, "owner process executable")
+            executable_before = os.fstat(executable_descriptor)
+            if not stat.S_ISREG(executable_before.st_mode):
+                raise PreflightError("owner process executable is unsafe")
+            snapshot.update(
+                {
+                    "executable": str(executable_path),
+                    "executableDevice": executable_before.st_dev,
+                    "executableInode": executable_before.st_ino,
+                }
+            )
+            if include_executable:
+                if (
+                    _CODEX_EXECUTABLE_PATH.fullmatch(str(executable_path)) is None
+                    or executable_before.st_uid != os.geteuid()
+                    or executable_before.st_nlink != 1
+                    or executable_before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or not executable_before.st_mode & stat.S_IXUSR
+                    or executable_before.st_size > MAX_CODEX_EXECUTABLE_BYTES
+                ):
+                    raise PreflightError("owner Codex executable is unsafe")
+                digest = hashlib.sha256()
+                total = 0
+                while True:
+                    block = os.read(executable_descriptor, 1048576)
+                    if not block:
+                        break
+                    digest.update(block)
+                    total += len(block)
+                    if total > MAX_CODEX_EXECUTABLE_BYTES:
+                        raise PreflightError("owner Codex executable exceeds its bound")
+                snapshot["executableSha256"] = digest.hexdigest()
+            executable_after = os.fstat(executable_descriptor)
+            executable_identity = (
+                executable_before.st_dev,
+                executable_before.st_ino,
+                executable_before.st_size,
+                executable_before.st_mtime_ns,
+                executable_before.st_ctime_ns,
+            )
+            if executable_identity != (
+                executable_after.st_dev,
+                executable_after.st_ino,
+                executable_after.st_size,
+                executable_after.st_mtime_ns,
+                executable_after.st_ctime_ns,
+            ) or (include_executable and total != executable_before.st_size):
+                raise PreflightError("owner process executable changed while read")
+        finally:
+            os.close(executable_descriptor)
+        try:
+            repeated_executable_path = Path(os.readlink("exe", dir_fd=process_descriptor))
+            repeated_executable = os.open(
+                "exe",
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=process_descriptor,
+            )
+        except OSError as error:
+            raise PreflightError("owner process executable changed") from error
+        try:
+            repeated_executable_state = os.fstat(repeated_executable)
+        finally:
+            os.close(repeated_executable)
+        if (
+            repeated_executable_path != executable_path
+            or executable_identity
+            != (
+                repeated_executable_state.st_dev,
+                repeated_executable_state.st_ino,
+                repeated_executable_state.st_size,
+                repeated_executable_state.st_mtime_ns,
+                repeated_executable_state.st_ctime_ns,
+            )
+        ):
+            raise PreflightError("owner process executable changed")
+        if (
+            _read_bounded_proc_file(
+                process_descriptor, "cmdline", limit=MAX_PROCESS_CMDLINE_BYTES
+            )
+            != cmdline_payload
+        ):
+            raise PreflightError("owner process command line changed")
+        after_stat = _read_bounded_proc_file(process_descriptor, "stat", limit=65536)
+        after_parent, after_start = _parse_process_stat(after_stat, expected_pid=pid)
+        if (after_parent, after_start) != (parent_pid, start_time):
+            raise PreflightError("owner process changed while inspected")
+        return snapshot
+    finally:
+        os.close(process_descriptor)
+
+
+def _read_owner_process_ancestry() -> list[dict[str, object]]:
+    current = os.getppid()
+    seen: set[int] = set()
+    ancestry: list[dict[str, object]] = []
+    for _ in range(MAX_PROCESS_ANCESTORS):
+        if current <= 0 or current in seen:
+            raise PreflightError("owner process ancestry is invalid")
+        seen.add(current)
+        metadata = _read_process_snapshot(current, include_executable=False)
+        ancestry.append(metadata)
+        parent = metadata["parentPid"]
+        if not isinstance(parent, int) or isinstance(parent, bool):
+            raise PreflightError("owner process ancestry is invalid")
+        if parent == 1:
+            break
+        current = parent
+    else:
+        raise PreflightError("owner process ancestry exceeds its bound")
+    return ancestry
+
+
+def _looks_like_codex_process(record: Mapping[str, object]) -> bool:
+    executable = record.get("executable")
+    argv = record.get("argv")
+    if not isinstance(executable, str) or not isinstance(argv, list) or any(
+        not isinstance(item, str) for item in argv
+    ):
+        raise PreflightError("owner process ancestry record is invalid")
+    return (
+        Path(executable).name == "codex"
+        or any(Path(item).name == "codex" for item in argv)
+        or any("@openai/codex" in item for item in argv)
+    )
+
+
+def _read_owner_process_evidence(
+    *, conversation_id: str, project: Path
+) -> dict[str, object]:
+    expected_argv = ["codex", "resume", conversation_id, "--cd", str(project)]
+    ancestry = _read_owner_process_ancestry()
+    codex_paths = [
+        record
+        for record in ancestry
+        if _looks_like_codex_process(record)
+    ]
+    if len(codex_paths) != 1:
+        raise PreflightError(
+            "preflight does not have exactly one Codex process ancestor"
+        )
+    candidate = codex_paths[0]
+    candidate_identity = (
+        candidate["executableDevice"],
+        candidate["executableInode"],
+    )
+    if sum(
+        (
+            record["executableDevice"],
+            record["executableInode"],
+        )
+        == candidate_identity
+        for record in ancestry
+    ) != 1:
+        raise PreflightError("preflight has multiple Codex process ancestors")
+    if candidate["argv"] != expected_argv:
+        raise PreflightError("the sole Codex ancestor is not the exact owner process")
+    match = _read_process_snapshot(
+        int(candidate["pid"]), include_executable=True
+    )
+    for stable_field in (
+        "pid",
+        "parentPid",
+        "startTime",
+        "argv",
+        "executable",
+        "executableDevice",
+        "executableInode",
+    ):
+        if match[stable_field] != candidate[stable_field]:
+            raise PreflightError("owner Codex process changed while inspected")
+    if _read_owner_process_ancestry() != ancestry:
+        raise PreflightError("owner process ancestry changed while inspected")
+    return {
+        "executable": match["executable"],
+        "device": match["executableDevice"],
+        "inode": match["executableInode"],
+        "sha256": match["executableSha256"],
+        "argv": match["argv"],
+    }
+
+
+def _owner_binding_from_registry(
+    *,
+    owner_thread: str,
+    owner_project: Path,
+    registry: Path,
+    registry_payload: bytes,
+    registry_identity_reader: Callable[[Path], dict[str, int]] | None = None,
+    launcher_evidence_reader: Callable[..., dict[str, object]] | None = None,
+    owner_process_evidence_reader: Callable[..., dict[str, object]] | None = None,
+) -> dict[str, object]:
+    if registry_identity_reader is None:
+        registry_identity_reader = _codex_registry_object_identity
+    if launcher_evidence_reader is None:
+        launcher_evidence_reader = _read_launcher_evidence
+    if owner_process_evidence_reader is None:
+        owner_process_evidence_reader = _read_owner_process_evidence
+    conversation_id = _require_exact_conversation_id(owner_thread, label="owner")
+    _validate_host_path(owner_project, "owner project")
+    _validate_host_path(registry, "Codex projects registry")
+    if registry != DEFAULT_CODEX_PROJECTS_REGISTRY:
+        raise PreflightError("Codex projects registry is not the authoritative registry")
+    try:
+        text = registry_payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PreflightError("Codex projects registry encoding is invalid") from error
+    if "\0" in text:
+        raise PreflightError("Codex projects registry encoding is invalid")
+    reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+    matches: list[dict[str, str]] = []
+    target_uuid = uuid.UUID(conversation_id)
+    try:
+        if tuple(reader.fieldnames or ()) != _CODEX_REGISTRY_FIELDS:
+            raise PreflightError("Codex projects registry header is invalid")
+        for row in reader:
+            if None in row or any(not isinstance(row.get(field), str) for field in _CODEX_REGISTRY_FIELDS):
+                raise PreflightError("Codex projects registry row is invalid")
+            try:
+                row_uuid = uuid.UUID(row["conversation_id"])
+            except (ValueError, AttributeError):
+                continue
+            if row_uuid == target_uuid:
+                if str(row_uuid) != row["conversation_id"]:
+                    raise PreflightError(
+                        "owner conversation id has a noncanonical registry alias"
+                    )
+                matches.append({field: row[field] for field in _CODEX_REGISTRY_FIELDS})
+    except csv.Error as error:
+        raise PreflightError("Codex projects registry CSV is invalid") from error
+    if len(matches) != 1:
+        raise PreflightError("owner conversation id must appear exactly once in the Codex projects registry")
+    match = matches[0]
+    if match["project"] != str(owner_project):
+        raise PreflightError("registered owner project does not match the exact requested owner project")
+    command = match["command"]
+    expected_command = f"codex-overseer-{conversation_id}"
+    if command != expected_command:
+        raise PreflightError("registered owner command is invalid")
+    launcher = Path(match["launcher"])
+    _validate_host_path(launcher, "registered owner launcher")
+    expected_launcher = Path("/home/god/.local/bin") / expected_command
+    if launcher != expected_launcher:
+        raise PreflightError("registered owner launcher is invalid")
+    registry_identity = registry_identity_reader(registry)
+    launcher_evidence = launcher_evidence_reader(
+        launcher,
+        conversation_id=conversation_id,
+        project=owner_project,
+        command=command,
+    )
+    process_evidence = owner_process_evidence_reader(
+        conversation_id=conversation_id,
+        project=owner_project,
+    )
+    if set(registry_identity) != {"device", "inode"} or set(launcher_evidence) != {
+        "device",
+        "inode",
+        "sha256",
+    }:
+        raise PreflightError("registered owner object identity is invalid")
+    if set(process_evidence) != {"executable", "device", "inode", "sha256", "argv"}:
+        raise PreflightError("owner Codex process evidence is invalid")
+    process_executable = process_evidence["executable"]
+    process_digest = process_evidence["sha256"]
+    process_device = process_evidence["device"]
+    process_inode = process_evidence["inode"]
+    expected_codex_argv = [
+        "codex",
+        "resume",
+        conversation_id,
+        "--cd",
+        str(owner_project),
+    ]
+    if not isinstance(process_executable, str):
+        raise PreflightError("owner Codex process evidence is invalid")
+    _validate_host_path(Path(process_executable), "owner Codex executable")
+    if (
+        _CODEX_EXECUTABLE_PATH.fullmatch(process_executable) is None
+        or
+        not isinstance(process_device, int)
+        or isinstance(process_device, bool)
+        or process_device < 0
+        or not isinstance(process_inode, int)
+        or isinstance(process_inode, bool)
+        or process_inode <= 0
+        or not isinstance(process_digest, str)
+        or _SHA256.fullmatch(process_digest) is None
+        or process_evidence["argv"] != expected_codex_argv
+    ):
+        raise PreflightError("owner Codex process evidence is invalid")
+    row_binding: dict[str, object] = {
+        "conversationId": conversation_id,
+        "project": str(owner_project),
+        "command": command,
+        "launcher": str(launcher),
+    }
+    binding: dict[str, object] = {
+        "schemaVersion": OWNER_BINDING_SCHEMA,
+        "status": "passed",
+        "conversationId": conversation_id,
+        "project": str(owner_project),
+        "registry": str(registry),
+        "registryDevice": registry_identity["device"],
+        "registryInode": registry_identity["inode"],
+        "registryRow": row_binding,
+        "registrySha256": hashlib.sha256(registry_payload).hexdigest(),
+        "registryRowDigest": hashlib.sha256(canonical_json(row_binding).encode()).hexdigest(),
+        "launcherDevice": launcher_evidence["device"],
+        "launcherInode": launcher_evidence["inode"],
+        "launcherSha256": launcher_evidence["sha256"],
+        "codexExecutable": process_executable,
+        "codexExecutableDevice": process_device,
+        "codexExecutableInode": process_inode,
+        "codexExecutableSha256": process_digest,
+        "codexArgv": expected_codex_argv,
+    }
+    binding["bindingDigest"] = hashlib.sha256(canonical_json(binding).encode()).hexdigest()
+    return binding
+
+
+def _bind_owner_repository(
+    binding: Mapping[str, object],
+    *,
+    owner_identity: Mapping[str, object],
+    source_identity: Mapping[str, object],
+    expected_source_root: Path,
+) -> dict[str, object]:
+    repository_fields = {
+        "ownerProjectToplevel",
+        "sourceRoot",
+        "gitCommonDirectory",
+        "ownerProjectDevice",
+        "ownerProjectInode",
+        "sourceRootDevice",
+        "sourceRootInode",
+        "gitCommonDirectoryDevice",
+        "gitCommonDirectoryInode",
+    }
+    if set(binding) != _OWNER_BINDING_KEYS - repository_fields:
+        raise PreflightError("owner binding fields are invalid")
+    owner = _validate_repository_identity(owner_identity, label="owner project repository")
+    source = _validate_repository_identity(source_identity, label="source repository")
+    if owner["topLevel"] != binding["project"]:
+        raise PreflightError("owner project repository is not its exact Git top level")
+    if source["topLevel"] != str(expected_source_root):
+        raise PreflightError("source repository is not its exact Git worktree top level")
+    if (
+        owner["commonDirectory"] != source["commonDirectory"]
+        or owner["commonDevice"] != source["commonDevice"]
+        or owner["commonInode"] != source["commonInode"]
+    ):
+        raise PreflightError("owner project repository does not match the rehearsed source")
+    enriched = dict(binding)
+    enriched.pop("bindingDigest")
+    enriched.update(
+        {
+            "ownerProjectToplevel": owner["topLevel"],
+            "sourceRoot": source["topLevel"],
+            "gitCommonDirectory": owner["commonDirectory"],
+            "ownerProjectDevice": owner["device"],
+            "ownerProjectInode": owner["inode"],
+            "sourceRootDevice": source["device"],
+            "sourceRootInode": source["inode"],
+            "gitCommonDirectoryDevice": owner["commonDevice"],
+            "gitCommonDirectoryInode": owner["commonInode"],
+        }
+    )
+    enriched["bindingDigest"] = hashlib.sha256(canonical_json(enriched).encode()).hexdigest()
+    return enriched
+
+
+def _validate_repository_identity(
+    value: Mapping[str, object], *, label: str
+) -> dict[str, object]:
+    if set(value) != _REPOSITORY_IDENTITY_KEYS:
+        raise PreflightError(f"{label} identity fields are invalid")
+    record = dict(value)
+    top_level = Path(record["topLevel"])
+    common_directory = Path(record["commonDirectory"])
+    _validate_host_path(top_level, f"{label} top level")
+    _validate_host_path(common_directory, f"{label} common directory")
+    for field in ("device", "inode", "commonDevice", "commonInode"):
+        field_value = record[field]
+        if (
+            not isinstance(field_value, int)
+            or isinstance(field_value, bool)
+            or field_value < 0
+            or (field in {"inode", "commonInode"} and field_value == 0)
+        ):
+            raise PreflightError(f"{label} identity is invalid")
+    return record
+
+
+def _validate_owner_binding(value: Mapping[str, object]) -> dict[str, object]:
+    try:
+        if set(value) != _OWNER_BINDING_KEYS:
+            raise PreflightError("owner binding fields are invalid")
+        binding = dict(value)
+        supplied_binding_digest = binding.pop("bindingDigest")
+        if (
+            binding["schemaVersion"] != OWNER_BINDING_SCHEMA
+            or binding["status"] != "passed"
+            or not isinstance(supplied_binding_digest, str)
+            or _SHA256.fullmatch(supplied_binding_digest) is None
+            or hashlib.sha256(canonical_json(binding).encode()).hexdigest()
+            != supplied_binding_digest
+        ):
+            raise PreflightError("owner binding digest is invalid")
+        conversation_id = _require_exact_conversation_id(
+            binding["conversationId"], label="owner binding"
+        )
+        project = Path(binding["project"])
+        owner_toplevel = Path(binding["ownerProjectToplevel"])
+        source_root = Path(binding["sourceRoot"])
+        git_common_directory = Path(binding["gitCommonDirectory"])
+        registry = Path(binding["registry"])
+        codex_executable = Path(binding["codexExecutable"])
+        _validate_host_path(project, "owner binding project")
+        _validate_host_path(owner_toplevel, "owner binding owner project repository")
+        _validate_host_path(source_root, "owner binding source repository")
+        _validate_host_path(git_common_directory, "owner binding Git common directory")
+        _validate_host_path(registry, "owner binding registry")
+        _validate_host_path(codex_executable, "owner binding Codex executable")
+        if _CODEX_EXECUTABLE_PATH.fullmatch(str(codex_executable)) is None:
+            raise PreflightError("owner binding Codex executable path is invalid")
+        _validate_repository_identity(
+            {
+                "topLevel": str(owner_toplevel),
+                "device": binding["ownerProjectDevice"],
+                "inode": binding["ownerProjectInode"],
+                "commonDirectory": str(git_common_directory),
+                "commonDevice": binding["gitCommonDirectoryDevice"],
+                "commonInode": binding["gitCommonDirectoryInode"],
+            },
+            label="owner binding owner project repository",
+        )
+        _validate_repository_identity(
+            {
+                "topLevel": str(source_root),
+                "device": binding["sourceRootDevice"],
+                "inode": binding["sourceRootInode"],
+                "commonDirectory": str(git_common_directory),
+                "commonDevice": binding["gitCommonDirectoryDevice"],
+                "commonInode": binding["gitCommonDirectoryInode"],
+            },
+            label="owner binding source repository",
+        )
+        if owner_toplevel != project:
+            raise PreflightError("owner binding owner project repository is invalid")
+        if registry != DEFAULT_CODEX_PROJECTS_REGISTRY:
+            raise PreflightError("owner binding registry is not authoritative")
+        row = binding["registryRow"]
+        if not isinstance(row, Mapping) or set(row) != _OWNER_REGISTRY_ROW_KEYS:
+            raise PreflightError("owner binding registry row is invalid")
+        row_binding = dict(row)
+        expected_command = f"codex-overseer-{conversation_id}"
+        expected_launcher = str(Path("/home/god/.local/bin") / expected_command)
+        if (
+            row_binding["conversationId"] != conversation_id
+            or row_binding["project"] != str(project)
+            or row_binding["command"] != expected_command
+            or row_binding["launcher"] != expected_launcher
+        ):
+            raise PreflightError("owner binding registry row is invalid")
+        _validate_host_path(Path(row_binding["launcher"]), "owner binding launcher")
+        registry_digest = binding["registrySha256"]
+        if not isinstance(registry_digest, str) or _SHA256.fullmatch(registry_digest) is None:
+            raise PreflightError("owner binding registry digest is invalid")
+        for identity_field in (
+            "registryDevice",
+            "registryInode",
+            "launcherDevice",
+            "launcherInode",
+            "codexExecutableDevice",
+            "codexExecutableInode",
+        ):
+            identity_value = binding[identity_field]
+            if (
+                not isinstance(identity_value, int)
+                or isinstance(identity_value, bool)
+                or identity_value < 0
+                or (identity_field.endswith("Inode") and identity_value == 0)
+            ):
+                raise PreflightError("owner binding object identity is invalid")
+        launcher_digest = binding["launcherSha256"]
+        if not isinstance(launcher_digest, str) or _SHA256.fullmatch(launcher_digest) is None:
+            raise PreflightError("owner binding launcher digest is invalid")
+        codex_executable_digest = binding["codexExecutableSha256"]
+        if (
+            not isinstance(codex_executable_digest, str)
+            or _SHA256.fullmatch(codex_executable_digest) is None
+        ):
+            raise PreflightError("owner binding Codex executable digest is invalid")
+        expected_codex_argv = [
+            "codex",
+            "resume",
+            conversation_id,
+            "--cd",
+            str(project),
+        ]
+        if binding["codexArgv"] != expected_codex_argv:
+            raise PreflightError("owner binding Codex process command is invalid")
+        supplied_row_digest = binding["registryRowDigest"]
+        if (
+            not isinstance(supplied_row_digest, str)
+            or _SHA256.fullmatch(supplied_row_digest) is None
+            or hashlib.sha256(canonical_json(row_binding).encode()).hexdigest()
+            != supplied_row_digest
+        ):
+            raise PreflightError("owner binding registry row digest is invalid")
+        return {**binding, "bindingDigest": supplied_binding_digest}
+    except (KeyError, TypeError, ValueError) as error:
+        if isinstance(error, PreflightError):
+            raise
+        raise PreflightError("owner binding is invalid") from error
+
+
+def _validate_owner_binding_live(
+    value: Mapping[str, object], *, source_root: Path
+) -> dict[str, object]:
+    validated = _validate_owner_binding(value)
+    if validated["sourceRoot"] != str(source_root):
+        raise PreflightError("owner binding source repository does not match the rendered source")
+    registry = Path(validated["registry"])
+    try:
+        registry_binding = _owner_binding_from_registry(
+            owner_thread=str(validated["conversationId"]),
+            owner_project=Path(str(validated["project"])),
+            registry=registry,
+            registry_payload=_read_codex_projects_registry(registry),
+        )
+        owner_identity = _read_only_repository_identity(
+            Path(str(validated["project"]))
+        )
+        source_identity = _read_only_repository_identity(source_root)
+    except PreflightError as error:
+        raise PreflightError(
+            "owner binding does not match the live Codex projects registry or repository identity"
+        ) from error
+    current = _bind_owner_repository(
+        registry_binding,
+        owner_identity=owner_identity,
+        source_identity=source_identity,
+        expected_source_root=source_root,
+    )
+    if current != validated:
+        raise PreflightError("owner binding does not match the live Codex projects registry")
+    return current
+
+
 def _validate_host_path(path: Path, label: str) -> None:
     text = str(path)
     if (
@@ -201,14 +1247,34 @@ def _normalized_file_mode(mode: int) -> int:
     return 0o755 if mode & stat.S_IXUSR else 0o644
 
 
-def _read_regular_file(root: Path, relative: str) -> tuple[bytes, int]:
+def _open_relative_artifact(root_descriptor: int, relative: str) -> int:
     relative = _safe_artifact_path(relative)
-    target = root.joinpath(*PurePosixPath(relative).parts)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parts = PurePosixPath(relative).parts
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | cloexec | nofollow | getattr(os, "O_DIRECTORY", 0)
+    parent_descriptor = os.dup(root_descriptor)
     try:
-        descriptor = os.open(target, flags)
+        for component in parts[:-1]:
+            next_descriptor = os.open(
+                component, directory_flags, dir_fd=parent_descriptor
+            )
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        return os.open(
+            parts[-1], os.O_RDONLY | cloexec | nofollow, dir_fd=parent_descriptor
+        )
     except OSError as error:
         raise PreflightError(f"artifact file is unavailable: {relative}") from error
+    finally:
+        os.close(parent_descriptor)
+
+
+def _read_regular_file_at(
+    root_descriptor: int, relative: str
+) -> tuple[bytes, int]:
+    relative = _safe_artifact_path(relative)
+    descriptor = _open_relative_artifact(root_descriptor, relative)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -244,6 +1310,35 @@ def _read_regular_file(root: Path, relative: str) -> tuple[bytes, int]:
         os.close(descriptor)
 
 
+def _root_directory_identity(descriptor: int) -> tuple[int, int]:
+    state = os.fstat(descriptor)
+    if not stat.S_ISDIR(state.st_mode) or state.st_uid != os.geteuid():
+        raise PreflightError("artifact root directory object is unsafe")
+    return state.st_dev, state.st_ino
+
+
+def _verify_artifact_root(root: Path, descriptor: int, identity: tuple[int, int]) -> None:
+    if _root_directory_identity(descriptor) != identity:
+        raise PreflightError("artifact root directory changed while it was read")
+    reopened = _open_nofollow_directory(root, label="artifact root directory")
+    try:
+        if _root_directory_identity(reopened) != identity:
+            raise PreflightError("artifact root directory changed while it was read")
+    finally:
+        os.close(reopened)
+
+
+def _read_regular_file(root: Path, relative: str) -> tuple[bytes, int]:
+    root_descriptor = _open_nofollow_directory(root, label="artifact root directory")
+    identity = _root_directory_identity(root_descriptor)
+    try:
+        result = _read_regular_file_at(root_descriptor, relative)
+        _verify_artifact_root(root, root_descriptor, identity)
+        return result
+    finally:
+        os.close(root_descriptor)
+
+
 def _archive_bytes(entries: Sequence[tuple[str, int, bytes]]) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED, strict_timestamps=True) as archive:
@@ -269,23 +1364,29 @@ def _manifest_from_paths(
     unique = sorted(set(paths))
     if not unique or len(unique) != len(paths) or len(unique) > max_files:
         raise PreflightError(f"{kind} artifact file inventory is invalid")
-    records: list[dict[str, object]] = []
-    entries: list[tuple[str, int, bytes]] = []
-    total = 0
-    for relative in unique:
-        payload, mode = _read_regular_file(root, relative)
-        total += len(payload)
-        if total > max_bytes:
-            raise PreflightError(f"{kind} artifact exceeds the bounded size")
-        records.append(
-            {
-                "path": relative,
-                "mode": mode,
-                "size": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest(),
-            }
-        )
-        entries.append((relative, mode, payload))
+    root_descriptor = _open_nofollow_directory(root, label=f"{kind} artifact root")
+    root_identity = _root_directory_identity(root_descriptor)
+    try:
+        records: list[dict[str, object]] = []
+        entries: list[tuple[str, int, bytes]] = []
+        total = 0
+        for relative in unique:
+            payload, mode = _read_regular_file_at(root_descriptor, relative)
+            total += len(payload)
+            if total > max_bytes:
+                raise PreflightError(f"{kind} artifact exceeds the bounded size")
+            records.append(
+                {
+                    "path": relative,
+                    "mode": mode,
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+            entries.append((relative, mode, payload))
+        _verify_artifact_root(root, root_descriptor, root_identity)
+    finally:
+        os.close(root_descriptor)
     archive = _archive_bytes(entries)
     return {
         "schemaVersion": ARTIFACT_MANIFEST_SCHEMA,
@@ -403,16 +1504,22 @@ def build_artifact_archive(root: Path, manifest: Mapping[str, object]) -> bytes:
     if kind not in {"source", "runtime"}:
         raise PreflightError("artifact manifest kind is invalid")
     validated = _validate_artifact_manifest(manifest, kind=kind)
-    entries: list[tuple[str, int, bytes]] = []
-    for item in validated["files"]:
-        payload, mode = _read_regular_file(root, item["path"])
-        if (
-            mode != item["mode"]
-            or len(payload) != item["size"]
-            or hashlib.sha256(payload).hexdigest() != item["sha256"]
-        ):
-            raise PreflightError(f"{kind} artifact changed after manifest")
-        entries.append((item["path"], mode, payload))
+    root_descriptor = _open_nofollow_directory(root, label=f"{kind} artifact root")
+    root_identity = _root_directory_identity(root_descriptor)
+    try:
+        entries: list[tuple[str, int, bytes]] = []
+        for item in validated["files"]:
+            payload, mode = _read_regular_file_at(root_descriptor, item["path"])
+            if (
+                mode != item["mode"]
+                or len(payload) != item["size"]
+                or hashlib.sha256(payload).hexdigest() != item["sha256"]
+            ):
+                raise PreflightError(f"{kind} artifact changed after manifest")
+            entries.append((item["path"], mode, payload))
+        _verify_artifact_root(root, root_descriptor, root_identity)
+    finally:
+        os.close(root_descriptor)
     archive = _archive_bytes(entries)
     if hashlib.sha256(archive).hexdigest() != validated["archiveSha256"]:
         raise PreflightError(f"{kind} artifact changed after manifest")
@@ -426,20 +1533,41 @@ def _runtime_probe_python() -> str:
             "from pathlib import Path",
             "sys.dont_write_bytecode=True",
             "sys.pycache_prefix='/proc/overseer-disabled-bytecode-cache'",
-            "source=Path(sys.argv[1]).resolve(strict=True)",
-            "runtime=Path(sys.argv[2]).resolve(strict=True)",
+            "source=Path(os.path.abspath(sys.argv[1]))",
+            "runtime=Path(os.path.abspath(sys.argv[2]))",
             "source_manifest=json.loads(sys.argv[3])",
             "runtime_manifest=json.loads(sys.argv[4])",
-            "source_modules=(source/'src').resolve(strict=True)",
+            "source_modules=source/'src'",
             "stdlib=Path(sysconfig.get_path('stdlib')).resolve(strict=True)",
             "platstdlib=Path(sysconfig.get_path('platstdlib')).resolve(strict=True)",
             "stdlib_dynamic=(stdlib/'lib-dynload').resolve(strict=True)",
             "def lexical(value): return os.path.abspath(os.path.normpath(os.fspath(value)))",
-            "def allowed(root,manifest): return {lexical(root/item['path']):item for item in manifest['files']}",
-            "allowed_source=allowed(source,source_manifest)",
-            "allowed_runtime=allowed(runtime,runtime_manifest)",
-            "def read_verified(origin,record):",
-            " fd=os.open(origin,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)",
+            "DIR_FLAGS=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_DIRECTORY",
+            "def open_root(path):",
+            " parts=Path(path).parts[1:]",
+            " if not parts: raise ImportError('manifest root path is invalid')",
+            " fd=os.open('/',DIR_FLAGS)",
+            " try:",
+            "  for part in parts:",
+            "   next_fd=os.open(part,DIR_FLAGS,dir_fd=fd); os.close(fd); fd=next_fd",
+            "  return fd",
+            " except BaseException: os.close(fd); raise",
+            "source_fd=open_root(source)",
+            "runtime_fd=open_root(runtime)",
+            "def allowed(root,root_fd,manifest): return {lexical(root/item['path']):(root_fd,item['path'],item) for item in manifest['files']}",
+            "allowed_source=allowed(source,source_fd,source_manifest)",
+            "allowed_runtime=allowed(runtime,runtime_fd,runtime_manifest)",
+            "def open_relative(root_fd,relative):",
+            " parts=Path(relative).parts",
+            " if not parts or Path(relative).is_absolute() or any(part in ('','.','..') for part in parts): raise ImportError('manifested import path is invalid')",
+            " parent=os.dup(root_fd)",
+            " try:",
+            "  for part in parts[:-1]:",
+            "   next_fd=os.open(part,DIR_FLAGS,dir_fd=parent); os.close(parent); parent=next_fd",
+            "  return os.open(parts[-1],os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=parent)",
+            " finally: os.close(parent)",
+            "def read_verified(root_fd,relative,record):",
+            " fd=open_relative(root_fd,relative)",
             " try:",
             "  before=os.fstat(fd)",
             "  if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1: raise ImportError('manifested import is not a single-link regular file')",
@@ -456,13 +1584,13 @@ def _runtime_probe_python() -> str:
             " if mode!=record['mode'] or len(payload)!=record['size'] or hashlib.sha256(payload).hexdigest()!=record['sha256']: raise ImportError('manifested import content mismatch')",
             " return payload",
             "class ManifestSourceLoader(importlib.abc.Loader):",
-            " def __init__(self,origin,record): self.origin=origin; self.record=record",
+            " def __init__(self,origin,root_fd,relative,record): self.origin=origin; self.root_fd=root_fd; self.relative=relative; self.record=record",
             " def create_module(self,spec): return None",
-            " def exec_module(self,module): exec(compile(read_verified(self.origin,self.record),self.origin,'exec',dont_inherit=True),module.__dict__)",
+            " def exec_module(self,module): exec(compile(read_verified(self.root_fd,self.relative,self.record),self.origin,'exec',dont_inherit=True),module.__dict__)",
             "class ManifestNativeLoader(importlib.abc.Loader):",
-            " def __init__(self,fullname,origin,record):",
+            " def __init__(self,fullname,origin,root_fd,relative,record):",
             "  self.fullname=fullname; self.origin=origin; self.fd=os.memfd_create('overseer-manifested-native',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)",
-            "  payload=read_verified(origin,record)",
+            "  payload=read_verified(root_fd,relative,record)",
             "  view=memoryview(payload)",
             "  while view:",
             "   written=os.write(self.fd,view); view=view[written:]",
@@ -487,10 +1615,12 @@ def _runtime_probe_python() -> str:
             "  origin=lexical(spec.origin)",
             "  in_source=Path(origin).is_relative_to(source)",
             "  in_runtime=Path(origin).is_relative_to(runtime)",
-            "  record=allowed_source.get(origin) if in_source else allowed_runtime.get(origin) if in_runtime else None",
-            "  if in_source and record is None: raise ImportError('source origin is not manifested')",
-            "  if in_runtime and record is None: raise ImportError('runtime origin is not manifested')",
-            "  if record is not None: spec.loader=ManifestSourceLoader(origin,record) if origin.endswith(('.py','.pyw')) else ManifestNativeLoader(fullname,origin,record)",
+            "  entry=allowed_source.get(origin) if in_source else allowed_runtime.get(origin) if in_runtime else None",
+            "  if in_source and entry is None: raise ImportError('source origin is not manifested')",
+            "  if in_runtime and entry is None: raise ImportError('runtime origin is not manifested')",
+            "  if entry is not None:",
+            "   root_fd,relative,record=entry",
+            "   spec.loader=ManifestSourceLoader(origin,root_fd,relative,record) if origin.endswith(('.py','.pyw')) else ManifestNativeLoader(fullname,origin,root_fd,relative,record)",
             "  return spec",
             "sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder),ManifestFinder())",
             "sys.path[:]=list(dict.fromkeys(map(str,(source_modules,runtime,stdlib,platstdlib,stdlib_dynamic))))",
@@ -499,7 +1629,7 @@ def _runtime_probe_python() -> str:
             "origins={}",
             "for name in names:",
             " module=importlib.import_module(name)",
-            " origin=Path(module.__file__).resolve(strict=True)",
+            " origin=Path(lexical(module.__file__))",
             " expected=runtime if name == 'cryptography' else source_modules",
             " origin.relative_to(expected)",
             " origins[name]=str(origin)",
@@ -672,6 +1802,26 @@ def _read_only_runner(command: tuple[str, ...]) -> str:
             "status",
             "--porcelain",
             "--untracked-files=all",
+        )
+    elif label == "git-toplevel":
+        argv = (
+            EXACT_TOOLS["git"],
+            *_GIT_SAFE_FLAGS,
+            "-C",
+            command[1],
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+        )
+    elif label == "git-common-dir":
+        argv = (
+            EXACT_TOOLS["git"],
+            *_GIT_SAFE_FLAGS,
+            "-C",
+            command[1],
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
         )
     elif label == "git-head":
         argv = (
@@ -871,10 +2021,25 @@ def preflight(
     source_commit: str,
     repo_root: Path,
     source_root: Path,
+    owner_thread: str,
+    owner_project: Path,
+    codex_projects_registry: Path = DEFAULT_CODEX_PROJECTS_REGISTRY,
+    registry_reader: Callable[[Path], bytes] = _read_codex_projects_registry,
+    registry_identity_reader: Callable[
+        [Path], dict[str, int]
+    ] = _codex_registry_object_identity,
+    launcher_evidence_reader: Callable[..., dict[str, object]] = _read_launcher_evidence,
+    owner_process_evidence_reader: Callable[
+        ..., dict[str, object]
+    ] = _read_owner_process_evidence,
     runtime_site: Path = DEFAULT_RUNTIME_SITE,
     base_image: Path = DEFAULT_BASE_IMAGE,
     temp_parent: Path = DEFAULT_TEMP_PARENT,
     runner: Callable[[tuple[str, ...]], str] = _read_only_runner,
+    repository_identity_probe: Callable[
+        [Path], dict[str, object]
+    ] = _read_only_repository_identity,
+    source_git_probe: Callable[[Path], dict[str, str]] = _read_only_source_git_state,
     path_exists: Callable[[Path], bool] = lambda path: path.exists(),
     path_stat: Callable[[Path], object] = lambda path: path.stat(),
     path_access: Callable[[Path, int], bool] = os.access,
@@ -895,6 +2060,8 @@ def preflight(
     for path, label in (
         (repo_root, "repository"),
         (source_root, "source"),
+        (owner_project, "owner project"),
+        (codex_projects_registry, "Codex projects registry"),
         (runtime_site, "runtime"),
         (base_image, "base image"),
         (FIRMWARE_CODE, "firmware code"),
@@ -905,17 +2072,64 @@ def preflight(
         _validate_host_path(path, label)
     if repo_root != source_root:
         raise PreflightError("source path must be the validated repository root")
+    if codex_projects_registry != DEFAULT_CODEX_PROJECTS_REGISTRY:
+        raise PreflightError("Codex projects registry is not the authoritative registry")
+    registry_mode = _require_path_state(
+        codex_projects_registry,
+        label="Codex projects registry",
+        expected_kind="regular",
+        access_mode=os.R_OK,
+        path_exists=path_exists,
+        path_stat=path_stat,
+        path_access=path_access,
+        is_symlink=is_symlink,
+    )
+    try:
+        registry_state = path_stat(codex_projects_registry)
+    except OSError as error:
+        raise PreflightError("Codex projects registry state is unavailable") from error
+    if (
+        registry_state.st_uid != os.geteuid()
+        or getattr(registry_state, "st_nlink", 1) != 1
+        or registry_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise PreflightError("Codex projects registry object is unsafe")
+    owner_binding = _owner_binding_from_registry(
+        owner_thread=owner_thread,
+        owner_project=owner_project,
+        registry=codex_projects_registry,
+        registry_payload=registry_reader(codex_projects_registry),
+        registry_identity_reader=registry_identity_reader,
+        launcher_evidence_reader=launcher_evidence_reader,
+        owner_process_evidence_reader=owner_process_evidence_reader,
+    )
     _validate_session_runtime_directory(
         path_exists=path_exists,
         path_stat=path_stat,
         path_access=path_access,
         is_symlink=is_symlink,
     )
-    if runner(("git-status", str(repo_root))):
+    try:
+        owner_identity = repository_identity_probe(owner_project)
+        source_identity = repository_identity_probe(source_root)
+    except (OSError, ValueError) as error:
+        raise PreflightError("owner project repository identity is unavailable") from error
+    owner_binding = _bind_owner_repository(
+        owner_binding,
+        owner_identity=owner_identity,
+        source_identity=source_identity,
+        expected_source_root=source_root,
+    )
+    git_state = source_git_probe(repo_root)
+    if set(git_state) != {"status", "head", "files"} or any(
+        not isinstance(git_state[field], str) for field in ("status", "head", "files")
+    ):
+        raise PreflightError("source Git state probe is invalid")
+    if git_state["status"]:
         raise PreflightError("source tree is dirty")
-    if runner(("git-head", str(repo_root))) != source_commit:
+    if git_state["head"] != source_commit:
         raise PreflightError("source commit does not match the requested full SHA")
-    tracked_raw = runner(("git-files", str(repo_root)))
+    tracked_raw = git_state["files"]
     if "\n" in tracked_raw and "\0" not in tracked_raw:
         raise PreflightError("tracked source inventory is not NUL-delimited")
     tracked = tuple(item for item in tracked_raw.split("\0") if item)
@@ -1088,6 +2302,14 @@ def preflight(
         )
     except PreflightError as error:
         raise PreflightError("runtime import probe failed") from error
+    final_owner_identity = _validate_repository_identity(
+        repository_identity_probe(owner_project), label="owner project repository"
+    )
+    final_source_identity = _validate_repository_identity(
+        repository_identity_probe(source_root), label="source repository"
+    )
+    if final_owner_identity != owner_identity or final_source_identity != source_identity:
+        raise PreflightError("owner or source repository identity changed during preflight")
     probe_digest = _manifest_digest(runtime_probe)
     inputs = _plan_inputs(
         source_manifest=source_manifest, runtime_manifest=runtime_manifest
@@ -1112,6 +2334,7 @@ def preflight(
         "planInputs": inputs,
         "checkedTools": dict(EXACT_TOOLS),
         "sessionRuntimeDirectory": str(SESSION_RUNTIME_DIR),
+        "ownerBinding": owner_binding,
         "tempDirectoryCreated": False,
     }
 
@@ -1392,15 +2615,36 @@ verify(sys.argv[3],sys.argv[4])
 def _archive_builder_python() -> str:
     return r"""import hashlib,io,json,os,stat,sys,zipfile
 from pathlib import Path,PurePosixPath
-root=Path(sys.argv[1])
+root=Path(os.path.abspath(sys.argv[1]))
 manifest=json.loads(sys.argv[2])
-output=Path(sys.argv[3])
+output=Path(os.path.abspath(sys.argv[3]))
+DIR_FLAGS=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_DIRECTORY
+def open_root(path):
+    parts=Path(os.path.abspath(path)).parts[1:]
+    if not parts: raise SystemExit("artifact root path invalid")
+    fd=os.open("/",DIR_FLAGS)
+    try:
+        for part in parts:
+            next_fd=os.open(part,DIR_FLAGS,dir_fd=fd);os.close(fd);fd=next_fd
+        return fd
+    except BaseException:
+        os.close(fd);raise
+def open_relative(root_fd,relative):
+    parts=relative.parts
+    parent=os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            next_fd=os.open(part,DIR_FLAGS,dir_fd=parent);os.close(parent);parent=next_fd
+        return os.open(parts[-1],os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=parent)
+    finally:
+        os.close(parent)
+root_fd=open_root(root)
+root_state=os.fstat(root_fd)
 entries=[]
 for item in manifest["files"]:
     relative=PurePosixPath(item["path"])
     if relative.is_absolute() or any(part in {"",".",".."} for part in relative.parts): raise SystemExit("artifact path invalid")
-    target=root.joinpath(*relative.parts)
-    fd=os.open(target,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+    fd=open_relative(root_fd,relative)
     try:
         before=os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1: raise SystemExit("artifact object invalid")
@@ -1417,6 +2661,12 @@ for item in manifest["files"]:
     mode=0o755 if before.st_mode&stat.S_IXUSR else 0o644
     if mode!=item["mode"] or len(payload)!=item["size"] or hashlib.sha256(payload).hexdigest()!=item["sha256"]: raise SystemExit("artifact changed after manifest")
     entries.append((item["path"],mode,payload))
+after_root=os.fstat(root_fd)
+reopened_root=open_root(root)
+try: reopened_root_state=os.fstat(reopened_root)
+finally: os.close(reopened_root)
+if (root_state.st_dev,root_state.st_ino)!=(after_root.st_dev,after_root.st_ino) or (root_state.st_dev,root_state.st_ino)!=(reopened_root_state.st_dev,reopened_root_state.st_ino): raise SystemExit("artifact root changed after manifest")
+os.close(root_fd)
 buffer=io.BytesIO()
 with zipfile.ZipFile(buffer,"w",compression=zipfile.ZIP_STORED,strict_timestamps=True) as archive:
     for relative,mode,payload in entries:
@@ -1429,7 +2679,9 @@ with zipfile.ZipFile(buffer,"w",compression=zipfile.ZIP_STORED,strict_timestamps
         archive.writestr(info,payload)
 payload=buffer.getvalue()
 if hashlib.sha256(payload).hexdigest()!=manifest["archiveSha256"]: raise SystemExit("artifact changed after manifest")
-fd=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+output_parent_fd=open_root(output.parent)
+try: fd=os.open(output.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=output_parent_fd)
+except BaseException: os.close(output_parent_fd);raise
 try:
     view=memoryview(payload)
     while view:
@@ -1438,6 +2690,7 @@ try:
     os.fsync(fd)
 finally:
     os.close(fd)
+    os.close(output_parent_fd)
 """
 
 
@@ -1601,6 +2854,247 @@ if not disk_valid or not serial_valid or not console_valid or not emulator_valid
 """
 
 
+def _future_owner_validator_python(
+    owner_binding: Mapping[str, object],
+    *,
+    source_commit: str,
+    source_manifest: Mapping[str, object],
+) -> str:
+    expected_binding = canonical_json(owner_binding)
+    expected_paths = sorted(str(item["path"]) for item in source_manifest["files"])
+    expected_binding_keys = sorted(_OWNER_BINDING_KEYS)
+    expected_registry_fields = list(_CODEX_REGISTRY_FIELDS)
+    return f'''import csv,hashlib,io,json,os,re,shlex,stat,subprocess,sys,uuid
+from pathlib import Path
+expected=json.loads({expected_binding!r})
+expected_paths={expected_paths!r}
+expected_binding_keys={expected_binding_keys!r}
+expected_registry_fields={expected_registry_fields!r}
+DIR_FLAGS=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_DIRECTORY
+def open_dir(path):
+ parts=Path(os.path.abspath(path)).parts[1:]
+ if not parts: raise SystemExit("owner validation path invalid")
+ fd=os.open("/",DIR_FLAGS)
+ try:
+  for part in parts:
+   next_fd=os.open(part,DIR_FLAGS,dir_fd=fd);os.close(fd);fd=next_fd
+  return fd
+ except BaseException: os.close(fd);raise
+def open_file(path):
+ absolute=Path(os.path.abspath(path));parts=absolute.parts[1:]
+ parent=open_dir(absolute.parent)
+ try: return os.open(parts[-1],os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=parent)
+ finally: os.close(parent)
+def read_file(path,limit):
+ fd=open_file(path)
+ try:
+  before=os.fstat(fd)
+  if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid() or before.st_nlink!=1 or before.st_mode&(stat.S_IWGRP|stat.S_IWOTH) or before.st_size>limit: raise SystemExit("owner validation object unsafe")
+  chunks=[];total=0
+  while True:
+   block=os.read(fd,min(1048576,limit+1-total))
+   if not block: break
+   chunks.append(block);total+=len(block)
+   if total>limit: raise SystemExit("owner validation object oversized")
+  after=os.fstat(fd)
+ finally: os.close(fd)
+ reopened=open_file(path)
+ try: current=os.fstat(reopened)
+ finally: os.close(reopened)
+ identity=lambda value:(value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+ if identity(before)!=identity(after) or identity(before)!=identity(current): raise SystemExit("owner validation object changed")
+ return b"".join(chunks),before
+def git(fd,*args,preserve=False):
+ completed=subprocess.run(("/usr/bin/git","--no-optional-locks","-c","core.fsmonitor=false","-c","core.untrackedCache=false","-C",f"/proc/self/fd/{{fd}}",*args),check=True,capture_output=True,text=True,stdin=subprocess.DEVNULL,pass_fds=(fd,))
+ return completed.stdout if preserve else completed.stdout.strip()
+def repository(path,device,inode):
+ fd=open_dir(path);state=os.fstat(fd)
+ if (state.st_dev,state.st_ino)!=(device,inode) or state.st_uid!=os.geteuid(): raise SystemExit("owner repository identity mismatch")
+ if git(fd,"rev-parse","--show-prefix"): raise SystemExit("owner repository is not top level")
+ common=git(fd,"rev-parse","--path-format=absolute","--git-common-dir")
+ if common!=expected["gitCommonDirectory"]: raise SystemExit("owner common Git directory mismatch")
+ common_fd=open_dir(common)
+ try: common_state=os.fstat(common_fd)
+ finally: os.close(common_fd)
+ if (common_state.st_dev,common_state.st_ino)!=(expected["gitCommonDirectoryDevice"],expected["gitCommonDirectoryInode"]): raise SystemExit("owner common Git identity mismatch")
+ reopened=open_dir(path)
+ try: reopened_state=os.fstat(reopened)
+ finally: os.close(reopened)
+ if (reopened_state.st_dev,reopened_state.st_ino)!=(device,inode): raise SystemExit("owner repository path changed")
+ return fd,state,common,common_state
+canonical=lambda value:json.dumps(value,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+if sorted(expected)!=expected_binding_keys: raise SystemExit("owner binding fields mismatch")
+supplied_digest=expected.pop("bindingDigest")
+if hashlib.sha256(canonical(expected).encode()).hexdigest()!=supplied_digest: raise SystemExit("owner binding digest mismatch")
+expected["bindingDigest"]=supplied_digest
+registry_payload,registry_state=read_file(expected["registry"],8388608)
+if (registry_state.st_dev,registry_state.st_ino)!=(expected["registryDevice"],expected["registryInode"]) or hashlib.sha256(registry_payload).hexdigest()!=expected["registrySha256"]: raise SystemExit("owner registry mismatch")
+try: registry_text=registry_payload.decode("utf-8")
+except UnicodeDecodeError as error: raise SystemExit("owner registry encoding invalid") from error
+def select_owner_row(registry_text):
+ if "\\0" in registry_text: raise SystemExit("owner registry encoding invalid")
+ reader=csv.DictReader(io.StringIO(registry_text,newline=""),strict=True)
+ if list(reader.fieldnames or ())!=expected_registry_fields: raise SystemExit("owner registry header invalid")
+ try: target_uuid=uuid.UUID(expected["conversationId"])
+ except (ValueError,AttributeError) as error: raise SystemExit("owner binding conversation invalid") from error
+ matches=[]
+ try:
+  for row in reader:
+   if None in row or any(not isinstance(row.get(field),str) for field in expected_registry_fields): raise SystemExit("owner registry row invalid")
+   try: row_uuid=uuid.UUID(row["conversation_id"])
+   except (ValueError,AttributeError): continue
+   if row_uuid==target_uuid:
+    if str(row_uuid)!=row["conversation_id"]: raise SystemExit("owner registry contains a noncanonical conversation alias")
+    matches.append(row)
+ except csv.Error as error: raise SystemExit("owner registry CSV invalid") from error
+ if len(matches)!=1: raise SystemExit("owner registry exact row unavailable")
+ return matches[0]
+matched=select_owner_row(registry_text)
+row_binding=dict(conversationId=matched["conversation_id"],project=matched["project"],command=matched["command"],launcher=matched["launcher"])
+try: canonical_conversation=str(uuid.UUID(row_binding["conversationId"]))
+except (ValueError,AttributeError) as error: raise SystemExit("owner registry conversation invalid") from error
+derived_command="codex-overseer-"+canonical_conversation
+derived_launcher="/home/god/.local/bin/"+derived_command
+derived_row=dict(conversationId=canonical_conversation,project=expected["project"],command=derived_command,launcher=derived_launcher)
+if row_binding!=derived_row or row_binding!=expected["registryRow"] or hashlib.sha256(canonical(row_binding).encode()).hexdigest()!=expected["registryRowDigest"]: raise SystemExit("owner registry row mismatch")
+if expected["schemaVersion"]!="overseer.phase-b-rehearsal-owner-binding.v2" or expected["status"]!="passed" or expected["conversationId"]!=canonical_conversation or expected["ownerProjectToplevel"]!=row_binding["project"] or expected["registry"]!="/home/god/.codex/codex-projects.csv": raise SystemExit("owner binding semantics invalid")
+launcher_path=expected["registryRow"]["launcher"]
+launcher_payload,launcher_state=read_file(launcher_path,65536)
+if (launcher_state.st_dev,launcher_state.st_ino)!=(expected["launcherDevice"],expected["launcherInode"]) or hashlib.sha256(launcher_payload).hexdigest()!=expected["launcherSha256"]: raise SystemExit("owner launcher mismatch")
+try: launcher_text=launcher_payload.decode("utf-8")
+except UnicodeDecodeError as error: raise SystemExit("owner launcher encoding invalid") from error
+launcher_lines=launcher_text.splitlines()
+if launcher_lines[:3]!=["#!/usr/bin/env bash","set -euo pipefail",""] or len(launcher_lines)!=4: raise SystemExit("owner launcher semantics invalid")
+try: launcher_tokens=shlex.split(launcher_lines[3])
+except ValueError as error: raise SystemExit("owner launcher semantics invalid") from error
+expected_launcher_tokens=["exec","/usr/bin/tmux","new-session","-A","-s",row_binding["command"],"-c",row_binding["project"],"/home/god/.local/bin/codex-memory-session resume "+row_binding["conversationId"]+" --cd '"+row_binding["project"]+"'"]
+if launcher_tokens!=expected_launcher_tokens: raise SystemExit("owner launcher semantics invalid")
+owner_fd,owner_state,owner_common,owner_common_state=repository(expected["project"],expected["ownerProjectDevice"],expected["ownerProjectInode"])
+source_fd,source_state,source_common,source_common_state=repository(expected["sourceRoot"],expected["sourceRootDevice"],expected["sourceRootInode"])
+try:
+ if git(source_fd,"rev-parse","HEAD")!={source_commit!r}: raise SystemExit("source commit mismatch")
+ if git(source_fd,"status","--porcelain","--untracked-files=all"): raise SystemExit("source tree dirty")
+ actual_paths=sorted(item for item in git(source_fd,"ls-files","-z",preserve=True).split("\\0") if item)
+ if actual_paths!=expected_paths: raise SystemExit("source tracked inventory mismatch")
+finally:
+ os.close(owner_fd);os.close(source_fd)
+def proc_read(fd,name,limit):
+ child=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=fd)
+ try:
+  chunks=[];total=0
+  while True:
+   block=os.read(child,min(65536,limit+1-total))
+   if not block: break
+   chunks.append(block);total+=len(block)
+   if total>limit: raise SystemExit("owner process metadata oversized")
+  return b"".join(chunks)
+ finally: os.close(child)
+def proc_stat(payload,pid):
+ marker=payload.rfind(b") ")
+ if marker<1: raise SystemExit("owner process metadata invalid")
+ try:
+  parsed=int(payload[:payload.index(b" ")]);fields=payload[marker+2:].split();parent=int(fields[1]);started=int(fields[19])
+ except (IndexError,ValueError) as error: raise SystemExit("owner process metadata invalid") from error
+ if parsed!=pid or parent<0 or started<=0: raise SystemExit("owner process metadata invalid")
+ return parent,started
+def open_process(pid):
+ if pid<=0: raise SystemExit("owner process ancestry invalid")
+ fd=os.open("/proc/"+str(pid),DIR_FLAGS);state=os.fstat(fd)
+ if not stat.S_ISDIR(state.st_mode) or state.st_uid!=os.geteuid(): os.close(fd);raise SystemExit("owner process ancestry unsafe")
+ return fd
+def classify_codex(executable_path,argv,device,inode):
+ codex_named=os.path.basename(executable_path)=="codex" or any(os.path.basename(item)=="codex" for item in argv) or any("@openai/codex" in item for item in argv)
+ bound_identity=(device,inode)==(expected["codexExecutableDevice"],expected["codexExecutableInode"])
+ if codex_named or bound_identity:
+  if executable_path!=expected["codexExecutable"] or not bound_identity: raise SystemExit("unexpected Codex process in owner ancestry")
+  return True
+ return False
+def process(pid):
+ fd=open_process(pid)
+ try:
+  before_parent,before_started=proc_stat(proc_read(fd,"stat",65536),pid)
+  cmdline=proc_read(fd,"cmdline",65536)
+  try: argv=[item.decode("utf-8") for item in cmdline.split(b"\\0") if item]
+  except UnicodeDecodeError as error: raise SystemExit("owner process command line invalid") from error
+  record=dict(pid=pid,parentPid=before_parent,startTime=before_started,argv=argv)
+  try: executable_path=os.readlink("exe",dir_fd=fd);executable_fd=os.open("exe",os.O_RDONLY|os.O_CLOEXEC,dir_fd=fd)
+  except OSError as error: raise SystemExit("owner process executable unavailable") from error
+  try:
+   before=os.fstat(executable_fd)
+   if not stat.S_ISREG(before.st_mode): raise SystemExit("owner process executable unsafe")
+   record.update(executable=executable_path,executableDevice=before.st_dev,executableInode=before.st_ino)
+   record["isCodex"]=classify_codex(executable_path,argv,before.st_dev,before.st_ino)
+   if record["isCodex"]:
+    if before.st_uid!=os.geteuid() or before.st_nlink!=1 or before.st_mode&(stat.S_IWGRP|stat.S_IWOTH) or not before.st_mode&stat.S_IXUSR or before.st_size>536870912: raise SystemExit("owner Codex executable unsafe")
+    digest=hashlib.sha256();total=0
+    while True:
+     block=os.read(executable_fd,1048576)
+     if not block: break
+     digest.update(block);total+=len(block)
+     if total>536870912: raise SystemExit("owner Codex executable oversized")
+    if total!=before.st_size or digest.hexdigest()!=expected["codexExecutableSha256"]: raise SystemExit("owner Codex executable mismatch")
+    record["executableSha256"]=digest.hexdigest()
+   after=os.fstat(executable_fd)
+  finally: os.close(executable_fd)
+  identity=lambda value:(value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+  try: repeated_path=os.readlink("exe",dir_fd=fd);repeated_fd=os.open("exe",os.O_RDONLY|os.O_CLOEXEC,dir_fd=fd)
+  except OSError as error: raise SystemExit("owner process executable changed") from error
+  try: repeated=os.fstat(repeated_fd)
+  finally: os.close(repeated_fd)
+  if identity(before)!=identity(after) or identity(before)!=identity(repeated) or executable_path!=repeated_path: raise SystemExit("owner process executable changed")
+  if proc_read(fd,"cmdline",65536)!=cmdline: raise SystemExit("owner process command line changed")
+  after_parent,after_started=proc_stat(proc_read(fd,"stat",65536),pid)
+  if (before_parent,before_started)!=(after_parent,after_started): raise SystemExit("owner process changed")
+  return record
+ finally: os.close(fd)
+def ancestry_snapshot():
+ current=os.getppid();seen=set();records=[]
+ for _ in range(128):
+  if current<=0 or current in seen: raise SystemExit("owner process ancestry invalid")
+  seen.add(current);record=process(current);records.append(record)
+  if record["parentPid"]==1: break
+  current=record["parentPid"]
+ else: raise SystemExit("owner process ancestry oversized")
+ return records
+def pane_snapshot():
+ lines=subprocess.run(("/usr/bin/tmux","list-panes","-s","-t","="+expected["registryRow"]["command"],"-F","#{{session_id}}\\t#{{session_name}}\\t#{{window_id}}\\t#{{pane_id}}\\t#{{pane_pid}}\\t#{{pane_tty}}"),check=True,capture_output=True,text=True,stdin=subprocess.DEVNULL).stdout.splitlines()
+ panes=[]
+ for line in lines:
+  fields=line.split("\\t")
+  if len(fields)!=6 or re.fullmatch(r"[$][0-9]+",fields[0]) is None or fields[1]!=expected["registryRow"]["command"] or re.fullmatch(r"@[0-9]+",fields[2]) is None or re.fullmatch(r"%[0-9]+",fields[3]) is None or not fields[4].isdigit() or int(fields[4])<=0 or re.fullmatch(r"/dev/pts/[0-9]+",fields[5]) is None: raise SystemExit("exact owner session pane metadata invalid")
+  panes.append((fields[0],fields[1],fields[2],fields[3],int(fields[4]),fields[5]))
+ return panes
+def authorize(first_ancestry,first_panes,second_ancestry,second_panes):
+ if first_ancestry!=second_ancestry: raise SystemExit("owner process ancestry changed during authorization")
+ if first_panes!=second_panes: raise SystemExit("exact owner session panes changed during authorization")
+ ancestry=[record["pid"] for record in second_ancestry]
+ codex=[record for record in second_ancestry if record["isCodex"]]
+ if len(codex)!=1 or codex[0]["argv"]!=expected["codexArgv"]: raise SystemExit("execution is not beneath exactly one exact owner Codex process")
+ owner_panes=[pane for pane in second_panes if pane[4] in ancestry]
+ if len(owner_panes)!=1: raise SystemExit("execution is not descended from the exact owner session pane")
+ pane_pid=owner_panes[0][4]
+ if pane_pid not in ancestry or ancestry.index(codex[0]["pid"])>=ancestry.index(pane_pid): raise SystemExit("owner process lineage is invalid")
+ return codex[0]
+first_ancestry=ancestry_snapshot();first_panes=pane_snapshot()
+second_ancestry=ancestry_snapshot();second_panes=pane_snapshot()
+owner_process=authorize(first_ancestry,first_panes,second_ancestry,second_panes)
+reconstructed=dict(
+ schemaVersion="overseer.phase-b-rehearsal-owner-binding.v2",status="passed",
+ conversationId=row_binding["conversationId"],project=row_binding["project"],ownerProjectToplevel=row_binding["project"],
+ sourceRoot=expected["sourceRoot"],gitCommonDirectory=owner_common,
+ ownerProjectDevice=owner_state.st_dev,ownerProjectInode=owner_state.st_ino,
+ sourceRootDevice=source_state.st_dev,sourceRootInode=source_state.st_ino,
+ gitCommonDirectoryDevice=owner_common_state.st_dev,gitCommonDirectoryInode=owner_common_state.st_ino,
+ registry="/home/god/.codex/codex-projects.csv",registryDevice=registry_state.st_dev,registryInode=registry_state.st_ino,
+ registryRow=row_binding,registrySha256=hashlib.sha256(registry_payload).hexdigest(),registryRowDigest=hashlib.sha256(canonical(row_binding).encode()).hexdigest(),
+ launcherDevice=launcher_state.st_dev,launcherInode=launcher_state.st_ino,launcherSha256=hashlib.sha256(launcher_payload).hexdigest(),
+ codexExecutable=owner_process["executable"],codexExecutableDevice=owner_process["executableDevice"],codexExecutableInode=owner_process["executableInode"],codexExecutableSha256=owner_process["executableSha256"],codexArgv=owner_process["argv"],
+)
+reconstructed["bindingDigest"]=hashlib.sha256(canonical(reconstructed).encode()).hexdigest()
+if canonical(reconstructed)!=canonical(expected): raise SystemExit("complete owner binding reconstruction mismatch")
+'''
+
+
 def _future_script(
     *,
     source_commit: str,
@@ -1620,6 +3114,7 @@ def _future_script(
     domain_xml: str,
     cloud_init: str,
     meta_data: str,
+    owner_binding: Mapping[str, object],
 ) -> str:
     validator = _result_validator_python()
     collector = _serial_collector_python()
@@ -1628,6 +3123,11 @@ def _future_script(
     firmware_validator = _firmware_validator_python()
     runtime_probe_code = _runtime_probe_python()
     capability_probe_code = _capability_probe_python()
+    owner_validator = _future_owner_validator_python(
+        owner_binding,
+        source_commit=source_commit,
+        source_manifest=source_manifest,
+    )
     source_manifest_json = canonical_json(source_manifest)
     runtime_manifest_json = canonical_json(runtime_manifest)
     runtime_probe_json = canonical_json(runtime_probe)
@@ -1696,6 +3196,10 @@ LOCK_HELD=0
 
 validate_firmware_runtime() {{
   /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(firmware_validator)} "$FIRMWARE_CODE" "$FIRMWARE_CODE_SHA256" "$FIRMWARE_VARS_TEMPLATE" "$FIRMWARE_VARS_SHA256"
+}}
+
+validate_exact_owner() {{
+  /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(owner_validator)}
 }}
 
 validate_session_runtime() {{
@@ -1840,6 +3344,7 @@ trap 'cleanup $?' EXIT
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
 
+validate_exact_owner
 validate_session_runtime
 
 if ! /usr/bin/mkdir "$RUN_LOCK" 2>/dev/null; then
@@ -1856,8 +3361,6 @@ else
   presence=$?
   [[ "$presence" -eq 1 ]] || {{ printf '%s\\n' 'libvirt domain inventory is unavailable at future execution boundary' >&2; exit 1; }}
 fi
-[[ "$(/usr/bin/git --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -C "$SOURCE_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
-[[ -z "$(/usr/bin/git --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -C "$SOURCE_ROOT" status --porcelain --untracked-files=all)" ]]
 ACTUAL_RUNTIME_PROBE_JSON="$(/usr/bin/python3.13 -B -s -P -S -c {shlex.quote(runtime_probe_code)} "$SOURCE_ROOT" "$RUNTIME_SITE" "$EXPECTED_SOURCE_MANIFEST_JSON" "$EXPECTED_RUNTIME_MANIFEST_JSON")"
 [[ "$ACTUAL_RUNTIME_PROBE_JSON" == "$EXPECTED_RUNTIME_PROBE_JSON" ]]
 [[ "$(printf '%s' "$ACTUAL_RUNTIME_PROBE_JSON" | /usr/bin/sha256sum | /usr/bin/awk '{{print $1}}')" == "$EXPECTED_RUNTIME_PROBE_SHA256" ]]
@@ -1957,10 +3460,11 @@ def render_plan(
     runtime_manifest: Mapping[str, object],
     runtime_probe: Mapping[str, object],
     capability_probe: Mapping[str, object],
+    owner_binding: Mapping[str, object],
     base_image: Path = DEFAULT_BASE_IMAGE,
     temp_parent: Path = DEFAULT_TEMP_PARENT,
 ) -> dict[str, object]:
-    """Purely render canonical plan data and a separate approval digest."""
+    """Revalidate the owner, then render canonical plan data and its approval digest."""
 
     _require_full_source_commit(source_commit)
     for path, label in (
@@ -1970,6 +3474,9 @@ def render_plan(
         (temp_parent, "temporary"),
     ):
         _validate_host_path(path, label)
+    validated_owner_binding = _validate_owner_binding_live(
+        owner_binding, source_root=source_root
+    )
     validated_source_manifest = _validate_artifact_manifest(source_manifest, kind="source")
     validated_runtime_manifest = _validate_artifact_manifest(runtime_manifest, kind="runtime")
     source_manifest_digest = _manifest_digest(validated_source_manifest)
@@ -2017,10 +3524,12 @@ def render_plan(
         domain_xml=domain_xml,
         cloud_init=cloud_init,
         meta_data=meta_data,
+        owner_binding=validated_owner_binding,
     )
     plan: dict[str, object] = {
         "schemaVersion": REHEARSAL_SCHEMA,
         "sourceCommit": source_commit,
+        "ownerBinding": validated_owner_binding,
         "image": {
             "url": BASE_IMAGE_URL,
             "sha512": BASE_IMAGE_SHA512,
@@ -2097,10 +3606,13 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("--base-image", type=Path, default=DEFAULT_BASE_IMAGE)
         sub.add_argument("--temp-parent", type=Path, default=DEFAULT_TEMP_PARENT)
     preflight_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    preflight_parser.add_argument("--owner-thread", required=True)
+    preflight_parser.add_argument("--owner-project", type=Path, required=True)
     render_parser.add_argument("--source-manifest-json", required=True)
     render_parser.add_argument("--runtime-manifest-json", required=True)
     render_parser.add_argument("--runtime-probe-json", required=True)
     render_parser.add_argument("--capability-probe-json", required=True)
+    render_parser.add_argument("--owner-binding-json", required=True)
     return parser
 
 
@@ -2122,6 +3634,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source_commit=args.source_commit,
                 repo_root=args.repo_root,
                 source_root=args.source_root,
+                owner_thread=args.owner_thread,
+                owner_project=args.owner_project,
                 runtime_site=args.runtime_site,
                 base_image=args.base_image,
                 temp_parent=args.temp_parent,
@@ -2135,6 +3649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime_manifest=_json_object(args.runtime_manifest_json, "runtime manifest"),
                 runtime_probe=_json_object(args.runtime_probe_json, "runtime probe"),
                 capability_probe=_json_object(args.capability_probe_json, "capability probe"),
+                owner_binding=_json_object(args.owner_binding_json, "owner binding"),
                 base_image=args.base_image,
                 temp_parent=args.temp_parent,
             )

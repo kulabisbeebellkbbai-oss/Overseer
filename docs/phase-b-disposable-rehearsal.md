@@ -1,7 +1,7 @@
 # Disposable Phase B rehearsal: inert host preparation
 
 The rehearsal tool prepares evidence and renders a separately approved future
-VM run. `preflight` is read-only and `render-plan` is pure. Neither subcommand
+VM run. Both `preflight` and `render-plan` are read-only. Neither subcommand
 downloads an image, creates an overlay or ISO, defines or starts a VM, imports
 or executes a package, invokes Phase B, or changes a host service.
 
@@ -22,6 +22,23 @@ Preflight fails closed unless:
   collision-resistant target VM name is absent;
 - source, runtime, image, and temporary-parent paths have conservative
   absolute names, safe object types, safe permissions, and required access;
+- `--owner-thread` is one canonical full conversation UUID appearing exactly
+  once in the safe, caller-owned Codex projects CSV, and that row's project is
+  exactly `--owner-project`; the command and launcher must encode that exact
+  UUID, and the owner project must be its exact registered worktree top level
+  in the same Git common directory as the rehearsed source. Repository probes
+  are anchored to no-follow directory descriptors, require both supplied paths
+  to be exact Git worktree top levels, bind device/inode identities for both
+  roots and their common directory, securely reopen those paths after probing, and re-attest
+  both identities after every pathname-based source read. Aliases,
+  absent or duplicate rows, project rebinding, malformed CSV, linked path
+  components, pathname replacement, group/other-writable registries, and
+  canonical-equivalent UUID aliases such as uppercase or braced forms fail
+  closed;
+- preflight itself is descended from exactly one Codex process whose complete
+  argv is `codex resume <owner-thread> --cd <owner-project>`; the executable's
+  canonical `/proc` path, device/inode identity, and SHA-256 are captured from
+  the stable process ancestry and added to the owner binding;
 - the exact caller session runtime directory is `/run/user/<caller-uid>`, is a
   non-linked directory owned by that caller with mode `0700`, and is bound to
   every libvirt probe and the separately approved execution as
@@ -36,9 +53,11 @@ Preflight fails closed unless:
   selected `_cffi_backend` extension, excluding links, `__pycache__`, and
   bytecode, within its independent bounds; and
 - `/usr/bin/python3.13 -B -s -P -S` imports the four required modules through a
-  manifest-enforcing finder. Every source loader opens with `O_NOFOLLOW`,
-  revalidates stable descriptor metadata, mode, size, and SHA-256, then compiles
-  those verified bytes directly. Native loaders copy the exact verified bytes
+  manifest-enforcing finder. Manifest and import reads pin safe root directory
+  descriptors and open every relative directory and file component with
+  `O_NOFOLLOW`, revalidate stable descriptor metadata, mode, size, and SHA-256,
+  then compile those verified bytes directly. Native loaders copy the exact
+  verified bytes
   into a sealed anonymous file, then create and execute the extension from that
   immutable descriptor, closing the path-reopen race. Module origins are
   classified by their lexical manifest path before any symlink resolution, so
@@ -69,15 +88,46 @@ helper or refresh the index during the read-only probe.
 
 ## Immutable host-to-guest handoff
 
-The v6 plan has no host filesystem share. It binds canonical source and runtime
+The v8 plan has no host filesystem share. It binds canonical source and runtime
 manifests, their SHA-256 digests, deterministic stored-ZIP digests, the runtime
-probe, KVM capability probe, source commit, domain XML, cloud-init, and future
-script under `planDigest`.
+probe, KVM capability probe, source commit, exact owner attestation, domain XML,
+cloud-init, and future script under `planDigest`. The owner attestation contains
+the exact conversation ID, project, owner top-level, source worktree, common Git
+directory, their device/inode identities, authoritative registry path, command,
+launcher, registry and launcher device/inode identities, complete registry and
+launcher digests, the exact Codex process argv plus executable path,
+device/inode identity and digest, canonical row digest, and self-digest.
+`render-plan` accepts that preflight output as `--owner-binding-json`, verifies
+all digests, securely rereads the authoritative registry without following any
+path symlink, re-probes the owner/source Git identity, and requires a
+byte-equivalent reconstruction of the binding. It does not run KVM, libvirt,
+VM, service, package, or activation operations.
 
-The separately approved future script rechecks Git identity and cleanliness,
-revalidates the exact private caller runtime directory before installing its
-lock or contacting libvirt, reruns the manifest-enforced import probe, and
-builds both ZIP files using
+The separately approved future script first reconstructs the exact registry,
+launcher, owner-project, source-root, common-Git, commit, cleanliness, and
+tracked-inventory evidence. Reconstruction includes strict CSV parsing of one
+canonical UUID row, the canonical row digest, the launcher's exact complete
+token vector, every owner-binding field, and a byte-equivalent binding digest.
+It then walks its stable `/proc` parent chain and
+requires both the exact registered tmux pane PID and exactly one intervening
+Codex process with the bound executable identity, digest, and complete
+`resume` argv. Borrowing or reopening that pane's TTY from another process is
+insufficient because the foreign process is not descended from the pane and
+owner Codex process. The script then revalidates the private caller runtime
+directory before installing its lock or contacting libvirt. Running it from
+another thread, launcher, terminal, or non-interactive process fails closed.
+Every process PID, parent PID, start time, command line, executable path, and
+executable identity is reread for stability during that invocation. The
+future validator snapshots the complete chain, reads the exact session pane
+set with stable tmux session, window, and pane IDs plus PID and TTY, repeats
+both snapshots, and requires exact equality before authorization; ancestor
+exit, PID reuse, or pane recreation therefore fails closed. PIDs are
+intentionally not preserved from preparation: execution is a later,
+separately approved phase, and a legitimate restart may recreate the exact
+registered session while resuming the same bound conversation. Any additional
+Codex executable in the execution ancestry, even with different argv or a
+different installed version, fails closed.
+It reruns the manifest-enforced import probe and builds both ZIP files using
 `O_NOFOLLOW`, descriptor metadata checks, per-file size/hash checks, and
 deterministic ZIP metadata. A changed, linked, hard-linked, added, or omitted
 artifact file fails before VM definition. Ignored bytecode, `.git`, and local
@@ -193,6 +243,11 @@ require one exact Dax resource claim plus explicit approval of the rendered
 Approval of this source, an older plan, or a different digest is not execution
 authority. Package import, host service action, the Phase B launcher, Phase B,
 and cutover remain excluded.
+
+Preparing a successor lease or transition file does not submit a claim, dispatch
+a continuation, release or activate any claim, or authorize VM lifecycle. Every
+successor owner field must equal the exact conversation ID already bound under
+the replacement plan digest.
 
 ## Source-only verification
 

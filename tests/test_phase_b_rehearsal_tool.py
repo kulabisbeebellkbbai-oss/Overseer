@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import inspect
@@ -37,6 +38,26 @@ FIRMWARE_VARS_TEMPLATE = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
 MACHINE_TYPE = "pc-i440fx-10.0"
 TEMP_PARENT = Path("/var/tmp")
 SESSION_RUNTIME_DIR = Path(f"/run/user/{os.geteuid()}")
+OWNER_THREAD = "01a0354f-d735-76d1-852c-f364b6e6af56"
+OWNER_PROJECT = Path("/home/god/Documents/Codex Workspace/Overseer")
+CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
+OWNER_PROJECT_DEVICE = 65025
+OWNER_PROJECT_INODE = 57303685
+SOURCE_ROOT_DEVICE = 65025
+SOURCE_ROOT_INODE = 1201523
+GIT_COMMON_DEVICE = 65025
+GIT_COMMON_INODE = 57304002
+REGISTRY_DEVICE = 65025
+REGISTRY_INODE = 58100001
+LAUNCHER_DEVICE = 65025
+LAUNCHER_INODE = 58100002
+LAUNCHER_SHA256 = "e" * 64
+CODEX_EXECUTABLE = Path(
+    "/home/god/.codex/packages/standalone/releases/0.151.0-x86_64-unknown-linux-musl/bin/codex"
+)
+CODEX_EXECUTABLE_DEVICE = 65025
+CODEX_EXECUTABLE_INODE = 58100003
+CODEX_EXECUTABLE_SHA256 = "f" * 64
 EXPECTED_IMPORTS = (
     "cryptography",
     "overseer.cli",
@@ -176,7 +197,62 @@ def manifest_digest(module, manifest: dict[str, object]) -> str:
     return hashlib.sha256(module.canonical_json(manifest).encode()).hexdigest()
 
 
+def owner_binding(module, *, conversation_id: str = OWNER_THREAD) -> dict[str, object]:
+    registry_payload = owner_registry_bytes(conversation_id=conversation_id)
+    row = {
+        "conversationId": conversation_id,
+        "project": str(OWNER_PROJECT),
+        "command": f"codex-overseer-{conversation_id}",
+        "launcher": f"/home/god/.local/bin/codex-overseer-{conversation_id}",
+    }
+    record: dict[str, object] = {
+        "schemaVersion": "overseer.phase-b-rehearsal-owner-binding.v2",
+        "status": "passed",
+        "conversationId": conversation_id,
+        "project": str(OWNER_PROJECT),
+        "ownerProjectToplevel": str(OWNER_PROJECT),
+        "sourceRoot": str(SOURCE_ROOT),
+        "gitCommonDirectory": str(OWNER_PROJECT / ".git"),
+        "ownerProjectDevice": OWNER_PROJECT_DEVICE,
+        "ownerProjectInode": OWNER_PROJECT_INODE,
+        "sourceRootDevice": SOURCE_ROOT_DEVICE,
+        "sourceRootInode": SOURCE_ROOT_INODE,
+        "gitCommonDirectoryDevice": GIT_COMMON_DEVICE,
+        "gitCommonDirectoryInode": GIT_COMMON_INODE,
+        "registry": str(CODEX_PROJECTS_REGISTRY),
+        "registryDevice": REGISTRY_DEVICE,
+        "registryInode": REGISTRY_INODE,
+        "registryRow": row,
+        "registrySha256": hashlib.sha256(registry_payload).hexdigest(),
+        "registryRowDigest": hashlib.sha256(module.canonical_json(row).encode()).hexdigest(),
+        "launcherDevice": LAUNCHER_DEVICE,
+        "launcherInode": LAUNCHER_INODE,
+        "launcherSha256": LAUNCHER_SHA256,
+        "codexExecutable": str(CODEX_EXECUTABLE),
+        "codexExecutableDevice": CODEX_EXECUTABLE_DEVICE,
+        "codexExecutableInode": CODEX_EXECUTABLE_INODE,
+        "codexExecutableSha256": CODEX_EXECUTABLE_SHA256,
+        "codexArgv": ["codex", "resume", conversation_id, "--cd", str(OWNER_PROJECT)],
+    }
+    record["bindingDigest"] = hashlib.sha256(module.canonical_json(record).encode()).hexdigest()
+    return record
+
+
+def owner_registry_bytes(
+    *, conversation_id: str = OWNER_THREAD, project: Path = OWNER_PROJECT, duplicate: bool = False
+) -> bytes:
+    header = "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+    row = (
+        f"{conversation_id},Overseer,{project},codex-overseer-{conversation_id},"
+        f"/home/god/.local/bin/codex-overseer-{conversation_id},"
+        "2026-08-24T19:47:00+00:00,2026-08-31T11:34:13+00:00,codex-state,\n"
+    )
+    return (header + row + (row if duplicate else "")).encode("utf-8")
+
+
 def render(module, **overrides: object) -> dict[str, object]:
+    registry_payload = overrides.pop("_registry_payload", None)
+    repository_identities = overrides.pop("_repository_identities", None)
     values: dict[str, object] = {
         "source_commit": SOURCE_COMMIT,
         "source_root": SOURCE_ROOT,
@@ -185,10 +261,55 @@ def render(module, **overrides: object) -> dict[str, object]:
         "capability_probe": capability_probe(),
         "source_manifest": artifact_manifest("source"),
         "runtime_manifest": artifact_manifest("runtime"),
+        "owner_binding": owner_binding(module),
         "base_image": BASE_IMAGE,
         "temp_parent": TEMP_PARENT,
     }
     values.update(overrides)
+    selected_binding = values["owner_binding"]
+    assert isinstance(selected_binding, dict)
+    if registry_payload is None:
+        registry_payload = owner_registry_bytes(
+            conversation_id=str(selected_binding["conversationId"]),
+            project=Path(str(selected_binding["project"])),
+        )
+    module._read_codex_projects_registry = lambda path: registry_payload
+    module._codex_registry_object_identity = lambda path: {
+        "device": selected_binding["registryDevice"],
+        "inode": selected_binding["registryInode"],
+    }
+    module._read_launcher_evidence = lambda path, **kwargs: {
+        "device": selected_binding["launcherDevice"],
+        "inode": selected_binding["launcherInode"],
+        "sha256": selected_binding["launcherSha256"],
+    }
+    module._read_owner_process_evidence = lambda **kwargs: {
+        "executable": selected_binding["codexExecutable"],
+        "device": selected_binding["codexExecutableDevice"],
+        "inode": selected_binding["codexExecutableInode"],
+        "sha256": selected_binding["codexExecutableSha256"],
+        "argv": selected_binding["codexArgv"],
+    }
+    if repository_identities is None:
+        repository_identities = {
+            Path(str(selected_binding["ownerProjectToplevel"])): {
+                "topLevel": str(selected_binding["ownerProjectToplevel"]),
+                "device": selected_binding["ownerProjectDevice"],
+                "inode": selected_binding["ownerProjectInode"],
+                "commonDirectory": str(selected_binding["gitCommonDirectory"]),
+                "commonDevice": selected_binding["gitCommonDirectoryDevice"],
+                "commonInode": selected_binding["gitCommonDirectoryInode"],
+            },
+            Path(str(selected_binding["sourceRoot"])): {
+                "topLevel": str(selected_binding["sourceRoot"]),
+                "device": selected_binding["sourceRootDevice"],
+                "inode": selected_binding["sourceRootInode"],
+                "commonDirectory": str(selected_binding["gitCommonDirectory"]),
+                "commonDevice": selected_binding["gitCommonDirectoryDevice"],
+                "commonInode": selected_binding["gitCommonDirectoryInode"],
+            },
+        }
+    module._read_only_repository_identity = lambda path: repository_identities[path]
     return module.render_plan(**values)
 
 
@@ -202,6 +323,7 @@ def fake_stat(path: Path) -> SimpleNamespace:
         FIRMWARE_VARS_TEMPLATE: stat.S_IFREG | 0o644,
         TEMP_PARENT: stat.S_IFDIR | 0o1777,
         SESSION_RUNTIME_DIR: stat.S_IFDIR | 0o700,
+        CODEX_PROJECTS_REGISTRY: stat.S_IFREG | 0o600,
     }
     firmware_paths = {FIRMWARE_CODE, FIRMWARE_VARS_TEMPLATE}
     return SimpleNamespace(
@@ -210,6 +332,22 @@ def fake_stat(path: Path) -> SimpleNamespace:
         st_gid=0 if path in firmware_paths else os.getegid(),
         st_nlink=1,
     )
+
+
+def repository_identity(path: Path) -> dict[str, object]:
+    if path == OWNER_PROJECT:
+        device, inode = OWNER_PROJECT_DEVICE, OWNER_PROJECT_INODE
+    else:
+        assert path == SOURCE_ROOT
+        device, inode = SOURCE_ROOT_DEVICE, SOURCE_ROOT_INODE
+    return {
+        "topLevel": str(path),
+        "device": device,
+        "inode": inode,
+        "commonDirectory": str(OWNER_PROJECT / ".git"),
+        "commonDevice": GIT_COMMON_DEVICE,
+        "commonInode": GIT_COMMON_INODE,
+    }
 
 
 def valid_preflight_kwargs(module) -> dict[str, object]:
@@ -237,10 +375,36 @@ def valid_preflight_kwargs(module) -> dict[str, object]:
         "source_commit": SOURCE_COMMIT,
         "repo_root": SOURCE_ROOT,
         "source_root": SOURCE_ROOT,
+        "owner_thread": OWNER_THREAD,
+        "owner_project": OWNER_PROJECT,
+        "codex_projects_registry": CODEX_PROJECTS_REGISTRY,
+        "registry_reader": lambda path: owner_registry_bytes(),
+        "registry_identity_reader": lambda path: {
+            "device": REGISTRY_DEVICE,
+            "inode": REGISTRY_INODE,
+        },
+        "launcher_evidence_reader": lambda path, **kwargs: {
+            "device": LAUNCHER_DEVICE,
+            "inode": LAUNCHER_INODE,
+            "sha256": LAUNCHER_SHA256,
+        },
+        "owner_process_evidence_reader": lambda **kwargs: {
+            "executable": str(CODEX_EXECUTABLE),
+            "device": CODEX_EXECUTABLE_DEVICE,
+            "inode": CODEX_EXECUTABLE_INODE,
+            "sha256": CODEX_EXECUTABLE_SHA256,
+            "argv": ["codex", "resume", OWNER_THREAD, "--cd", str(OWNER_PROJECT)],
+        },
         "runtime_site": RUNTIME_SITE,
         "base_image": BASE_IMAGE,
         "temp_parent": TEMP_PARENT,
         "runner": lambda command: responses[command[0]],
+        "repository_identity_probe": repository_identity,
+        "source_git_probe": lambda path: {
+            "status": responses["git-status"],
+            "head": responses["git-head"],
+            "files": responses["git-files"],
+        },
         "path_exists": lambda path: path
         in {
             Path("/dev/kvm"),
@@ -251,6 +415,7 @@ def valid_preflight_kwargs(module) -> dict[str, object]:
             FIRMWARE_VARS_TEMPLATE,
             TEMP_PARENT,
             SESSION_RUNTIME_DIR,
+            CODEX_PROJECTS_REGISTRY,
         },
         "path_stat": fake_stat,
         "path_access": lambda path, mode: True,
@@ -281,7 +446,9 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
     )
     assert module.DEFAULT_RUNTIME_SITE == RUNTIME_SITE
     assert module.MACHINE_TYPE == MACHINE_TYPE
-    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v6"
+    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v8"
+    assert module.OWNER_BINDING_SCHEMA == "overseer.phase-b-rehearsal-owner-binding.v2"
+    assert module.DEFAULT_CODEX_PROJECTS_REGISTRY == CODEX_PROJECTS_REGISTRY
     assert module.SESSION_RUNTIME_DIR == SESSION_RUNTIME_DIR
     assert module.MINIMAL_ENV["XDG_RUNTIME_DIR"] == str(SESSION_RUNTIME_DIR)
     assert module.MAX_SERIAL_BYTES == 1024 * 1024
@@ -310,6 +477,710 @@ def test_preflight_accepts_sticky_var_tmp_and_binds_runtime_probe() -> None:
     assert result["planInputs"]["runtimeArtifact"]["manifest"] == artifact_manifest("runtime")
     assert result["tempDirectoryCreated"] is False
     assert result["sessionRuntimeDirectory"] == str(SESSION_RUNTIME_DIR)
+    assert result["ownerBinding"] == owner_binding(module)
+
+
+def test_preflight_binds_one_exact_registered_owner_before_probes() -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    result = module.preflight(**values)
+
+    assert result["ownerBinding"]["conversationId"] == OWNER_THREAD
+    assert result["ownerBinding"]["project"] == str(OWNER_PROJECT)
+    assert result["ownerBinding"]["registryRowDigest"] == hashlib.sha256(
+        module.canonical_json(result["ownerBinding"]["registryRow"]).encode()
+    ).hexdigest()
+    assert result["ownerBinding"]["codexExecutable"] == str(CODEX_EXECUTABLE)
+    assert result["ownerBinding"]["codexArgv"] == [
+        "codex",
+        "resume",
+        OWNER_THREAD,
+        "--cd",
+        str(OWNER_PROJECT),
+    ]
+
+
+def test_owner_process_evidence_requires_one_exact_codex_ancestor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_tool()
+    expected_argv = ["codex", "resume", OWNER_THREAD, "--cd", str(OWNER_PROJECT)]
+    snapshots = {
+        40: {
+            "pid": 40,
+            "parentPid": 30,
+            "startTime": 4,
+            "argv": ["bash"],
+            "executable": "/usr/bin/bash",
+            "executableDevice": 1,
+            "executableInode": 40,
+        },
+        30: {
+            "pid": 30,
+            "parentPid": 20,
+            "startTime": 3,
+            "argv": expected_argv,
+            "executable": str(CODEX_EXECUTABLE),
+            "executableDevice": CODEX_EXECUTABLE_DEVICE,
+            "executableInode": CODEX_EXECUTABLE_INODE,
+            "executableSha256": CODEX_EXECUTABLE_SHA256,
+        },
+        20: {
+            "pid": 20,
+            "parentPid": 1,
+            "startTime": 2,
+            "argv": ["tmux"],
+            "executable": "/usr/bin/tmux",
+            "executableDevice": 1,
+            "executableInode": 20,
+        },
+    }
+    monkeypatch.setattr(module.os, "getppid", lambda: 40)
+    monkeypatch.setattr(
+        module,
+        "_read_process_snapshot",
+        lambda pid, *, include_executable: snapshots[pid],
+    )
+
+    result = module._read_owner_process_evidence(
+        conversation_id=OWNER_THREAD,
+        project=OWNER_PROJECT,
+    )
+
+    assert result == {
+        "executable": str(CODEX_EXECUTABLE),
+        "device": CODEX_EXECUTABLE_DEVICE,
+        "inode": CODEX_EXECUTABLE_INODE,
+        "sha256": CODEX_EXECUTABLE_SHA256,
+        "argv": expected_argv,
+    }
+
+
+def test_owner_process_evidence_rejects_nested_different_codex_ancestor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_tool()
+    owner_argv = ["codex", "resume", OWNER_THREAD, "--cd", str(OWNER_PROJECT)]
+    other = "019fefa5-f52a-74f3-8179-715e12d9cd2e"
+    snapshots = {
+        40: {
+            "pid": 40,
+            "parentPid": 30,
+            "startTime": 4,
+            "argv": ["codex", "resume", other, "--cd", str(OWNER_PROJECT)],
+            "executable": "/opt/openai-codex/bin/codex",
+            "executableDevice": CODEX_EXECUTABLE_DEVICE + 1,
+            "executableInode": CODEX_EXECUTABLE_INODE + 1,
+        },
+        30: {
+            "pid": 30,
+            "parentPid": 20,
+            "startTime": 3,
+            "argv": owner_argv,
+            "executable": str(CODEX_EXECUTABLE),
+            "executableDevice": CODEX_EXECUTABLE_DEVICE,
+            "executableInode": CODEX_EXECUTABLE_INODE,
+        },
+        20: {
+            "pid": 20,
+            "parentPid": 1,
+            "startTime": 2,
+            "argv": ["tmux"],
+            "executable": "/usr/bin/tmux",
+            "executableDevice": 1,
+            "executableInode": 20,
+        },
+    }
+    monkeypatch.setattr(module.os, "getppid", lambda: 40)
+    monkeypatch.setattr(
+        module,
+        "_read_process_snapshot",
+        lambda pid, *, include_executable: snapshots[pid],
+    )
+
+    with pytest.raises(module.PreflightError, match="exactly one Codex"):
+        module._read_owner_process_evidence(
+            conversation_id=OWNER_THREAD,
+            project=OWNER_PROJECT,
+        )
+
+
+def test_owner_process_evidence_rejects_pid_reuse_between_ancestry_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_tool()
+    expected_argv = ["codex", "resume", OWNER_THREAD, "--cd", str(OWNER_PROJECT)]
+    snapshots = {
+        40: {
+            "pid": 40,
+            "parentPid": 30,
+            "startTime": 4,
+            "argv": ["bash"],
+            "executable": "/usr/bin/bash",
+            "executableDevice": 1,
+            "executableInode": 40,
+        },
+        30: {
+            "pid": 30,
+            "parentPid": 20,
+            "startTime": 3,
+            "argv": expected_argv,
+            "executable": str(CODEX_EXECUTABLE),
+            "executableDevice": CODEX_EXECUTABLE_DEVICE,
+            "executableInode": CODEX_EXECUTABLE_INODE,
+            "executableSha256": CODEX_EXECUTABLE_SHA256,
+        },
+        20: {
+            "pid": 20,
+            "parentPid": 1,
+            "startTime": 2,
+            "argv": ["tmux"],
+            "executable": "/usr/bin/tmux",
+            "executableDevice": 1,
+            "executableInode": 20,
+        },
+    }
+    calls = 0
+
+    def changing_snapshot(pid: int, *, include_executable: bool) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        result = dict(snapshots[pid])
+        if calls > 4 and pid == 40:
+            result["startTime"] = 99
+        return result
+
+    monkeypatch.setattr(module.os, "getppid", lambda: 40)
+    monkeypatch.setattr(module, "_read_process_snapshot", changing_snapshot)
+
+    with pytest.raises(module.PreflightError, match="ancestry changed"):
+        module._read_owner_process_evidence(
+            conversation_id=OWNER_THREAD,
+            project=OWNER_PROJECT,
+        )
+
+
+def test_future_owner_validator_is_valid_python_and_requires_process_lineage() -> None:
+    module = load_tool()
+    validator = module._future_owner_validator_python(
+        owner_binding(module),
+        source_commit=SOURCE_COMMIT,
+        source_manifest=artifact_manifest("source"),
+    )
+
+    compile(validator, "<future-owner-validator>", "exec")
+    assert "ttyname" not in validator
+    assert "os.getppid()" in validator
+    assert "pane_pid not in ancestry" in validator
+    assert "first_ancestry=ancestry_snapshot();first_panes=pane_snapshot()" in validator
+    assert "second_ancestry=ancestry_snapshot();second_panes=pane_snapshot()" in validator
+    assert "first_ancestry!=second_ancestry" in validator
+    assert "first_panes!=second_panes" in validator
+
+
+def _generated_owner_authorizer(module):
+    validator = module._future_owner_validator_python(
+        owner_binding(module),
+        source_commit=SOURCE_COMMIT,
+        source_manifest=artifact_manifest("source"),
+    )
+    parsed = ast.parse(validator)
+    authorize = next(
+        node
+        for node in parsed.body
+        if isinstance(node, ast.FunctionDef) and node.name == "authorize"
+    )
+    namespace = {"expected": {"codexArgv": ["codex", "resume", OWNER_THREAD, "--cd", str(OWNER_PROJECT)]}}
+    exec(compile(ast.Module(body=[authorize], type_ignores=[]), "<owner-authorizer>", "exec"), namespace)
+    return namespace["authorize"]
+
+
+def _generated_codex_classifier(module):
+    validator = module._future_owner_validator_python(
+        owner_binding(module),
+        source_commit=SOURCE_COMMIT,
+        source_manifest=artifact_manifest("source"),
+    )
+    parsed = ast.parse(validator)
+    classify = next(
+        node
+        for node in parsed.body
+        if isinstance(node, ast.FunctionDef) and node.name == "classify_codex"
+    )
+    namespace = {
+        "os": os,
+        "expected": {
+            "codexExecutable": str(CODEX_EXECUTABLE),
+            "codexExecutableDevice": CODEX_EXECUTABLE_DEVICE,
+            "codexExecutableInode": CODEX_EXECUTABLE_INODE,
+        },
+    }
+    exec(
+        compile(
+            ast.Module(body=[classify], type_ignores=[]),
+            "<codex-classifier>",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["classify_codex"]
+
+
+def _generated_owner_row_selector(module):
+    validator = module._future_owner_validator_python(
+        owner_binding(module),
+        source_commit=SOURCE_COMMIT,
+        source_manifest=artifact_manifest("source"),
+    )
+    parsed = ast.parse(validator)
+    selector = next(
+        node
+        for node in parsed.body
+        if isinstance(node, ast.FunctionDef) and node.name == "select_owner_row"
+    )
+    namespace = {
+        "csv": module.csv,
+        "io": module.io,
+        "uuid": module.uuid,
+        "expected": {"conversationId": OWNER_THREAD},
+        "expected_registry_fields": list(module._CODEX_REGISTRY_FIELDS),
+    }
+    exec(
+        compile(
+            ast.Module(body=[selector], type_ignores=[]),
+            "<owner-row-selector>",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["select_owner_row"]
+
+
+def test_generated_owner_row_selector_rejects_canonical_uuid_alias_duplicate() -> None:
+    module = load_tool()
+    select_owner_row = _generated_owner_row_selector(module)
+    payload = owner_registry_bytes()
+    row = payload.splitlines(keepends=True)[1]
+    alias = row.replace(OWNER_THREAD.encode(), OWNER_THREAD.upper().encode())
+
+    selected = select_owner_row(payload.decode("utf-8"))
+    assert selected["conversation_id"] == OWNER_THREAD
+    with pytest.raises(SystemExit, match="noncanonical"):
+        select_owner_row((payload + alias).decode("utf-8"))
+
+
+def test_generated_codex_classifier_accepts_only_bound_executable() -> None:
+    module = load_tool()
+    classify = _generated_codex_classifier(module)
+
+    assert classify(
+        str(CODEX_EXECUTABLE),
+        ["codex", "resume", OWNER_THREAD],
+        CODEX_EXECUTABLE_DEVICE,
+        CODEX_EXECUTABLE_INODE,
+    ) is True
+    assert classify("/usr/bin/bash", ["bash"], 1, 2) is False
+
+
+@pytest.mark.parametrize(
+    ("path", "argv", "device", "inode"),
+    (
+        ("/opt/alternate/bin/codex", ["other"], 1, 2),
+        ("/usr/bin/node", ["/opt/alternate/bin/codex"], 1, 2),
+        ("/usr/bin/node", ["node", "/opt/alternate/bin/codex"], 1, 2),
+        ("/usr/bin/node", ["node", "/opt/@openai/codex/bin/codex.js"], 1, 2),
+        ("/tmp/bound-hardlink", ["other"], CODEX_EXECUTABLE_DEVICE, CODEX_EXECUTABLE_INODE),
+    ),
+)
+def test_generated_codex_classifier_rejects_non_bound_codex_signals(
+    path: str, argv: list[str], device: int, inode: int
+) -> None:
+    module = load_tool()
+    classify = _generated_codex_classifier(module)
+
+    with pytest.raises(SystemExit):
+        classify(path, argv, device, inode)
+
+
+def _valid_generated_owner_lineage() -> tuple[
+    list[dict[str, object]], list[tuple[str, str, str, str, int, str]]
+]:
+    owner_argv = ["codex", "resume", OWNER_THREAD, "--cd", str(OWNER_PROJECT)]
+    return (
+        [
+            {"pid": 50, "parentPid": 40, "startTime": 5, "argv": ["bash"], "isCodex": False},
+            {"pid": 40, "parentPid": 30, "startTime": 4, "argv": owner_argv, "isCodex": True},
+            {"pid": 30, "parentPid": 20, "startTime": 3, "argv": ["owner-wrapper"], "isCodex": False},
+            {"pid": 20, "parentPid": 1, "startTime": 2, "argv": ["tmux"], "isCodex": False},
+        ],
+        [("$7", f"codex-overseer-{OWNER_THREAD}", "@3", "%4", 30, "/dev/pts/3")],
+    )
+
+
+def test_generated_owner_authorizer_accepts_stable_exact_lineage() -> None:
+    module = load_tool()
+    authorize = _generated_owner_authorizer(module)
+    ancestry, panes = _valid_generated_owner_lineage()
+
+    authorize(ancestry, panes, list(ancestry), list(panes))
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("pid-reuse", "ancestor-exit", "pane-recreation", "nested-codex", "foreign-pane"),
+)
+def test_generated_owner_authorizer_rejects_unstable_or_foreign_lineage(
+    case: str,
+) -> None:
+    module = load_tool()
+    authorize = _generated_owner_authorizer(module)
+    first_ancestry, first_panes = _valid_generated_owner_lineage()
+    second_ancestry = [dict(record) for record in first_ancestry]
+    second_panes = list(first_panes)
+    if case == "pid-reuse":
+        second_ancestry[0]["startTime"] = 99
+    elif case == "ancestor-exit":
+        second_ancestry.pop()
+    elif case == "pane-recreation":
+        second_panes = [
+            ("$8", f"codex-overseer-{OWNER_THREAD}", "@4", "%5", 31, "/dev/pts/4")
+        ]
+    elif case == "nested-codex":
+        nested = {
+            "pid": 45,
+            "parentPid": 40,
+            "startTime": 45,
+            "argv": ["codex", "resume", "019fefa5-f52a-74f3-8179-715e12d9cd2e"],
+            "isCodex": True,
+        }
+        first_ancestry.insert(1, nested)
+        second_ancestry.insert(1, dict(nested))
+    else:
+        first_panes = [
+            ("$7", f"codex-overseer-{OWNER_THREAD}", "@3", "%4", 99, "/dev/pts/9")
+        ]
+        second_panes = list(first_panes)
+
+    with pytest.raises(SystemExit):
+        authorize(first_ancestry, first_panes, second_ancestry, second_panes)
+
+
+def test_launcher_evidence_rejects_trailing_command_tokens(tmp_path: Path) -> None:
+    module = load_tool()
+    launcher = tmp_path / "launcher"
+    command = f"codex-overseer-{OWNER_THREAD}"
+    canonical = Path("/home/god/.local/bin") / command
+    payload = canonical.read_text(encoding="utf-8").rstrip("\n") + " trailing extra\n"
+    launcher.write_text(payload, encoding="utf-8")
+    launcher.chmod(0o700)
+
+    with pytest.raises(module.PreflightError, match="launcher content"):
+        module._read_launcher_evidence(
+            launcher,
+            conversation_id=OWNER_THREAD,
+            project=OWNER_PROJECT,
+            command=command,
+        )
+
+
+@pytest.mark.parametrize("field", ("command", "launcher"))
+def test_preflight_rejects_registry_command_or_launcher_not_bound_to_exact_owner(
+    field: str,
+) -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    registry = owner_registry_bytes()
+    other = "019fefa5-f52a-74f3-8179-715e12d9cd2e"
+    if field == "command":
+        registry = registry.replace(
+            f"codex-overseer-{OWNER_THREAD}".encode(),
+            f"codex-overseer-{other}".encode(),
+            1,
+        )
+    else:
+        registry = registry.replace(
+            f"/home/god/.local/bin/codex-overseer-{OWNER_THREAD}".encode(),
+            f"/home/god/.local/bin/codex-overseer-{other}".encode(),
+            1,
+        )
+    values["registry_reader"] = lambda path: registry
+
+    with pytest.raises(module.PreflightError, match=field):
+        module.preflight(**values)
+
+
+def test_preflight_rejects_owner_project_from_different_git_repository() -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    def mismatched_identity(path: Path) -> dict[str, object]:
+        identity = repository_identity(path)
+        if path == SOURCE_ROOT:
+            identity["commonDirectory"] = "/home/god/Documents/Codex Workspace/Other/.git"
+            identity["commonInode"] = GIT_COMMON_INODE + 1
+        return identity
+
+    values["repository_identity_probe"] = mismatched_identity
+
+    with pytest.raises(module.PreflightError, match="owner project repository"):
+        module.preflight(**values)
+
+
+def test_preflight_rejects_source_replacement_after_initial_identity_probe() -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    source_replaced = False
+
+    def source_git_probe(path: Path) -> dict[str, str]:
+        nonlocal source_replaced
+        source_replaced = True
+        return {
+            "status": "",
+            "head": SOURCE_COMMIT,
+            "files": "src/overseer/cli.py\0tests/phase_b_rehearsal/guest_rehearsal.py\0",
+        }
+
+    def identity_probe(path: Path) -> dict[str, object]:
+        identity = repository_identity(path)
+        if path == SOURCE_ROOT and source_replaced:
+            identity["inode"] = SOURCE_ROOT_INODE + 1
+        return identity
+
+    values["source_git_probe"] = source_git_probe
+    values["repository_identity_probe"] = identity_probe
+
+    with pytest.raises(module.PreflightError, match="changed during preflight"):
+        module.preflight(**values)
+
+
+def test_default_registry_reader_rejects_ancestor_symlink(tmp_path: Path) -> None:
+    module = load_tool()
+    real = tmp_path / "real"
+    real.mkdir()
+    registry = real / "codex-projects.csv"
+    registry.write_bytes(owner_registry_bytes())
+    registry.chmod(0o600)
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(module.PreflightError, match="registry"):
+        module._read_codex_projects_registry(linked / registry.name)
+
+
+def test_default_registry_reader_rejects_post_read_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_tool()
+    registry = tmp_path / "codex-projects.csv"
+    registry.write_bytes(owner_registry_bytes())
+    registry.chmod(0o600)
+    moved = tmp_path / "replaced.csv"
+    real_read = module.os.read
+    replaced = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        payload = real_read(descriptor, size)
+        if not payload and not replaced:
+            registry.rename(moved)
+            registry.write_bytes(owner_registry_bytes())
+            registry.chmod(0o600)
+            replaced = True
+        return payload
+
+    monkeypatch.setattr(module.os, "read", replacing_read)
+
+    with pytest.raises(module.PreflightError, match="changed|replaced"):
+        module._read_codex_projects_registry(registry)
+
+
+def test_default_registry_reader_rejects_post_read_ancestor_symlink_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_tool()
+    parent = tmp_path / "authoritative"
+    parent.mkdir()
+    registry = parent / "codex-projects.csv"
+    registry.write_bytes(owner_registry_bytes())
+    registry.chmod(0o600)
+    moved = tmp_path / "moved"
+    real_read = module.os.read
+    replaced = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        payload = real_read(descriptor, size)
+        if not payload and not replaced:
+            parent.rename(moved)
+            parent.symlink_to(moved, target_is_directory=True)
+            replaced = True
+        return payload
+
+    monkeypatch.setattr(module.os, "read", replacing_read)
+
+    with pytest.raises(module.PreflightError, match="registry"):
+        module._read_codex_projects_registry(registry)
+
+
+def test_repository_identity_rejects_non_toplevel_directory(tmp_path: Path) -> None:
+    module = load_tool()
+    repository = tmp_path / "repository"
+    subprocess.run(["/usr/bin/git", "init", "-q", str(repository)], check=True)
+    nested = repository / "nested"
+    nested.mkdir()
+
+    with pytest.raises(module.PreflightError, match="top level"):
+        module._read_only_repository_identity(nested)
+
+
+def test_repository_identity_rejects_ancestor_replacement_during_git_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_tool()
+    repository = tmp_path / "repository"
+    subprocess.run(["/usr/bin/git", "init", "-q", str(repository)], check=True)
+    moved = tmp_path / "moved"
+    real_run = module.subprocess.run
+    replaced = False
+
+    def replacing_run(*args: object, **kwargs: object):
+        nonlocal replaced
+        completed = real_run(*args, **kwargs)
+        if not replaced:
+            repository.rename(moved)
+            repository.symlink_to(moved, target_is_directory=True)
+            replaced = True
+        return completed
+
+    monkeypatch.setattr(module.subprocess, "run", replacing_run)
+
+    with pytest.raises(module.PreflightError, match="repository"):
+        module._read_only_repository_identity(repository)
+
+
+def test_source_git_state_rejects_ancestor_replacement_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_tool()
+    repository = tmp_path / "repository"
+    subprocess.run(["/usr/bin/git", "init", "-q", str(repository)], check=True)
+    (repository / "tracked.txt").write_text("approved\n", encoding="utf-8")
+    subprocess.run(["/usr/bin/git", "-C", str(repository), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    moved = tmp_path / "moved"
+    real_run = module.subprocess.run
+    replaced = False
+
+    def replacing_run(*args: object, **kwargs: object):
+        nonlocal replaced
+        completed = real_run(*args, **kwargs)
+        if not replaced:
+            repository.rename(moved)
+            repository.symlink_to(moved, target_is_directory=True)
+            replaced = True
+        return completed
+
+    monkeypatch.setattr(module.subprocess, "run", replacing_run)
+
+    with pytest.raises(module.PreflightError, match="Git state"):
+        module._read_only_source_git_state(repository)
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        ("alias", "conversation id"),
+        ("missing", "exactly once"),
+        ("duplicate", "exactly once"),
+        ("canonical-alias-duplicate", "noncanonical"),
+        ("wrong-project", "owner project"),
+        ("linked-registry", "registry"),
+        ("malformed-registry", "header"),
+        ("unterminated-quoted-field", "CSV"),
+        ("unterminated-quoted-header", "CSV"),
+        ("wrong-registry-owner", "registry object"),
+        ("unsafe-registry-mode", "registry object"),
+    ),
+)
+def test_preflight_rejects_inexact_owner_before_any_probe(case: str, message: str) -> None:
+    module = load_tool()
+    values = valid_preflight_kwargs(module)
+    calls: list[tuple[str, ...]] = []
+    original_runner = values["runner"]
+    values["runner"] = lambda command: calls.append(command) or original_runner(command)
+    if case == "alias":
+        values["owner_thread"] = "approval-smoke-v1-1-6"
+    elif case == "missing":
+        values["registry_reader"] = lambda path: owner_registry_bytes(
+            conversation_id="019fefa5-f52a-74f3-8179-715e12d9cd2e"
+        )
+    elif case == "duplicate":
+        values["registry_reader"] = lambda path: owner_registry_bytes(duplicate=True)
+    elif case == "canonical-alias-duplicate":
+        payload = owner_registry_bytes()
+        row = payload.splitlines(keepends=True)[1]
+        alias = row.replace(OWNER_THREAD.encode(), OWNER_THREAD.upper().encode())
+        values["registry_reader"] = lambda path: payload + alias
+    elif case == "wrong-project":
+        values["registry_reader"] = lambda path: owner_registry_bytes(
+            project=Path("/home/god/Documents/Codex Workspace/Roadex")
+        )
+    elif case == "linked-registry":
+        original_is_symlink = values["is_symlink"]
+        values["is_symlink"] = lambda path: (
+            path == CODEX_PROJECTS_REGISTRY or original_is_symlink(path)
+        )
+    elif case == "malformed-registry":
+        values["registry_reader"] = lambda path: b"conversation_id,project\n"
+    elif case == "unterminated-quoted-field":
+        values["registry_reader"] = lambda path: owner_registry_bytes().replace(
+            b"codex-state,\n", b'codex-state,"unterminated\n'
+        )
+    elif case == "unterminated-quoted-header":
+        values["registry_reader"] = lambda path: (
+            b'conversation_id,label,project,command,launcher,created_at,updated_at,source,"notes\n'
+        )
+    else:
+        original_stat = values["path_stat"]
+
+        def path_stat(path: Path):
+            state = original_stat(path)
+            if path != CODEX_PROJECTS_REGISTRY:
+                return state
+            return SimpleNamespace(
+                st_mode=(
+                    stat.S_IFREG | 0o620
+                    if case == "unsafe-registry-mode"
+                    else state.st_mode
+                ),
+                st_uid=(
+                    state.st_uid
+                    if case == "unsafe-registry-mode"
+                    else os.geteuid() + 1
+                ),
+                st_gid=state.st_gid,
+                st_nlink=1,
+            )
+
+        values["path_stat"] = path_stat
+
+    with pytest.raises(module.PreflightError, match=message):
+        module.preflight(**values)
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -855,7 +1726,11 @@ def test_preflight_rejects_unsafe_kvm_path_image_runtime_and_tool_states(case: s
     values = valid_preflight_kwargs(module)
     original_runner = values["runner"]
     if case == "dirty":
-        values["runner"] = lambda command: " M file" if command[0] == "git-status" else original_runner(command)
+        values["source_git_probe"] = lambda path: {
+            "status": " M file",
+            "head": SOURCE_COMMIT,
+            "files": "src/overseer/cli.py\0tests/phase_b_rehearsal/guest_rehearsal.py\0",
+        }
     elif case == "missing-kvm":
         values["path_exists"] = lambda path: path != Path("/dev/kvm")
     elif case == "regular-kvm":
@@ -928,9 +1803,6 @@ def test_preflight_uses_only_read_only_probe_labels() -> None:
     module.preflight(**values)
 
     assert {command[0] for command in calls} == {
-        "git-status",
-        "git-head",
-        "git-files",
         "libvirt-uri",
         "domains",
         "domain-capabilities",
@@ -1078,6 +1950,20 @@ def test_source_manifest_is_tracked_only_and_rejects_post_plan_replacement(
         module.build_artifact_archive(root, manifest)
 
 
+def test_source_manifest_rejects_symlinked_ancestor_directory(tmp_path: Path) -> None:
+    module = load_tool()
+    root = tmp_path / "source"
+    outside = tmp_path / "outside"
+    package = outside / "overseer"
+    root.mkdir()
+    package.mkdir(parents=True)
+    (package / "cli.py").write_text("VALUE = 'outside'\n", encoding="utf-8")
+    (root / "src").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(module.PreflightError, match="artifact file"):
+        module.build_source_manifest(root, ("src/overseer/cli.py",))
+
+
 def test_import_probe_ignores_valid_adjacent_untracked_bytecode(
     tmp_path: Path,
 ) -> None:
@@ -1213,14 +2099,92 @@ def test_import_probe_rejects_manifested_symlink_escape_before_execution(
     assert not marker.exists()
 
 
-def test_render_plan_is_pure_canonical_and_probe_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_import_probe_rejects_symlinked_ancestor_before_manifested_code_execution(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    source = tmp_path / "source"
+    source_tree = source / "src"
+    package = source_tree / "overseer"
+    runtime = tmp_path / "runtime"
+    cryptography = runtime / "cryptography"
+    package.mkdir(parents=True)
+    cryptography.mkdir(parents=True)
+    marker = tmp_path / "ancestor-code-executed"
+    for relative in ("__init__.py", "user_bridge.py", "admin_executor.py"):
+        (package / relative).write_text("VALUE = 'approved'\n", encoding="utf-8")
+    (package / "cli.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    (cryptography / "__init__.py").write_text("VALUE = 'approved'\n", encoding="utf-8")
+    (runtime / "_cffi_backend.cpython-313-x86_64-linux-gnu.so").write_bytes(b"fixture")
+    tracked = tuple(
+        f"src/overseer/{name}"
+        for name in ("__init__.py", "admin_executor.py", "cli.py", "user_bridge.py")
+    )
+    source_manifest = module.build_source_manifest(source, tracked)
+    runtime_manifest = module.build_runtime_manifest(runtime)
+    outside = tmp_path / "outside-src"
+    source_tree.rename(outside)
+    source_tree.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        module._read_only_runner(
+            (
+                "import-probe",
+                str(source),
+                str(runtime),
+                module.canonical_json(source_manifest),
+                module.canonical_json(runtime_manifest),
+            )
+        )
+
+    assert not marker.exists()
+
+
+def test_future_archive_builder_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    module = load_tool()
+    root = tmp_path / "source"
+    directory = root / "src"
+    directory.mkdir(parents=True)
+    (directory / "file.py").write_text("VALUE = 'approved'\n", encoding="utf-8")
+    manifest = module.build_source_manifest(root, ("src/file.py",))
+    moved = tmp_path / "outside-src"
+    directory.rename(moved)
+    directory.symlink_to(moved, target_is_directory=True)
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-c",
+            module._archive_builder_python(),
+            str(root),
+            module.canonical_json(manifest),
+            str(tmp_path / "source.zip"),
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert completed.returncode != 0
+
+
+def test_render_plan_is_read_only_canonical_and_probe_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = load_tool()
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("render ran subprocess"))
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: pytest.fail("render spawned process"))
 
     rendered = render(module)
     plan = rendered["plan"]
-    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v6"
+    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v8"
     assert module.canonical_json(rendered) == json.dumps(rendered, sort_keys=True, separators=(",", ":"))
     assert rendered["planDigest"] == hashlib.sha256(module.canonical_json(plan).encode()).hexdigest()
     assert plan["sourceArtifact"]["manifest"] == artifact_manifest("source")
@@ -1248,6 +2212,89 @@ def test_render_plan_is_pure_canonical_and_probe_bound(monkeypatch: pytest.Monke
         SESSION_RUNTIME_DIR
     )
     assert f"XDG_RUNTIME_DIR={SESSION_RUNTIME_DIR}" in plan["executionCommand"]
+    assert plan["ownerBinding"] == owner_binding(module)
+
+
+def test_render_plan_digest_changes_with_exact_owner_binding() -> None:
+    module = load_tool()
+    first = render(module)
+    second_owner = "019fefa5-f52a-74f3-8179-715e12d9cd2e"
+    second = render(module, owner_binding=owner_binding(module, conversation_id=second_owner))
+
+    assert first["plan"]["ownerBinding"]["conversationId"] == OWNER_THREAD
+    assert second["plan"]["ownerBinding"]["conversationId"] == second_owner
+    assert first["planDigest"] != second["planDigest"]
+
+
+def test_render_plan_rejects_digest_valid_binding_not_in_live_registry() -> None:
+    module = load_tool()
+    attacker = "019fefa5-f52a-74f3-8179-715e12d9cd2e"
+    binding = owner_binding(module, conversation_id=attacker)
+    module._read_codex_projects_registry = lambda path: owner_registry_bytes()
+
+    with pytest.raises(module.PreflightError, match="live Codex projects registry"):
+        render(
+            module,
+            owner_binding=binding,
+            _registry_payload=owner_registry_bytes(),
+        )
+
+
+def test_render_plan_rejects_owner_binding_for_a_different_source_repository() -> None:
+    module = load_tool()
+    different_source = Path("/home/god/Documents/Codex Workspace/Other/source")
+    probe = runtime_probe()
+    probe["sourceRoot"] = str(different_source)
+    imports = probe["imports"]
+    assert isinstance(imports, dict)
+    for name in ("overseer.cli", "overseer.user_bridge", "overseer.admin_executor"):
+        imports[name] = str(imports[name]).replace(str(SOURCE_ROOT), str(different_source))
+
+    with pytest.raises(module.PreflightError, match="owner binding source repository"):
+        render(
+            module,
+            source_root=different_source,
+            runtime_probe=probe,
+        )
+
+
+@pytest.mark.parametrize("case", ("alias", "tampered-row", "tampered-binding"))
+def test_render_plan_rejects_invalid_owner_binding(case: str) -> None:
+    module = load_tool()
+    binding = owner_binding(module)
+    if case == "alias":
+        binding["conversationId"] = "approval-smoke-v1-1-6"
+    elif case == "tampered-row":
+        binding["registryRow"]["project"] = "/home/god/Documents/Codex Workspace/Roadex"
+    else:
+        binding["bindingDigest"] = "0" * 64
+
+    with pytest.raises(module.PreflightError, match="owner binding"):
+        render(module, owner_binding=binding)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("codexExecutable", "/tmp/codex"),
+        ("codexExecutableInode", 0),
+        ("codexExecutableSha256", "0" * 63),
+        ("codexArgv", ["codex", "resume", OWNER_THREAD, "--cd", "/tmp"]),
+    ),
+)
+def test_render_plan_rejects_semantically_forged_codex_process_binding(
+    field: str, value: object
+) -> None:
+    module = load_tool()
+    binding = owner_binding(module)
+    binding[field] = value
+    binding.pop("bindingDigest")
+    binding["bindingDigest"] = hashlib.sha256(
+        module.canonical_json(binding).encode()
+    ).hexdigest()
+
+    with pytest.raises(module.PreflightError, match="owner binding"):
+        render(module, owner_binding=binding)
 
 
 def test_domain_xml_parses_and_has_seed_only_no_host_share_with_owned_pipe_serial() -> None:
@@ -1628,9 +2675,28 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert disable < start
     assert script.rindex("verify_domain_ownership", disable, start) > disable
     assert "target VM already exists at future execution boundary" in script
-    assert "/usr/bin/git --no-optional-locks -c core.fsmonitor=false" in script
-    assert '-C "$SOURCE_ROOT" rev-parse HEAD' in script
-    assert '-C "$SOURCE_ROOT" status --porcelain' in script
+    assert "validate_exact_owner()" in script
+    assert script.index("validate_exact_owner\n") < script.index(
+        'if ! /usr/bin/mkdir "$RUN_LOCK"'
+    )
+    assert OWNER_THREAD in script
+    assert '"/proc/self/fd/{fd}"' in script
+    assert '"/usr/bin/tmux","list-panes","-s","-t","="+' in script
+    assert '"#{session_id}\\t#{session_name}\\t#{window_id}\\t#{pane_id}\\t#{pane_pid}\\t#{pane_tty}"' in script
+    assert "os.getppid()" in script
+    assert 'open_process(pid)' in script
+    assert 'if pane_pid not in ancestry' in script
+    assert 'codex=[record for record in second_ancestry if record["isCodex"]]' in script
+    assert 'len(codex)!=1 or codex[0]["argv"]!=expected["codexArgv"]' in script
+    assert 'expected["codexExecutableDevice"]' in script
+    assert 'expected["codexExecutableInode"]' in script
+    assert 'digest.hexdigest()!=expected["codexExecutableSha256"]' in script
+    assert "classify_codex(executable_path,argv,before.st_dev,before.st_ino)" in script
+    assert "complete owner binding reconstruction mismatch" in script
+    assert "launcher_tokens!=expected_launcher_tokens" in script
+    assert "ttyname" not in script
+    assert 'git(source_fd,"rev-parse","HEAD")' in script
+    assert 'git(source_fd,"status","--porcelain","--untracked-files=all")' in script
     assert "artifact changed after manifest" in script
     assert "source-manifest.json" in script and "runtime-manifest.json" in script
     assert "/usr/bin/genisoimage" in script

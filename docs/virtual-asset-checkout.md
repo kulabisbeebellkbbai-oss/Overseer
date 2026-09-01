@@ -251,10 +251,11 @@ For a digest-bound transition package, do not import `overseer` from a mutable
 worktree and do not inherit the caller's process environment. The prepared
 package must provide an exact replacement environment and execute a reviewed
 source archive only after opening it without following symlinks, verifying its
-approved SHA-256, copying the verified bytes into a sealed in-memory file, and
-importing from that sealed descriptor. Package preparation and source-archive
-verification remain non-execution steps; package import and the transition
-itself still require separate explicit approvals.
+approved byte size before reading, verifying its approved SHA-256, copying the
+verified bytes into a sealed in-memory file, and importing from that sealed
+descriptor. Package preparation and source-archive verification remain
+non-execution steps; package import and the transition itself still require
+separate explicit approvals.
 
 ## Live Listener Discovery
 

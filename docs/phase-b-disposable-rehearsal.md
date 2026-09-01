@@ -12,7 +12,7 @@ URL: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-
 SHA-512: 184761b0dad0f9ace02f9298050ca96ce3caa39a461a47706d47ff9698b59933918b91b40177fbd4d392f6446af8b4d18ecb94caca988169b19641606bf34003
 ```
 
-## v10 timing and timeout evidence
+## v11 timing and timeout evidence
 
 The rendered future script uses independent, bounded phases. The boot budget
 starts immediately after the owned domain is started and waits only for the
@@ -71,20 +71,69 @@ validated temporary-directory descriptor, then writes the hidden
 `.run-id.pending.json` record exclusively and durably. That pending record has
 schema `overseer.phase-b-rehearsal-timeout-pending.v1`, state
 `raw-cleanup-pending`, and `rawSerialRetained: true`, and binds the evidence
-root device/inode, pending-file device/inode, and final-record digest.
+root device/inode, pending-file device/inode, exact temporary-directory
+device/inode, complete descriptor-verified child count and inventory digest,
+and final-record digest.
 
-Raw serial and temporary files are then removed through the exact enumerated
-cleanup, the temporary directory is removed and its absence verified, and
-domain absence is revalidated immediately before publication. Publication
+Preparation also returns a canonical, maximum-1024-byte launcher-memory
+attestation with schema
+`overseer.phase-b-rehearsal-timeout-attestation.v1`. It binds the evidence-root
+and pending-file identities, the SHA-256 of the exact pending bytes, and the
+temporary-directory identity and inventory digest. The launcher keeps that
+value only in its running process. Exact raw removal must consume the prepared
+attestation and returns a successor attestation for the completed hidden
+record; final publication and bounded recovery must consume that successor.
+Consequently, a same-UID process cannot replace a hidden record with a new
+self-consistent object and continue the in-flight transition. If the launcher
+process loses its attestation, automatic publication stops and the remaining
+hidden record requires explicit manual recovery.
+
+After all fixed artifacts are finalized and before collector launch or domain
+definition, the launcher stores a
+second bounded in-memory attestation of the temporary directory and stable
+device/inode/type/owner/link identities of the complete fixed raw-artifact set,
+including `serial.log`, collector files, disk and seed images, manifests,
+archives, and domain/cloud-init inputs. Preparation requires those same
+identities while it captures the complete cleanup inventory. Only the
+collector-ready, service-entry, terminal-status, progress, and empty
+stop-control children are stage-dependent or non-diagnostic. A required child renamed, removed, or
+replaced before preparation therefore prevents any cleanup attestation or final
+evidence publication.
+
+The launcher precreates the mode-`0600` serial log before sealing this identity.
+The collector opens that exact existing safe object without truncation or
+replacement and must match the sealed device/inode before it publishes
+readiness. A rename, decoy, or ABA swap after the seal is therefore rejected
+either by the collector or by preparation and cannot leave an escaped
+descriptor receiving guest output while final evidence is published.
+
+Raw serial and temporary files are pinned and removed relative to the exact
+attested temporary-directory descriptor. Every child must have the exact safe
+type, owner, mode, and single-link identity; each open descriptor must report
+the same metadata and inventory digest captured during preparation, and each
+open descriptor must report zero links after unlink. A child renamed or
+hardlinked out after preparation therefore prevents completed evidence. The
+directory is removed only after its parent entry
+still matches the attested device/inode, and the held directory descriptor must
+then report zero links. A rename or replacement therefore fails closed and
+cannot produce a final record while the original raw directory survives.
+Domain absence is revalidated immediately before publication. Publication
 reopens and reattests the evidence root and pending file, writes and fsyncs a
 new private `raw-cleanup-complete` record with `rawSerialRetained: false`, then
 atomically replaces the hidden pending name. It never truncates the only
-recovery record in place. Publication then uses an exclusive no-overwrite link
+recovery record in place. The completed staging record must byte-semantically
+equal the deterministic transformation of the independently revalidated
+pending record; self-consistent but altered staging fields are rejected.
+Publication then uses an exclusive no-overwrite link
 for the final exact record. A collision, identity change, malformed
 status/progress, unsafe metadata, incomplete cleanup, or any
 write/link/fsync/unlink failure fails closed while retaining either the prior
-valid pending record or the valid completed replacement. A changed or unknown
-target-domain state produces no final record.
+valid pending record or the valid completed hidden replacement. A completed
+staging sibling is accepted only inside the same removal invocation that just
+verified exact descriptor-based cleanup. A later invocation with an absent
+temporary path and a still-pending hidden record always requires explicit
+manual recovery; same-UID staging content is never treated as proof of prior
+deletion. A changed or unknown target-domain state produces no final record.
 
 The timeout record schema is
 `overseer.phase-b-rehearsal-timeout-evidence.v1` and its exact fields are:
@@ -180,7 +229,7 @@ helper or refresh the index during the read-only probe.
 
 ## Immutable host-to-guest handoff
 
-The v10 plan has no host filesystem share. It binds canonical source and runtime
+The v11 plan has no host filesystem share. It binds canonical source and runtime
 manifests, their SHA-256 digests, deterministic stored-ZIP digests, the runtime
 probe, KVM capability probe, source commit, exact owner attestation, domain XML,
 cloud-init, and future script under `planDigest`. The owner attestation contains
@@ -332,6 +381,10 @@ creates no timeout evidence. Collector stop is bounded to 10 seconds and must
 reap a clean child exit before a complete result is accepted. A timeout or
 unclean collector exit returns without an unbounded `wait`, retains the exact
 temporary artifacts and execution lock, and requires explicit recovery.
+The collector is bound once by PID and `/proc` start time, while subsequent
+liveness checks and TERM/KILL requests open a pidfd, revalidate that start
+identity, and signal only through the pidfd. PID reuse or identity mismatch
+retains artifacts and the lock without signaling the unrelated process.
 Shutdown is attempted before waiting on a collector so guest chatter cannot
 block owned VM cleanup.
 

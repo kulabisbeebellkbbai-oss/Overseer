@@ -74,7 +74,10 @@ and terminal result status. The host checks the exact collector child during
 both waits and requires a bounded clean collector seal before accepting
 completion. If the collector cannot be cleanly reaped within its stop budget,
 cleanup returns without an unbounded wait and retains the exact artifacts and
-execution lock for explicit recovery.
+execution lock for explicit recovery. The collector binding includes its PID
+and `/proc` start time. Every later state check or signal opens a pidfd and
+revalidates that start identity; PID reuse therefore fails closed without
+signaling the replacement process.
 
 The passing contract remains unchanged: a run passes only after the existing
 collector reaches `complete`, the owned VM is inactive and absent, the
@@ -119,15 +122,44 @@ directories without following links and reads status children relative to one
 pinned temporary-directory descriptor. Before raw cleanup it creates and
 fsyncs a mode-0600 hidden pending record that accurately reports
 `raw-cleanup-pending` and raw retention, then returns a bounded attestation of
-the root and pending-file identities plus the final-record digest. After
-confirmed owned-domain absence, exact raw cleanup, and verified temporary-path
-absence, publication revalidates those identities, writes and fsyncs a new
+the evidence root, pending file, exact temporary-directory identity, and
+complete descriptor-verified child inventory digest plus the final-record
+digest. This canonical launcher-memory handoff uses
+`overseer.phase-b-rehearsal-timeout-attestation.v1`, is bounded to 1024 bytes,
+and additionally binds the SHA-256 of the exact pending bytes. After confirmed
+owned-domain absence, preparation first consumes an earlier launcher-memory
+seal created after fixed-artifact finalization and before collector launch or
+domain definition. The serial log is precreated and the collector opens that
+exact existing object only when its opened device/inode matches the launcher
+seal, before readiness is published. That seal
+binds the temporary directory and stable identities of every fixed raw child;
+only collector-ready and the stage-dependent service-entry, terminal-status,
+progress, and empty stop-control children are outside that diagnostic identity set. Cleanup then
+consumes the exact prepared attestation, opens
+and pins the attested temporary directory and every allowlisted child, requires the child
+inventory to match the prepared digest, removes children relative to that
+descriptor, verifies each held child has zero links,
+removes the parent entry only while it still resolves to the attested directory,
+and verifies the held directory itself has zero links. Rename, replacement, or
+hardlink substitution cannot produce a completed cleanup attestation. The
+exact-removal invocation writes and fsyncs a new
 private `raw-cleanup-complete` record, atomically replaces the hidden pending
-name, rechecks target-domain absence, and creates the exact final
+name, and returns a successor launcher-memory attestation for that exact
+completed object. Publication consumes the successor, rechecks target-domain
+absence, and creates the exact final
 `<run-id>.json` without overwrite. It never truncates the only recovery record
-in place. A final-publication failure therefore leaves either the prior valid
-pending record or the valid completed replacement instead of silently losing
-both raw and sanitized diagnostics. An existing destination, root or hidden
+in place. Before replacement, completed staging must exactly equal the
+deterministic transformation of the independently revalidated pending record;
+self-consistent semantic substitutions fail closed. A final-publication
+failure therefore leaves either the prior valid
+pending record or the valid completed hidden replacement instead of silently
+losing both raw and sanitized diagnostics. Staging is usable only within the
+same exact-removal invocation; path absence plus a still-pending hidden record
+fails closed for explicit manual recovery because same-UID staging is not
+unforgeable deletion evidence. Loss of the launcher-memory attestation also
+requires explicit manual recovery; filesystem content alone cannot resume or
+authenticate the transition. A same-UID hidden-record replacement therefore
+cannot self-attest and publish. An existing destination, root or hidden
 replacement, unsafe status metadata, malformed progress, unknown domain state,
 incomplete raw cleanup, or write failure fails closed.
 

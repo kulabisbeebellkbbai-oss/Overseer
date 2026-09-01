@@ -67,6 +67,7 @@ EXPECTED_IMPORTS = (
 EXPECTED_PYTHON_VERSION = "3.13.5"
 EXPECTED_PYTHON_ABI = "cpython-313-x86_64-linux-gnu"
 MANIFEST_SCHEMA = "overseer.rehearsal-artifact-manifest.v1"
+MAX_TIMEOUT_ATTESTATION_BYTES = 1024
 EXPECTED_CONTROLS = frozenset(
     {
         "systemdCredentials",
@@ -446,7 +447,7 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
     )
     assert module.DEFAULT_RUNTIME_SITE == RUNTIME_SITE
     assert module.MACHINE_TYPE == MACHINE_TYPE
-    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v10"
+    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v11"
     assert module.BOOT_TIMEOUT_SECONDS == 600
     assert module.RESULT_TIMEOUT_SECONDS == 1020
     assert module.SHUTDOWN_TIMEOUT_SECONDS == 120
@@ -472,7 +473,10 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
     assert module.MAX_TIMEOUT_EVIDENCE_BYTES == 2048
     assert module.EXACT_TOOLS["python"] == "/usr/bin/python3.13"
     assert module.EXACT_TOOLS["genisoimage"] == "/usr/bin/genisoimage"
-    assert module.EXACT_TOOLS["kill"] == "/usr/bin/kill"
+    assert "kill" not in module.EXACT_TOOLS
+    collector_control = module._collector_process_control_python()
+    assert "os.pidfd_open" in collector_control
+    assert "signal.pidfd_send_signal" in collector_control
     assert "cloud-localds" not in module.EXACT_TOOLS
     assert all(Path(value).is_absolute() for value in module.EXACT_TOOLS.values())
 
@@ -490,7 +494,7 @@ def test_second_round_timing_and_embedded_bounds_are_single_source() -> None:
     assert module.TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS > 0
 
     rendered = render(module)["plan"]
-    assert rendered["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v10"
+    assert rendered["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v11"
     assert rendered["timeouts"] == {
         "bootSeconds": module.BOOT_TIMEOUT_SECONDS,
         "resultSeconds": module.RESULT_TIMEOUT_SECONDS,
@@ -509,9 +513,20 @@ def test_second_round_timing_and_embedded_bounds_are_single_source() -> None:
     assert rendered["serialLog"]["maxBytes"] == module.MAX_SERIAL_BYTES
     assert rendered["serialLog"]["maxLineBytes"] == module.MAX_SERIAL_LINE_BYTES
     assert rendered["timeoutEvidence"]["maxBytes"] == module.MAX_TIMEOUT_EVIDENCE_BYTES
+    assert (
+        rendered["timeoutEvidence"]["maxAttestationBytes"]
+        == module.MAX_TIMEOUT_ATTESTATION_BYTES
+    )
     assert rendered["timeoutEvidence"]["pendingSchema"] == module.TIMEOUT_EVIDENCE_PENDING_SCHEMA
+    assert (
+        rendered["timeoutEvidence"]["attestationSchema"]
+        == module.TIMEOUT_EVIDENCE_ATTESTATION_SCHEMA
+    )
     assert rendered["timeoutEvidence"]["pendingState"] == "raw-cleanup-pending"
     assert rendered["timeoutEvidence"]["completeState"] == "raw-cleanup-complete"
+    assert rendered["timeoutEvidence"]["requiredRawNames"] == sorted(
+        module.TIMEOUT_REQUIRED_RAW_NAMES
+    )
 
     script = rendered["futureScript"]
     assert f"readonly COLLECTOR_READY_TIMEOUT_SECONDS={module.COLLECTOR_READY_TIMEOUT_SECONDS}" in script
@@ -520,9 +535,25 @@ def test_second_round_timing_and_embedded_bounds_are_single_source() -> None:
     assert f"readonly GUEST_WATCHDOG_SECONDS={module.GUEST_WATCHDOG_SECONDS}" in script
     assert f"readonly SYSTEMD_HARD_STOP_SECONDS={module.SYSTEMD_HARD_STOP_SECONDS}" in script
     assert f"readonly MAX_TIMEOUT_EVIDENCE_BYTES={module.MAX_TIMEOUT_EVIDENCE_BYTES}" in script
+    assert (
+        f"readonly MAX_TIMEOUT_ATTESTATION_BYTES={module.MAX_TIMEOUT_ATTESTATION_BYTES}"
+        in script
+    )
     assert f"MAX_RECORD_BYTES={module.MAX_TIMEOUT_EVIDENCE_BYTES}" in module._timeout_evidence_python()
+    assert (
+        f"MAX_ATTESTATION_BYTES={module.MAX_TIMEOUT_ATTESTATION_BYTES}"
+        in module._timeout_evidence_python()
+    )
     assert repr(module.PROGRESS_PREFIX) in module._serial_collector_python()
     assert repr(module.PROGRESS_SCHEMA) in module._serial_collector_python()
+    collector = module._serial_collector_python()
+    log_open = collector[
+        collector.index("def open_bound_log") : collector.index("def publish_terminal")
+    ]
+    assert "O_CREAT" not in log_open
+    assert "out=open_bound_log(log)" in collector
+    assert "(state.st_dev,state.st_ino)!=EXPECTED_LOG_IDENTITY" in collector
+    assert '"$SERIAL_STOP" "$TIMEOUT_RAW_IDENTITY_ATTESTATION"' in script
 
 
 def test_docs_describe_configured_budget_and_cleanup_overhead() -> None:
@@ -2304,7 +2335,7 @@ def test_render_plan_is_read_only_canonical_and_probe_bound(
 
     rendered = render(module)
     plan = rendered["plan"]
-    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v10"
+    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v11"
     assert module.canonical_json(rendered) == json.dumps(rendered, sort_keys=True, separators=(",", ":"))
     assert rendered["planDigest"] == hashlib.sha256(module.canonical_json(plan).encode()).hexdigest()
     assert plan["sourceArtifact"]["manifest"] == artifact_manifest("source")
@@ -2342,20 +2373,29 @@ def test_render_plan_is_read_only_canonical_and_probe_bound(
     assert plan["timeoutEvidence"]["maxBytes"] == module.MAX_TIMEOUT_EVIDENCE_BYTES
     assert plan["timeoutEvidence"] == {
         "schemaVersion": module.TIMEOUT_EVIDENCE_SCHEMA,
+        "attestationSchema": module.TIMEOUT_EVIDENCE_ATTESTATION_SCHEMA,
+        "rawIdentityAttestationSchema": module.TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA,
         "root": str(module.TIMEOUT_EVIDENCE_ROOT),
         "directoryMode": "0700",
         "fileMode": "0600",
         "maxBytes": module.MAX_TIMEOUT_EVIDENCE_BYTES,
+        "maxAttestationBytes": module.MAX_TIMEOUT_ATTESTATION_BYTES,
         "finalName": "<run-id>.json",
         "temporaryName": ".<run-id>.pending.json",
         "pendingSchema": module.TIMEOUT_EVIDENCE_PENDING_SCHEMA,
         "pendingState": "raw-cleanup-pending",
         "completeState": "raw-cleanup-complete",
+        "requiredRawNames": sorted(module.TIMEOUT_REQUIRED_RAW_NAMES),
         "attestationFields": [
             "rootDevice",
             "rootInode",
             "pendingDevice",
             "pendingInode",
+            "pendingSha256",
+            "tempDevice",
+            "tempInode",
+            "tempEntryCount",
+            "tempInventorySha256",
             "finalRecordSha256",
         ],
         "rawSerialRetained": False,
@@ -3000,7 +3040,7 @@ def _run_cleanup_harness(
     evidence_root: Path | None = None,
     collector_setup: str = "",
 ) -> subprocess.CompletedProcess[str]:
-    start = script.index("domain_presence() {")
+    start = script.index("readonly COLLECTOR_CONTROL_CODE=")
     end = script.index("trap 'cleanup $?' EXIT")
     helpers = script[start:end].replace("/usr/bin/virsh", "virsh")
     paths = {
@@ -3028,8 +3068,11 @@ def _run_cleanup_harness(
         if name != "SERIAL_PIPE":
             content = domain_xml if name == "DOMAIN_XML" and domain_xml is not None else "fixture"
             path.write_text(content, encoding="utf-8")
+            path.chmod(0o600)
     for suffix in (".in", ".out"):
-        Path(str(paths["SERIAL_PIPE"]) + suffix).write_text("fixture", encoding="utf-8")
+        pipe_path = Path(str(paths["SERIAL_PIPE"]) + suffix)
+        pipe_path.write_text("fixture", encoding="utf-8")
+        pipe_path.chmod(0o600)
     for name, content in (
         ("SERIAL_READY_STATUS", "collector-ready\n"),
         ("SERIAL_SERVICE_STATUS", service_status),
@@ -3062,10 +3105,13 @@ def _run_cleanup_harness(
         "SHUTDOWN_TIMEOUT_SECONDS=1",
         "COLLECTOR_STOP_TIMEOUT_SECONDS=1",
         "TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS=1",
+        f"MAX_TIMEOUT_ATTESTATION_BYTES={MAX_TIMEOUT_ATTESTATION_BYTES}",
         f"TIMEOUT_KIND={shlex.quote(timeout_kind)}",
         f"EVIDENCE_ROOT={shlex.quote(str(selected_evidence_root))}",
         f"TIMEOUT_EVIDENCE_TEMP={shlex.quote(str(evidence_temp))}",
         f"TIMEOUT_EVIDENCE_FINAL={shlex.quote(str(evidence_final))}",
+        "TIMEOUT_EVIDENCE_ATTESTATION=",
+        "TIMEOUT_RAW_IDENTITY_ATTESTATION=",
         "COLLECTOR_PID=",
         "LOCK_HELD=1",
         f"RUN_LOCK={shlex.quote(str(run_lock))}",
@@ -3073,6 +3119,7 @@ def _run_cleanup_harness(
         *(f"{name}={shlex.quote(str(path))}" for name, path in paths.items()),
         virsh_function,
         helpers,
+        "bind_timeout_raw_identity",
         collector_setup,
         f"cleanup {original_status}",
     ]
@@ -3350,7 +3397,12 @@ def _progress_line(module, stage: str = "provisioning") -> bytes:
 
 
 def _run_collector(
-    module, tmp_path: Path, payload: bytes
+    module,
+    tmp_path: Path,
+    payload: bytes,
+    *,
+    serial_identity_offset: int = 0,
+    expect_ready: bool = True,
 ) -> tuple[dict[str, Path], subprocess.CompletedProcess[bytes]]:
     paths = {
         "pipe": tmp_path / "serial.out",
@@ -3362,6 +3414,20 @@ def _run_collector(
         "stop": tmp_path / "serial.stop",
     }
     os.mkfifo(paths["pipe"], 0o600)
+    paths["log"].touch(mode=0o600)
+    log_state = paths["log"].stat()
+    raw_identity = module.canonical_json(
+        {
+            "schemaVersion": module.TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA,
+            "tempDevice": tmp_path.stat().st_dev,
+            "tempInode": tmp_path.stat().st_ino,
+            "childCount": len(module.TIMEOUT_REQUIRED_RAW_NAMES),
+            "identitySha256": "0" * 64,
+            "serialLogDevice": log_state.st_dev,
+            "serialLogInode": log_state.st_ino + serial_identity_offset,
+            "secretValuesRecorded": False,
+        }
+    )
     process = subprocess.Popen(
         (
             sys.executable,
@@ -3377,6 +3443,7 @@ def _run_collector(
             str(paths["service"]),
             str(paths["progress"]),
             str(paths["stop"]),
+            raw_identity,
             str(module.MAX_SERIAL_BYTES),
             str(module.MAX_SERIAL_LINE_BYTES),
         ),
@@ -3393,6 +3460,13 @@ def _run_collector(
         time.sleep(0.01)
     if process.poll() is not None:
         stdout, stderr = process.communicate(timeout=5)
+        if not expect_ready:
+            return paths, subprocess.CompletedProcess(
+                process.args,
+                process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
         raise AssertionError(
             f"collector exited before FIFO readiness: rc={process.returncode}, "
             f"stdout={stdout!r}, stderr={stderr!r}"
@@ -3413,6 +3487,24 @@ def _run_collector(
     return paths, subprocess.CompletedProcess(
         process.args, process.returncode, stdout=stdout, stderr=stderr
     )
+
+
+def test_serial_collector_rejects_log_inode_outside_launcher_seal(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+
+    paths, completed = _run_collector(
+        module,
+        tmp_path,
+        b"",
+        serial_identity_offset=1,
+        expect_ready=False,
+    )
+
+    assert completed.returncode != 0
+    assert not paths["ready"].exists()
+    assert paths["log"].read_bytes() == b""
 
 
 def test_serial_collector_publishes_exact_marker_and_last_canonical_progress(
@@ -3551,6 +3643,12 @@ def test_future_script_has_independent_boot_and_result_waits_without_real_waitin
     assert script.index('start "$VM_UUID"') < script.index(
         "wait_for_service_entry\nwait_status=$?"
     )
+    assert (
+        script.index('/usr/bin/cat >"$DOMAIN_XML"')
+        < script.index("bind_timeout_raw_identity ||")
+        < script.index('/usr/bin/python3.13 -B -s -P -S "$SERIAL_COLLECTOR"')
+        < script.index('define --validate "$DOMAIN_XML"')
+    )
     assert "if ! wait_for_service_entry" not in script
     boot_wait = script.index("bounded rehearsal boot wait expired")
     result_wait = script.index("bounded rehearsal result wait expired")
@@ -3572,9 +3670,11 @@ def test_future_script_has_independent_boot_and_result_waits_without_real_waitin
     cleanup = script[cleanup_start:cleanup_end]
     prepare = cleanup.index("prepare_timeout_evidence")
     remove = cleanup.index("remove_timeout_raw_artifacts")
-    rmdir = cleanup.index('/usr/bin/rmdir -- "$TEMP_DIR"')
     publish = cleanup.index("publish_timeout_evidence")
-    assert prepare < remove < rmdir < publish
+    assert prepare < remove < publish
+    assert cleanup.index("remove_success_raw_artifacts") < cleanup.index(
+        '/usr/bin/rmdir -- "$TEMP_DIR"'
+    )
     assert 'if [[ -n "$TIMEOUT_KIND" ]]' in cleanup
     assert 'TIMEOUT_KIND=""' in script
     assert script.index('TIMEOUT_KIND=""') < script.index("cleanup() {")
@@ -3657,7 +3757,7 @@ def test_future_script_has_collector_readiness_liveness_and_ordered_cleanup() ->
 def _run_future_control_harness(
     script: str, tmp_path: Path, body: str
 ) -> subprocess.CompletedProcess[str]:
-    start = script.index("stop_collector() {")
+    start = script.index("readonly COLLECTOR_CONTROL_CODE=")
     end = script.index("cleanup() {")
     helpers = script[start:end]
     ready = tmp_path / "serial.ready"
@@ -3697,8 +3797,9 @@ def test_generated_wait_distinguishes_collector_dead_before_ready(tmp_path: Path
     body = "\n".join(
         (
             "set +e",
-            "/usr/bin/bash -c 'exit 17' &",
+            "/usr/bin/bash -c 'sleep 0.1; exit 17' &",
             "COLLECTOR_PID=$!",
+            "bind_collector",
             "wait_for_collector_ready",
             "observed=$?",
             "wait \"$COLLECTOR_PID\" 2>/dev/null",
@@ -3719,9 +3820,10 @@ def test_generated_wait_rejects_ready_file_from_dead_collector(tmp_path: Path) -
     body = "\n".join(
         (
             "set +e",
-            "/usr/bin/bash -c 'exit 17' &",
+            "/usr/bin/bash -c 'sleep 0.1; exit 17' &",
             "COLLECTOR_PID=$!",
-            "/usr/bin/sleep 0.1",
+            "bind_collector",
+            "/usr/bin/sleep 0.2",
             "wait_for_collector_ready",
             "observed=$?",
             "wait \"$COLLECTOR_PID\" 2>/dev/null",
@@ -3743,6 +3845,7 @@ def test_generated_wait_detects_collector_death_during_boot(tmp_path: Path) -> N
             "set +e",
             "/usr/bin/bash -c 'sleep 0.1; exit 17' &",
             "COLLECTOR_PID=$!",
+            "bind_collector",
             "wait_for_service_entry",
             "observed=$?",
             "wait \"$COLLECTOR_PID\" 2>/dev/null",
@@ -3763,8 +3866,9 @@ def test_generated_stop_rejects_collector_death_after_complete(tmp_path: Path) -
     body = "\n".join(
         (
             "set +e",
-            "/usr/bin/bash -c 'exit 17' &",
+            "/usr/bin/bash -c 'sleep 0.1; exit 17' &",
             "COLLECTOR_PID=$!",
+            "bind_collector",
             "stop_collector",
             "observed=$?",
             "printf '%s\\n' \"$observed\"",
@@ -3786,6 +3890,7 @@ def test_generated_collector_stop_is_bounded_without_long_wait(tmp_path: Path) -
             "/usr/bin/bash -c 'sleep 10' &",
             "child=$!",
             "COLLECTOR_PID=$child",
+            "bind_collector",
             "stop_collector",
             "observed=$?",
             "kill \"$child\" 2>/dev/null",
@@ -3804,6 +3909,48 @@ def test_generated_collector_stop_is_bounded_without_long_wait(tmp_path: Path) -
     assert stop.index("return 1", deadline) < stop.index('wait "$pid"')
 
 
+def test_pidfd_collector_control_rejects_start_identity_mismatch() -> None:
+    module = load_tool()
+    control = module._collector_process_control_python()
+    child = subprocess.Popen(("/usr/bin/sleep", "10"))
+    try:
+        bound = subprocess.run(
+            (sys.executable, "-B", "-s", "-P", "-S", "-c", control, "bind", str(child.pid)),
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        assert bound.returncode == 0, bound.stderr
+        assert bound.stdout.strip().isdigit()
+
+        rejected = subprocess.run(
+            (
+                sys.executable,
+                "-B",
+                "-s",
+                "-P",
+                "-S",
+                "-c",
+                control,
+                "signal",
+                str(child.pid),
+                "0",
+                "KILL",
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+
+        assert rejected.returncode != 0
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
 def _run_timeout_evidence(
     module,
     mode: str,
@@ -3815,6 +3962,53 @@ def _run_timeout_evidence(
     service_path: Path,
     terminal_path: Path,
     progress_path: Path,
+    attestation: str | None = None,
+    *,
+    helper_code: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    selected_helper = helper_code or module._timeout_evidence_python()
+    if mode == "prepare" and attestation is None:
+        bound = _bind_timeout_raw_identity(
+            module,
+            service_path.parent,
+            helper_code=selected_helper,
+        )
+        if bound.returncode != 0:
+            return bound
+        attestation = bound.stdout.strip()
+    argv = (
+        sys.executable,
+        "-B",
+        "-s",
+        "-P",
+        "-S",
+        "-c",
+        selected_helper,
+        mode,
+        str(evidence_root),
+        run_id,
+        vm_name,
+        source_commit,
+        failure,
+        str(service_path.parent),
+    )
+    if attestation is not None:
+        argv = (*argv, attestation)
+    return subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=5,
+    )
+
+
+def _bind_timeout_raw_identity(
+    module,
+    temp_dir: Path,
+    *,
+    helper_code: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         (
@@ -3824,14 +4018,9 @@ def _run_timeout_evidence(
             "-P",
             "-S",
             "-c",
-            module._timeout_evidence_python(),
-            mode,
-            str(evidence_root),
-            run_id,
-            vm_name,
-            source_commit,
-            failure,
-            str(service_path.parent),
+            helper_code or module._timeout_evidence_python(),
+            "bind",
+            str(temp_dir),
         ),
         check=False,
         capture_output=True,
@@ -3851,6 +4040,10 @@ def _write_timeout_statuses(
 ) -> tuple[Path, Path, Path]:
     temp_dir = tmp_path / "temp"
     temp_dir.mkdir(mode=0o700)
+    for name in module.TIMEOUT_REQUIRED_RAW_NAMES:
+        path = temp_dir / name
+        path.write_text("fixture", encoding="ascii")
+        path.chmod(0o600)
     service_path = temp_dir / "serial.service-started"
     terminal_path = temp_dir / "serial.status"
     progress_path = temp_dir / "serial.progress"
@@ -3892,6 +4085,28 @@ def _expected_timeout_record(
     }
 
 
+def _expected_temp_inventory(module, temp_dir: Path) -> tuple[int, str]:
+    entries = []
+    for path in sorted(temp_dir.iterdir(), key=lambda item: item.name):
+        state = path.stat(follow_symlinks=False)
+        entries.append(
+            {
+                "name": path.name,
+                "device": state.st_dev,
+                "inode": state.st_ino,
+                "mode": state.st_mode,
+                "uid": state.st_uid,
+                "gid": state.st_gid,
+                "links": state.st_nlink,
+                "size": state.st_size,
+                "modifiedNs": state.st_mtime_ns,
+                "changedNs": state.st_ctime_ns,
+            }
+        )
+    payload = module.canonical_json(entries).encode("ascii")
+    return len(entries), hashlib.sha256(payload).hexdigest()
+
+
 def test_timeout_evidence_prepare_writes_durable_pending_attestation(
     tmp_path: Path,
 ) -> None:
@@ -3923,6 +4138,14 @@ def test_timeout_evidence_prepare_writes_durable_pending_attestation(
     pending = root / f".{run_id}.pending.json"
     assert pending.exists()
     record = json.loads(pending.read_text(encoding="ascii"))
+    attestation = json.loads(prepared.stdout)
+    assert prepared.stdout.strip() == module.canonical_json(attestation)
+    assert len(prepared.stdout.strip().encode("ascii")) <= (
+        module.MAX_TIMEOUT_ATTESTATION_BYTES
+    )
+    inventory_count, inventory_sha256 = _expected_temp_inventory(
+        module, service_path.parent
+    )
     final_record = _expected_timeout_record(
         module,
         run_id=run_id,
@@ -3943,15 +4166,111 @@ def test_timeout_evidence_prepare_writes_durable_pending_attestation(
         "rootInode": root.stat().st_ino,
         "pendingDevice": pending.stat().st_dev,
         "pendingInode": pending.stat().st_ino,
+        "tempDevice": service_path.parent.stat().st_dev,
+        "tempInode": service_path.parent.stat().st_ino,
+        "tempEntryCount": inventory_count,
+        "tempInventorySha256": inventory_sha256,
         "finalRecordSha256": hashlib.sha256(
             (module.canonical_json(final_record) + "\n").encode("ascii")
         ).hexdigest(),
+    }
+    assert attestation == {
+        "schemaVersion": module.TIMEOUT_EVIDENCE_ATTESTATION_SCHEMA,
+        "state": "raw-cleanup-pending",
+        "rootDevice": root.stat().st_dev,
+        "rootInode": root.stat().st_ino,
+        "pendingDevice": pending.stat().st_dev,
+        "pendingInode": pending.stat().st_ino,
+        "pendingSha256": hashlib.sha256(pending.read_bytes()).hexdigest(),
+        "tempDevice": service_path.parent.stat().st_dev,
+        "tempInode": service_path.parent.stat().st_ino,
+        "tempInventorySha256": inventory_sha256,
+        "secretValuesRecorded": False,
     }
     assert stat.S_IMODE(pending.stat().st_mode) == 0o600
     assert len(pending.read_bytes()) <= module.MAX_TIMEOUT_EVIDENCE_BYTES
     helper = module._timeout_evidence_python()
     assert "os.ftruncate" not in helper
     assert "os.replace(staging,hidden" in helper
+
+
+def test_timeout_evidence_prepare_rejects_pre_attestation_raw_child_escape(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    run_id = "8" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-888888888888"
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    serial_log = service_path.parent / "serial.log"
+    escaped = tmp_path / "escaped-serial.log"
+    serial_log.rename(escaped)
+    root = tmp_path / "evidence"
+
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        "9" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert prepared.returncode != 0
+    assert escaped.read_text(encoding="ascii") == "fixture"
+    assert not root.exists()
+
+
+def test_timeout_evidence_prepare_rejects_bound_raw_child_replacement(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    run_id = "9" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-999999999999"
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    raw_identity = _bind_timeout_raw_identity(module, service_path.parent)
+    assert raw_identity.returncode == 0, raw_identity.stderr
+    raw_record = json.loads(raw_identity.stdout)
+    assert raw_identity.stdout.strip() == module.canonical_json(raw_record)
+    assert raw_record == {
+        "schemaVersion": module.TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA,
+        "tempDevice": service_path.parent.stat().st_dev,
+        "tempInode": service_path.parent.stat().st_ino,
+        "childCount": len(module.TIMEOUT_REQUIRED_RAW_NAMES),
+        "identitySha256": raw_record["identitySha256"],
+        "serialLogDevice": (service_path.parent / "serial.log").stat().st_dev,
+        "serialLogInode": (service_path.parent / "serial.log").stat().st_ino,
+        "secretValuesRecorded": False,
+    }
+    assert len(raw_record["identitySha256"]) == 64
+    serial_log = service_path.parent / "serial.log"
+    escaped = tmp_path / "escaped-serial.log"
+    serial_log.rename(escaped)
+    serial_log.write_text("safe decoy", encoding="ascii")
+    serial_log.chmod(0o600)
+    root = tmp_path / "evidence"
+
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        "a" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        raw_identity.stdout.strip(),
+    )
+
+    assert prepared.returncode != 0
+    assert escaped.read_text(encoding="ascii") == "fixture"
+    assert serial_log.read_text(encoding="ascii") == "safe decoy"
+    assert not root.exists()
 
 
 def test_timeout_evidence_publish_transforms_pending_before_final_collision(
@@ -3979,7 +4298,20 @@ def test_timeout_evidence_publish_transforms_pending_before_final_collision(
     pending_inode = pending.stat().st_ino
     final = root / f"{run_id}.json"
     final.write_text("existing\n", encoding="ascii")
-    shutil.rmtree(service_path.parent)
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        "a" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+    )
+    assert removed.returncode == 0, removed.stderr
 
     published = _run_timeout_evidence(
         module,
@@ -3992,6 +4324,7 @@ def test_timeout_evidence_publish_transforms_pending_before_final_collision(
         service_path,
         terminal_path,
         progress_path,
+        removed.stdout.strip(),
     )
 
     assert published.returncode != 0
@@ -4006,7 +4339,7 @@ def test_timeout_evidence_publish_transforms_pending_before_final_collision(
 
 
 @pytest.mark.parametrize("staging_kind", ("complete", "partial"))
-def test_timeout_evidence_recovers_interrupted_complete_staging(
+def test_timeout_evidence_requires_manual_recovery_for_interrupted_staging(
     tmp_path: Path,
     staging_kind: str,
 ) -> None:
@@ -4059,12 +4392,237 @@ def test_timeout_evidence_recovers_interrupted_complete_staging(
         service_path,
         terminal_path,
         progress_path,
+        prepared.stdout.strip(),
     )
 
-    assert published.returncode == 0, published.stderr
-    assert (root / f"{run_id}.json").is_file()
-    assert not hidden.exists()
-    assert not staging.exists()
+    assert published.returncode != 0
+    assert hidden.is_file()
+    assert not (root / f"{run_id}.json").exists()
+
+
+def test_timeout_evidence_remove_rejects_semantically_forged_staging(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    run_id = "3" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-333333333333"
+    source_commit = "4" * 40
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    hidden = root / f".{run_id}.pending.json"
+    staging = root / f".{run_id}.pending.json.next"
+    staging.touch(mode=0o600)
+    forged = json.loads(hidden.read_text(encoding="ascii"))
+    forged["state"] = "raw-cleanup-complete"
+    forged["rawSerialRetained"] = False
+    forged["serviceStarted"] = False
+    forged["pendingDevice"] = staging.stat().st_dev
+    forged["pendingInode"] = staging.stat().st_ino
+    forged_final = _expected_timeout_record(
+        module,
+        run_id=run_id,
+        vm_name=vm_name,
+        source_commit=source_commit,
+        failure="boot-timeout",
+        service_started=False,
+        result_status="absent",
+        last_stage=None,
+    )
+    forged["finalRecordSha256"] = hashlib.sha256(
+        (module.canonical_json(forged_final) + "\n").encode("ascii")
+    ).hexdigest()
+    staging.write_text(module.canonical_json(forged) + "\n", encoding="ascii")
+    staging.chmod(0o600)
+
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+    )
+
+    assert removed.returncode != 0
+    assert not service_path.parent.exists()
+    assert hidden.is_file()
+    assert not (root / f"{run_id}.json").exists()
+
+
+def test_timeout_evidence_remove_rejects_post_validation_staging_mutation(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    run_id = "5" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-555555555555"
+    source_commit = "6" * 40
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    helper = module._timeout_evidence_python()
+    replace_call = (
+        "    os.replace(staging,hidden,src_dir_fd=descriptor,dst_dir_fd=descriptor)"
+    )
+    mutation = """    attack=dict(expected_staging)
+    attack["serviceStarted"]=False
+    semantic=dict(attack)
+    semantic["schemaVersion"]=SCHEMA
+    semantic.pop("state",None)
+    for key in ("rootDevice","rootInode","pendingDevice","pendingInode","tempDevice","tempInode","tempEntryCount","tempInventorySha256","finalRecordSha256"):
+        semantic.pop(key,None)
+    semantic["status"]="failed"
+    semantic["rawSerialRetained"]=False
+    attack["finalRecordSha256"]=hashlib.sha256(canonical_payload(semantic)).hexdigest()
+    attack_payload=canonical_payload(attack)
+    attack_fd=os.open(staging,os.O_WRONLY|os.O_TRUNC|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=descriptor)
+    try:
+        write_all(attack_fd,attack_payload)
+        os.fsync(attack_fd)
+    finally:
+        os.close(attack_fd)
+    os.replace(staging,hidden,src_dir_fd=descriptor,dst_dir_fd=descriptor)"""
+    mutating_helper = helper.replace(replace_call, mutation)
+    assert mutating_helper != helper
+
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+        helper_code=mutating_helper,
+    )
+
+    assert removed.returncode != 0
+    assert removed.stdout == ""
+    assert not service_path.parent.exists()
+    assert (root / f".{run_id}.pending.json").is_file()
+    assert not (root / f"{run_id}.json").exists()
+
+
+def test_timeout_evidence_successor_attestation_does_not_bless_later_replacement(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    run_id = "6" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-666666666666"
+    source_commit = "7" * 40
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    helper = module._timeout_evidence_python()
+    print_call = (
+        "        print(make_attestation(root_state,complete_state,"
+        "complete_payload,complete_record))"
+    )
+    mutation = """        attack_name=hidden+".attack"
+        attack_fd=os.open(attack_name,WRITE_FLAGS,0o600,dir_fd=evidence)
+        try:
+            attack_state=os.fstat(attack_fd)
+            attack=dict(complete_record)
+            attack["serviceStarted"]=False
+            attack["pendingDevice"]=attack_state.st_dev
+            attack["pendingInode"]=attack_state.st_ino
+            semantic=dict(attack)
+            semantic["schemaVersion"]=SCHEMA
+            semantic.pop("state",None)
+            for key in ("rootDevice","rootInode","pendingDevice","pendingInode","tempDevice","tempInode","tempEntryCount","tempInventorySha256","finalRecordSha256"):
+                semantic.pop(key,None)
+            semantic["status"]="failed"
+            semantic["rawSerialRetained"]=False
+            attack["finalRecordSha256"]=hashlib.sha256(canonical_payload(semantic)).hexdigest()
+            write_all(attack_fd,canonical_payload(attack))
+            os.fsync(attack_fd)
+        finally:
+            os.close(attack_fd)
+        os.replace(attack_name,hidden,src_dir_fd=evidence,dst_dir_fd=evidence)
+        os.fsync(evidence)
+        print(make_attestation(root_state,complete_state,complete_payload,complete_record))"""
+    mutating_helper = helper.replace(print_call, mutation)
+    assert mutating_helper != helper
+
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+        helper_code=mutating_helper,
+    )
+    assert removed.returncode == 0, removed.stderr
+
+    published = _run_timeout_evidence(
+        module,
+        "publish",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        removed.stdout.strip(),
+    )
+
+    assert published.returncode != 0
+    assert not service_path.parent.exists()
+    assert (root / f".{run_id}.pending.json").is_file()
+    assert not (root / f"{run_id}.json").exists()
 
 
 @pytest.mark.parametrize("unsafe_staging", ("symlink", "wrong-mode"))
@@ -4111,6 +4669,7 @@ def test_timeout_evidence_rejects_unsafe_interrupted_staging(
         service_path,
         terminal_path,
         progress_path,
+        prepared.stdout.strip(),
     )
 
     assert published.returncode != 0
@@ -4122,7 +4681,7 @@ def test_timeout_evidence_rejects_replaced_root_and_hidden_pending(tmp_path: Pat
     module = load_tool()
     for replacement in ("root", "hidden"):
         case = tmp_path / replacement
-        case.mkdir()
+        case.mkdir(mode=0o700)
         service_path, terminal_path, progress_path = _write_timeout_statuses(case, module)
         root = case / "evidence"
         run_id = "b" * 64
@@ -4141,7 +4700,20 @@ def test_timeout_evidence_rejects_replaced_root_and_hidden_pending(tmp_path: Pat
         )
         assert prepared.returncode == 0, prepared.stderr
         pending = root / f".{run_id}.pending.json"
-        shutil.rmtree(service_path.parent)
+        removed = _run_timeout_evidence(
+            module,
+            "remove",
+            root,
+            run_id,
+            vm_name,
+            "c" * 40,
+            "result-timeout",
+            service_path,
+            terminal_path,
+            progress_path,
+            prepared.stdout.strip(),
+        )
+        assert removed.returncode == 0, removed.stderr
         if replacement == "root":
             old_root = case / "old-evidence"
             root.rename(old_root)
@@ -4163,12 +4735,13 @@ def test_timeout_evidence_rejects_replaced_root_and_hidden_pending(tmp_path: Pat
             service_path,
             terminal_path,
             progress_path,
+            removed.stdout.strip(),
         )
         assert published.returncode != 0
         assert not (root / f"{run_id}.json").exists()
 
 
-@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo", "swap"))
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo", "hardlink", "swap"))
 def test_timeout_evidence_rejects_unsafe_or_swapped_status_child(
     tmp_path: Path, unsafe_kind: str
 ) -> None:
@@ -4183,6 +4756,8 @@ def test_timeout_evidence_rejects_unsafe_or_swapped_status_child(
     elif unsafe_kind == "fifo":
         service_path.unlink()
         os.mkfifo(service_path, 0o600)
+    elif unsafe_kind == "hardlink":
+        os.link(service_path, tmp_path / "service-hardlink")
     else:
         replacement = tmp_path / "service-replacement"
         replacement.write_text("wrong\n", encoding="ascii")
@@ -4203,6 +4778,125 @@ def test_timeout_evidence_rejects_unsafe_or_swapped_status_child(
     )
 
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize("substitution", ("replacement", "absent-with-forged-staging"))
+def test_timeout_evidence_remove_rejects_temporary_directory_substitution(
+    tmp_path: Path,
+    substitution: str,
+) -> None:
+    module = load_tool()
+    run_id = "8" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-888888888888"
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    temp_dir = service_path.parent
+    serial_log = temp_dir / "serial.log"
+    serial_log.write_text("raw diagnostic\n", encoding="ascii")
+    serial_log.chmod(0o600)
+    root = tmp_path / "evidence"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        "9" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    original = tmp_path / "renamed-original"
+    temp_dir.rename(original)
+    if substitution == "replacement":
+        temp_dir.mkdir(mode=0o700)
+    else:
+        hidden = root / f".{run_id}.pending.json"
+        staging = root / f".{run_id}.pending.json.next"
+        staging.touch(mode=0o600)
+        forged = json.loads(hidden.read_text(encoding="ascii"))
+        forged["state"] = "raw-cleanup-complete"
+        forged["rawSerialRetained"] = False
+        forged["pendingDevice"] = staging.stat().st_dev
+        forged["pendingInode"] = staging.stat().st_ino
+        staging.write_text(module.canonical_json(forged) + "\n", encoding="ascii")
+        staging.chmod(0o600)
+
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        "9" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+    )
+
+    assert removed.returncode != 0
+    assert (original / "serial.log").is_file()
+    pending = json.loads((root / f".{run_id}.pending.json").read_text(encoding="ascii"))
+    assert pending["state"] == "raw-cleanup-pending"
+    assert pending["rawSerialRetained"] is True
+    assert not (root / f"{run_id}.json").exists()
+
+
+@pytest.mark.parametrize("mutation", ("rename", "hardlink"))
+def test_timeout_evidence_remove_rejects_post_prepare_child_escape(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    module = load_tool()
+    run_id = "a" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-aaaaaaaaaaaa"
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    serial_log = service_path.parent / "serial.log"
+    serial_log.write_text("raw sentinel\n", encoding="ascii")
+    serial_log.chmod(0o600)
+    root = tmp_path / "evidence"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        "b" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    escaped = tmp_path / "escaped-serial.log"
+    if mutation == "rename":
+        serial_log.rename(escaped)
+    else:
+        os.link(serial_log, escaped)
+
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        "b" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+    )
+
+    assert removed.returncode != 0
+    assert escaped.read_text(encoding="ascii") == "raw sentinel\n"
+    pending = json.loads((root / f".{run_id}.pending.json").read_text(encoding="ascii"))
+    assert pending["state"] == "raw-cleanup-pending"
+    assert pending["rawSerialRetained"] is True
+    assert not (root / f"{run_id}.json").exists()
 
 
 def test_cleanup_retains_raw_artifacts_when_timeout_prepare_fails(
@@ -4288,7 +4982,7 @@ def test_cleanup_retains_artifacts_and_lock_after_unclean_collector_exit(
         .split(" ", 1)[1],
         original_status=1,
         evidence_root=evidence_root,
-        collector_setup="/usr/bin/bash -c 'exit 17' & COLLECTOR_PID=$!",
+        collector_setup="/usr/bin/bash -c 'sleep 0.1; exit 17' & COLLECTOR_PID=$!; bind_collector",
     )
 
     assert completed.returncode != 0
@@ -4334,6 +5028,9 @@ def test_timeout_evidence_is_canonical_bounded_and_redacted(tmp_path: Path) -> N
     assert hidden.exists()
     assert stat.S_IMODE(hidden.stat().st_mode) == 0o600
     record = json.loads(hidden.read_text(encoding="ascii"))
+    inventory_count, inventory_sha256 = _expected_temp_inventory(
+        module, service_path.parent
+    )
     assert hidden.read_text(encoding="ascii") == module.canonical_json(record) + "\n"
     assert record == {
         "schemaVersion": module.TIMEOUT_EVIDENCE_PENDING_SCHEMA,
@@ -4353,6 +5050,10 @@ def test_timeout_evidence_is_canonical_bounded_and_redacted(tmp_path: Path) -> N
         "rootInode": root.stat().st_ino,
         "pendingDevice": hidden.stat().st_dev,
         "pendingInode": hidden.stat().st_ino,
+        "tempDevice": service_path.parent.stat().st_dev,
+        "tempInode": service_path.parent.stat().st_ino,
+        "tempEntryCount": inventory_count,
+        "tempInventorySha256": inventory_sha256,
         "finalRecordSha256": hashlib.sha256(
             (
                 module.canonical_json(
@@ -4378,7 +5079,20 @@ def test_timeout_evidence_is_canonical_bounded_and_redacted(tmp_path: Path) -> N
         for forbidden in ("serial.log", "argv", "environment", "password", "token", "/tmp/")
     )
 
-    shutil.rmtree(service_path.parent)
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "result-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+    )
+    assert removed.returncode == 0, removed.stderr
     published = _run_timeout_evidence(
         module,
         "publish",
@@ -4390,6 +5104,7 @@ def test_timeout_evidence_is_canonical_bounded_and_redacted(tmp_path: Path) -> N
         service_path,
         terminal_path,
         progress_path,
+        removed.stdout.strip(),
     )
     assert published.returncode == 0, published.stderr
     final = root / f"{run_id}.json"
@@ -4554,7 +5269,20 @@ def test_timeout_evidence_publish_rejects_final_destination_collision(
     assert prepared.returncode == 0, prepared.stderr
     final = root / f"{run_id}.json"
     final.write_text("existing\n", encoding="ascii")
-    shutil.rmtree(service_path.parent)
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        "overseer-phase-b-rehearsal-54a53bc34078-555555555555",
+        "f" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+    )
+    assert removed.returncode == 0, removed.stderr
 
     published = _run_timeout_evidence(
         module,
@@ -4567,6 +5295,7 @@ def test_timeout_evidence_publish_rejects_final_destination_collision(
         service_path,
         terminal_path,
         progress_path,
+        removed.stdout.strip(),
     )
 
     assert published.returncode != 0
@@ -4595,12 +5324,24 @@ def test_timeout_evidence_publish_revalidates_hidden_artifact(
     )
     assert prepared.returncode == 0, prepared.stderr
     hidden = root / f".{run_id}.pending.json"
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        "overseer-phase-b-rehearsal-54a53bc34078-666666666666",
+        "1" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+    )
+    assert removed.returncode == 0, removed.stderr
     if mutation == "content":
         hidden.write_text('{"status":"tampered"}\n', encoding="ascii")
     else:
         hidden.chmod(0o640)
-    shutil.rmtree(service_path.parent)
-
     published = _run_timeout_evidence(
         module,
         "publish",
@@ -4612,9 +5353,117 @@ def test_timeout_evidence_publish_revalidates_hidden_artifact(
         service_path,
         terminal_path,
         progress_path,
+        removed.stdout.strip(),
     )
 
     assert published.returncode != 0
+    assert not (root / f"{run_id}.json").exists()
+
+
+def test_timeout_evidence_remove_rejects_forged_launcher_attestation(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    run_id = "1" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-121212121212"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        "2" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    forged = json.loads(prepared.stdout)
+    forged["pendingSha256"] = "0" * 64
+
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        "2" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        module.canonical_json(forged),
+    )
+
+    assert removed.returncode != 0
+    assert service_path.parent.is_dir()
+    assert (root / f".{run_id}.pending.json").is_file()
+    assert not (root / f"{run_id}.json").exists()
+
+
+def test_timeout_evidence_publish_rejects_self_consistent_hidden_replacement(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    run_id = "2" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-343434343434"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        "3" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    removed = _run_timeout_evidence(
+        module,
+        "remove",
+        root,
+        run_id,
+        vm_name,
+        "3" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        prepared.stdout.strip(),
+    )
+    assert removed.returncode == 0, removed.stderr
+    hidden = root / f".{run_id}.pending.json"
+    replacement = json.loads(hidden.read_text(encoding="ascii"))
+    hidden.unlink()
+    hidden.touch(mode=0o600)
+    replacement["pendingDevice"] = hidden.stat().st_dev
+    replacement["pendingInode"] = hidden.stat().st_ino
+    hidden.write_text(module.canonical_json(replacement) + "\n", encoding="ascii")
+    hidden.chmod(0o600)
+
+    published = _run_timeout_evidence(
+        module,
+        "publish",
+        root,
+        run_id,
+        vm_name,
+        "3" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+        removed.stdout.strip(),
+    )
+
+    assert published.returncode != 0
+    assert hidden.is_file()
     assert not (root / f"{run_id}.json").exists()
 
 

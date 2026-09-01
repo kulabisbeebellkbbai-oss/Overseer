@@ -51,7 +51,7 @@ DEFAULT_RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
 DEFAULT_TEMP_PARENT = Path("/var/tmp")
 DEFAULT_CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
 SESSION_RUNTIME_DIR = Path("/run/user") / str(os.geteuid())
-REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v10"
+REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v11"
 OWNER_BINDING_SCHEMA = "overseer.phase-b-rehearsal-owner-binding.v2"
 ARTIFACT_MANIFEST_SCHEMA = "overseer.rehearsal-artifact-manifest.v1"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
@@ -92,11 +92,36 @@ PROGRESS_STAGES = frozenset(
 )
 TIMEOUT_EVIDENCE_SCHEMA = "overseer.phase-b-rehearsal-timeout-evidence.v1"
 TIMEOUT_EVIDENCE_PENDING_SCHEMA = "overseer.phase-b-rehearsal-timeout-pending.v1"
+TIMEOUT_EVIDENCE_ATTESTATION_SCHEMA = (
+    "overseer.phase-b-rehearsal-timeout-attestation.v1"
+)
+TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA = (
+    "overseer.phase-b-rehearsal-raw-identity-attestation.v1"
+)
 TIMEOUT_EVIDENCE_PENDING_NAME = ".<run-id>.pending.json"
 TIMEOUT_EVIDENCE_ROOT = Path(
     "/home/god/.local/share/overseer/phase-b-rehearsal-evidence"
 )
+TIMEOUT_REQUIRED_RAW_NAMES = frozenset(
+    {
+        "domain.xml",
+        "user-data",
+        "meta-data",
+        "overlay.qcow2",
+        "seed.iso",
+        "nvram.fd",
+        "serial.log",
+        "serial-collector.py",
+        "serial.in",
+        "serial.out",
+        "source.zip",
+        "runtime.zip",
+        "source-manifest.json",
+        "runtime-manifest.json",
+    }
+)
 MAX_TIMEOUT_EVIDENCE_BYTES = 2048
+MAX_TIMEOUT_ATTESTATION_BYTES = 1024
 MAX_TIMEOUT_STATUS_BYTES = 512
 MAX_SERIAL_BYTES = 1024 * 1024
 MAX_SERIAL_LINE_BYTES = 64 * 1024
@@ -119,7 +144,6 @@ EXACT_TOOLS = {
     "grep": "/usr/bin/grep",
     "id": "/usr/bin/id",
     "install": "/usr/bin/install",
-    "kill": "/usr/bin/kill",
     "mkfifo": "/usr/bin/mkfifo",
     "mkdir": "/usr/bin/mkdir",
     "mktemp": "/usr/bin/mktemp",
@@ -2780,11 +2804,12 @@ finally:
 
 def _serial_collector_python() -> str:
     stages = "{" + ",".join(repr(stage) for stage in sorted(PROGRESS_STAGES)) + "}"
-    template = r"""import json,os,select,stat,sys
+    template = r"""import json,os,re,select,stat,sys
 
-pipe,log,ready,status,service_status,progress_status,stop,max_bytes,max_line=sys.argv[1:]
+pipe,log,ready,status,service_status,progress_status,stop,raw_identity,max_bytes,max_line=sys.argv[1:]
 max_bytes=int(max_bytes)
 max_line=int(max_line)
+RAW_IDENTITY_ATTESTATION_SCHEMA=__RAW_IDENTITY_ATTESTATION_SCHEMA__
 SERVICE_MARKER=__SERVICE_MARKER__
 SERVICE_STATUS=__SERVICE_STATUS__
 READY_STATUS=__READY_STATUS__
@@ -2793,6 +2818,22 @@ PROGRESS_SCHEMA=__PROGRESS_SCHEMA__
 PROGRESS_STAGES=frozenset(__PROGRESS_STAGES__)
 RESULT_BEGIN=__RESULT_BEGIN__
 RESULT_END=__RESULT_END__
+
+def expected_log_identity(value):
+    try: record=json.loads(value)
+    except (TypeError,ValueError,json.JSONDecodeError): raise OSError("raw identity attestation is invalid")
+    if (not isinstance(record,dict)
+            or set(record)!={"schemaVersion","tempDevice","tempInode","childCount","identitySha256","serialLogDevice","serialLogInode","secretValuesRecorded"}
+            or record.get("schemaVersion")!=RAW_IDENTITY_ATTESTATION_SCHEMA
+            or any(type(record.get(key)) is not int for key in ("tempDevice","tempInode","childCount","serialLogDevice","serialLogInode"))
+            or record.get("childCount")<=0
+            or re.fullmatch(r"[0-9a-f]{64}",record.get("identitySha256","")) is None
+            or record.get("secretValuesRecorded") is not False
+            or json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))!=value):
+        raise OSError("raw identity attestation is invalid")
+    return record["serialLogDevice"],record["serialLogInode"]
+
+EXPECTED_LOG_IDENTITY=expected_log_identity(raw_identity)
 
 def write_all(descriptor,payload):
     view=memoryview(payload)
@@ -2827,6 +2868,26 @@ def publish_file(path,payload):
     finally:
         os.close(descriptor)
     os.replace(temporary,path)
+
+def open_bound_log(path):
+    before=os.lstat(path)
+    descriptor=None
+    try:
+        descriptor=os.open(path,os.O_WRONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        state=os.fstat(descriptor)
+        after=os.lstat(path)
+        identity=lambda value:(value.st_dev,value.st_ino,value.st_mode,value.st_uid,value.st_gid,value.st_nlink)
+        if (identity(before)!=identity(state) or identity(state)!=identity(after)
+                or not stat.S_ISREG(state.st_mode) or state.st_uid!=os.geteuid()
+                or state.st_nlink!=1 or stat.S_IMODE(state.st_mode)!=0o600
+                or state.st_size!=0
+                or (state.st_dev,state.st_ino)!=EXPECTED_LOG_IDENTITY):
+            raise OSError("collector log identity is unsafe")
+        return descriptor
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
 
 def publish_terminal(value):
     global terminal
@@ -2913,7 +2974,7 @@ result_ended=False
 progress_record=None
 try:
     fd=os.open(pipe,os.O_RDWR|os.O_NONBLOCK|os.O_CLOEXEC)
-    out=os.open(log,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    out=open_bound_log(log)
     publish_file(ready,READY_STATUS+"\n")
     while True:
         had_data=False
@@ -2955,26 +3016,105 @@ finally:
         .replace("__READY_STATUS__", repr(COLLECTOR_READY_STATUS))
         .replace("__PROGRESS_PREFIX__", repr(PROGRESS_PREFIX.encode("ascii")))
         .replace("__PROGRESS_SCHEMA__", repr(PROGRESS_SCHEMA))
+        .replace(
+            "__RAW_IDENTITY_ATTESTATION_SCHEMA__",
+            repr(TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA),
+        )
         .replace("__PROGRESS_STAGES__", stages)
         .replace("__RESULT_BEGIN__", repr(RESULT_BEGIN.encode("ascii")))
         .replace("__RESULT_END__", repr(RESULT_END.encode("ascii")))
     )
 
 
+def _collector_process_control_python() -> str:
+    return r"""import os,re,select,signal,sys
+
+def fail(code=1):
+    raise SystemExit(code)
+
+def process_state(pid,pidfd):
+    path=f"/proc/{pid}/stat"
+    try:
+        descriptor=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        payload=os.read(descriptor,4096)
+        if os.read(descriptor,1): fail()
+    finally:
+        os.close(descriptor)
+    boundary=payload.rfind(b") ")
+    if boundary<0: fail()
+    fields=payload[boundary+2:].split()
+    if len(fields)<20: fail()
+    try:
+        state=fields[0].decode("ascii")
+        parent=int(fields[1])
+        started=fields[19].decode("ascii")
+    except (UnicodeError,ValueError): fail()
+    if re.fullmatch(r"[0-9]+",started) is None: fail()
+    return state,started,parent
+
+if len(sys.argv) not in {3,4,5}: fail()
+mode=sys.argv[1]
+try: pid=int(sys.argv[2])
+except ValueError: fail()
+if pid<=0: fail()
+try: pidfd=os.pidfd_open(pid,0)
+except ProcessLookupError:
+    if mode=="state": print("exited")
+    else: fail()
+    raise SystemExit(0)
+try:
+    observed=process_state(pid,pidfd)
+    if observed is None:
+        if mode=="state": print("exited")
+        else: fail()
+        raise SystemExit(0)
+    state,started,parent=observed
+    if mode=="bind":
+        if len(sys.argv)!=3 or state=="Z" or parent!=os.getppid(): fail(2)
+        print(started)
+    else:
+        if len(sys.argv)<4 or re.fullmatch(r"[0-9]+",sys.argv[3]) is None:
+            fail()
+        if started!=sys.argv[3]: fail(2)
+        poller=select.poll()
+        poller.register(pidfd,select.POLLIN)
+        exited=bool(poller.poll(0))
+        if mode=="state":
+            if len(sys.argv)!=4: fail()
+            print("exited" if exited else "zombie" if state=="Z" else "running")
+        elif mode=="signal":
+            if len(sys.argv)!=5 or exited or sys.argv[4] not in {"TERM","KILL"}: fail()
+            signal.pidfd_send_signal(pidfd,getattr(signal,"SIG"+sys.argv[4]))
+        else:
+            fail()
+finally:
+    os.close(pidfd)
+"""
+
+
 def _timeout_evidence_python() -> str:
     stages = "{" + ",".join(repr(stage) for stage in sorted(PROGRESS_STAGES)) + "}"
+    required_raw_names = (
+        "{" + ",".join(repr(name) for name in sorted(TIMEOUT_REQUIRED_RAW_NAMES)) + "}"
+    )
     template = r"""import hashlib,json,os,re,stat,sys
 
 SCHEMA=__SCHEMA__
 PENDING_SCHEMA=__PENDING_SCHEMA__
+ATTESTATION_SCHEMA=__ATTESTATION_SCHEMA__
+RAW_IDENTITY_ATTESTATION_SCHEMA=__RAW_IDENTITY_ATTESTATION_SCHEMA__
 MAX_RECORD_BYTES=__MAX_RECORD_BYTES__
+MAX_ATTESTATION_BYTES=__MAX_ATTESTATION_BYTES__
 MAX_CHILD_BYTES=__MAX_CHILD_BYTES__
 SERVICE_STATUS=__SERVICE_STATUS__
 RESULT_STATUSES={"absent","complete","overflow"}
 PROGRESS_SCHEMA=__PROGRESS_SCHEMA__
 PROGRESS_STAGES=frozenset(__PROGRESS_STAGES__)
 KEYS={"schemaVersion","status","failure","runId","vmName","sourceCommit","serviceStarted","resultStatus","lastStage","domainAbsent","rawSerialRetained","secretValuesRecorded"}
-PENDING_KEYS=KEYS|{"state","rootDevice","rootInode","pendingDevice","pendingInode","finalRecordSha256"}
+PENDING_KEYS=KEYS|{"state","rootDevice","rootInode","pendingDevice","pendingInode","tempDevice","tempInode","tempEntryCount","tempInventorySha256","finalRecordSha256"}
 RUN_ID_RE=re.compile(r"[0-9a-f]{64}\Z")
 VM_NAME_RE=re.compile(r"overseer-phase-b-rehearsal-[0-9a-f]{12}-[0-9a-f]{12}\Z")
 COMMIT_RE=re.compile(r"[0-9a-f]{40}\Z")
@@ -2982,6 +3122,14 @@ DIR_FLAGS=os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW
 READ_FLAGS=os.O_RDONLY|os.O_NONBLOCK|os.O_CLOEXEC|os.O_NOFOLLOW
 WRITE_FLAGS=os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW
 CHILD_NAMES=("serial.service-started","serial.status","serial.progress")
+RAW_NAMES=frozenset({
+    "domain.xml","user-data","meta-data","overlay.qcow2","seed.iso","nvram.fd",
+    "serial.log","serial.ready","serial.status","serial.service-started",
+    "serial.progress","serial.stop","serial-collector.py","serial.in","serial.out",
+    "source.zip","runtime.zip","source-manifest.json","runtime-manifest.json",
+})
+REQUIRED_RAW_NAMES=frozenset(__REQUIRED_RAW_NAMES__)
+BIND_REQUIRED_RAW_NAMES=REQUIRED_RAW_NAMES
 PENDING_STATE="raw-cleanup-pending"
 COMPLETE_STATE="raw-cleanup-complete"
 
@@ -3066,6 +3214,38 @@ def write_all(descriptor,payload):
 def canonical_payload(record):
     return (json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))+"\n").encode("ascii")
 
+def make_attestation(root_state,pending_state,pending_payload,pending):
+    record={
+        "schemaVersion":ATTESTATION_SCHEMA,
+        "state":pending["state"],
+        "rootDevice":root_state.st_dev,
+        "rootInode":root_state.st_ino,
+        "pendingDevice":pending_state.st_dev,
+        "pendingInode":pending_state.st_ino,
+        "pendingSha256":hashlib.sha256(pending_payload).hexdigest(),
+        "tempDevice":pending["tempDevice"],
+        "tempInode":pending["tempInode"],
+        "tempInventorySha256":pending["tempInventorySha256"],
+        "secretValuesRecorded":False,
+    }
+    payload=json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+    if len(payload.encode("ascii"))>MAX_ATTESTATION_BYTES: fail()
+    return payload
+
+def validate_attestation(value,root_state,pending_state,pending_payload,pending,expected_state):
+    if not isinstance(value,str): fail()
+    try:
+        if len(value.encode("ascii"))>MAX_ATTESTATION_BYTES: fail()
+        record=json.loads(value)
+    except (TypeError,UnicodeError,ValueError,json.JSONDecodeError): fail()
+    expected=json.loads(make_attestation(root_state,pending_state,pending_payload,pending))
+    if (not isinstance(record,dict) or record!=expected
+            or record.get("schemaVersion")!=ATTESTATION_SCHEMA
+            or record.get("state")!=expected_state
+            or record.get("secretValuesRecorded") is not False
+            or json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))!=value):
+        fail()
+
 def read_child(temp_descriptor,name):
     try:
         entry_before=os.stat(name,dir_fd=temp_descriptor,follow_symlinks=False)
@@ -3120,6 +3300,96 @@ def validate_inputs(run_id,vm_name,source_commit,failure):
             or failure not in {"boot-timeout","result-timeout"}):
         fail()
 
+def inventory_item(name,state):
+    return {
+        "name":name,
+        "device":state.st_dev,
+        "inode":state.st_ino,
+        "mode":state.st_mode,
+        "uid":state.st_uid,
+        "gid":state.st_gid,
+        "links":state.st_nlink,
+        "size":state.st_size,
+        "modifiedNs":state.st_mtime_ns,
+        "changedNs":state.st_ctime_ns,
+    }
+
+def inventory_digest(entries):
+    payload=json.dumps(entries,ensure_ascii=True,sort_keys=True,separators=(",",":")).encode("ascii")
+    return len(entries),hashlib.sha256(payload).hexdigest()
+
+def stable_identity_item(entry):
+    return {key:entry[key] for key in ("name","device","inode","mode","uid","gid","links")}
+
+def bound_identity_digest(entries):
+    selected=[stable_identity_item(entry) for entry in entries if entry["name"] in BIND_REQUIRED_RAW_NAMES]
+    if {entry["name"] for entry in selected}!=BIND_REQUIRED_RAW_NAMES: fail()
+    count,digest=inventory_digest(selected)
+    serial_log=next(entry for entry in selected if entry["name"]=="serial.log")
+    return count,digest,serial_log["device"],serial_log["inode"]
+
+def read_temp_inventory(descriptor,required_names):
+    names=sorted(os.listdir(descriptor))
+    if not required_names<=set(names)<=RAW_NAMES: fail()
+    entries=[]
+    for name in names:
+        before=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+        source=None
+        try:
+            source=os.open(name,READ_FLAGS,dir_fd=descriptor)
+            state=os.fstat(source)
+            if (metadata(before)!=metadata(state)
+                    or not (stat.S_ISREG(state.st_mode) or stat.S_ISFIFO(state.st_mode))
+                    or state.st_uid!=os.geteuid() or state.st_nlink!=1
+                    or stat.S_IMODE(state.st_mode)!=0o600):
+                fail()
+            after=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+            if metadata(after)!=metadata(state): fail()
+            entries.append(inventory_item(name,state))
+        finally:
+            close_quietly(source)
+    if sorted(os.listdir(descriptor))!=names: fail()
+    return inventory_digest(entries),bound_identity_digest(entries)
+
+def make_raw_identity_attestation(temp_state,identity):
+    record={
+        "schemaVersion":RAW_IDENTITY_ATTESTATION_SCHEMA,
+        "tempDevice":temp_state.st_dev,
+        "tempInode":temp_state.st_ino,
+        "childCount":identity[0],
+        "identitySha256":identity[1],
+        "serialLogDevice":identity[2],
+        "serialLogInode":identity[3],
+        "secretValuesRecorded":False,
+    }
+    payload=json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+    if len(payload.encode("ascii"))>MAX_ATTESTATION_BYTES: fail()
+    return payload
+
+def validate_raw_identity_attestation(value,temp_state,identity):
+    if not isinstance(value,str): fail()
+    try:
+        if len(value.encode("ascii"))>MAX_ATTESTATION_BYTES: fail()
+        record=json.loads(value)
+    except (TypeError,UnicodeError,ValueError,json.JSONDecodeError): fail()
+    expected=json.loads(make_raw_identity_attestation(temp_state,identity))
+    if (not isinstance(record,dict) or record!=expected
+            or record.get("schemaVersion")!=RAW_IDENTITY_ATTESTATION_SCHEMA
+            or record.get("secretValuesRecorded") is not False
+            or json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))!=value):
+        fail()
+
+def bind_raw_identity(temp_dir):
+    descriptor=open_directory(temp_dir,False,0o700)
+    try:
+        temp_state=os.fstat(descriptor)
+        first=read_temp_inventory(descriptor,BIND_REQUIRED_RAW_NAMES)
+        second=read_temp_inventory(descriptor,BIND_REQUIRED_RAW_NAMES)
+        if first!=second: fail()
+        print(make_raw_identity_attestation(temp_state,first[1]))
+    finally:
+        os.close(descriptor)
+
 def read_state(temp_descriptor):
     service=read_child(temp_descriptor,"serial.service-started")
     terminal=read_child(temp_descriptor,"serial.status")
@@ -3130,11 +3400,18 @@ def read_state(temp_descriptor):
     last_stage=validate_progress(progress)
     return service==SERVICE_STATUS+"\n", "absent" if terminal is None else terminal[:-1], last_stage
 
-def make_record(run_id,vm_name,source_commit,failure,temp_dir):
+def make_record(run_id,vm_name,source_commit,failure,temp_dir,raw_identity_attestation):
     validate_inputs(run_id,vm_name,source_commit,failure)
-    descriptor=open_directory(temp_dir,False)
+    descriptor=open_directory(temp_dir,False,0o700)
     try:
+        temp_state=os.fstat(descriptor)
+        inventory_before=read_temp_inventory(descriptor,REQUIRED_RAW_NAMES)
+        validate_raw_identity_attestation(
+            raw_identity_attestation,temp_state,inventory_before[1],
+        )
         service_started,result_status,last_stage=read_state(descriptor)
+        inventory_after=read_temp_inventory(descriptor,REQUIRED_RAW_NAMES)
+        if inventory_before!=inventory_after: fail()
     finally:
         os.close(descriptor)
     if result_status=="complete" and not service_started: fail()
@@ -3155,7 +3432,7 @@ def make_record(run_id,vm_name,source_commit,failure,temp_dir):
     }
     payload=canonical_payload(record)
     if len(payload)>MAX_RECORD_BYTES: fail()
-    return record,payload
+    return record,payload,temp_state,inventory_after[0]
 
 def validate_record(payload,run_id,vm_name,source_commit,failure):
     if len(payload)>MAX_RECORD_BYTES or not payload.endswith(b"\n"): fail()
@@ -3177,7 +3454,7 @@ def validate_record(payload,run_id,vm_name,source_commit,failure):
     if canonical_payload(record)!=payload: fail()
     return record
 
-def pending_record(record,root_state,pending_state,pending_identity,final_digest):
+def pending_record(record,root_state,temp_state,temp_inventory,pending_state,pending_identity,final_digest):
     return {
         "schemaVersion":PENDING_SCHEMA,
         "status":"pending",
@@ -3188,6 +3465,10 @@ def pending_record(record,root_state,pending_state,pending_identity,final_digest
         "rootInode":root_state.st_ino,
         "pendingDevice":pending_identity[0],
         "pendingInode":pending_identity[1],
+        "tempDevice":temp_state.st_dev,
+        "tempInode":temp_state.st_ino,
+        "tempEntryCount":temp_inventory[0],
+        "tempInventorySha256":temp_inventory[1],
         "finalRecordSha256":final_digest,
     }
 
@@ -3205,12 +3486,15 @@ def validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,pen
     if record.get("rawSerialRetained") is not (pending_state==PENDING_STATE): fail()
     if record.get("rootDevice")!=root_state.st_dev or record.get("rootInode")!=root_state.st_ino: fail()
     if (type(record.get("pendingDevice")) is not int or type(record.get("pendingInode")) is not int
+            or type(record.get("tempDevice")) is not int or type(record.get("tempInode")) is not int
+            or type(record.get("tempEntryCount")) is not int or record.get("tempEntryCount")<0
+            or not re.fullmatch(r"[0-9a-f]{64}",record.get("tempInventorySha256",""))
             or not re.fullmatch(r"[0-9a-f]{64}",record.get("finalRecordSha256",""))):
         fail()
     semantic=dict(record)
     semantic["schemaVersion"]=SCHEMA
     semantic.pop("state",None)
-    for key in ("rootDevice","rootInode","pendingDevice","pendingInode","finalRecordSha256"):
+    for key in ("rootDevice","rootInode","pendingDevice","pendingInode","tempDevice","tempInode","tempEntryCount","tempInventorySha256","finalRecordSha256"):
         semantic.pop(key,None)
     semantic["status"]="failed"
     semantic["rawSerialRetained"]=False
@@ -3270,8 +3554,10 @@ def write_pending(descriptor,name,payload):
     finally:
         os.close(output)
 
-def prepare(root,run_id,vm_name,source_commit,failure,temp_dir):
-    record,final_payload=make_record(run_id,vm_name,source_commit,failure,temp_dir)
+def prepare(root,run_id,vm_name,source_commit,failure,temp_dir,raw_identity_attestation):
+    record,final_payload,temp_state,temp_inventory=make_record(
+        run_id,vm_name,source_commit,failure,temp_dir,raw_identity_attestation,
+    )
     descriptor=open_directory(root,True,0o700)
     hidden="."+run_id+".pending.json"
     final=run_id+".json"
@@ -3287,7 +3573,7 @@ def prepare(root,run_id,vm_name,source_commit,failure,temp_dir):
             state=os.fstat(output)
             if (not stat.S_ISREG(state.st_mode) or state.st_uid!=os.geteuid()
                     or state.st_nlink!=1 or stat.S_IMODE(state.st_mode)!=0o600): fail()
-            pending=pending_record(record,os.fstat(descriptor),PENDING_STATE,(state.st_dev,state.st_ino),hashlib.sha256(final_payload).hexdigest())
+            pending=pending_record(record,os.fstat(descriptor),temp_state,temp_inventory,PENDING_STATE,(state.st_dev,state.st_ino),hashlib.sha256(final_payload).hexdigest())
             pending_payload=canonical_payload(pending)
             if len(pending_payload)>MAX_RECORD_BYTES: fail()
             write_all(output,pending_payload)
@@ -3297,6 +3583,12 @@ def prepare(root,run_id,vm_name,source_commit,failure,temp_dir):
         finally:
             os.close(output)
         os.fsync(descriptor)
+        pending_payload,pending_state=read_pending(descriptor,hidden)
+        pending_record_value,_=validate_pending(
+            pending_payload,run_id,vm_name,source_commit,failure,
+            os.fstat(descriptor),PENDING_STATE,
+        )
+        print(make_attestation(os.fstat(descriptor),pending_state,pending_payload,pending_record_value))
     finally:
         os.close(descriptor)
 
@@ -3383,18 +3675,136 @@ def rewrite_pending_complete(descriptor,hidden,pending,root_state,expected_ident
     if (current_state.st_dev,current_state.st_ino)!=expected_identity: fail()
     staging_payload,staging_state=read_pending(descriptor,staging)
     staging_record,_=validate_pending(staging_payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
+    expected_staging=dict(pending)
+    expected_staging["state"]=COMPLETE_STATE
+    expected_staging["rawSerialRetained"]=False
+    expected_staging["pendingDevice"]=staging_state.st_dev
+    expected_staging["pendingInode"]=staging_state.st_ino
     if (metadata(staging_state)!=metadata(state)
-            or (staging_state.st_dev,staging_state.st_ino)!=(staging_record["pendingDevice"],staging_record["pendingInode"])):
+            or (staging_state.st_dev,staging_state.st_ino)!=(staging_record["pendingDevice"],staging_record["pendingInode"])
+            or staging_record!=expected_staging):
         fail()
     os.replace(staging,hidden,src_dir_fd=descriptor,dst_dir_fd=descriptor)
     os.fsync(descriptor)
     replaced_payload,replaced_state=read_pending(descriptor,hidden)
-    validate_pending(replaced_payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
-    if (replaced_state.st_dev,replaced_state.st_ino)!=(state.st_dev,state.st_ino): fail()
+    replaced_record,_=validate_pending(
+        replaced_payload,run_id,vm_name,source_commit,failure,
+        root_state,COMPLETE_STATE,
+    )
+    if ((replaced_state.st_dev,replaced_state.st_ino,replaced_state.st_mode,
+            replaced_state.st_uid,replaced_state.st_gid,replaced_state.st_nlink,
+            replaced_state.st_size)!=(staging_state.st_dev,staging_state.st_ino,
+            staging_state.st_mode,staging_state.st_uid,staging_state.st_gid,
+            staging_state.st_nlink,staging_state.st_size)
+            or replaced_record!=expected_staging):
+        fail()
+    return replaced_payload,replaced_state,replaced_record
 
-def complete_pending(root,run_id,vm_name,source_commit,failure,temp_dir):
+def open_temp_parent(path):
+    parts=path_parts(path)
+    parent=os.open("/",DIR_FLAGS)
+    try:
+        for part in parts[:-1]:
+            next_parent=os.open(part,DIR_FLAGS,dir_fd=parent)
+            os.close(parent)
+            parent=next_parent
+        state=os.fstat(parent)
+        mode=stat.S_IMODE(state.st_mode)
+        private_owner=(state.st_uid==os.geteuid() and not mode&0o022)
+        sticky_root=(state.st_uid==0 and bool(mode&stat.S_ISVTX))
+        if not stat.S_ISDIR(state.st_mode) or not (private_owner or sticky_root): fail()
+        return parent,parts[-1]
+    except BaseException:
+        close_quietly(parent)
+        raise
+
+def temp_path_absent(path):
+    parent,name=open_temp_parent(path)
+    try:
+        try: os.stat(name,dir_fd=parent,follow_symlinks=False)
+        except FileNotFoundError: return True
+        return False
+    finally:
+        os.close(parent)
+
+def remove_exact_raw(root,run_id,vm_name,source_commit,failure,temp_dir,attestation):
     validate_inputs(run_id,vm_name,source_commit,failure)
-    require_absent(temp_dir)
+    evidence=open_directory(root,False,0o700)
+    hidden="."+run_id+".pending.json"
+    parent=None
+    temp=None
+    opened=[]
+    try:
+        root_state=os.fstat(evidence)
+        ensure_root_identity(root,evidence,root_state)
+        pending_payload,pending_state=read_pending(evidence,hidden)
+        pending,_=validate_pending(pending_payload,run_id,vm_name,source_commit,failure,root_state,PENDING_STATE)
+        expected_pending=(pending["pendingDevice"],pending["pendingInode"])
+        if (pending_state.st_dev,pending_state.st_ino)!=expected_pending: fail()
+        validate_attestation(attestation,root_state,pending_state,pending_payload,pending,PENDING_STATE)
+        parent,name=open_temp_parent(temp_dir)
+        try: entry=os.stat(name,dir_fd=parent,follow_symlinks=False)
+        except FileNotFoundError: fail()
+        temp=os.open(name,DIR_FLAGS,dir_fd=parent)
+        temp_state=validate_directory(temp,0o700)
+        if (metadata(entry)!=metadata(temp_state)
+                or (temp_state.st_dev,temp_state.st_ino)!=(pending["tempDevice"],pending["tempInode"])):
+            fail()
+        names=set(os.listdir(temp))
+        if not REQUIRED_RAW_NAMES<=names<=RAW_NAMES: fail()
+        pinned={}
+        inventory=[]
+        for child in sorted(names):
+            before=os.stat(child,dir_fd=temp,follow_symlinks=False)
+            descriptor=os.open(child,READ_FLAGS,dir_fd=temp)
+            opened.append(descriptor)
+            state=os.fstat(descriptor)
+            if (metadata(before)!=metadata(state)
+                    or not (stat.S_ISREG(state.st_mode) or stat.S_ISFIFO(state.st_mode))
+                    or state.st_uid!=os.geteuid() or state.st_nlink!=1
+                    or stat.S_IMODE(state.st_mode)!=0o600):
+                fail()
+            after=os.stat(child,dir_fd=temp,follow_symlinks=False)
+            if metadata(after)!=metadata(state): fail()
+            pinned[child]=(descriptor,state)
+            inventory.append(inventory_item(child,state))
+        if set(os.listdir(temp))!=names: fail()
+        entry_count,inventory_sha256=inventory_digest(inventory)
+        if (entry_count!=pending["tempEntryCount"]
+                or inventory_sha256!=pending["tempInventorySha256"]):
+            fail()
+        ensure_root_identity(root,evidence,root_state)
+        current_payload,current_pending_state=read_pending(evidence,hidden)
+        validate_pending(current_payload,run_id,vm_name,source_commit,failure,root_state,PENDING_STATE)
+        if (current_pending_state.st_dev,current_pending_state.st_ino)!=expected_pending: fail()
+        for child in sorted(names):
+            descriptor,state=pinned[child]
+            current=os.stat(child,dir_fd=temp,follow_symlinks=False)
+            if metadata(current)!=metadata(state): fail()
+            os.unlink(child,dir_fd=temp)
+            if os.fstat(descriptor).st_nlink!=0: fail()
+        os.fsync(temp)
+        current_entry=os.stat(name,dir_fd=parent,follow_symlinks=False)
+        if (current_entry.st_dev,current_entry.st_ino)!=(temp_state.st_dev,temp_state.st_ino): fail()
+        os.rmdir(name,dir_fd=parent)
+        os.fsync(parent)
+        if os.fstat(temp).st_nlink!=0 or not temp_path_absent(temp_dir): fail()
+        ensure_root_identity(root,evidence,root_state)
+        complete_payload,complete_state,complete_record=rewrite_pending_complete(
+            evidence,hidden,pending,root_state,expected_pending,
+            run_id,vm_name,source_commit,failure,
+        )
+        print(make_attestation(root_state,complete_state,complete_payload,complete_record))
+    finally:
+        for descriptor in opened:
+            close_quietly(descriptor)
+        close_quietly(temp)
+        close_quietly(parent)
+        os.close(evidence)
+
+def complete_pending(root,run_id,vm_name,source_commit,failure,temp_dir,attestation):
+    validate_inputs(run_id,vm_name,source_commit,failure)
+    if not temp_path_absent(temp_dir): fail()
     descriptor=open_directory(root,False,0o700)
     hidden="."+run_id+".pending.json"
     try:
@@ -3407,23 +3817,17 @@ def complete_pending(root,run_id,vm_name,source_commit,failure,temp_dir):
         pending,_=validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,state_hint)
         expected_identity=(pending["pendingDevice"],pending["pendingInode"])
         if (pending_file_state.st_dev,pending_file_state.st_ino)!=expected_identity: fail()
+        validate_attestation(attestation,root_state,pending_file_state,payload,pending,COMPLETE_STATE)
         if state_hint==PENDING_STATE:
-            ensure_root_identity(root,descriptor,root_state)
-            current_payload,current_state=read_pending(descriptor,hidden)
-            validate_pending(current_payload,run_id,vm_name,source_commit,failure,root_state,PENDING_STATE)
-            if (current_state.st_dev,current_state.st_ino)!=expected_identity: fail()
-            rewrite_pending_complete(
-                descriptor,hidden,pending,root_state,expected_identity,
-                run_id,vm_name,source_commit,failure,
-            )
+            fail()
         else:
             validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
     finally:
         os.close(descriptor)
 
-def publish(root,run_id,vm_name,source_commit,failure,temp_dir):
+def publish(root,run_id,vm_name,source_commit,failure,temp_dir,attestation):
     validate_inputs(run_id,vm_name,source_commit,failure)
-    require_absent(temp_dir)
+    if not temp_path_absent(temp_dir): fail()
     descriptor=open_directory(root,False,0o700)
     hidden="."+run_id+".pending.json"
     final=run_id+".json"
@@ -3441,15 +3845,9 @@ def publish(root,run_id,vm_name,source_commit,failure,temp_dir):
         pending,final_payload=validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,state_hint)
         expected_identity=(pending["pendingDevice"],pending["pendingInode"])
         if (pending_file_state.st_dev,pending_file_state.st_ino)!=expected_identity: fail()
+        validate_attestation(attestation,root_state,pending_file_state,payload,pending,COMPLETE_STATE)
         if pending["state"]==PENDING_STATE:
-            ensure_root_identity(root,descriptor,root_state)
-            current_payload,current_state=read_pending(descriptor,hidden)
-            validate_pending(current_payload,run_id,vm_name,source_commit,failure,root_state,PENDING_STATE)
-            if (current_state.st_dev,current_state.st_ino)!=expected_identity: fail()
-            rewrite_pending_complete(
-                descriptor,hidden,pending,root_state,expected_identity,
-                run_id,vm_name,source_commit,failure,
-            )
+            fail()
         else:
             validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
         ensure_root_identity(root,descriptor,root_state)
@@ -3472,12 +3870,18 @@ def publish(root,run_id,vm_name,source_commit,failure,temp_dir):
     finally:
         os.close(descriptor)
 
-if len(sys.argv)!=8: fail()
-mode,root,run_id,vm_name,source_commit,failure,temp_dir=sys.argv[1:]
+if len(sys.argv)==3:
+    if sys.argv[1]!="bind": fail()
+    try: bind_raw_identity(sys.argv[2])
+    except (OSError,ValueError,TypeError): raise SystemExit(1)
+    raise SystemExit(0)
+if len(sys.argv)!=9: fail()
+mode,root,run_id,vm_name,source_commit,failure,temp_dir,attestation=sys.argv[1:]
 try:
-    if mode=="prepare": prepare(root,run_id,vm_name,source_commit,failure,temp_dir)
-    elif mode=="complete": complete_pending(root,run_id,vm_name,source_commit,failure,temp_dir)
-    elif mode=="publish": publish(root,run_id,vm_name,source_commit,failure,temp_dir)
+    if mode=="prepare": prepare(root,run_id,vm_name,source_commit,failure,temp_dir,attestation)
+    elif mode=="remove" and attestation is not None: remove_exact_raw(root,run_id,vm_name,source_commit,failure,temp_dir,attestation)
+    elif mode=="complete" and attestation is not None: complete_pending(root,run_id,vm_name,source_commit,failure,temp_dir,attestation)
+    elif mode=="publish" and attestation is not None: publish(root,run_id,vm_name,source_commit,failure,temp_dir,attestation)
     else: fail()
 except (OSError,ValueError,TypeError):
     raise SystemExit(1)
@@ -3485,11 +3889,20 @@ except (OSError,ValueError,TypeError):
     return (
         template.replace("__SCHEMA__", repr(TIMEOUT_EVIDENCE_SCHEMA))
         .replace("__PENDING_SCHEMA__", repr(TIMEOUT_EVIDENCE_PENDING_SCHEMA))
+        .replace(
+            "__ATTESTATION_SCHEMA__", repr(TIMEOUT_EVIDENCE_ATTESTATION_SCHEMA)
+        )
+        .replace(
+            "__RAW_IDENTITY_ATTESTATION_SCHEMA__",
+            repr(TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA),
+        )
         .replace("__MAX_RECORD_BYTES__", str(MAX_TIMEOUT_EVIDENCE_BYTES))
+        .replace("__MAX_ATTESTATION_BYTES__", str(MAX_TIMEOUT_ATTESTATION_BYTES))
         .replace("__MAX_CHILD_BYTES__", str(MAX_TIMEOUT_STATUS_BYTES))
         .replace("__SERVICE_STATUS__", repr(SERVICE_STARTED_STATUS))
         .replace("__PROGRESS_SCHEMA__", repr(PROGRESS_SCHEMA))
         .replace("__PROGRESS_STAGES__", stages)
+        .replace("__REQUIRED_RAW_NAMES__", required_raw_names)
     )
 
 
@@ -3870,6 +4283,7 @@ def _future_script(
 ) -> str:
     validator = _result_validator_python()
     collector = _serial_collector_python()
+    collector_control = _collector_process_control_python()
     timeout_evidence = _timeout_evidence_python()
     archive_builder = _archive_builder_python()
     ownership_validator = _ownership_validator_python()
@@ -3940,8 +4354,11 @@ readonly PROGRESS_PREFIX={shlex.quote(PROGRESS_PREFIX)}
 readonly PROGRESS_SCHEMA={shlex.quote(PROGRESS_SCHEMA)}
 readonly TIMEOUT_EVIDENCE_SCHEMA={shlex.quote(TIMEOUT_EVIDENCE_SCHEMA)}
 readonly TIMEOUT_EVIDENCE_PENDING_SCHEMA={shlex.quote(TIMEOUT_EVIDENCE_PENDING_SCHEMA)}
+readonly TIMEOUT_EVIDENCE_ATTESTATION_SCHEMA={shlex.quote(TIMEOUT_EVIDENCE_ATTESTATION_SCHEMA)}
+readonly TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA={shlex.quote(TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA)}
 readonly TIMEOUT_EVIDENCE_ROOT={shlex.quote(str(TIMEOUT_EVIDENCE_ROOT))}
 readonly MAX_TIMEOUT_EVIDENCE_BYTES={MAX_TIMEOUT_EVIDENCE_BYTES}
+readonly MAX_TIMEOUT_ATTESTATION_BYTES={MAX_TIMEOUT_ATTESTATION_BYTES}
 readonly MAX_SERIAL_BYTES={MAX_SERIAL_BYTES}
 readonly MAX_SERIAL_LINE_BYTES={MAX_SERIAL_LINE_BYTES}
 readonly EXPECTED_SESSION_RUNTIME_DIR={shlex.quote(str(SESSION_RUNTIME_DIR))}
@@ -3960,6 +4377,7 @@ SERIAL_PROGRESS_STATUS=""
 SERIAL_STOP=""
 SERIAL_COLLECTOR=""
 COLLECTOR_PID=""
+COLLECTOR_START_TIME=""
 DOMAIN_XML=""
 USER_DATA=""
 META_DATA=""
@@ -3970,8 +4388,17 @@ RUNTIME_MANIFEST_FILE=""
 TIMEOUT_KIND=""
 TIMEOUT_EVIDENCE_TEMP=""
 TIMEOUT_EVIDENCE_FINAL=""
+TIMEOUT_EVIDENCE_ATTESTATION=""
+TIMEOUT_RAW_IDENTITY_ATTESTATION=""
 EVIDENCE_ROOT="$TIMEOUT_EVIDENCE_ROOT"
 LOCK_HELD=0
+
+readonly COLLECTOR_CONTROL_CODE="$(/usr/bin/cat <<'PY_COLLECTOR_CONTROL'
+{collector_control}PY_COLLECTOR_CONTROL
+)"
+readonly TIMEOUT_EVIDENCE_CODE="$(/usr/bin/cat <<'PY_TIMEOUT_EVIDENCE'
+{timeout_evidence}PY_TIMEOUT_EVIDENCE
+)"
 
 validate_firmware_runtime() {{
   /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(firmware_validator)} "$FIRMWARE_CODE" "$FIRMWARE_CODE_SHA256" "$FIRMWARE_VARS_TEMPLATE" "$FIRMWARE_VARS_SHA256"
@@ -4082,6 +4509,12 @@ temp_layout_is_exact() {{
   [[ "$RUNTIME_MANIFEST_FILE" == "$TEMP_DIR/runtime-manifest.json" ]]
 }}
 
+bind_collector() {{
+  [[ "$COLLECTOR_PID" =~ ^[0-9]+$ && "$COLLECTOR_PID" -gt 0 ]] || return 1
+  COLLECTOR_START_TIME="$(/usr/bin/python3.13 -B -s -P -S -c "$COLLECTOR_CONTROL_CODE" bind "$COLLECTOR_PID")" || return 1
+  [[ "$COLLECTOR_START_TIME" =~ ^[0-9]+$ ]]
+}}
+
 stop_collector() {{
   local pid deadline wait_status restore_errexit=0 state
   [[ -n "$COLLECTOR_PID" ]] || return 0
@@ -4095,8 +4528,8 @@ stop_collector() {{
       [[ "$state" == "running" ]] || break
     fi
     if (( SECONDS >= deadline )); then
-      /usr/bin/kill -TERM "$pid" 2>/dev/null
-      /usr/bin/kill -KILL "$pid" 2>/dev/null
+      /usr/bin/python3.13 -B -s -P -S -c "$COLLECTOR_CONTROL_CODE" signal "$pid" "$COLLECTOR_START_TIME" TERM 2>/dev/null
+      /usr/bin/python3.13 -B -s -P -S -c "$COLLECTOR_CONTROL_CODE" signal "$pid" "$COLLECTOR_START_TIME" KILL 2>/dev/null
       if (( restore_errexit == 1 )); then set -e; fi
       printf '%s\n' 'collector stop timed out' >&2
       return 1
@@ -4108,6 +4541,7 @@ stop_collector() {{
   if (( restore_errexit == 1 )); then set -e; fi
   if [[ $wait_status -eq 0 ]]; then
     COLLECTOR_PID=""
+    COLLECTOR_START_TIME=""
     return 0
   fi
   return 1
@@ -4129,6 +4563,15 @@ release_lock() {{
 }}
 
 remove_timeout_raw_artifacts() {{
+  local next
+  [[ "$TIMEOUT_KIND" == "boot-timeout" || "$TIMEOUT_KIND" == "result-timeout" ]] || return 1
+  [[ -n "$TIMEOUT_EVIDENCE_ATTESTATION" ]] || return 1
+  if ! next="$(/usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c "$TIMEOUT_EVIDENCE_CODE" remove "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR" "$TIMEOUT_EVIDENCE_ATTESTATION")"; then return 1; fi
+  [[ -n "$next" && "${{#next}}" -le "$MAX_TIMEOUT_ATTESTATION_BYTES" && "$next" != *$'\n'* ]] || return 1
+  TIMEOUT_EVIDENCE_ATTESTATION="$next"
+}}
+
+remove_success_raw_artifacts() {{
   local path
   for path in "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$NVRAM" "$SERIAL_LOG" "$SERIAL_READY_STATUS" "$SERIAL_STATUS" "$SERIAL_SERVICE_STATUS" "$SERIAL_PROGRESS_STATUS" "$SERIAL_STOP" "$SERIAL_COLLECTOR" "${{SERIAL_PIPE}}.in" "${{SERIAL_PIPE}}.out" "$SOURCE_ARCHIVE" "$RUNTIME_ARCHIVE" "$SOURCE_MANIFEST_FILE" "$RUNTIME_MANIFEST_FILE"; do
     [[ ! -L "$path" ]] || return 1
@@ -4143,30 +4586,37 @@ remove_timeout_raw_artifacts() {{
 }}
 
 prepare_timeout_evidence() {{
+  local next
   [[ "$TIMEOUT_KIND" == "boot-timeout" || "$TIMEOUT_KIND" == "result-timeout" ]] || return 1
-  /usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(timeout_evidence)} prepare "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR"
+  [[ -n "$TIMEOUT_RAW_IDENTITY_ATTESTATION" ]] || return 1
+  if ! next="$(/usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c "$TIMEOUT_EVIDENCE_CODE" prepare "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR" "$TIMEOUT_RAW_IDENTITY_ATTESTATION")"; then return 1; fi
+  [[ -n "$next" && "${{#next}}" -le "$MAX_TIMEOUT_ATTESTATION_BYTES" && "$next" != *$'\n'* ]] || return 1
+  TIMEOUT_EVIDENCE_ATTESTATION="$next"
+}}
+
+bind_timeout_raw_identity() {{
+  local next
+  if ! next="$(/usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c "$TIMEOUT_EVIDENCE_CODE" bind "$TEMP_DIR")"; then return 1; fi
+  [[ -n "$next" && "${{#next}}" -le "$MAX_TIMEOUT_ATTESTATION_BYTES" && "$next" != *$'\n'* ]] || return 1
+  TIMEOUT_RAW_IDENTITY_ATTESTATION="$next"
 }}
 
 publish_timeout_evidence() {{
   [[ "$TIMEOUT_KIND" == "boot-timeout" || "$TIMEOUT_KIND" == "result-timeout" ]] || return 1
-  /usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(timeout_evidence)} publish "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR"
+  [[ -n "$TIMEOUT_EVIDENCE_ATTESTATION" ]] || return 1
+  /usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c "$TIMEOUT_EVIDENCE_CODE" publish "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR" "$TIMEOUT_EVIDENCE_ATTESTATION"
 }}
 
 recover_timeout_evidence() {{
   [[ "$TIMEOUT_KIND" == "boot-timeout" || "$TIMEOUT_KIND" == "result-timeout" ]] || return 1
-  /usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(timeout_evidence)} complete "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR"
+  [[ -n "$TIMEOUT_EVIDENCE_ATTESTATION" ]] || return 1
+  /usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c "$TIMEOUT_EVIDENCE_CODE" complete "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR" "$TIMEOUT_EVIDENCE_ATTESTATION"
 }}
 
 collector_process_state() {{
-  local pid="${{COLLECTOR_PID:-}}" state
-  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 ]] || return 1
-  if ! /usr/bin/kill -0 "$pid" 2>/dev/null; then
-    printf '%s\n' exited
-    return 0
-  fi
-  [[ -r "/proc/$pid/stat" ]] || return 1
-  state="$(/usr/bin/awk '{{sub(/^.*\\) /,"",$0); print $1}}' "/proc/$pid/stat" 2>/dev/null)" || return 1
-  if [[ "$state" == "Z" ]]; then printf '%s\n' zombie; else printf '%s\n' running; fi
+  local pid="${{COLLECTOR_PID:-}}" started="${{COLLECTOR_START_TIME:-}}"
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 && "$started" =~ ^[0-9]+$ ]] || return 1
+  /usr/bin/python3.13 -B -s -P -S -c "$COLLECTOR_CONTROL_CODE" state "$pid" "$started"
 }}
 
 collector_is_alive() {{
@@ -4253,8 +4703,14 @@ cleanup() {{
         cleanup_status=1
       fi
     fi
-    if [[ -z "$TIMEOUT_KIND" || "$evidence_prepared" == 1 ]]; then
-      if remove_timeout_raw_artifacts && /usr/bin/rmdir -- "$TEMP_DIR" && [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
+    if [[ -z "$TIMEOUT_KIND" ]]; then
+      if remove_success_raw_artifacts && /usr/bin/rmdir -- "$TEMP_DIR" && [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
+        :
+      else
+        cleanup_status=1
+      fi
+    elif [[ "$evidence_prepared" == 1 ]]; then
+      if remove_timeout_raw_artifacts && [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
         if [[ "$evidence_prepared" == 1 ]]; then
           if revalidate_domain_absence_before_publish; then
             publish_timeout_evidence || cleanup_status=1
@@ -4334,6 +4790,7 @@ temp_layout_is_exact
 /usr/bin/install -m 0600 /dev/null "$SOURCE_MANIFEST_FILE"
 /usr/bin/install -m 0600 /dev/null "$RUNTIME_MANIFEST_FILE"
 /usr/bin/install -m 0600 /dev/null "$SERIAL_COLLECTOR"
+/usr/bin/install -m 0600 /dev/null "$SERIAL_LOG"
 printf '%s' "$EXPECTED_SOURCE_MANIFEST_JSON" >"$SOURCE_MANIFEST_FILE"
 printf '%s' "$EXPECTED_RUNTIME_MANIFEST_JSON" >"$RUNTIME_MANIFEST_FILE"
 /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(archive_builder)} "$SOURCE_ROOT" "$EXPECTED_SOURCE_MANIFEST_JSON" "$SOURCE_ARCHIVE"
@@ -4352,8 +4809,12 @@ printf '%s  %s\n' "$FIRMWARE_VARS_SHA256" "$NVRAM" | /usr/bin/sha256sum --check 
 /usr/bin/genisoimage -quiet -output "$SEED_ISO" -volid cidata -joliet -rock -graft-points "user-data=$USER_DATA" "meta-data=$META_DATA" "source.zip=$SOURCE_ARCHIVE" "runtime.zip=$RUNTIME_ARCHIVE" "source-manifest.json=$SOURCE_MANIFEST_FILE" "runtime-manifest.json=$RUNTIME_MANIFEST_FILE"
 
 /usr/bin/mkfifo -m 0600 "$SERIAL_PIPE.in" "$SERIAL_PIPE.out"
-/usr/bin/python3.13 -B -s -P -S "$SERIAL_COLLECTOR" "$SERIAL_PIPE.out" "$SERIAL_LOG" "$SERIAL_READY_STATUS" "$SERIAL_STATUS" "$SERIAL_SERVICE_STATUS" "$SERIAL_PROGRESS_STATUS" "$SERIAL_STOP" "$MAX_SERIAL_BYTES" "$MAX_SERIAL_LINE_BYTES" &
+/usr/bin/cat >"$DOMAIN_XML" <<DOMAIN_XML
+{domain_xml}DOMAIN_XML
+bind_timeout_raw_identity || {{ printf '%s\\n' 'raw artifact identity binding failed' >&2; exit 1; }}
+/usr/bin/python3.13 -B -s -P -S "$SERIAL_COLLECTOR" "$SERIAL_PIPE.out" "$SERIAL_LOG" "$SERIAL_READY_STATUS" "$SERIAL_STATUS" "$SERIAL_SERVICE_STATUS" "$SERIAL_PROGRESS_STATUS" "$SERIAL_STOP" "$TIMEOUT_RAW_IDENTITY_ATTESTATION" "$MAX_SERIAL_BYTES" "$MAX_SERIAL_LINE_BYTES" &
 COLLECTOR_PID=$!
+bind_collector
 
 set +e
 wait_for_collector_ready
@@ -4371,8 +4832,6 @@ elif [[ $wait_status -ne 0 ]]; then
 fi
 
 collector_is_alive || {{ printf '%s\\n' 'collector died before domain definition' >&2; exit 1; }}
-/usr/bin/cat >"$DOMAIN_XML" <<DOMAIN_XML
-{domain_xml}DOMAIN_XML
 verify_lock
 validate_firmware_runtime
 /usr/bin/virsh --connect "$LIBVIRT_URI" define --validate "$DOMAIN_XML"
@@ -4578,20 +5037,29 @@ def render_plan(
         },
         "timeoutEvidence": {
             "schemaVersion": TIMEOUT_EVIDENCE_SCHEMA,
+            "attestationSchema": TIMEOUT_EVIDENCE_ATTESTATION_SCHEMA,
+            "rawIdentityAttestationSchema": TIMEOUT_RAW_IDENTITY_ATTESTATION_SCHEMA,
             "root": str(TIMEOUT_EVIDENCE_ROOT),
             "directoryMode": "0700",
             "fileMode": "0600",
             "maxBytes": MAX_TIMEOUT_EVIDENCE_BYTES,
+            "maxAttestationBytes": MAX_TIMEOUT_ATTESTATION_BYTES,
             "finalName": "<run-id>.json",
             "temporaryName": TIMEOUT_EVIDENCE_PENDING_NAME,
             "pendingSchema": TIMEOUT_EVIDENCE_PENDING_SCHEMA,
             "pendingState": "raw-cleanup-pending",
             "completeState": "raw-cleanup-complete",
+            "requiredRawNames": sorted(TIMEOUT_REQUIRED_RAW_NAMES),
             "attestationFields": [
                 "rootDevice",
                 "rootInode",
                 "pendingDevice",
                 "pendingInode",
+                "pendingSha256",
+                "tempDevice",
+                "tempInode",
+                "tempEntryCount",
+                "tempInventorySha256",
                 "finalRecordSha256",
             ],
             "rawSerialRetained": False,

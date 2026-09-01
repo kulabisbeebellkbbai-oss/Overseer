@@ -58,3 +58,18 @@
 | 1. Add guest entry, progress, and watchdog contracts | Complete | Terra ordinary review approved after output-before-cleanup and broken-serial cleanup fixes; focused `68 passed`, systemd unit verification passed |
 | 2. Split host clocks and retain sanitized timeout evidence | In progress | Pending |
 | 3. Verify, review, and prepare the inert replacement package | Pending | Pending |
+
+## Atomic predecessor/successor claim transition
+
+- Plan: `docs/superpowers/plans/2026-09-01-atomic-claim-transition.md`
+- Branch: `fix/approval-smoke-v1-1-6`
+- Plan commit: `3f7fd78`
+- Execution boundary: source, tests, reviews, and inert package preparation only; live claim transition and all operational phases remain prohibited
+
+| Task | Status | Review |
+| --- | --- | --- |
+| 1. Add atomic transition tests | Complete (`e80919c`, `16988f9`, `7628529`, `ba9772a`) | Re-reviewed; spec compliant and task quality approved with no remaining findings |
+| 2. Implement the atomic runner | In progress | Pending |
+| 3. Correct linked Dax evidence wording | Pending | Pending |
+| 4. Document and prepare the inert replacement package | Pending | Pending |
+| 5. Verify and review | Pending | Pending |

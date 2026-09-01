@@ -204,9 +204,10 @@ checked. The Psychlo writer lock remains held through the Overseer commit, then
 is rolled back and released because the transition makes no Psychlo mutation.
 The trusted lifecycle database is opened through retained no-follow directory
 and file descriptors. Its type, owner, permissions, link count, device, inode,
-and directory entry are checked before locking, immediately before the Overseer
-commit, and again when the lock is released. Path replacement or unsafe
-metadata aborts and rolls the transition back.
+and directory entry are checked before locking and immediately before the
+Overseer commit. Path replacement or unsafe metadata detected before that
+commit aborts and rolls the transition back. Cleanup after a successful commit
+is best-effort and cannot turn a durable transition into a reported failure.
 For an initially ungrouped transition, Overseer takes its writer lock and
 confirms that no group row appeared before proceeding. Changed durable records
 are reloaded and checked again before commit, so a stale probe, concurrent

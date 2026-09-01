@@ -89,6 +89,7 @@ from .claim_continuation import (
     release_claim_group_status,
     dispatch_claim_approval_continuations_status,
 )
+from .claim_transition import transition_claim_status
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
 from .agent_adapters.codex import CodexDriver, legacy_codex_session_resource
 from .agent_contracts import (
@@ -12165,6 +12166,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     release_parser.add_argument("--reason")
     release_parser.add_argument("--evidence-id", action="append", default=[])
     release_parser.add_argument("--released-at")
+    transition_parser = subparsers.add_parser(
+        "transition-claim",
+        help="atomically release one predecessor claim and activate its successor",
+    )
+    transition_parser.add_argument("--store", required=True)
+    transition_parser.add_argument("--predecessor-claim-id", required=True)
+    transition_parser.add_argument("--successor-claim-id", required=True)
+    transition_parser.add_argument("--approval-id", required=True)
+    transition_parser.add_argument("--expected-resource-id", required=True)
+    transition_parser.add_argument("--expected-owner-thread", required=True)
+    transition_parser.add_argument(
+        "--expected-owner-role",
+        required=True,
+        choices=[item.value for item in OwnerDomain],
+    )
+    transition_parser.add_argument("--expected-activation-group-id", required=True)
+    transition_parser.add_argument("--expected-lifecycle-id", required=True)
+    transition_parser.add_argument("--plan-digest", required=True)
+    transition_parser.add_argument("--transitioned-by", required=True)
+    transition_parser.add_argument("--evidence-id", action="append", required=True)
+    transition_parser.add_argument("--transitioned-at", required=True)
     args = parser.parse_args(argv)
 
     if args.command == "agent-providers":
@@ -13843,6 +13865,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.release_condition,
                     args.activation_group_id,
                     args.lifecycle_id,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "transition-claim":
+        print(
+            json.dumps(
+                transition_claim_status(
+                    store_path=args.store,
+                    predecessor_claim_id=args.predecessor_claim_id,
+                    successor_claim_id=args.successor_claim_id,
+                    approval_id=args.approval_id,
+                    expected_resource_id=args.expected_resource_id,
+                    expected_owner_thread=args.expected_owner_thread,
+                    expected_owner_role=args.expected_owner_role,
+                    expected_activation_group_id=args.expected_activation_group_id,
+                    expected_lifecycle_id=args.expected_lifecycle_id,
+                    plan_digest=args.plan_digest,
+                    transitioned_by=args.transitioned_by,
+                    evidence_ids=tuple(args.evidence_id),
+                    transitioned_at=args.transitioned_at,
                 ),
                 sort_keys=True,
             )

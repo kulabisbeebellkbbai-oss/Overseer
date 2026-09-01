@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -20,7 +21,11 @@ from overseer.claim_continuation import (
     ClaimActivationGroupState,
     ContinuationState,
 )
-from overseer.claim_transition import transition_claim_status
+from overseer.claim_transition import (
+    CLAIM_TRANSITION_RECORD_SET_EVIDENCE_PREFIX,
+    claim_transition_record_set_digest,
+    transition_claim_status,
+)
 from overseer.core import (
     ApprovalLevel,
     Claim,
@@ -54,8 +59,27 @@ PREDECESSOR_LIFECYCLE_ID = "lifecycle.phase-b.predecessor"
 LIFECYCLE_ID = "lifecycle.phase-b.rehearsal"
 TRANSITIONED_AT = "2026-09-01T12:00:00+00:00"
 EVIDENCE_IDS = ("evidence.phase-b.result", "evidence.phase-b.cleanup")
+RECORD_SET_EVIDENCE_PREFIX = CLAIM_TRANSITION_RECORD_SET_EVIDENCE_PREFIX
 RELEASE_AUDIT_ID = f"audit.claim-transition.{SUCCESSOR_CLAIM_ID}.predecessor-released"
 TRANSITION_AUDIT_ID = f"audit.claim-transition.{SUCCESSOR_CLAIM_ID}.executed"
+
+
+def _record_set_evidence(path: Path) -> str:
+    store = SQLiteStore(path)
+    try:
+        digest = claim_transition_record_set_digest(
+            store,
+            predecessor_claim_id=PREDECESSOR_CLAIM_ID,
+            predecessor_resource_id=PREDECESSOR_RESOURCE_ID,
+            successor_claim_id=SUCCESSOR_CLAIM_ID,
+            successor_resource_id=SUCCESSOR_RESOURCE_ID,
+            approval_id=APPROVAL_ID,
+            continuation_id=CONTINUATION_ID,
+            attempt_id=CONTINUATION_ATTEMPT_ID,
+        )
+    finally:
+        store.close()
+    return RECORD_SET_EVIDENCE_PREFIX + digest
 
 
 def _seed_transition_store(path: Path) -> dict[str, object]:
@@ -199,7 +223,7 @@ def _seed_transition_store(path: Path) -> dict[str, object]:
         "expected_lifecycle_id": LIFECYCLE_ID,
         "plan_digest": PLAN_DIGEST,
         "transitioned_by": OWNER_ROLE,
-        "evidence_ids": EVIDENCE_IDS,
+        "evidence_ids": (*EVIDENCE_IDS, _record_set_evidence(path)),
         "transitioned_at": TRANSITIONED_AT,
     }
 
@@ -437,8 +461,56 @@ def test_transition_claim_status_atomically_releases_and_activates_with_bound_au
         }
         for event in (*release_events, *transition_events):
             assert exact_bound_evidence.issubset(event.evidence_ids)
+            assert sum(
+                item.startswith(RECORD_SET_EVIDENCE_PREFIX)
+                for item in event.evidence_ids
+            ) == 1
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    "record_set_case",
+    ["missing", "duplicate", "malformed", "wrong"],
+)
+def test_transition_rejects_invalid_record_set_evidence_without_mutation(
+    tmp_path: Path,
+    record_set_case: str,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    valid = _record_set_evidence(path)
+    if record_set_case == "missing":
+        evidence_ids = EVIDENCE_IDS
+    elif record_set_case == "duplicate":
+        evidence_ids = (*EVIDENCE_IDS, valid, valid)
+    elif record_set_case == "malformed":
+        evidence_ids = (*EVIDENCE_IDS, RECORD_SET_EVIDENCE_PREFIX + "not-hex")
+    else:
+        evidence_ids = (*EVIDENCE_IDS, RECORD_SET_EVIDENCE_PREFIX + "0" * 64)
+    arguments["evidence_ids"] = evidence_ids
+    before = _snapshot(path)
+
+    with pytest.raises(ValueError):
+        transition_claim_status(**arguments)
+
+    assert _snapshot(path) == before
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.ACTIVE,
+        successor=ClaimStatus.REQUESTED,
+        predecessor_resource=PREDECESSOR_CLAIM_ID,
+        successor_resource=None,
+    )
+
+
+def test_transition_accepts_the_exact_record_set_digest_with_ordinary_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+
+    result = transition_claim_status(**arguments)
+
+    assert result["status"] == "transitioned"
 
 
 def test_transition_with_exact_optional_singleton_groups_changes_both_group_states_atomically(tmp_path: Path) -> None:
@@ -489,6 +561,98 @@ def test_transition_rejects_partial_or_non_exact_optional_groups_without_mutatio
     with pytest.raises((KeyError, ValueError), match=""):
         transition_claim_status(**arguments, _psychlo_store_path=str(psychlo))
 
+    assert _snapshot(path) == before
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.ACTIVE,
+        successor=ClaimStatus.REQUESTED,
+        predecessor_resource=PREDECESSOR_CLAIM_ID,
+        successor_resource=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_case",
+    ["symlink", "non-regular", "multilink", "untrusted-mode", "parent-symlink"],
+)
+def test_grouped_transition_rejects_unsafe_psychlo_path_metadata_without_mutation(
+    tmp_path: Path,
+    unsafe_case: str,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    if unsafe_case == "parent-symlink":
+        real_parent = tmp_path / "real-psychlo-parent"
+        real_parent.mkdir()
+        psychlo = _seed_psychlo_round(real_parent / "psychlo.sqlite3")
+        linked_parent = tmp_path / "linked-psychlo-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        psychlo_path = linked_parent / psychlo.name
+    else:
+        psychlo = _seed_psychlo_round(tmp_path / "psychlo.sqlite3")
+        psychlo_path = psychlo
+        if unsafe_case == "symlink":
+            target = tmp_path / "psychlo-target.sqlite3"
+            psychlo.rename(target)
+            psychlo.symlink_to(target)
+        elif unsafe_case == "non-regular":
+            psychlo.unlink()
+            psychlo.mkdir()
+        elif unsafe_case == "multilink":
+            os.link(psychlo, tmp_path / "psychlo-alias.sqlite3")
+        elif unsafe_case == "untrusted-mode":
+            os.chmod(psychlo, 0o666)
+
+    arguments = _seed_transition_store(path)
+    _seed_optional_groups(path)
+    before = _snapshot(path)
+
+    with pytest.raises((OSError, ValueError, sqlite3.Error), match=""):
+        transition_claim_status(
+            **arguments,
+            _psychlo_store_path=str(psychlo_path),
+        )
+
+    assert _snapshot(path) == before
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.ACTIVE,
+        successor=ClaimStatus.REQUESTED,
+        predecessor_resource=PREDECESSOR_CLAIM_ID,
+        successor_resource=None,
+    )
+
+
+def test_grouped_transition_rejects_psychlo_path_substitution_before_commit_without_overseer_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    psychlo = _seed_psychlo_round(tmp_path / "psychlo.sqlite3")
+    replacement = _seed_psychlo_round(tmp_path / "psychlo-replacement.sqlite3")
+    renamed = tmp_path / "psychlo-renamed.sqlite3"
+    arguments = _seed_transition_store(path)
+    _seed_optional_groups(path)
+    before = _snapshot(path)
+    original_save_audit_event = SQLiteStore.save_audit_event
+    substituted = False
+
+    def substitute_after_transition_audit(self: SQLiteStore, event: AuditEvent) -> None:
+        nonlocal substituted
+        original_save_audit_event(self, event)
+        if event.id == TRANSITION_AUDIT_ID and not substituted:
+            substituted = True
+            psychlo.rename(renamed)
+            replacement.rename(psychlo)
+
+    monkeypatch.setattr(SQLiteStore, "save_audit_event", substitute_after_transition_audit)
+
+    with pytest.raises((OSError, ValueError, sqlite3.Error), match=""):
+        transition_claim_status(
+            **arguments,
+            _psychlo_store_path=str(psychlo),
+        )
+
+    assert substituted
     assert _snapshot(path) == before
     _assert_transition_state(
         path,
@@ -902,7 +1066,7 @@ def test_transition_rejects_material_binding_without_mutation(tmp_path: Path, ca
 )
 def test_transition_rejects_invalid_or_undelivered_authority_without_mutation(tmp_path: Path, invalid_case: str) -> None:
     path = tmp_path / "overseer.sqlite3"
-    _seed_transition_store(path)
+    initial_arguments = _seed_transition_store(path)
     store = SQLiteStore(path)
     try:
         if invalid_case.startswith("approval"):
@@ -941,8 +1105,125 @@ def test_transition_rejects_invalid_or_undelivered_authority_without_mutation(tm
         store.close()
     before = _snapshot(path)
 
+    arguments = (
+        _seed_transition_arguments(path)
+        if invalid_case != "missing continuation"
+        else initial_arguments
+    )
     with pytest.raises((KeyError, ValueError), match=""):
-        transition_claim_status(**_seed_transition_arguments(path))
+        transition_claim_status(**arguments)
+
+    assert _snapshot(path) == before
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.ACTIVE,
+        successor=ClaimStatus.REQUESTED,
+        predecessor_resource=PREDECESSOR_CLAIM_ID,
+        successor_resource=None,
+    )
+
+
+def _overwrite_payload(
+    store: SQLiteStore,
+    table: str,
+    record_id: str,
+    **changes: object,
+) -> None:
+    row = store._connection.execute(
+        f"SELECT payload FROM {table} WHERE id = ?",
+        (record_id,),
+    ).fetchone()
+    assert row is not None
+    payload = json.loads(str(row["payload"]))
+    payload.update(changes)
+    store._connection.execute(
+        f"UPDATE {table} SET payload = ? WHERE id = ?",
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")), record_id),
+    )
+    store._connection.commit()
+
+
+@pytest.mark.parametrize(
+    ("record_kind", "changes"),
+    [
+        ("approval", {"id": "approval.payload-forged"}),
+        ("approval", {"subject_id": PREDECESSOR_CLAIM_ID}),
+        ("approval", {"requester_thread": "thread.payload-forged"}),
+        ("approval", {"owner_domain": OwnerDomain.ODO.value}),
+        ("approval", {"approval_level": ApprovalLevel.SISKO.value}),
+        ("approval", {"status": ApprovalStatus.PENDING.value}),
+        ("approval", {"decided_by": OwnerDomain.ODO.value}),
+        ("approval", {"decided_at": ""}),
+        ("attempt", {"id": "attempt.payload-forged"}),
+        ("attempt", {"continuation_id": "continuation.payload-forged"}),
+        ("attempt", {"owner_thread": "thread.payload-forged"}),
+        ("attempt", {"state": ContinuationState.ATTEMPTING.value}),
+        ("attempt", {"attempted_at": ""}),
+        ("attempt", {"result_status": "prompt_failed"}),
+        ("attempt", {"result_reason": ""}),
+    ],
+)
+def test_transition_rejects_material_approval_or_attempt_payload_mutation_without_mutation(
+    tmp_path: Path,
+    record_kind: str,
+    changes: dict[str, object],
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    initial_arguments = _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        if record_kind == "approval":
+            _overwrite_payload(store, "approvals", APPROVAL_ID, **changes)
+        else:
+            _overwrite_payload(
+                store,
+                "claim_approval_continuation_attempts",
+                CONTINUATION_ATTEMPT_ID,
+                **changes,
+            )
+    finally:
+        store.close()
+    before = _snapshot(path)
+
+    with pytest.raises((KeyError, ValueError), match=""):
+        transition_claim_status(**initial_arguments)
+
+    assert _snapshot(path) == before
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.ACTIVE,
+        successor=ClaimStatus.REQUESTED,
+        predecessor_resource=PREDECESSOR_CLAIM_ID,
+        successor_resource=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("table", "record_id", "changes"),
+    [
+        ("claims", PREDECESSOR_CLAIM_ID, {"intent": "forged predecessor"}),
+        ("resources", PREDECESSOR_RESOURCE_ID, {"name": "forged predecessor"}),
+        ("claims", SUCCESSOR_CLAIM_ID, {"intent": "forged successor"}),
+        ("resources", SUCCESSOR_RESOURCE_ID, {"name": "forged successor"}),
+    ],
+)
+def test_transition_rejects_bound_claim_or_resource_payload_mutation_without_mutation(
+    tmp_path: Path,
+    table: str,
+    record_id: str,
+    changes: dict[str, object],
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    initial_arguments = _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        _overwrite_payload(store, table, record_id, **changes)
+    finally:
+        store.close()
+    before = _snapshot(path)
+
+    with pytest.raises((KeyError, ValueError), match=""):
+        transition_claim_status(**initial_arguments)
 
     assert _snapshot(path) == before
     _assert_transition_state(
@@ -985,7 +1266,7 @@ def _seed_transition_arguments(path: Path) -> dict[str, object]:
         "expected_lifecycle_id": LIFECYCLE_ID,
         "plan_digest": PLAN_DIGEST,
         "transitioned_by": OWNER_ROLE,
-        "evidence_ids": EVIDENCE_IDS,
+        "evidence_ids": (*EVIDENCE_IDS, _record_set_evidence(path)),
         "transitioned_at": TRANSITIONED_AT,
     }
 

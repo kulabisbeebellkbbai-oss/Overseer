@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import fcntl
+import hashlib
+import hmac
 import json
+import os
 from pathlib import Path
+import re
+import stat
 import sqlite3
 import sys
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from .audit import ApprovalStatus, AuditEvent, AuditEventType
 from .claim_continuation import (
@@ -38,25 +44,295 @@ def _require_text(value: str, name: str) -> str:
     return value
 
 
+CLAIM_TRANSITION_RECORD_SET_EVIDENCE_PREFIX = (
+    "overseer.claim-transition-record-set-sha256.v1:"
+)
+RECORD_SET_EVIDENCE_PREFIX = CLAIM_TRANSITION_RECORD_SET_EVIDENCE_PREFIX
+_RECORD_SET_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_RECORD_SET_TABLES = (
+    "claims",
+    "resources",
+    "claims",
+    "resources",
+    "approvals",
+    "claim_approval_continuations",
+    "claim_approval_continuation_attempts",
+)
+
+
+def canonical_claim_transition_record_set_digest(
+    record_hashes: Iterable[tuple[str, str, str]],
+) -> str:
+    """Return the package-safe digest for ordered record IDs and payload hashes.
+
+    Callers provide only SQLite table names, record IDs, and SHA-256 hashes of
+    the raw canonical payloads.  The payloads themselves never enter this
+    return value or any transition evidence.
+    """
+    entries = []
+    for table, record_id, payload_sha256 in record_hashes:
+        if (
+            not isinstance(table, str)
+            or not table
+            or not isinstance(record_id, str)
+            or not record_id
+            or not isinstance(payload_sha256, str)
+            or _RECORD_SET_SHA256_RE.fullmatch(payload_sha256) is None
+        ):
+            raise ValueError("claim transition record-set entry is invalid")
+        entries.append(
+            {
+                "id": record_id,
+                "payloadSha256": payload_sha256,
+                "table": table,
+            }
+        )
+    if len(entries) != len(_RECORD_SET_TABLES) or tuple(
+        entry["table"] for entry in entries
+    ) != _RECORD_SET_TABLES:
+        raise ValueError("claim transition record-set shape is invalid")
+    canonical = json.dumps(
+        {"records": entries, "version": 1},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def claim_transition_record_set_digest(
+    store: SQLiteStore,
+    *,
+    predecessor_claim_id: str,
+    predecessor_resource_id: str,
+    successor_claim_id: str,
+    successor_resource_id: str,
+    approval_id: str,
+    continuation_id: str,
+    attempt_id: str,
+) -> str:
+    """Hash the exact seven raw SQLite payloads required by a transition.
+
+    This helper is intentionally suitable for package validation: it exposes
+    only the stable record IDs and one-way payload hashes, never payload text.
+    """
+    record_ids = (
+        predecessor_claim_id,
+        predecessor_resource_id,
+        successor_claim_id,
+        successor_resource_id,
+        approval_id,
+        continuation_id,
+        attempt_id,
+    )
+    entries: list[tuple[str, str, str]] = []
+    for table, record_id in zip(_RECORD_SET_TABLES, record_ids):
+        row = store._connection.execute(
+            f"SELECT id, payload FROM {table} WHERE id = ?",
+            (record_id,),
+        ).fetchone()
+        if row is None or str(row["id"]) != record_id:
+            raise ValueError("claim transition record set is incomplete")
+        payload = row["payload"]
+        if not isinstance(payload, str):
+            raise ValueError("claim transition record payload is invalid")
+        entries.append(
+            (
+                table,
+                record_id,
+                hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            )
+        )
+    return canonical_claim_transition_record_set_digest(entries)
+
+
+class _PsychloConnection(sqlite3.Connection):
+    """SQLite connection retaining the descriptor identity validator."""
+
+
+def _descriptor_binding(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+    )
+
+
+def _validate_psychlo_parent_info(
+    info: os.stat_result,
+    label: str,
+    *,
+    allow_sticky_shared: bool = False,
+) -> None:
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid not in {os.geteuid(), 0}
+        or (
+            stat.S_IMODE(info.st_mode) & 0o022
+            and not (allow_sticky_shared and stat.S_IMODE(info.st_mode) & stat.S_ISVTX)
+        )
+        or info.st_nlink < 2
+    ):
+        raise ValueError(f"{label} is not a trusted directory")
+
+
+def _validate_psychlo_file_info(info: os.stat_result, label: str) -> None:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or info.st_nlink != 1
+    ):
+        raise ValueError(f"{label} is not a trusted single-link regular file")
+
+
+def _open_psychlo_parent(path: Path) -> int:
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise ValueError("trusted Psychlo lifecycle database path is invalid")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(os.sep, flags)
+    try:
+        _validate_psychlo_parent_info(
+            os.fstat(descriptor),
+            "trusted Psychlo lifecycle database parent",
+            allow_sticky_shared=True,
+        )
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            _validate_psychlo_parent_info(
+                os.fstat(descriptor),
+                "trusted Psychlo lifecycle database parent",
+                allow_sticky_shared=True,
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _psychlo_revalidate(connection: sqlite3.Connection) -> None:
+    validator = getattr(connection, "_overseer_revalidate", None)
+    if not callable(validator):
+        raise ValueError("trusted Psychlo lifecycle database identity is unavailable")
+    validator()
+
+
 @contextmanager
 def _psychlo_writer(path: str | Path) -> Iterator[sqlite3.Connection]:
     psychlo_path = Path(path)
-    if not psychlo_path.is_file():
+    if not psychlo_path.is_absolute() or not psychlo_path.name:
         raise ValueError("trusted Psychlo lifecycle database is unavailable")
+    parent_fd = -1
+    file_fd = -1
+    file_locked = False
+    connection: sqlite3.Connection | None = None
+    parent_info: os.stat_result | None = None
+    file_info: os.stat_result | None = None
     try:
-        connection = sqlite3.connect(psychlo_path, timeout=10.0)
-    except sqlite3.Error as error:
-        raise ValueError("trusted Psychlo lifecycle database is unavailable") from error
-    try:
+        parent_fd = _open_psychlo_parent(psychlo_path.parent)
+        parent_info = os.fstat(parent_fd)
+        _validate_psychlo_parent_info(
+            parent_info,
+            "trusted Psychlo lifecycle database parent",
+        )
+        lexical_parent = os.stat(psychlo_path.parent, follow_symlinks=False)
+        if _descriptor_binding(parent_info) != _descriptor_binding(lexical_parent):
+            raise ValueError("trusted Psychlo lifecycle database parent was replaced")
+        entry_info = os.stat(
+            psychlo_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        _validate_psychlo_file_info(
+            entry_info,
+            "trusted Psychlo lifecycle database",
+        )
+        file_fd = os.open(
+            psychlo_path.name,
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        file_info = os.fstat(file_fd)
+        _validate_psychlo_file_info(
+            file_info,
+            "trusted Psychlo lifecycle database",
+        )
+        if _descriptor_binding(file_info) != _descriptor_binding(entry_info):
+            raise ValueError("trusted Psychlo lifecycle database was replaced")
+
+        def revalidate() -> None:
+            assert parent_info is not None
+            assert file_info is not None
+            current_parent = os.fstat(parent_fd)
+            lexical_parent_now = os.stat(
+                psychlo_path.parent,
+                follow_symlinks=False,
+            )
+            if (
+                _descriptor_binding(current_parent) != _descriptor_binding(parent_info)
+                or _descriptor_binding(lexical_parent_now) != _descriptor_binding(parent_info)
+            ):
+                raise ValueError("trusted Psychlo lifecycle database parent changed")
+            current_entry = os.stat(
+                psychlo_path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            opened_file = os.fstat(file_fd)
+            _validate_psychlo_file_info(
+                current_entry,
+                "trusted Psychlo lifecycle database",
+            )
+            _validate_psychlo_file_info(
+                opened_file,
+                "trusted Psychlo lifecycle database",
+            )
+            if (
+                _descriptor_binding(current_entry) != _descriptor_binding(file_info)
+                or _descriptor_binding(opened_file) != _descriptor_binding(file_info)
+            ):
+                raise ValueError("trusted Psychlo lifecycle database changed or was replaced")
+
+        fcntl.flock(file_fd, fcntl.LOCK_EX)
+        file_locked = True
+        connection = sqlite3.connect(
+            f"/proc/self/fd/{file_fd}",
+            timeout=10.0,
+            factory=_PsychloConnection,
+        )
+        connection._overseer_revalidate = revalidate
         connection.execute("BEGIN IMMEDIATE")
-        yield connection
-    except Exception:
-        connection.rollback()
-        raise
-    else:
-        connection.rollback()
+        revalidate()
+        try:
+            yield connection
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            try:
+                revalidate()
+            finally:
+                connection.rollback()
     finally:
-        connection.close()
+        try:
+            if connection is not None:
+                try:
+                    _psychlo_revalidate(connection)
+                finally:
+                    connection.close()
+        finally:
+            try:
+                if file_locked:
+                    fcntl.flock(file_fd, fcntl.LOCK_UN)
+            finally:
+                if file_fd >= 0:
+                    os.close(file_fd)
+                if parent_fd >= 0:
+                    os.close(parent_fd)
 
 
 def _raw_group_lock_required(
@@ -148,6 +424,8 @@ def _transition_transaction(
             elif predecessor_present or successor_present:
                 raise ValueError("claim activation groups appeared during transition setup")
             yield initial_grouped, psychlo_connection
+            if psychlo_connection is not None:
+                _psychlo_revalidate(psychlo_connection)
     except BaseException:
         error = sys.exc_info()
         if psychlo_entered and psychlo_context is not None:
@@ -378,7 +656,8 @@ def _validate_inputs(
 
     approval = store.load_approval(approval_id)
     if (
-        approval.subject_id != successor_claim_id
+        approval.id != approval_id
+        or approval.subject_id != successor_claim_id
         or approval.requester_thread != expected_owner_thread
         or approval.owner_domain != owner_role
         or approval.approval_level != ApprovalLevel.ROLE
@@ -412,11 +691,39 @@ def _validate_inputs(
         raise ValueError("successor approval continuation binding is invalid")
     attempt = store.load_claim_approval_continuation_attempt(continuation.attempt_id)
     if (
-        attempt.continuation_id != continuation_id
+        attempt.id != continuation.attempt_id
+        or attempt.continuation_id != continuation_id
         or attempt.owner_thread != expected_owner_thread
         or attempt.state != ContinuationState.DELIVERED
+        or not attempt.attempted_at
+        or attempt.result_status != "prompt_dispatched"
+        or not attempt.result_reason
     ):
         raise ValueError("successor approval continuation delivery is invalid")
+    record_set_digest = claim_transition_record_set_digest(
+        store,
+        predecessor_claim_id=predecessor_claim_id,
+        predecessor_resource_id=predecessor_resource.id,
+        successor_claim_id=successor_claim_id,
+        successor_resource_id=successor_resource.id,
+        approval_id=approval_id,
+        continuation_id=continuation.id,
+        attempt_id=attempt.id,
+    )
+    record_set_evidence = tuple(
+        item
+        for item in evidence_ids
+        if item.startswith(CLAIM_TRANSITION_RECORD_SET_EVIDENCE_PREFIX)
+    )
+    if len(record_set_evidence) != 1:
+        raise ValueError("claim transition requires exactly one record-set evidence ID")
+    evidence_digest = record_set_evidence[0][
+        len(CLAIM_TRANSITION_RECORD_SET_EVIDENCE_PREFIX) :
+    ]
+    if _RECORD_SET_SHA256_RE.fullmatch(evidence_digest) is None:
+        raise ValueError("claim transition record-set evidence ID is malformed")
+    if not hmac.compare_digest(evidence_digest, record_set_digest):
+        raise ValueError("claim transition record-set evidence does not match live records")
     _validate_conflicts(
         store,
         successor=successor,
@@ -505,6 +812,18 @@ def _verify_transition(
         or successor_resource.owner_domain != expected_owner_role
     ):
         raise ValueError("claim transition postcondition failed")
+    approval = store.load_approval(approval_id)
+    if (
+        approval.id != approval_id
+        or approval.subject_id != successor_claim_id
+        or approval.requester_thread != successor.owner_thread
+        or approval.owner_domain != expected_owner_role
+        or approval.approval_level != ApprovalLevel.ROLE
+        or approval.status != ApprovalStatus.APPROVED
+        or approval.decided_by != expected_owner_role.value
+        or not approval.decided_at
+    ):
+        raise ValueError("successor approval postcondition failed")
     successor_continuations = tuple(
         continuation
         for continuation in store.list_claim_approval_continuations()
@@ -516,9 +835,13 @@ def _verify_transition(
         raise ValueError("successor continuation delivery postcondition failed")
     attempt = store.load_claim_approval_continuation_attempt(expected_continuation.attempt_id)
     if (
-        attempt.continuation_id != expected_continuation.id
+        attempt.id != expected_continuation.attempt_id
+        or attempt.continuation_id != expected_continuation.id
         or attempt.owner_thread != expected_continuation.owner_thread
         or attempt.state != ContinuationState.DELIVERED
+        or not attempt.attempted_at
+        or attempt.result_status != "prompt_dispatched"
+        or not attempt.result_reason
     ):
         raise ValueError("successor continuation delivery postcondition failed")
     if release_group_id is not None:

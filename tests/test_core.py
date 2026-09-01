@@ -12893,6 +12893,148 @@ class RuntimeTests(unittest.TestCase):
             )
             self.assertEqual(message.decided_by, OwnerDomain.DAX.value)
 
+    def test_reconciliation_revalidates_linked_dax_state_before_commit(self):
+        cases = ("message", "message-status", "dispatch", "claim", "approval", "audit")
+        for mutation in cases:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                requested, dispatch_event = self._prepare_replayable_dax_role_approval(
+                    store_path,
+                    f"toctou-{mutation}",
+                )
+                injected = False
+                original_review = overseer_cli._exact_dax_role_approval_review
+
+                def inject_after_preliminary_validation(
+                    preliminary_store_path,
+                    message,
+                    result,
+                    evidence_id,
+                    decided_at,
+                    **kwargs,
+                ):
+                    nonlocal injected
+                    review, validation_error = original_review(
+                        preliminary_store_path,
+                        message,
+                        result,
+                        evidence_id,
+                        decided_at,
+                        **kwargs,
+                    )
+                    if review is None or injected or kwargs.get("store") is not None:
+                        return review, validation_error
+                    injected = True
+                    store = SQLiteStore(store_path)
+                    try:
+                        if mutation == "message":
+                            current = store.load_crew_message(message.id)
+                            store.save_crew_message(
+                                replace(
+                                    current,
+                                    request_evidence_ids=("evidence.changed-after-validation",),
+                                )
+                            )
+                        elif mutation == "message-status":
+                            current = store.load_crew_message(message.id)
+                            store.save_crew_message(
+                                replace(current, status=CrewMessageStatus.OPEN)
+                            )
+                        elif mutation == "dispatch":
+                            store.save_audit_event(
+                                replace(
+                                    dispatch_event,
+                                    evidence_ids=("overseer.linked-role-action.sha256:forged",),
+                                )
+                            )
+                        elif mutation == "claim":
+                            claim = store.load_claim(message.related_claim_id)
+                            store.save_claim(
+                                replace(claim, requested_action="changed after validation")
+                            )
+                        elif mutation == "approval":
+                            approval = store.load_approval(message.related_approval_id)
+                            store.save_approval(replace(approval, decided_by="forged-dax"))
+                        else:
+                            store.save_audit_event(
+                                replace(
+                                    dispatch_event,
+                                    summary=f"{dispatch_event.summary} forged after validation",
+                                )
+                            )
+                    finally:
+                        store.close()
+                    return review, validation_error
+
+                with patch.object(
+                    overseer_cli,
+                    "_exact_dax_role_approval_review",
+                    side_effect=inject_after_preliminary_validation,
+                ):
+                    reconciled = reconcile_crew_reviews_status(
+                        store_path,
+                        message_id=requested["approval_handoff_id"],
+                        reconciled_at="2026-08-21T20:07:00+00:00",
+                    )
+
+                self.assertTrue(injected)
+                store = SQLiteStore(store_path)
+                try:
+                    message = store.load_crew_message(requested["approval_handoff_id"])
+                finally:
+                    store.close()
+                self.assertEqual(reconciled["approved"], 0, mutation)
+                self.assertEqual(reconciled["correction_requested"], 1, mutation)
+                self.assertEqual(message.review_status, CrewReviewStatus.CORRECTION_REQUESTED, mutation)
+                self.assertIsNotNone(message.decision_reason)
+                self.assertNotEqual(
+                    message.decision_reason,
+                    f"dax approved the exact original ROLE approval {requested['approval_id']}; activation remains separate",
+                )
+
+    def test_reconciliation_does_not_replace_review_audit_id_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            requested, _ = self._prepare_replayable_dax_role_approval(
+                store_path,
+                "review-audit-collision",
+            )
+            review_audit_id = (
+                f"audit.{requested['approval_handoff_id']}.review."
+                f"{overseer_cli._status_id('2026-08-21T20:07:00+00:00')}"
+            )
+            collision = AuditEvent(
+                id=review_audit_id,
+                event_type=AuditEventType.REJECTED,
+                owner_domain=OwnerDomain.DAX,
+                subject_id=requested["approval_handoff_id"],
+                summary="pre-existing conflicting review audit",
+                risk_level=RiskLevel.LOW,
+                evidence_ids=("evidence.conflict",),
+                occurred_at="2026-08-21T20:07:00+00:00",
+            )
+            store = SQLiteStore(store_path)
+            store.save_audit_event(collision)
+            store.close()
+
+            with self.assertRaisesRegex(ValueError, "crew review audit id already exists"):
+                reconcile_crew_reviews_status(
+                    store_path,
+                    message_id=requested["approval_handoff_id"],
+                    reconciled_at="2026-08-21T20:07:00+00:00",
+                )
+
+            store = SQLiteStore(store_path)
+            try:
+                message = store.load_crew_message(requested["approval_handoff_id"])
+                audit_event = next(
+                    event for event in store.list_audit_events() if event.id == review_audit_id
+                )
+            finally:
+                store.close()
+            self.assertEqual(message.review_status, CrewReviewStatus.PENDING)
+            self.assertEqual(audit_event, collision)
+
     def test_reconciliation_rejects_non_deterministic_linked_dispatch_audit_id(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

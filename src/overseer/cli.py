@@ -7910,26 +7910,36 @@ def reconcile_crew_reviews_status(
             for message in messages
         }
         linked_dispatch_events_by_message = {
-            message.id: tuple(
-                event
-                for event in sorted(
-                    audit_events,
-                    key=lambda item: item.occurred_at or item.id,
-                    reverse=True,
-                )
-                if event.id.startswith(f"audit.{message.id}.dispatch.")
-                or (
-                    event.subject_id == message.id
-                    and event.summary.startswith("dax dispatch ")
-                )
-            )
+            message.id: _linked_dispatch_events_for_message(message, audit_events)
             for message in messages
             if _is_dax_linked_message(message)
         }
+        linked_preliminary_state_by_message = {}
+        for message in messages:
+            if not _is_dax_linked_message(message):
+                continue
+            claim = None
+            approval = None
+            try:
+                claim = store.load_claim(message.related_claim_id)
+            except KeyError:
+                pass
+            try:
+                approval = store.load_approval(message.related_approval_id)
+            except KeyError:
+                pass
+            linked_preliminary_state_by_message[message.id] = (
+                message,
+                linked_dispatch_events_by_message[message.id],
+                claim,
+                approval,
+            )
         packages = list(store.list_host_security_ids_review_packages())
     finally:
         store.close()
-    pending_decisions: list[tuple[object, CrewReviewStatus, str, tuple[str, ...], str | None]] = []
+    pending_decisions: list[
+        tuple[object, CrewReviewStatus, str, tuple[str, ...], str | None, object | None]
+    ] = []
     for message in messages:
         dispatch_event = dispatch_event_by_message.get(message.id)
         dispatch_evidence = dispatch_event.id if dispatch_event is not None else None
@@ -7937,42 +7947,12 @@ def reconcile_crew_reviews_status(
         text = f"{message.subject}\n{message.message}".lower()
         read_only = any(marker in text for marker in ("read-only", "read only", "advisory", "inventory", "review"))
         if _is_dax_linked_message(message):
-            linked_events = linked_dispatch_events_by_message.get(message.id, ())
-            if len(linked_events) != 1:
-                reason = "linked Dax ROLE approval reconciliation requires exactly one dispatch audit event"
-                evidence = tuple(dict.fromkeys(event.id for event in linked_events))
-                decision = (CrewReviewStatus.CORRECTION_REQUESTED, reason, evidence, reason)
-            else:
-                dispatch_event = linked_events[0]
-                dispatch_evidence = dispatch_event.id
-                reconstructed_result, validation_error = _linked_role_result_from_dispatch_event(
-                    message,
-                    dispatch_event,
-                )
-                linked_role_review = None
-                if reconstructed_result is not None:
-                    linked_role_review, validation_error = _exact_dax_role_approval_review(
-                        store_path,
-                        message,
-                        reconstructed_result,
-                        dispatch_evidence,
-                        now,
-                    )
-                if linked_role_review is not None:
-                    decision = (
-                        CrewReviewStatus.APPROVED,
-                        linked_role_review["decision_reason"],
-                        linked_role_review["decision_evidence_ids"],
-                        None,
-                    )
-                else:
-                    reason = validation_error or "linked Dax ROLE approval evidence is invalid"
-                    decision = (
-                        CrewReviewStatus.CORRECTION_REQUESTED,
-                        reason,
-                        (dispatch_evidence,),
-                        reason,
-                    )
+            decision = _linked_dax_reconciliation_decision(
+                store_path,
+                message,
+                linked_dispatch_events_by_message.get(message.id, ()),
+                now,
+            )
         elif message.owner_domain == OwnerDomain.DAX and read_only and dispatch_evidence:
             decision = (
                 CrewReviewStatus.APPROVED,
@@ -8057,15 +8037,48 @@ def reconcile_crew_reviews_status(
         if decision is None:
             continue
         status, reason, evidence, correction = decision
-        pending_decisions.append((message, status, reason, evidence, correction))
+        pending_decisions.append(
+            (
+                message,
+                status,
+                reason,
+                evidence,
+                correction,
+                linked_preliminary_state_by_message.get(message.id),
+            )
+        )
     results: list[dict[str, object]] = []
     store = SQLiteStore(store_path)
     try:
         with store.agent_transaction():
-            for message, status, reason, evidence, correction in pending_decisions:
+            for message, status, reason, evidence, correction, preliminary_state in pending_decisions:
                 latest = store.load_crew_message(message.id)
                 if latest.review_status != CrewReviewStatus.PENDING:
                     continue
+                if _is_dax_linked_message(message) or _is_dax_linked_message(latest):
+                    linked_events = _linked_dispatch_events_for_message(
+                        latest,
+                        store.list_audit_events(),
+                    )
+                    state_error = _linked_dax_preliminary_state_error(
+                        store,
+                        latest,
+                        linked_events,
+                        preliminary_state,
+                    )
+                    if state_error is not None:
+                        status = CrewReviewStatus.CORRECTION_REQUESTED
+                        reason = state_error
+                        evidence = tuple(event.id for event in linked_events[:1])
+                        correction = state_error
+                    else:
+                        status, reason, evidence, correction = _linked_dax_reconciliation_decision(
+                            store_path,
+                            latest,
+                            linked_events,
+                            now,
+                            store=store,
+                        )
                 decided_by = (
                     reconciled_by
                     if latest.owner_domain not in {OwnerDomain.DAX, OwnerDomain.KIRA, OwnerDomain.ODO_IDS}
@@ -8099,7 +8112,7 @@ def reconcile_crew_reviews_status(
                     evidence_ids=evidence,
                     occurred_at=now,
                 )
-                store.save_audit_event(event)
+                _save_reconciliation_review_audit_event(store, event)
                 results.append({
                     "store": str(store.path),
                     "message": crew_message_status(updated),
@@ -8338,6 +8351,8 @@ def _exact_dax_role_approval_review(
     result,
     evidence_id: str | None,
     decided_at: str,
+    *,
+    store: SQLiteStore | None = None,
 ) -> tuple[dict[str, object] | None, str | None]:
     if message.owner_domain != OwnerDomain.DAX:
         return None, "linked ROLE approval review owner must be dax"
@@ -8349,18 +8364,20 @@ def _exact_dax_role_approval_review(
         return None, "linked Dax ROLE approval requires dispatch audit evidence"
     if _crew_dispatch_result_mutated_host(result):
         return None, "linked Dax ROLE approval result must not mutate the host"
-    store = SQLiteStore(store_path)
+    review_store = store if store is not None else SQLiteStore(store_path)
+    close_review_store = store is None
     try:
         try:
-            claim = store.load_claim(message.related_claim_id)
+            claim = review_store.load_claim(message.related_claim_id)
         except KeyError:
             return None, "linked Dax ROLE approval claim record is missing"
         try:
-            approval = store.load_approval(message.related_approval_id)
+            approval = review_store.load_approval(message.related_approval_id)
         except KeyError:
             return None, "linked Dax ROLE approval record is missing"
     finally:
-        store.close()
+        if close_review_store:
+            review_store.close()
     if (
         claim.owner_role != OwnerDomain.DAX
         or claim.status != ClaimStatus.REQUESTED
@@ -8401,6 +8418,108 @@ def _exact_dax_role_approval_review(
         "decided_by": OwnerDomain.DAX.value,
         "decided_at": decided_at,
     }, None
+
+
+def _linked_dispatch_events_for_message(message, audit_events) -> tuple[AuditEvent, ...]:
+    return tuple(
+        event
+        for event in sorted(
+            audit_events,
+            key=lambda item: item.occurred_at or item.id,
+            reverse=True,
+        )
+        if event.id.startswith(f"audit.{message.id}.dispatch.")
+        or (
+            event.subject_id == message.id
+            and event.summary.startswith("dax dispatch ")
+        )
+    )
+
+
+def _linked_dax_preliminary_state_error(
+    store: SQLiteStore,
+    latest,
+    linked_events: Sequence[AuditEvent],
+    preliminary_state,
+) -> str | None:
+    if preliminary_state is None:
+        return "linked Dax ROLE approval linkage was not validated before final persistence"
+    preliminary_message, preliminary_events, preliminary_claim, preliminary_approval = preliminary_state
+    if latest.status != CrewMessageStatus.ACKNOWLEDGED:
+        return "linked Dax ROLE approval latest message is not acknowledged"
+    if not _canonical_role_handoff_matches(
+        latest,
+        preliminary_message,
+        allowed_mutable_fields=("status", "review_status"),
+    ):
+        return "linked Dax ROLE approval message changed after preliminary validation"
+    if tuple(linked_events) != tuple(preliminary_events):
+        return "linked Dax ROLE approval dispatch audit changed after preliminary validation"
+    try:
+        claim = store.load_claim(latest.related_claim_id)
+    except (KeyError, TypeError):
+        claim = None
+    try:
+        approval = store.load_approval(latest.related_approval_id)
+    except (KeyError, TypeError):
+        approval = None
+    if claim != preliminary_claim:
+        return "linked Dax ROLE approval claim changed after preliminary validation"
+    if approval != preliminary_approval:
+        return "linked Dax ROLE approval changed after preliminary validation"
+    return None
+
+
+def _linked_dax_reconciliation_decision(
+    store_path,
+    message,
+    linked_events: Sequence[AuditEvent],
+    decided_at: str,
+    *,
+    store: SQLiteStore | None = None,
+) -> tuple[CrewReviewStatus, str, tuple[str, ...], str | None]:
+    if len(linked_events) != 1:
+        reason = "linked Dax ROLE approval reconciliation requires exactly one dispatch audit event"
+        evidence = tuple(dict.fromkeys(event.id for event in linked_events))
+        return CrewReviewStatus.CORRECTION_REQUESTED, reason, evidence, reason
+
+    dispatch_event = linked_events[0]
+    dispatch_evidence = dispatch_event.id
+    reconstructed_result, validation_error = _linked_role_result_from_dispatch_event(
+        message,
+        dispatch_event,
+    )
+    linked_role_review = None
+    if reconstructed_result is not None:
+        linked_role_review, validation_error = _exact_dax_role_approval_review(
+            store_path,
+            message,
+            reconstructed_result,
+            dispatch_evidence,
+            decided_at,
+            store=store,
+        )
+    if linked_role_review is not None:
+        return (
+            CrewReviewStatus.APPROVED,
+            linked_role_review["decision_reason"],
+            linked_role_review["decision_evidence_ids"],
+            None,
+        )
+    reason = validation_error or "linked Dax ROLE approval evidence is invalid"
+    return CrewReviewStatus.CORRECTION_REQUESTED, reason, (dispatch_evidence,), reason
+
+
+def _save_reconciliation_review_audit_event(store: SQLiteStore, event: AuditEvent) -> None:
+    existing = next(
+        (item for item in store.list_audit_events() if item.id == event.id),
+        None,
+    )
+    if existing is not None:
+        if existing != event:
+            raise ValueError("crew review audit id already exists")
+        return
+    store.save_audit_event(event)
 
 
 def _automatic_crew_review(store_path, message, result, delivery_status, evidence_id: str, decided_by: str, decided_at: str) -> dict[str, object]:

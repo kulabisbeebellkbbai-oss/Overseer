@@ -235,13 +235,20 @@ probe, KVM capability probe, source commit, exact owner attestation, domain XML,
 cloud-init, and future script under `planDigest`. The owner attestation contains
 the exact conversation ID, project, owner top-level, source worktree, common Git
 directory, their device/inode identities, authoritative registry path, command,
-launcher, registry and launcher device/inode identities, complete registry and
-launcher digests, the exact Codex process argv plus executable path,
-device/inode identity and digest, canonical row digest, and self-digest.
+launcher, launcher device/inode identity and digest, the exact selected owner
+row's stable conversation/project/command/launcher semantics and row digest,
+the exact Codex process argv plus executable path, device/inode identity and
+digest, and self-digest.
 `render-plan` accepts that preflight output as `--owner-binding-json`, verifies
-all digests, securely rereads the authoritative registry without following any
-path symlink, re-probes the owner/source Git identity, and requires a
-byte-equivalent reconstruction of the binding. It does not run KVM, libvirt,
+all binding and artifact digests, securely rereads the authoritative registry
+without following any path symlink, re-probes the owner/source Git identity,
+and requires a byte-equivalent reconstruction of the binding. The v3 owner
+binding intentionally does not include the registry file SHA-256 or registry
+device/inode identity, so safe atomic registry rewrites and unrelated
+row/timestamp changes do not invalidate an unrelated owner lease. Each read
+still enforces the authoritative path, no-follow traversal, owner, regular
+single-link type, safe permissions, bounded size, and stable descriptor/path
+identity checks. It does not run KVM, libvirt,
 VM, service, package, or activation operations.
 
 The separately approved future script first reconstructs the exact registry,

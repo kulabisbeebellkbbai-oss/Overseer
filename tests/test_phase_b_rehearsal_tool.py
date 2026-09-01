@@ -207,7 +207,7 @@ def owner_binding(module, *, conversation_id: str = OWNER_THREAD) -> dict[str, o
         "launcher": f"/home/god/.local/bin/codex-overseer-{conversation_id}",
     }
     record: dict[str, object] = {
-        "schemaVersion": "overseer.phase-b-rehearsal-owner-binding.v2",
+        "schemaVersion": "overseer.phase-b-rehearsal-owner-binding.v3",
         "status": "passed",
         "conversationId": conversation_id,
         "project": str(OWNER_PROJECT),
@@ -221,10 +221,7 @@ def owner_binding(module, *, conversation_id: str = OWNER_THREAD) -> dict[str, o
         "gitCommonDirectoryDevice": GIT_COMMON_DEVICE,
         "gitCommonDirectoryInode": GIT_COMMON_INODE,
         "registry": str(CODEX_PROJECTS_REGISTRY),
-        "registryDevice": REGISTRY_DEVICE,
-        "registryInode": REGISTRY_INODE,
         "registryRow": row,
-        "registrySha256": hashlib.sha256(registry_payload).hexdigest(),
         "registryRowDigest": hashlib.sha256(module.canonical_json(row).encode()).hexdigest(),
         "launcherDevice": LAUNCHER_DEVICE,
         "launcherInode": LAUNCHER_INODE,
@@ -240,15 +237,27 @@ def owner_binding(module, *, conversation_id: str = OWNER_THREAD) -> dict[str, o
 
 
 def owner_registry_bytes(
-    *, conversation_id: str = OWNER_THREAD, project: Path = OWNER_PROJECT, duplicate: bool = False
+    *,
+    conversation_id: str = OWNER_THREAD,
+    project: Path = OWNER_PROJECT,
+    duplicate: bool = False,
+    target_timestamp: str = "2026-08-31T11:34:13+00:00",
+    unrelated_row: bool = False,
 ) -> bytes:
     header = "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
     row = (
         f"{conversation_id},Overseer,{project},codex-overseer-{conversation_id},"
         f"/home/god/.local/bin/codex-overseer-{conversation_id},"
-        "2026-08-24T19:47:00+00:00,2026-08-31T11:34:13+00:00,codex-state,\n"
+        f"2026-08-24T19:47:00+00:00,{target_timestamp},codex-state,\n"
     )
-    return (header + row + (row if duplicate else "")).encode("utf-8")
+    other = (
+        "019fefa5-f52a-74f3-8179-715e12d9cd2e,Other,/home/god/Documents/Codex Workspace/Other,"
+        "codex-other,/home/god/.local/bin/codex-other,2020-01-01T00:00:00+00:00,"
+        "2030-01-01T00:00:00+00:00,other,unrelated\n"
+        if unrelated_row
+        else ""
+    )
+    return (header + other + row + (row if duplicate else "")).encode("utf-8")
 
 
 def render(module, **overrides: object) -> dict[str, object]:
@@ -276,8 +285,8 @@ def render(module, **overrides: object) -> dict[str, object]:
         )
     module._read_codex_projects_registry = lambda path: registry_payload
     module._codex_registry_object_identity = lambda path: {
-        "device": selected_binding["registryDevice"],
-        "inode": selected_binding["registryInode"],
+        "device": REGISTRY_DEVICE,
+        "inode": REGISTRY_INODE,
     }
     module._read_launcher_evidence = lambda path, **kwargs: {
         "device": selected_binding["launcherDevice"],
@@ -380,10 +389,6 @@ def valid_preflight_kwargs(module) -> dict[str, object]:
         "owner_project": OWNER_PROJECT,
         "codex_projects_registry": CODEX_PROJECTS_REGISTRY,
         "registry_reader": lambda path: owner_registry_bytes(),
-        "registry_identity_reader": lambda path: {
-            "device": REGISTRY_DEVICE,
-            "inode": REGISTRY_INODE,
-        },
         "launcher_evidence_reader": lambda path, **kwargs: {
             "device": LAUNCHER_DEVICE,
             "inode": LAUNCHER_INODE,
@@ -464,7 +469,7 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
     )
     assert module.TIMEOUT_EVIDENCE_PENDING_NAME == ".<run-id>.pending.json"
     assert module.TIMEOUT_EVIDENCE_SCHEMA == "overseer.phase-b-rehearsal-timeout-evidence.v1"
-    assert module.OWNER_BINDING_SCHEMA == "overseer.phase-b-rehearsal-owner-binding.v2"
+    assert module.OWNER_BINDING_SCHEMA == "overseer.phase-b-rehearsal-owner-binding.v3"
     assert module.DEFAULT_CODEX_PROJECTS_REGISTRY == CODEX_PROJECTS_REGISTRY
     assert module.SESSION_RUNTIME_DIR == SESSION_RUNTIME_DIR
     assert module.MINIMAL_ENV["XDG_RUNTIME_DIR"] == str(SESSION_RUNTIME_DIR)
@@ -649,6 +654,9 @@ def test_preflight_binds_one_exact_registered_owner_before_probes() -> None:
         "--cd",
         str(OWNER_PROJECT),
     ]
+    assert "registrySha256" not in result["ownerBinding"]
+    assert "registryDevice" not in result["ownerBinding"]
+    assert "registryInode" not in result["ownerBinding"]
 
 
 def test_owner_process_evidence_requires_one_exact_codex_ancestor(
@@ -827,6 +835,10 @@ def test_future_owner_validator_is_valid_python_and_requires_process_lineage() -
     assert "second_ancestry=ancestry_snapshot();second_panes=pane_snapshot()" in validator
     assert "first_ancestry!=second_ancestry" in validator
     assert "first_panes!=second_panes" in validator
+    assert "overseer.phase-b-rehearsal-owner-binding.v3" in validator
+    assert "registrySha256" not in validator
+    assert "registryDevice" not in validator
+    assert "registryInode" not in validator
 
 
 def _generated_owner_authorizer(module):
@@ -1141,6 +1153,33 @@ def test_default_registry_reader_rejects_post_read_path_replacement(
     monkeypatch.setattr(module.os, "read", replacing_read)
 
     with pytest.raises(module.PreflightError, match="changed|replaced"):
+        module._read_codex_projects_registry(registry)
+
+
+def test_default_registry_reader_rejects_unsafe_replacement_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_tool()
+    registry = tmp_path / "codex-projects.csv"
+    registry.write_bytes(owner_registry_bytes())
+    registry.chmod(0o600)
+    moved = tmp_path / "replaced.csv"
+    real_read = module.os.read
+    replaced = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        payload = real_read(descriptor, size)
+        if not payload and not replaced:
+            registry.rename(moved)
+            registry.write_bytes(owner_registry_bytes())
+            registry.chmod(0o666)
+            replaced = True
+        return payload
+
+    monkeypatch.setattr(module.os, "read", replacing_read)
+
+    with pytest.raises(module.PreflightError, match="unsafe|changed|replaced"):
         module._read_codex_projects_registry(registry)
 
 
@@ -2423,6 +2462,37 @@ def test_render_plan_digest_changes_with_exact_owner_binding() -> None:
     assert first["plan"]["ownerBinding"]["conversationId"] == OWNER_THREAD
     assert second["plan"]["ownerBinding"]["conversationId"] == second_owner
     assert first["planDigest"] != second["planDigest"]
+
+
+@pytest.mark.parametrize(
+    "registry_payload",
+    (
+        owner_registry_bytes(target_timestamp="2035-01-01T00:00:00+00:00"),
+        owner_registry_bytes(unrelated_row=True),
+        owner_registry_bytes(
+            target_timestamp="2035-01-01T00:00:00+00:00", unrelated_row=True
+        ),
+    ),
+)
+def test_render_plan_digest_ignores_safe_registry_rewrite_unrelated_row_and_timestamp(
+    registry_payload: bytes,
+) -> None:
+    module = load_tool()
+    baseline = render(module)
+    rewritten = render(module, _registry_payload=registry_payload)
+
+    assert rewritten["plan"]["ownerBinding"] == baseline["plan"]["ownerBinding"]
+    assert rewritten["planDigest"] == baseline["planDigest"]
+
+
+def test_render_plan_rejects_changed_target_owner_row() -> None:
+    module = load_tool()
+    changed = owner_registry_bytes(
+        project=Path("/home/god/Documents/Codex Workspace/Roadex")
+    )
+
+    with pytest.raises(module.PreflightError, match="owner binding"):
+        render(module, _registry_payload=changed)
 
 
 def test_render_plan_rejects_digest_valid_binding_not_in_live_registry() -> None:
@@ -3846,6 +3916,7 @@ def test_generated_wait_detects_collector_death_during_boot(tmp_path: Path) -> N
             "/usr/bin/bash -c 'sleep 0.1; exit 17' &",
             "COLLECTOR_PID=$!",
             "bind_collector",
+            "BOOT_TIMEOUT_SECONDS=2",
             "wait_for_service_entry",
             "observed=$?",
             "wait \"$COLLECTOR_PID\" 2>/dev/null",

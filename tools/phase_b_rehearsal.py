@@ -52,7 +52,7 @@ DEFAULT_TEMP_PARENT = Path("/var/tmp")
 DEFAULT_CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
 SESSION_RUNTIME_DIR = Path("/run/user") / str(os.geteuid())
 REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v11"
-OWNER_BINDING_SCHEMA = "overseer.phase-b-rehearsal-owner-binding.v2"
+OWNER_BINDING_SCHEMA = "overseer.phase-b-rehearsal-owner-binding.v3"
 ARTIFACT_MANIFEST_SCHEMA = "overseer.rehearsal-artifact-manifest.v1"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
 BOOT_TIMEOUT_SECONDS = 600
@@ -245,10 +245,7 @@ _OWNER_BINDING_KEYS = frozenset(
         "gitCommonDirectoryDevice",
         "gitCommonDirectoryInode",
         "registry",
-        "registryDevice",
-        "registryInode",
         "registryRow",
-        "registrySha256",
         "registryRowDigest",
         "launcherDevice",
         "launcherInode",
@@ -926,12 +923,9 @@ def _owner_binding_from_registry(
     owner_project: Path,
     registry: Path,
     registry_payload: bytes,
-    registry_identity_reader: Callable[[Path], dict[str, int]] | None = None,
     launcher_evidence_reader: Callable[..., dict[str, object]] | None = None,
     owner_process_evidence_reader: Callable[..., dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    if registry_identity_reader is None:
-        registry_identity_reader = _codex_registry_object_identity
     if launcher_evidence_reader is None:
         launcher_evidence_reader = _read_launcher_evidence
     if owner_process_evidence_reader is None:
@@ -982,7 +976,6 @@ def _owner_binding_from_registry(
     expected_launcher = Path("/home/god/.local/bin") / expected_command
     if launcher != expected_launcher:
         raise PreflightError("registered owner launcher is invalid")
-    registry_identity = registry_identity_reader(registry)
     launcher_evidence = launcher_evidence_reader(
         launcher,
         conversation_id=conversation_id,
@@ -993,7 +986,7 @@ def _owner_binding_from_registry(
         conversation_id=conversation_id,
         project=owner_project,
     )
-    if set(registry_identity) != {"device", "inode"} or set(launcher_evidence) != {
+    if set(launcher_evidence) != {
         "device",
         "inode",
         "sha256",
@@ -1041,10 +1034,7 @@ def _owner_binding_from_registry(
         "conversationId": conversation_id,
         "project": str(owner_project),
         "registry": str(registry),
-        "registryDevice": registry_identity["device"],
-        "registryInode": registry_identity["inode"],
         "registryRow": row_binding,
-        "registrySha256": hashlib.sha256(registry_payload).hexdigest(),
         "registryRowDigest": hashlib.sha256(canonical_json(row_binding).encode()).hexdigest(),
         "launcherDevice": launcher_evidence["device"],
         "launcherInode": launcher_evidence["inode"],
@@ -1204,12 +1194,7 @@ def _validate_owner_binding(value: Mapping[str, object]) -> dict[str, object]:
         ):
             raise PreflightError("owner binding registry row is invalid")
         _validate_host_path(Path(row_binding["launcher"]), "owner binding launcher")
-        registry_digest = binding["registrySha256"]
-        if not isinstance(registry_digest, str) or _SHA256.fullmatch(registry_digest) is None:
-            raise PreflightError("owner binding registry digest is invalid")
         for identity_field in (
-            "registryDevice",
-            "registryInode",
             "launcherDevice",
             "launcherInode",
             "codexExecutableDevice",
@@ -2128,9 +2113,6 @@ def preflight(
     owner_project: Path,
     codex_projects_registry: Path = DEFAULT_CODEX_PROJECTS_REGISTRY,
     registry_reader: Callable[[Path], bytes] = _read_codex_projects_registry,
-    registry_identity_reader: Callable[
-        [Path], dict[str, int]
-    ] = _codex_registry_object_identity,
     launcher_evidence_reader: Callable[..., dict[str, object]] = _read_launcher_evidence,
     owner_process_evidence_reader: Callable[
         ..., dict[str, object]
@@ -2202,7 +2184,6 @@ def preflight(
         owner_project=owner_project,
         registry=codex_projects_registry,
         registry_payload=registry_reader(codex_projects_registry),
-        registry_identity_reader=registry_identity_reader,
         launcher_evidence_reader=launcher_evidence_reader,
         owner_process_evidence_reader=owner_process_evidence_reader,
     )
@@ -4092,8 +4073,7 @@ if sorted(expected)!=expected_binding_keys: raise SystemExit("owner binding fiel
 supplied_digest=expected.pop("bindingDigest")
 if hashlib.sha256(canonical(expected).encode()).hexdigest()!=supplied_digest: raise SystemExit("owner binding digest mismatch")
 expected["bindingDigest"]=supplied_digest
-registry_payload,registry_state=read_file(expected["registry"],8388608)
-if (registry_state.st_dev,registry_state.st_ino)!=(expected["registryDevice"],expected["registryInode"]) or hashlib.sha256(registry_payload).hexdigest()!=expected["registrySha256"]: raise SystemExit("owner registry mismatch")
+registry_payload,_=read_file(expected["registry"],8388608)
 try: registry_text=registry_payload.decode("utf-8")
 except UnicodeDecodeError as error: raise SystemExit("owner registry encoding invalid") from error
 def select_owner_row(registry_text):
@@ -4122,7 +4102,7 @@ derived_command="codex-overseer-"+canonical_conversation
 derived_launcher="/home/god/.local/bin/"+derived_command
 derived_row=dict(conversationId=canonical_conversation,project=expected["project"],command=derived_command,launcher=derived_launcher)
 if row_binding!=derived_row or row_binding!=expected["registryRow"] or hashlib.sha256(canonical(row_binding).encode()).hexdigest()!=expected["registryRowDigest"]: raise SystemExit("owner registry row mismatch")
-if expected["schemaVersion"]!="overseer.phase-b-rehearsal-owner-binding.v2" or expected["status"]!="passed" or expected["conversationId"]!=canonical_conversation or expected["ownerProjectToplevel"]!=row_binding["project"] or expected["registry"]!="/home/god/.codex/codex-projects.csv": raise SystemExit("owner binding semantics invalid")
+if expected["schemaVersion"]!="overseer.phase-b-rehearsal-owner-binding.v3" or expected["status"]!="passed" or expected["conversationId"]!=canonical_conversation or expected["ownerProjectToplevel"]!=row_binding["project"] or expected["registry"]!="/home/god/.codex/codex-projects.csv": raise SystemExit("owner binding semantics invalid")
 launcher_path=expected["registryRow"]["launcher"]
 launcher_payload,launcher_state=read_file(launcher_path,65536)
 if (launcher_state.st_dev,launcher_state.st_ino)!=(expected["launcherDevice"],expected["launcherInode"]) or hashlib.sha256(launcher_payload).hexdigest()!=expected["launcherSha256"]: raise SystemExit("owner launcher mismatch")
@@ -4244,14 +4224,14 @@ first_ancestry=ancestry_snapshot();first_panes=pane_snapshot()
 second_ancestry=ancestry_snapshot();second_panes=pane_snapshot()
 owner_process=authorize(first_ancestry,first_panes,second_ancestry,second_panes)
 reconstructed=dict(
- schemaVersion="overseer.phase-b-rehearsal-owner-binding.v2",status="passed",
+ schemaVersion="overseer.phase-b-rehearsal-owner-binding.v3",status="passed",
  conversationId=row_binding["conversationId"],project=row_binding["project"],ownerProjectToplevel=row_binding["project"],
  sourceRoot=expected["sourceRoot"],gitCommonDirectory=owner_common,
  ownerProjectDevice=owner_state.st_dev,ownerProjectInode=owner_state.st_ino,
  sourceRootDevice=source_state.st_dev,sourceRootInode=source_state.st_ino,
  gitCommonDirectoryDevice=owner_common_state.st_dev,gitCommonDirectoryInode=owner_common_state.st_ino,
- registry="/home/god/.codex/codex-projects.csv",registryDevice=registry_state.st_dev,registryInode=registry_state.st_ino,
- registryRow=row_binding,registrySha256=hashlib.sha256(registry_payload).hexdigest(),registryRowDigest=hashlib.sha256(canonical(row_binding).encode()).hexdigest(),
+ registry="/home/god/.codex/codex-projects.csv",
+ registryRow=row_binding,registryRowDigest=hashlib.sha256(canonical(row_binding).encode()).hexdigest(),
  launcherDevice=launcher_state.st_dev,launcherInode=launcher_state.st_ino,launcherSha256=hashlib.sha256(launcher_payload).hexdigest(),
  codexExecutable=owner_process["executable"],codexExecutableDevice=owner_process["executableDevice"],codexExecutableInode=owner_process["executableInode"],codexExecutableSha256=owner_process["executableSha256"],codexArgv=owner_process["argv"],
 )

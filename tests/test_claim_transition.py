@@ -948,6 +948,10 @@ def test_grouped_transition_holds_psychlo_writer_lock_through_overseer_commit(
         blocked_lifecycle_validation,
     )
     monkeypatch.setattr(SQLiteStore, "_commit", blocked_transition_commit)
+    # This test deliberately introduces threads to observe cross-database lock
+    # ordering. Bypass only the one-shot process precondition; dedicated store
+    # tests verify that production strict mode rejects a multithreaded process.
+    monkeypatch.setattr(threading, "active_count", lambda: 1)
 
     def transition() -> None:
         try:

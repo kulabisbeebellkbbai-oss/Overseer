@@ -940,7 +940,7 @@ def transition_claim_status(
         "transitioned_at": transitioned_at,
         "audit_event_ids": [release_audit_id, transition_audit_id],
     }
-    store = SQLiteStore(store_path)
+    store = SQLiteStore(store_path, strict_descriptor_binding=True)
     postconditions: _TransitionPostconditions | None = None
     committed = False
     try:

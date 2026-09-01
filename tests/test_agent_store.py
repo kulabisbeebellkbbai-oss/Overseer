@@ -7,11 +7,13 @@ import stat
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import overseer.store as store_module
 from overseer.agent_contracts import (
     AgentCapabilities,
     AgentCheckpoint,
@@ -809,7 +811,7 @@ def test_store_rejects_hardlinked_database_without_chmodding_either_name(
     assert _mode(alias) == 0o644
 
 
-def test_store_descriptor_pin_resists_aba_substitute(
+def test_strict_store_descriptor_pin_fails_closed_on_aba_substitute(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -855,7 +857,7 @@ def test_store_descriptor_pin_resists_aba_substitute(
 
     monkeypatch.setattr(sqlite3, "connect", connect_to_substitute)
     with pytest.raises(ValueError, match="connection identity"):
-        OverseerStore(path)
+        OverseerStore(path, strict_descriptor_binding=True)
 
     assert injected
     assert checkpoint_ids(path) == canonical_before
@@ -882,7 +884,7 @@ def test_store_ignores_unrelated_regular_descriptor_opened_during_connect(
 
     monkeypatch.setattr(sqlite3, "connect", connect_and_open_unrelated)
     try:
-        with OverseerStore(path) as store:
+        with OverseerStore(path, strict_descriptor_binding=True) as store:
             assert store._connection.execute("PRAGMA schema_version").fetchone()
     finally:
         if unrelated_fd is not None:
@@ -1016,6 +1018,75 @@ finally:
     finally:
         outer._connection.rollback()
         outer.close()
+
+
+def test_strict_store_rejects_preexisting_connection_to_same_inode(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    outer = OverseerStore(path)
+    try:
+        with pytest.raises(ValueError, match="pre-existing SQLite descriptor"):
+            OverseerStore(path, strict_descriptor_binding=True)
+    finally:
+        outer.close()
+
+
+def test_strict_store_rejects_caller_owned_verified_descriptor(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        with pytest.raises(ValueError, match="caller-owned verified_fd"):
+            OverseerStore(
+                path,
+                verified_fd=descriptor,
+                strict_descriptor_binding=True,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def test_strict_store_rejects_multithreaded_process(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    ready = threading.Event()
+    stop = threading.Event()
+
+    def wait_for_stop() -> None:
+        ready.set()
+        stop.wait(timeout=10)
+
+    worker = threading.Thread(target=wait_for_stop)
+    worker.start()
+    assert ready.wait(timeout=10)
+    try:
+        with pytest.raises(RuntimeError, match="single-threaded process"):
+            OverseerStore(path, strict_descriptor_binding=True)
+    finally:
+        stop.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+
+
+def test_strict_store_pin_budget_fails_before_retaining_another_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    retained_before = len(store_module._STRICT_DATABASE_PINS)
+    monkeypatch.setattr(store_module, "_STRICT_DATABASE_PIN_LIMIT", retained_before)
+
+    with pytest.raises(RuntimeError, match="descriptor pin limit"):
+        OverseerStore(path, strict_descriptor_binding=True)
+
+    assert len(store_module._STRICT_DATABASE_PINS) == retained_before
 
 
 def test_sidecar_disappearance_during_recheck_is_treated_as_checkpoint_race(

@@ -352,8 +352,9 @@ _AGENT_SECRET_VALUE_RE = re.compile(
     r"(?:\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----|(?:^|[;,\s])(?:session|auth|access)?_?token=\S+)",
     re.IGNORECASE,
 )
-_DATABASE_PIN_LOCK = threading.Lock()
-_DATABASE_PINS: dict[tuple[int, int], int] = {}
+_STRICT_DATABASE_PIN_LOCK = threading.Lock()
+_STRICT_DATABASE_PINS: list[int] = []
+_STRICT_DATABASE_PIN_LIMIT = 256
 
 
 @dataclass(frozen=True)
@@ -390,10 +391,21 @@ class SQLiteStore:
         *,
         verified_fd: int | None = None,
         timeout_seconds: float = 30.0,
+        strict_descriptor_binding: bool = False,
     ) -> None:
         if isinstance(timeout_seconds, bool) or float(timeout_seconds) <= 0:
             raise ValueError("SQLite timeout must be positive")
+        if not isinstance(strict_descriptor_binding, bool):
+            raise TypeError("strict_descriptor_binding must be a boolean")
+        if strict_descriptor_binding and verified_fd is not None:
+            raise ValueError(
+                "strict descriptor binding rejects caller-owned verified_fd"
+            )
         self._collection_deadline = current_collection_deadline()
+        if strict_descriptor_binding and self._collection_deadline is not None:
+            raise RuntimeError(
+                "strict descriptor binding is unavailable during collection"
+            )
         remaining = require_collection_time(self._collection_deadline)
         self._sqlite_timeout_seconds = (
             min(float(timeout_seconds), remaining)
@@ -401,47 +413,91 @@ class SQLiteStore:
             else float(timeout_seconds)
         )
         self.path = Path(path)
-        if self._collection_deadline is not None and verified_fd is None:
+        owned_verified_fd: int | None = None
+        if strict_descriptor_binding:
+            if threading.active_count() != 1:
+                raise RuntimeError(
+                    "strict descriptor binding requires a single-threaded process"
+                )
             try:
                 status = self.path.lstat()
+            except FileNotFoundError as error:
+                raise ValueError(
+                    "strict descriptor binding requires a pre-existing SQLite store"
+                ) from error
+            self._validate_artifact_status(self.path, status)
+            self._database_identity = (status.st_dev, status.st_ino)
+        elif self._collection_deadline is not None and verified_fd is None:
+            flags = os.O_RDWR | os.O_NONBLOCK
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            try:
+                owned_verified_fd = os.open(self.path, flags)
             except FileNotFoundError as error:
                 raise RuntimeError(
                     "collection persistence requires a pre-existing SQLite store"
                 ) from error
-            self._validate_artifact_status(self.path, status)
-            self._database_identity = (status.st_dev, status.st_ino)
-        elif verified_fd is None:
+            verified_fd = owned_verified_fd
+        if not strict_descriptor_binding and verified_fd is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._database_identity = self._prepare_database_file()
-        else:
-            status = os.fstat(verified_fd)
-            self._validate_artifact_status(self.path, status)
-            self._database_identity = (status.st_dev, status.st_ino)
-        verified_fd = self._acquire_database_pin()
+        elif not strict_descriptor_binding:
+            try:
+                status = os.fstat(verified_fd)
+                self._validate_artifact_status(self.path, status)
+                self._database_identity = (status.st_dev, status.st_ino)
+            except BaseException:
+                if owned_verified_fd is not None:
+                    os.close(owned_verified_fd)
+                    owned_verified_fd = None
+                raise
         self._sidecar_identities: dict[str, tuple[int, int]] = {}
         self._compromised_sidecars: set[str] = set()
         connection = None
         try:
-            connection = sqlite3.connect(
-                f"file:/proc/self/fd/{verified_fd}?mode=rw",
-                uri=True,
-                timeout=self._sqlite_timeout_seconds,
-            )
-            try:
-                connection.execute("PRAGMA schema_version").fetchone()
-            except sqlite3.Error as error:
-                raise ValueError(
-                    f"SQLite connection identity cannot be verified: {self.path}"
-                ) from error
+            if strict_descriptor_binding:
+                existing_descriptors = self._database_descriptors()
+                if existing_descriptors:
+                    raise ValueError(
+                        "strict descriptor binding rejects a pre-existing SQLite descriptor"
+                    )
+                strict_pin = self._acquire_strict_database_pin()
+                pinned_descriptors = self._database_descriptors()
+                if pinned_descriptors != frozenset({strict_pin}):
+                    raise ValueError(
+                        f"SQLite descriptor pin identity cannot be verified: {self.path}"
+                    )
+                connection = sqlite3.connect(
+                    f"file:/proc/self/fd/{strict_pin}?mode=rw",
+                    uri=True,
+                    timeout=self._sqlite_timeout_seconds,
+                )
+                self._verify_strict_connection_binding(
+                    connection,
+                    strict_pin,
+                    pinned_descriptors,
+                )
+            elif verified_fd is None:
+                connection = sqlite3.connect(
+                    self.path,
+                    timeout=self._sqlite_timeout_seconds,
+                )
+            else:
+                connection = sqlite3.connect(
+                    f"file:/proc/self/fd/{verified_fd}?mode=rw",
+                    uri=True,
+                    timeout=self._sqlite_timeout_seconds,
+                )
             self._connection = connection
-            self._verify_connection_descriptor_bindings(
-                verified_fd,
-                self._database_descriptors(),
-            )
         except BaseException:
             if connection is not None:
                 connection.close()
             raise
+        finally:
+            if owned_verified_fd is not None:
+                os.close(owned_verified_fd)
         try:
             self._harden_database_files()
         except Exception:
@@ -505,20 +561,24 @@ class SQLiteStore:
                 f"SQLite artifact must have exactly one link: {path}"
             )
 
-    def _acquire_database_pin(self) -> int:
-        """Return a process-lifetime O_PATH pin for the prepared inode."""
+    def _acquire_strict_database_pin(self) -> int:
+        """Retain one bounded process-lifetime pin for a one-shot transition."""
         if not hasattr(os, "O_PATH"):
             raise RuntimeError("SQLite descriptor verification requires O_PATH")
-        with _DATABASE_PIN_LOCK:
-            existing = _DATABASE_PINS.get(self._database_identity)
-            if existing is not None:
-                return existing
+        with _STRICT_DATABASE_PIN_LOCK:
+            if len(_STRICT_DATABASE_PINS) >= _STRICT_DATABASE_PIN_LIMIT:
+                raise RuntimeError("strict SQLite descriptor pin limit reached")
             flags = os.O_PATH
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC
             descriptor = os.open(self.path, flags)
+            # Once opened, a strict pin is never closed by application code.
+            # Retaining even a failed pin avoids releasing same-process POSIX
+            # locks through an unmanaged descriptor. The bounded registry and
+            # one-shot process contract cap this fail-closed retention.
+            _STRICT_DATABASE_PINS.append(descriptor)
             try:
                 status = os.fstat(descriptor)
                 self._validate_artifact_status(self.path, status)
@@ -527,9 +587,7 @@ class SQLiteStore:
                         f"SQLite artifact identity changed: {self.path}"
                     )
             except BaseException:
-                os.close(descriptor)
                 raise
-            _DATABASE_PINS[self._database_identity] = descriptor
             return descriptor
 
     def _database_descriptors(self) -> frozenset[int]:
@@ -554,15 +612,28 @@ class SQLiteStore:
                 descriptors.add(descriptor)
         return frozenset(descriptors)
 
-    def _verify_connection_descriptor_bindings(
+    def _verify_strict_connection_binding(
         self,
-        verified_fd: int,
-        database_descriptors: frozenset[int],
+        connection: sqlite3.Connection,
+        strict_pin: int,
+        pinned_descriptors: frozenset[int],
     ) -> None:
-        if not database_descriptors.difference({verified_fd}):
+        database_descriptors = self._database_descriptors()
+        connection_descriptors = database_descriptors - pinned_descriptors
+        if pinned_descriptors != frozenset({strict_pin}) or len(connection_descriptors) != 1:
             raise ValueError(
                 f"SQLite connection identity does not match artifact: {self.path}"
             )
+        path_status = self.path.lstat()
+        self._validate_artifact_status(self.path, path_status)
+        if (path_status.st_dev, path_status.st_ino) != self._database_identity:
+            raise ValueError(f"SQLite artifact identity changed: {self.path}")
+        try:
+            connection.execute("PRAGMA schema_version").fetchone()
+        except sqlite3.Error as error:
+            raise ValueError(
+                f"SQLite connection identity cannot be verified: {self.path}"
+            ) from error
 
     def _harden_database_files(
         self, *, database_missing_ok: bool = False

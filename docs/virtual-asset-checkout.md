@@ -255,7 +255,9 @@ approved byte size before reading, verifying its approved SHA-256, copying the
 verified bytes into a sealed in-memory file, and importing from that sealed
 descriptor. Package preparation and source-archive verification remain
 non-execution steps; package import and the transition itself still require
-separate explicit approvals.
+separate explicit approvals. The archive reader consumes at most the exact
+approved size, rejects early EOF, then performs a one-byte excess check so
+concurrent growth cannot expand memory use beyond the approved bound.
 
 ## Live Listener Discovery
 

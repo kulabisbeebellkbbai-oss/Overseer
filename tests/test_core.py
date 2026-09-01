@@ -10215,6 +10215,18 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertFalse(status["host_mutation_performed"])
             self.assertIn("read-only advisory", status["items"][0]["reason"])
             self.assertEqual(status["items"][0]["review_status"], CrewReviewStatus.APPROVED.value)
+            item = crew_messages_status(store_path, message_id="crew.dax.read-only-advisory")["items"][0]
+            self.assertEqual(
+                item["decision_reason"],
+                "Dax completed the bounded read-only inventory review without reserving or mutating a resource",
+            )
+            self.assertEqual(
+                item["decision_evidence_ids"],
+                [
+                    f"audit.crew.dax.read-only-advisory.dispatch."
+                    f"{overseer_cli._status_id('2026-07-31T20:30:00+00:00')}"
+                ],
+            )
             discover.assert_called_once_with(store_path)
 
     def test_acknowledged_crew_message_receives_terminal_dispatch_decision(self):
@@ -12568,6 +12580,100 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(claims[0].approval_id)
             self.assertIsNone(resource.current_claim_id)
             self.assertEqual(message.review_status, CrewReviewStatus.APPROVED)
+            dispatch_audit_id = (
+                f"audit.{requested['approval_handoff_id']}.dispatch."
+                f"{overseer_cli._status_id('2026-08-21T20:00:00+00:00')}"
+            )
+            self.assertEqual(
+                message.decision_reason,
+                f"dax approved the exact original ROLE approval {requested['approval_id']}; activation remains separate",
+            )
+            self.assertEqual(
+                message.decision_evidence_ids,
+                (requested["claim"], requested["approval_id"], dispatch_audit_id),
+            )
+            self.assertEqual(message.decided_by, OwnerDomain.DAX.value)
+
+    def test_reconciliation_replays_exact_dax_role_approval_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.role-handoff-reconcile",
+                    name="Role Handoff Reconcile Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.role-handoff-reconcile",
+                "proxy.role-handoff-reconcile",
+                ClaimType.LEASE.value,
+                "thread-role-handoff-reconcile",
+                OwnerDomain.DAX.value,
+                "run one bounded loopback test",
+                "bind an OS-assigned loopback listener",
+                RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.role-handoff-reconcile",
+                lifecycle_id="lifecycle.claim.cli.role-handoff-reconcile",
+                release_condition="release immediately after the test",
+            )
+
+            with patch(
+                "overseer.cli.discover_virtual_listeners_status",
+                return_value={"listeners": 0, "host_mutation_performed": False},
+            ):
+                dispatch_crew_messages_status(
+                    store_path,
+                    message_id=requested["approval_handoff_id"],
+                    dispatched_at="2026-08-21T20:06:00+00:00",
+                )
+
+            store = SQLiteStore(store_path)
+            message = store.load_crew_message(requested["approval_handoff_id"])
+            store.save_crew_message(
+                replace(
+                    message,
+                    review_status=CrewReviewStatus.PENDING,
+                    decision_reason=None,
+                    correction_request=None,
+                    decision_evidence_ids=(),
+                    decided_by=None,
+                    decided_at=None,
+                )
+            )
+            store.close()
+
+            reconciled = reconcile_crew_reviews_status(
+                store_path,
+                message_id=requested["approval_handoff_id"],
+                reconciled_at="2026-08-21T20:07:00+00:00",
+            )
+
+            store = SQLiteStore(store_path)
+            message = store.load_crew_message(requested["approval_handoff_id"])
+            store.close()
+            dispatch_audit_id = (
+                f"audit.{requested['approval_handoff_id']}.dispatch."
+                f"{overseer_cli._status_id('2026-08-21T20:06:00+00:00')}"
+            )
+            self.assertEqual(reconciled["reviewed"], 1)
+            self.assertEqual(reconciled["approved"], 1)
+            self.assertEqual(message.review_status, CrewReviewStatus.APPROVED)
+            self.assertEqual(
+                message.decision_reason,
+                f"dax approved the exact original ROLE approval {requested['approval_id']}; activation remains separate",
+            )
+            self.assertEqual(
+                message.decision_evidence_ids,
+                (requested["claim"], requested["approval_id"], dispatch_audit_id),
+            )
+            self.assertEqual(message.decided_by, OwnerDomain.DAX.value)
 
     def test_tampered_role_approval_handoff_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:

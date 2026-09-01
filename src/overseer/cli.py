@@ -7885,10 +7885,10 @@ def reconcile_crew_reviews_status(
             and item.review_status == CrewReviewStatus.PENDING
             and (message_id is None or item.id == message_id)
         ]
-        dispatch_evidence_by_message = {
+        dispatch_event_by_message = {
             message.id: next(
                 (
-                    event.id
+                    event
                     for event in sorted(
                         store.list_audit_events(
                             subject_prefix=message.id,
@@ -7908,11 +7908,44 @@ def reconcile_crew_reviews_status(
         store.close()
     pending_decisions: list[tuple[object, CrewReviewStatus, str, tuple[str, ...], str | None]] = []
     for message in messages:
-        dispatch_evidence = dispatch_evidence_by_message.get(message.id)
+        dispatch_event = dispatch_event_by_message.get(message.id)
+        dispatch_evidence = dispatch_event.id if dispatch_event is not None else None
         decision: tuple[CrewReviewStatus, str, tuple[str, ...], str | None] | None = None
         text = f"{message.subject}\n{message.message}".lower()
         read_only = any(marker in text for marker in ("read-only", "read only", "advisory", "inventory", "review"))
-        if message.owner_domain == OwnerDomain.DAX and read_only and dispatch_evidence:
+        linked_role_review = None
+        if (
+            message.owner_domain == OwnerDomain.DAX
+            and dispatch_event is not None
+            and dispatch_event.summary
+            == f"dax dispatch dispatched: dax approved the exact original ROLE approval {message.related_approval_id}; activation remains separate"
+        ):
+            linked_role_review = _exact_dax_role_approval_review(
+                store_path,
+                message,
+                {
+                    "status": "dispatched",
+                    "reason": dispatch_event.summary.split(": ", 1)[1],
+                    "actions": [
+                        {
+                            "claim_id": message.related_claim_id,
+                            "approval_id": message.related_approval_id,
+                            "approval_status": ApprovalStatus.APPROVED.value,
+                            "activation_required": True,
+                        }
+                    ],
+                },
+                dispatch_evidence,
+                now,
+            )
+        if linked_role_review is not None:
+            decision = (
+                CrewReviewStatus.APPROVED,
+                linked_role_review["decision_reason"],
+                linked_role_review["decision_evidence_ids"],
+                None,
+            )
+        elif message.owner_domain == OwnerDomain.DAX and read_only and dispatch_evidence:
             decision = (
                 CrewReviewStatus.APPROVED,
                 "Dax completed the bounded read-only inventory review without reserving or mutating a resource",
@@ -8199,6 +8232,87 @@ def _dispatch_crew_messages_status_unlocked(
     }
 
 
+def _exact_dax_role_approval_review(
+    store_path,
+    message,
+    result,
+    evidence_id: str | None,
+    decided_at: str,
+) -> dict[str, object] | None:
+    if (
+        message.owner_domain != OwnerDomain.DAX
+        or not message.related_claim_id
+        or not message.related_approval_id
+        or result.get("status") != "dispatched"
+        or not evidence_id
+        or _crew_dispatch_result_mutated_host(result)
+    ):
+        return None
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            claim = store.load_claim(message.related_claim_id)
+            approval = store.load_approval(message.related_approval_id)
+        except KeyError:
+            return None
+    finally:
+        store.close()
+    if (
+        claim.owner_role != OwnerDomain.DAX
+        or claim.status != ClaimStatus.REQUESTED
+        or approval.id != f"approval.{claim.id}"
+        or approval.subject_id != claim.id
+        or approval.approval_level != ApprovalLevel.ROLE
+        or approval.owner_domain != OwnerDomain.DAX
+        or approval.status != ApprovalStatus.APPROVED
+        or approval.decided_by != OwnerDomain.DAX.value
+    ):
+        return None
+    expected = role_approval_handoff(claim, approval)
+    if expected is None:
+        return None
+    fields = (
+        "id",
+        "owner_domain",
+        "subject",
+        "message",
+        "priority",
+        "requested_by",
+        "related_resource_id",
+        "related_claim_id",
+        "related_approval_id",
+        "related_plan_id",
+        "related_limit_id",
+        "supersedes_message_id",
+        "acceptance_criteria",
+    )
+    if any(getattr(message, field) != getattr(expected, field) for field in fields):
+        return None
+    actions = result.get("actions")
+    if not isinstance(actions, (list, tuple)) or len(actions) != 1 or not isinstance(actions[0], dict):
+        return None
+    action = actions[0]
+    if (
+        action.get("claim_id") != claim.id
+        or action.get("approval_id") != approval.id
+        or action.get("approval_status") != ApprovalStatus.APPROVED.value
+        or action.get("activation_required") is not True
+    ):
+        return None
+    reason = f"dax approved the exact original ROLE approval {approval.id}; activation remains separate"
+    if result.get("reason") != reason:
+        return None
+    return {
+        "review_status": CrewReviewStatus.APPROVED,
+        "decision_reason": reason,
+        "decision_evidence_ids": tuple(
+            dict.fromkeys((*message.request_evidence_ids, claim.id, approval.id, evidence_id))
+        ),
+        "decided_by": OwnerDomain.DAX.value,
+        "decided_at": decided_at,
+    }
+
+
 def _automatic_crew_review(store_path, message, result, delivery_status, evidence_id: str, decided_by: str, decided_at: str) -> dict[str, object]:
     if delivery_status != CrewMessageStatus.ACKNOWLEDGED:
         return {}
@@ -8223,6 +8337,15 @@ def _automatic_crew_review(store_path, message, result, delivery_status, evidenc
             "decided_by": message.owner_domain.value,
             "decided_at": decided_at,
         }
+    linked_role_review = _exact_dax_role_approval_review(
+        store_path,
+        message,
+        result,
+        evidence_id,
+        decided_at,
+    )
+    if linked_role_review is not None:
+        return linked_role_review
     if message.owner_domain == OwnerDomain.DAX and read_only and result.get("status") == "dispatched" and not _crew_dispatch_result_mutated_host(result):
         return {
             "review_status": CrewReviewStatus.APPROVED,

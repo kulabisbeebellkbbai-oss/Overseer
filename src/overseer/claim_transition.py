@@ -189,6 +189,9 @@ def _validate_optional_groups(
     predecessor: Claim,
     successor: Claim,
     approval_id: str,
+    expected_predecessor_resource_id: str,
+    expected_predecessor_activation_group_id: str,
+    expected_predecessor_lifecycle_id: str,
     expected_resource_id: str,
     expected_owner_thread: str,
     owner_role: OwnerDomain,
@@ -199,17 +202,17 @@ def _validate_optional_groups(
 ) -> tuple[ClaimActivationGroup, ClaimActivationGroup]:
     if not predecessor.activation_group_id or not predecessor.approval_id:
         raise ValueError("predecessor group binding is incomplete")
-    predecessor_group = store.load_claim_activation_group(predecessor.activation_group_id)
+    predecessor_group = store.load_claim_activation_group(expected_predecessor_activation_group_id)
     successor_group = store.load_claim_activation_group(expected_activation_group_id)
     _validate_group(
         predecessor_group,
-        group_id=predecessor.activation_group_id,
-        lifecycle_id=expected_lifecycle_id,
+        group_id=expected_predecessor_activation_group_id,
+        lifecycle_id=expected_predecessor_lifecycle_id,
         owner_thread=expected_owner_thread,
         owner_role=owner_role,
         claim_id=predecessor.id,
         approval_id=predecessor.approval_id,
-        resource_id=predecessor.resource_id,
+        resource_id=expected_predecessor_resource_id,
         state=ClaimActivationGroupState.ACTIVE,
     )
     _validate_group(
@@ -233,6 +236,15 @@ def _validate_optional_groups(
         successor_group.plan_version,
     ):
         raise ValueError("claim activation group plan bindings do not match")
+    _validate_psychlo_round(
+        psychlo_store_path,
+        lifecycle_id=predecessor_group.lifecycle_id,
+        project_id=predecessor_group.project_id,
+        plan_id=predecessor_group.plan_id,
+        plan_version=predecessor_group.plan_version,
+        owner_thread=predecessor_group.owner_thread,
+        _connection=psychlo_connection,
+    )
     _validate_psychlo_round(
         psychlo_store_path,
         lifecycle_id=successor_group.lifecycle_id,
@@ -290,6 +302,9 @@ def _validate_inputs(
     predecessor_claim_id: str,
     successor_claim_id: str,
     approval_id: str,
+    expected_predecessor_resource_id: str,
+    expected_predecessor_activation_group_id: str,
+    expected_predecessor_lifecycle_id: str,
     expected_resource_id: str,
     expected_owner_thread: str,
     expected_owner_role: str,
@@ -302,6 +317,9 @@ def _validate_inputs(
         (predecessor_claim_id, "predecessor_claim_id"),
         (successor_claim_id, "successor_claim_id"),
         (approval_id, "approval_id"),
+        (expected_predecessor_resource_id, "expected_predecessor_resource_id"),
+        (expected_predecessor_activation_group_id, "expected_predecessor_activation_group_id"),
+        (expected_predecessor_lifecycle_id, "expected_predecessor_lifecycle_id"),
         (expected_resource_id, "expected_resource_id"),
         (expected_owner_thread, "expected_owner_thread"),
         (expected_owner_role, "expected_owner_role"),
@@ -330,6 +348,9 @@ def _validate_inputs(
     if (
         predecessor.owner_thread != expected_owner_thread
         or predecessor.owner_role != owner_role
+        or predecessor.resource_id != expected_predecessor_resource_id
+        or predecessor.activation_group_id != expected_predecessor_activation_group_id
+        or predecessor.lifecycle_id != expected_predecessor_lifecycle_id
         or successor.owner_thread != expected_owner_thread
         or successor.owner_role != owner_role
         or successor.activation_group_id != expected_activation_group_id
@@ -338,8 +359,6 @@ def _validate_inputs(
         raise ValueError("claim binding is invalid")
     if successor.resource_id != expected_resource_id:
         raise ValueError("successor resource binding is invalid")
-    if not predecessor.activation_group_id or predecessor.lifecycle_id != expected_lifecycle_id:
-        raise ValueError("predecessor lifecycle binding is invalid")
 
     predecessor_resource = store.load_resource(predecessor.resource_id)
     successor_resource = store.load_resource(expected_resource_id)
@@ -366,7 +385,6 @@ def _validate_inputs(
         or approval.status != ApprovalStatus.APPROVED
         or approval.decided_by != expected_owner_role
         or not approval.decided_at
-        or plan_digest not in approval.evidence_required
     ):
         raise ValueError("successor approval binding is invalid")
 
@@ -424,6 +442,9 @@ def _event_evidence(
     successor_resource: Resource,
     approval_id: str,
     continuation: ClaimApprovalContinuation,
+    expected_predecessor_resource_id: str,
+    expected_predecessor_activation_group_id: str,
+    expected_predecessor_lifecycle_id: str,
     expected_owner_thread: str,
     expected_owner_role: str,
     expected_activation_group_id: str,
@@ -440,6 +461,9 @@ def _event_evidence(
         successor_resource.id,
         approval_id,
         continuation.id,
+        expected_predecessor_resource_id,
+        expected_predecessor_activation_group_id,
+        expected_predecessor_lifecycle_id,
         expected_owner_thread,
         expected_owner_role,
         expected_activation_group_id,
@@ -519,6 +543,9 @@ def transition_claim_status(
     predecessor_claim_id: str,
     successor_claim_id: str,
     approval_id: str,
+    expected_predecessor_resource_id: str,
+    expected_predecessor_activation_group_id: str,
+    expected_predecessor_lifecycle_id: str,
     expected_resource_id: str,
     expected_owner_thread: str,
     expected_owner_role: str,
@@ -558,6 +585,9 @@ def transition_claim_status(
                     predecessor_claim_id=predecessor_claim_id,
                     successor_claim_id=successor_claim_id,
                     approval_id=approval_id,
+                    expected_predecessor_resource_id=expected_predecessor_resource_id,
+                    expected_predecessor_activation_group_id=expected_predecessor_activation_group_id,
+                    expected_predecessor_lifecycle_id=expected_predecessor_lifecycle_id,
                     expected_resource_id=expected_resource_id,
                     expected_owner_thread=expected_owner_thread,
                     expected_owner_role=expected_owner_role,
@@ -575,6 +605,9 @@ def transition_claim_status(
                         predecessor=predecessor,
                         successor=successor,
                         approval_id=approval_id,
+                        expected_predecessor_resource_id=expected_predecessor_resource_id,
+                        expected_predecessor_activation_group_id=expected_predecessor_activation_group_id,
+                        expected_predecessor_lifecycle_id=expected_predecessor_lifecycle_id,
                         expected_resource_id=expected_resource_id,
                         expected_owner_thread=expected_owner_thread,
                         owner_role=owner_role,
@@ -605,6 +638,9 @@ def transition_claim_status(
                     successor_resource=successor_resource,
                     approval_id=approval_id,
                     continuation=continuation,
+                    expected_predecessor_resource_id=expected_predecessor_resource_id,
+                    expected_predecessor_activation_group_id=expected_predecessor_activation_group_id,
+                    expected_predecessor_lifecycle_id=expected_predecessor_lifecycle_id,
                     expected_owner_thread=expected_owner_thread,
                     expected_owner_role=expected_owner_role,
                     expected_activation_group_id=expected_activation_group_id,

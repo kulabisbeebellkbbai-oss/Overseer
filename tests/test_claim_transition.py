@@ -50,6 +50,7 @@ CONTINUATION_ATTEMPT_ID = f"{CONTINUATION_ID}.attempt.2026-09-01T12-00-00-00-00"
 OWNER_THREAD = "thread.phase-b.exact-owner"
 OWNER_ROLE = OwnerDomain.DAX.value
 ACTIVATION_GROUP_ID = "group.phase-b.successor"
+PREDECESSOR_LIFECYCLE_ID = "lifecycle.phase-b.predecessor"
 LIFECYCLE_ID = "lifecycle.phase-b.rehearsal"
 TRANSITIONED_AT = "2026-09-01T12:00:00+00:00"
 EVIDENCE_IDS = ("evidence.phase-b.result", "evidence.phase-b.cleanup")
@@ -98,7 +99,7 @@ def _seed_transition_store(path: Path) -> dict[str, object]:
             risk_level=RiskLevel.LOW,
             status=ClaimStatus.ACTIVE,
             activation_group_id=PREDECESSOR_GROUP_ID,
-            lifecycle_id=LIFECYCLE_ID,
+            lifecycle_id=PREDECESSOR_LIFECYCLE_ID,
             approval_id=PREDECESSOR_APPROVAL_ID,
         )
         successor = Claim(
@@ -151,7 +152,7 @@ def _seed_transition_store(path: Path) -> dict[str, object]:
                 owner_domain=OwnerDomain.DAX,
                 reason="approve the exact Phase B successor claim",
                 status=ApprovalStatus.APPROVED,
-                evidence_required=(PLAN_DIGEST,),
+                evidence_required=(),
                 decided_by=OWNER_ROLE,
                 decided_at="2026-09-01T11:50:00+00:00",
             )
@@ -188,6 +189,9 @@ def _seed_transition_store(path: Path) -> dict[str, object]:
         "predecessor_claim_id": PREDECESSOR_CLAIM_ID,
         "successor_claim_id": SUCCESSOR_CLAIM_ID,
         "approval_id": APPROVAL_ID,
+        "expected_predecessor_resource_id": PREDECESSOR_RESOURCE_ID,
+        "expected_predecessor_activation_group_id": PREDECESSOR_GROUP_ID,
+        "expected_predecessor_lifecycle_id": PREDECESSOR_LIFECYCLE_ID,
         "expected_resource_id": SUCCESSOR_RESOURCE_ID,
         "expected_owner_thread": OWNER_THREAD,
         "expected_owner_role": OWNER_ROLE,
@@ -206,18 +210,19 @@ def _seed_psychlo_round(path: Path) -> Path:
         "CREATE TABLE projects (id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, plan_version TEXT NOT NULL);"
         "CREATE TABLE rounds (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, state TEXT NOT NULL, request_json TEXT NOT NULL);"
     )
-    request = {
-        "roundId": LIFECYCLE_ID,
-        "projectId": "phase-b",
-        "planId": "phase-b-plan",
-        "planVersion": "1",
-        "threadId": OWNER_THREAD,
-    }
     connection.execute("INSERT INTO projects VALUES (?, ?, ?)", ("phase-b", "phase-b-plan", "1"))
-    connection.execute(
-        "INSERT INTO rounds VALUES (?, ?, 'active', ?)",
-        (LIFECYCLE_ID, "phase-b", json.dumps(request)),
-    )
+    for lifecycle_id in (PREDECESSOR_LIFECYCLE_ID, LIFECYCLE_ID):
+        request = {
+            "roundId": lifecycle_id,
+            "projectId": "phase-b",
+            "planId": "phase-b-plan",
+            "planVersion": "1",
+            "threadId": OWNER_THREAD,
+        }
+        connection.execute(
+            "INSERT INTO rounds VALUES (?, ?, 'active', ?)",
+            (lifecycle_id, "phase-b", json.dumps(request)),
+        )
     connection.commit()
     connection.close()
     return path
@@ -253,7 +258,7 @@ def _exact_optional_groups() -> tuple[ClaimActivationGroup, ClaimActivationGroup
     return (
         ClaimActivationGroup(
             id=PREDECESSOR_GROUP_ID,
-            lifecycle_id=LIFECYCLE_ID,
+            lifecycle_id=PREDECESSOR_LIFECYCLE_ID,
             project_id="phase-b",
             plan_id="phase-b-plan",
             plan_version="1",
@@ -843,6 +848,9 @@ def test_transition_postconditions_reject_owner_or_continuation_tamper(
     [
         ("predecessor claim", {"predecessor_claim_id": "claim.wrong-predecessor"}),
         ("successor claim", {"successor_claim_id": "claim.wrong-successor"}),
+        ("predecessor resource", {"expected_predecessor_resource_id": "resource.wrong-predecessor"}),
+        ("predecessor activation group", {"expected_predecessor_activation_group_id": "group.wrong-predecessor"}),
+        ("predecessor lifecycle", {"expected_predecessor_lifecycle_id": "lifecycle.wrong-predecessor"}),
         ("resource", {"expected_resource_id": "resource.wrong"}),
         ("owner thread", {"expected_owner_thread": "thread.wrong"}),
         ("owner role", {"expected_owner_role": OwnerDomain.ODO.value}),
@@ -967,6 +975,9 @@ def _seed_transition_arguments(path: Path) -> dict[str, object]:
         "predecessor_claim_id": PREDECESSOR_CLAIM_ID,
         "successor_claim_id": SUCCESSOR_CLAIM_ID,
         "approval_id": APPROVAL_ID,
+        "expected_predecessor_resource_id": PREDECESSOR_RESOURCE_ID,
+        "expected_predecessor_activation_group_id": PREDECESSOR_GROUP_ID,
+        "expected_predecessor_lifecycle_id": PREDECESSOR_LIFECYCLE_ID,
         "expected_resource_id": SUCCESSOR_RESOURCE_ID,
         "expected_owner_thread": OWNER_THREAD,
         "expected_owner_role": OWNER_ROLE,
@@ -1162,6 +1173,12 @@ def test_transition_claim_cli_routes_every_explicit_binding_as_keyword(monkeypat
             SUCCESSOR_CLAIM_ID,
             "--approval-id",
             APPROVAL_ID,
+            "--expected-predecessor-resource-id",
+            PREDECESSOR_RESOURCE_ID,
+            "--expected-predecessor-activation-group-id",
+            PREDECESSOR_GROUP_ID,
+            "--expected-predecessor-lifecycle-id",
+            PREDECESSOR_LIFECYCLE_ID,
             "--expected-resource-id",
             SUCCESSOR_RESOURCE_ID,
             "--expected-owner-thread",
@@ -1190,6 +1207,9 @@ def test_transition_claim_cli_routes_every_explicit_binding_as_keyword(monkeypat
         "predecessor_claim_id": PREDECESSOR_CLAIM_ID,
         "successor_claim_id": SUCCESSOR_CLAIM_ID,
         "approval_id": APPROVAL_ID,
+        "expected_predecessor_resource_id": PREDECESSOR_RESOURCE_ID,
+        "expected_predecessor_activation_group_id": PREDECESSOR_GROUP_ID,
+        "expected_predecessor_lifecycle_id": PREDECESSOR_LIFECYCLE_ID,
         "expected_resource_id": SUCCESSOR_RESOURCE_ID,
         "expected_owner_thread": OWNER_THREAD,
         "expected_owner_role": OWNER_ROLE,
@@ -1203,9 +1223,19 @@ def test_transition_claim_cli_routes_every_explicit_binding_as_keyword(monkeypat
     assert json.loads(capsys.readouterr().out) == expected_result
 
 
+@pytest.mark.parametrize(
+    "omitted_option",
+    [
+        "--successor-claim-id",
+        "--expected-predecessor-resource-id",
+        "--expected-predecessor-activation-group-id",
+        "--expected-predecessor-lifecycle-id",
+    ],
+)
 def test_transition_claim_cli_omitted_required_argument_fails_before_routing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    omitted_option: str,
 ) -> None:
     called = False
 
@@ -1215,35 +1245,30 @@ def test_transition_claim_cli_omitted_required_argument_fails_before_routing(
         return {"status": "unexpected"}
 
     monkeypatch.setattr(cli, "transition_claim_status", intercepted_transition_claim_status)
+    required_arguments = [
+        ("--store", str(tmp_path / "temporary.sqlite3")),
+        ("--predecessor-claim-id", PREDECESSOR_CLAIM_ID),
+        ("--successor-claim-id", SUCCESSOR_CLAIM_ID),
+        ("--approval-id", APPROVAL_ID),
+        ("--expected-predecessor-resource-id", PREDECESSOR_RESOURCE_ID),
+        ("--expected-predecessor-activation-group-id", PREDECESSOR_GROUP_ID),
+        ("--expected-predecessor-lifecycle-id", PREDECESSOR_LIFECYCLE_ID),
+        ("--expected-resource-id", SUCCESSOR_RESOURCE_ID),
+        ("--expected-owner-thread", OWNER_THREAD),
+        ("--expected-owner-role", OWNER_ROLE),
+        ("--expected-activation-group-id", ACTIVATION_GROUP_ID),
+        ("--expected-lifecycle-id", LIFECYCLE_ID),
+        ("--plan-digest", PLAN_DIGEST),
+        ("--transitioned-by", OWNER_ROLE),
+        ("--evidence-id", EVIDENCE_IDS[0]),
+        ("--transitioned-at", TRANSITIONED_AT),
+    ]
+    command = ["transition-claim"]
+    for option, value in required_arguments:
+        if option != omitted_option:
+            command.extend([option, value])
     with pytest.raises(SystemExit) as error:
-        cli.main(
-            [
-                "transition-claim",
-                "--store",
-                str(tmp_path / "temporary.sqlite3"),
-                "--predecessor-claim-id",
-                PREDECESSOR_CLAIM_ID,
-                "--approval-id",
-                APPROVAL_ID,
-                "--expected-resource-id",
-                SUCCESSOR_RESOURCE_ID,
-                "--expected-owner-thread",
-                OWNER_THREAD,
-                "--expected-owner-role",
-                OWNER_ROLE,
-                "--expected-activation-group-id",
-                ACTIVATION_GROUP_ID,
-                "--expected-lifecycle-id",
-                LIFECYCLE_ID,
-                "--plan-digest",
-                PLAN_DIGEST,
-                "--transitioned-by",
-                OWNER_ROLE,
-                "--evidence-id",
-                EVIDENCE_IDS[0],
-                # --successor-claim-id is intentionally omitted.
-            ]
-        )
+        cli.main(command)
 
     assert error.value.code == 2
     assert called is False

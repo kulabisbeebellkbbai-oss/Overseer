@@ -354,7 +354,7 @@ _AGENT_SECRET_VALUE_RE = re.compile(
 )
 _STRICT_DATABASE_PIN_LOCK = threading.Lock()
 _STRICT_DATABASE_PINS: list[int] = []
-_STRICT_DATABASE_PIN_LIMIT = 256
+_STRICT_DATABASE_PIN_LIMIT = 512
 
 
 @dataclass(frozen=True)
@@ -414,20 +414,42 @@ class SQLiteStore:
             else float(timeout_seconds)
         )
         self.path = Path(path)
+        self._strict_instance_pins: set[int] = set()
+        self._strict_parent_pin: int | None = None
+        self._strict_parent_identity: tuple[int, int] | None = None
+        self._strict_baseline_regular_descriptors: dict[int, tuple[int, int]] = {}
+        self._strict_connection_artifacts: dict[
+            str, tuple[tuple[int, int], frozenset[int]]
+        ] = {}
+        self._strict_connection_open = False
         owned_verified_fd: int | None = None
         if strict_descriptor_binding:
             if threading.active_count() != 1:
                 raise RuntimeError(
                     "strict descriptor binding requires a single-threaded process"
                 )
+            if not self.path.is_absolute():
+                raise ValueError("strict descriptor binding requires an absolute path")
+            self._strict_baseline_regular_descriptors = (
+                self._regular_descriptor_identities()
+            )
+            self._strict_parent_pin = self._acquire_strict_parent_pin()
             try:
-                status = self.path.lstat()
+                status = os.stat(
+                    self.path.name,
+                    dir_fd=self._strict_parent_pin,
+                    follow_symlinks=False,
+                )
             except FileNotFoundError as error:
                 raise ValueError(
                     "strict descriptor binding requires a pre-existing SQLite store"
                 ) from error
             self._validate_strict_artifact_status(self.path, status)
             self._database_identity = (status.st_dev, status.st_ino)
+            path_status = self.path.lstat()
+            self._validate_strict_artifact_status(self.path, path_status)
+            if (path_status.st_dev, path_status.st_ino) != self._database_identity:
+                raise ValueError(f"SQLite artifact identity changed: {self.path}")
         elif self._collection_deadline is not None and verified_fd is None:
             flags = os.O_RDWR | os.O_NONBLOCK
             if hasattr(os, "O_NOFOLLOW"):
@@ -572,10 +594,61 @@ class SQLiteStore:
                 f"strict SQLite artifact must already have owner-only mode: {path}"
             )
 
-    def _acquire_strict_database_pin(self) -> int:
-        """Retain one bounded process-lifetime pin for a one-shot transition."""
+    @staticmethod
+    def _validate_strict_parent_status(path: Path, status: os.stat_result) -> None:
+        if not stat.S_ISDIR(status.st_mode):
+            raise ValueError(f"strict SQLite parent must be a directory: {path}")
+        if hasattr(os, "geteuid") and status.st_uid != os.geteuid():
+            raise PermissionError(
+                f"strict SQLite parent is not owned by this process: {path}"
+            )
+        if stat.S_IMODE(status.st_mode) & 0o002:
+            raise PermissionError(
+                f"strict SQLite parent must not be world writable: {path}"
+            )
+
+    def _acquire_strict_parent_pin(self) -> int:
+        """Retain and verify the directory containing the strict namespace."""
         if not hasattr(os, "O_PATH"):
             raise RuntimeError("SQLite descriptor verification requires O_PATH")
+        with _STRICT_DATABASE_PIN_LOCK:
+            if len(_STRICT_DATABASE_PINS) >= _STRICT_DATABASE_PIN_LIMIT:
+                raise RuntimeError("strict SQLite descriptor pin limit reached")
+            flags = os.O_PATH | os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            descriptor = os.open(self.path.parent, flags)
+            _STRICT_DATABASE_PINS.append(descriptor)
+            self._strict_instance_pins.add(descriptor)
+            status = os.fstat(descriptor)
+            self._validate_strict_parent_status(self.path.parent, status)
+            identity = (status.st_dev, status.st_ino)
+            if (
+                self._strict_parent_identity is not None
+                and identity != self._strict_parent_identity
+            ):
+                raise ValueError(
+                    f"strict SQLite parent identity changed: {self.path.parent}"
+                )
+            path_status = self.path.parent.lstat()
+            self._validate_strict_parent_status(self.path.parent, path_status)
+            if (path_status.st_dev, path_status.st_ino) != identity:
+                raise ValueError(
+                    f"strict SQLite parent identity changed: {self.path.parent}"
+                )
+            if self._strict_parent_identity is None:
+                self._strict_parent_identity = identity
+            return descriptor
+
+    def _acquire_strict_database_pin(self, *, parent_fd: int | None = None) -> int:
+        """Retain one bounded process-lifetime pin for the strict main file."""
+        if not hasattr(os, "O_PATH"):
+            raise RuntimeError("SQLite descriptor verification requires O_PATH")
+        directory_fd = self._strict_parent_pin if parent_fd is None else parent_fd
+        if directory_fd is None:
+            raise RuntimeError("strict SQLite parent pin is unavailable")
         with _STRICT_DATABASE_PIN_LOCK:
             if len(_STRICT_DATABASE_PINS) >= _STRICT_DATABASE_PIN_LIMIT:
                 raise RuntimeError("strict SQLite descriptor pin limit reached")
@@ -584,39 +657,80 @@ class SQLiteStore:
                 flags |= os.O_NOFOLLOW
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC
-            descriptor = os.open(self.path, flags)
-            # Once opened, a strict pin is never closed by application code.
-            # Retaining even a failed pin avoids releasing same-process POSIX
-            # locks through an unmanaged descriptor. The bounded registry and
-            # one-shot process contract cap this fail-closed retention.
+            descriptor = os.open(self.path.name, flags, dir_fd=directory_fd)
+            # Strict pins are never closed by application code. Retaining even
+            # failed pins avoids releasing same-process POSIX locks through an
+            # unmanaged descriptor; the one-shot bounded registry caps them.
             _STRICT_DATABASE_PINS.append(descriptor)
+            self._strict_instance_pins.add(descriptor)
             status = os.fstat(descriptor)
             self._validate_strict_artifact_status(self.path, status)
             if (status.st_dev, status.st_ino) != self._database_identity:
                 raise ValueError(f"SQLite artifact identity changed: {self.path}")
             return descriptor
 
-    def _database_descriptors(self) -> frozenset[int]:
-        """Return only process descriptors bound to the prepared inode."""
+    def _acquire_strict_sidecar_pin(
+        self,
+        suffix: str,
+        expected_identity: tuple[int, int],
+        *,
+        parent_fd: int | None = None,
+    ) -> int:
+        """Retain a no-follow pin for one exact WAL/SHM sidecar inode."""
+        if suffix not in {"-wal", "-shm"}:
+            raise ValueError("strict SQLite sidecar suffix is invalid")
+        directory_fd = self._strict_parent_pin if parent_fd is None else parent_fd
+        if directory_fd is None:
+            raise RuntimeError("strict SQLite parent pin is unavailable")
+        sidecar = Path(f"{self.path}{suffix}")
+        with _STRICT_DATABASE_PIN_LOCK:
+            if len(_STRICT_DATABASE_PINS) >= _STRICT_DATABASE_PIN_LIMIT:
+                raise RuntimeError("strict SQLite descriptor pin limit reached")
+            flags = os.O_PATH
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            descriptor = os.open(
+                f"{self.path.name}{suffix}",
+                flags,
+                dir_fd=directory_fd,
+            )
+            _STRICT_DATABASE_PINS.append(descriptor)
+            self._strict_instance_pins.add(descriptor)
+            status = os.fstat(descriptor)
+            self._validate_strict_artifact_status(sidecar, status)
+            if (status.st_dev, status.st_ino) != expected_identity:
+                raise ValueError(f"SQLite artifact identity changed: {sidecar}")
+            return descriptor
+
+    @staticmethod
+    def _regular_descriptor_identities() -> dict[int, tuple[int, int]]:
+        """Return every current process regular-file descriptor identity."""
         try:
             names = os.listdir("/proc/self/fd")
         except OSError as error:
             raise RuntimeError(
                 "SQLite connection identity cannot be verified"
             ) from error
-        descriptors: set[int] = set()
+        descriptors: dict[int, tuple[int, int]] = {}
         for name in names:
             try:
                 descriptor = int(name)
                 status = os.fstat(descriptor)
             except (OSError, ValueError):
                 continue
-            if (
-                stat.S_ISREG(status.st_mode)
-                and (status.st_dev, status.st_ino) == self._database_identity
-            ):
-                descriptors.add(descriptor)
-        return frozenset(descriptors)
+            if stat.S_ISREG(status.st_mode):
+                descriptors[descriptor] = (status.st_dev, status.st_ino)
+        return descriptors
+
+    def _database_descriptors(self) -> frozenset[int]:
+        """Return only process descriptors bound to the prepared inode."""
+        return frozenset(
+            descriptor
+            for descriptor, identity in self._regular_descriptor_identities().items()
+            if identity == self._database_identity
+        )
 
     def _verify_strict_connection_binding(
         self,
@@ -639,20 +753,174 @@ class SQLiteStore:
             raise ValueError(f"SQLite artifact identity changed: {self.path}")
         try:
             connection.execute("PRAGMA schema_version").fetchone()
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
         except sqlite3.Error as error:
             raise ValueError(
                 f"SQLite connection identity cannot be verified: {self.path}"
             ) from error
+        if journal_mode is None or str(journal_mode[0]).lower() != "wal":
+            raise ValueError("strict SQLite namespace requires WAL mode")
+        self._bind_strict_connection_namespace(
+            strict_pin=strict_pin,
+            pinned_descriptors=pinned_descriptors,
+            connection_descriptors=connection_descriptors,
+        )
+
+    def _new_strict_regular_descriptors(self) -> dict[int, tuple[int, int]]:
+        current = self._regular_descriptor_identities()
+        return {
+            descriptor: identity
+            for descriptor, identity in current.items()
+            if self._strict_baseline_regular_descriptors.get(descriptor) != identity
+        }
+
+    def _strict_sidecar_status(
+        self,
+        suffix: str,
+        *,
+        parent_fd: int,
+    ) -> os.stat_result:
+        sidecar = Path(f"{self.path}{suffix}")
+        try:
+            status = os.stat(
+                f"{self.path.name}{suffix}",
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            path_status = sidecar.lstat()
+        except FileNotFoundError as error:
+            raise ValueError(
+                f"strict SQLite namespace sidecar is missing: {sidecar}"
+            ) from error
+        self._validate_strict_artifact_status(sidecar, status)
+        self._validate_strict_artifact_status(sidecar, path_status)
+        if (path_status.st_dev, path_status.st_ino) != (status.st_dev, status.st_ino):
+            raise ValueError(f"SQLite artifact identity changed: {sidecar}")
+        return status
+
+    def _bind_strict_connection_namespace(
+        self,
+        *,
+        strict_pin: int,
+        pinned_descriptors: frozenset[int],
+        connection_descriptors: frozenset[int],
+    ) -> None:
+        """Bind the live main/WAL/SHM descriptors to one canonical namespace."""
+        parent_fd = self._strict_parent_pin
+        if parent_fd is None:
+            raise RuntimeError("strict SQLite parent pin is unavailable")
+        new_descriptors = self._new_strict_regular_descriptors()
+        if set(pinned_descriptors) != {strict_pin}:
+            raise ValueError("strict SQLite namespace main pin is ambiguous")
+        if set(connection_descriptors) != {
+            descriptor
+            for descriptor, identity in new_descriptors.items()
+            if identity == self._database_identity
+            and descriptor not in self._strict_instance_pins
+        }:
+            raise ValueError("strict SQLite namespace main descriptor is ambiguous")
+
+        artifacts: dict[str, tuple[tuple[int, int], frozenset[int]]] = {
+            "database": (self._database_identity, connection_descriptors)
+        }
+        accounted = {strict_pin, *connection_descriptors}
+        for suffix in ("-wal", "-shm"):
+            status = self._strict_sidecar_status(suffix, parent_fd=parent_fd)
+            identity = (status.st_dev, status.st_ino)
+            sidecar_descriptors = frozenset(
+                descriptor
+                for descriptor, descriptor_identity in new_descriptors.items()
+                if descriptor_identity == identity
+                and descriptor not in self._strict_instance_pins
+            )
+            if len(sidecar_descriptors) != 1:
+                raise ValueError(
+                    f"strict SQLite namespace descriptor is ambiguous: {self.path}{suffix}"
+                )
+            self._acquire_strict_sidecar_pin(suffix, identity)
+            self._sidecar_identities[suffix] = identity
+            artifacts[suffix] = (identity, sidecar_descriptors)
+            accounted.update(sidecar_descriptors)
+
+        journal = Path(f"{self.path}-journal")
+        try:
+            journal.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(f"strict SQLite namespace rejects journal: {journal}")
+        if set(new_descriptors) != accounted:
+            raise ValueError("strict SQLite namespace has an unbound descriptor")
+        self._strict_connection_artifacts = artifacts
+        self._strict_connection_open = True
 
     def verify_strict_path_binding(self) -> None:
         """Prove the current pathname still names the strict store inode."""
         if not self._strict_descriptor_binding:
             raise RuntimeError("strict descriptor binding is not enabled")
-        self._acquire_strict_database_pin()
+        parent_pin = self._acquire_strict_parent_pin()
+        self._acquire_strict_database_pin(parent_fd=parent_pin)
         path_status = self.path.lstat()
         self._validate_strict_artifact_status(self.path, path_status)
         if (path_status.st_dev, path_status.st_ino) != self._database_identity:
             raise ValueError(f"SQLite artifact identity changed: {self.path}")
+
+    def verify_strict_connection_namespace(self) -> None:
+        """Revalidate every live SQLite descriptor and canonical sidecar path."""
+        if not self._strict_connection_artifacts:
+            raise RuntimeError("strict SQLite namespace is not bound")
+        self.verify_strict_path_binding()
+        parent_pin = self._acquire_strict_parent_pin()
+        for suffix in ("-wal", "-shm"):
+            expected_identity, descriptors = self._strict_connection_artifacts[suffix]
+            status = self._strict_sidecar_status(suffix, parent_fd=parent_pin)
+            if (status.st_dev, status.st_ino) != expected_identity:
+                raise ValueError(
+                    f"SQLite artifact identity changed: {self.path}{suffix}"
+                )
+            self._acquire_strict_sidecar_pin(
+                suffix,
+                expected_identity,
+                parent_fd=parent_pin,
+            )
+            for descriptor in descriptors:
+                try:
+                    descriptor_status = os.fstat(descriptor)
+                except OSError as error:
+                    raise ValueError(
+                        f"strict SQLite namespace descriptor closed: {self.path}{suffix}"
+                    ) from error
+                if (descriptor_status.st_dev, descriptor_status.st_ino) != expected_identity:
+                    raise ValueError(
+                        f"strict SQLite namespace descriptor changed: {self.path}{suffix}"
+                    )
+        database_identity, database_descriptors = self._strict_connection_artifacts[
+            "database"
+        ]
+        for descriptor in database_descriptors:
+            try:
+                descriptor_status = os.fstat(descriptor)
+            except OSError as error:
+                raise ValueError(
+                    f"strict SQLite namespace descriptor closed: {self.path}"
+                ) from error
+            if (descriptor_status.st_dev, descriptor_status.st_ino) != database_identity:
+                raise ValueError(
+                    f"strict SQLite namespace descriptor changed: {self.path}"
+                )
+        journal = Path(f"{self.path}-journal")
+        try:
+            journal.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(f"strict SQLite namespace rejects journal: {journal}")
+        current = self._new_strict_regular_descriptors()
+        allowed = self._strict_instance_pins.intersection(current)
+        for _identity, descriptors in self._strict_connection_artifacts.values():
+            allowed.update(descriptors)
+        if set(current) != allowed:
+            raise ValueError("strict SQLite namespace has an unbound descriptor")
 
     def _harden_database_files(
         self, *, database_missing_ok: bool = False
@@ -696,7 +964,15 @@ class SQLiteStore:
         try:
             path_status = sidecar.lstat()
         except FileNotFoundError:
+            if (
+                self._strict_descriptor_binding
+                and self._strict_connection_open
+                and expected is not None
+            ):
+                raise ValueError(f"SQLite artifact identity changed: {sidecar}")
             return None
+        if self._strict_descriptor_binding and suffix == "-journal":
+            raise ValueError(f"strict SQLite namespace rejects journal: {sidecar}")
         self._validate_artifact_status(sidecar, path_status)
         path_identity = (path_status.st_dev, path_status.st_ino)
         if expected == path_identity and stat.S_IMODE(path_status.st_mode) == 0o600:
@@ -705,13 +981,22 @@ class SQLiteStore:
         try:
             status = sidecar.lstat()
         except FileNotFoundError:
+            if (
+                self._strict_descriptor_binding
+                and self._strict_connection_open
+                and expected is not None
+            ):
+                raise ValueError(f"SQLite artifact identity changed: {sidecar}")
             # A checkpoint may remove a sidecar between the initial
             # inspection and this identity re-check.
             return None
         self._validate_artifact_status(sidecar, status)
         identity = (status.st_dev, status.st_ino)
         if expected is not None and identity != expected:
-            if stat.S_IMODE(status.st_mode) != 0o600:
+            if (
+                self._strict_descriptor_binding
+                or stat.S_IMODE(status.st_mode) != 0o600
+            ):
                 raise ValueError(f"SQLite artifact identity changed: {sidecar}")
         try:
             os.chmod(sidecar, 0o600, follow_symlinks=False)
@@ -1015,7 +1300,10 @@ class SQLiteStore:
                 failure = error
                 stashed = self._stash_compromised_sidecars()
         finally:
-            self._connection.close()
+            try:
+                self._connection.close()
+            finally:
+                self._strict_connection_open = False
             for sidecar, quarantine in stashed:
                 if quarantine.exists():
                     os.replace(quarantine, sidecar)

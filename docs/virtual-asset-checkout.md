@@ -215,15 +215,17 @@ topology change, failed write, or failed postcondition cannot produce a partial
 handoff.
 
 The transition is a one-shot, single-threaded operation. Its primary Overseer
-store must already be an owner-only, singly linked regular file with no
-same-inode descriptor open in the process. The runner opens SQLite through a
-retained no-follow inode pin and verifies exactly one new connection descriptor;
-path replacement, an ambiguous descriptor set, or pin-budget exhaustion fails
-before transaction work. Ordinary Overseer stores do not use this strict mode,
-so normal nested and concurrent store behavior remains unchanged. Before
-reporting a normal or recovered commit as successful, the runner opens and
-retains a fresh no-follow path pin and proves the current pathname still names
-the committed inode; a postcommit substitution is an error, not success.
+store must use an absolute path beneath an owner-controlled, non-world-writable
+parent and must already be an owner-only, singly linked regular file with no
+same-inode descriptor open in the process. The runner retains no-follow parent,
+main, WAL, and SHM pins and attributes every new regular descriptor to that
+exact namespace. Rollback-journal mode, a replacement path or sidecar, an
+ambiguous or unbound descriptor, or pin-budget exhaustion fails before record
+work. Ordinary Overseer stores do not use this strict mode, so normal nested and
+concurrent store behavior remains unchanged. Before reporting a normal or
+recovered commit as successful, the runner revalidates every live connection
+descriptor and retains fresh parent/main/WAL/SHM path pins; a postcommit
+substitution is an error, not success.
 
 ### Commit, rollback, replay, and audit
 

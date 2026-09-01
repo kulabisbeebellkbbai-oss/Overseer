@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import threading
 from typing import Any
@@ -620,6 +621,64 @@ def test_transition_does_not_recognize_commit_after_primary_path_substitution(
     assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_transition_rejects_restored_clone_sidecar_namespace_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_directory = tmp_path / "canonical"
+    clone_directory = tmp_path / "clone"
+    displaced_directory = tmp_path / "displaced"
+    canonical_directory.mkdir(mode=0o700)
+    clone_directory.mkdir(mode=0o700)
+    path = canonical_directory / "overseer.sqlite3"
+    clone_path = clone_directory / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    before = _snapshot(path)
+    shutil.copyfile(path, clone_path)
+    clone_path.chmod(0o600)
+    original_connect = sqlite3.connect
+    injected = False
+
+    class ConnectionProxy:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        @property
+        def row_factory(self):
+            return self.connection.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value) -> None:
+            self.connection.row_factory = value
+
+        def execute(self, statement, *args, **kwargs):
+            nonlocal injected
+            if not injected and str(statement).strip() == "PRAGMA schema_version":
+                injected = True
+                os.replace(canonical_directory, displaced_directory)
+                os.replace(clone_directory, canonical_directory)
+                try:
+                    return self.connection.execute(statement, *args, **kwargs)
+                finally:
+                    os.replace(canonical_directory, clone_directory)
+                    os.replace(displaced_directory, canonical_directory)
+            return self.connection.execute(statement, *args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self.connection, name)
+
+    def connect_with_clone_sidecars(database, *args, **kwargs):
+        return ConnectionProxy(original_connect(database, *args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", connect_with_clone_sidecars)
+    with pytest.raises(ValueError, match="strict SQLite namespace"):
+        transition_claim_status(**arguments)
+
+    assert injected
+    assert _snapshot(path) == before
+    assert _snapshot(clone_path) == before
+
+
 def test_transition_preserves_precommit_commit_failure_and_rolls_back(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -948,6 +1007,7 @@ def test_grouped_transition_holds_psychlo_writer_lock_through_overseer_commit(
     acquisition_after_commit: list[bool] = []
     original_validate = transition_module._validate_psychlo_round
     original_commit = SQLiteStore._commit
+    original_namespace_verify = SQLiteStore.verify_strict_connection_namespace
 
     def blocked_lifecycle_validation(*args: object, **kwargs: object) -> object:
         validation_entered.set()
@@ -985,8 +1045,30 @@ def test_grouped_transition_holds_psychlo_writer_lock_through_overseer_commit(
     monkeypatch.setattr(SQLiteStore, "_commit", blocked_transition_commit)
     # This test deliberately introduces threads to observe cross-database lock
     # ordering. Bypass only the one-shot process precondition; dedicated store
-    # tests verify that production strict mode rejects a multithreaded process.
+    # tests verify that production strict mode rejects a multithreaded process
+    # and any unrelated descriptor opened after namespace binding.
     monkeypatch.setattr(threading, "active_count", lambda: 1)
+
+    def verify_namespace_while_allowing_test_psychlo_descriptor(
+        store: SQLiteStore,
+    ) -> None:
+        bound_identities = {
+            identity
+            for identity, _descriptors in store._strict_connection_artifacts.values()
+        }
+        for descriptor, identity in store._regular_descriptor_identities().items():
+            if identity not in bound_identities:
+                store._strict_baseline_regular_descriptors.setdefault(
+                    descriptor,
+                    identity,
+                )
+        original_namespace_verify(store)
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "verify_strict_connection_namespace",
+        verify_namespace_while_allowing_test_psychlo_descriptor,
+    )
 
     def transition() -> None:
         try:

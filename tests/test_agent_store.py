@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import socket
 import sqlite3
 import stat
-import socket
 import subprocess
 import sys
 import threading
@@ -864,7 +865,75 @@ def test_strict_store_descriptor_pin_fails_closed_on_aba_substitute(
     assert checkpoint_ids(substitute) == substitute_before
 
 
-def test_store_ignores_unrelated_regular_descriptor_opened_during_connect(
+def test_strict_store_rejects_sidecars_opened_in_restored_clone_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_directory = tmp_path / "canonical"
+    clone_directory = tmp_path / "clone"
+    displaced_directory = tmp_path / "displaced"
+    canonical_directory.mkdir(mode=0o700)
+    clone_directory.mkdir(mode=0o700)
+    path = canonical_directory / "state.sqlite3"
+    clone_path = clone_directory / "state.sqlite3"
+    with OverseerStore(path) as store:
+        store.save_agent_checkpoint(_checkpoint("checkpoint.canonical", "epoch.canonical"))
+    shutil.copyfile(path, clone_path)
+    clone_path.chmod(0o600)
+    original_connect = sqlite3.connect
+    injected = False
+
+    class ConnectionProxy:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        @property
+        def row_factory(self):
+            return self.connection.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value) -> None:
+            self.connection.row_factory = value
+
+        def execute(self, statement, *args, **kwargs):
+            nonlocal injected
+            if not injected and str(statement).strip() == "PRAGMA schema_version":
+                injected = True
+                os.replace(canonical_directory, displaced_directory)
+                os.replace(clone_directory, canonical_directory)
+                try:
+                    return self.connection.execute(statement, *args, **kwargs)
+                finally:
+                    os.replace(canonical_directory, clone_directory)
+                    os.replace(displaced_directory, canonical_directory)
+            return self.connection.execute(statement, *args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self.connection, name)
+
+    def connect_with_clone_sidecars(database, *args, **kwargs):
+        return ConnectionProxy(original_connect(database, *args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", connect_with_clone_sidecars)
+    with pytest.raises(ValueError, match="SQLite namespace"):
+        OverseerStore(path, strict_descriptor_binding=True)
+
+    assert injected
+    for database in (path, clone_path):
+        connection = original_connect(database)
+        try:
+            checkpoint_ids = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT id FROM agent_checkpoints ORDER BY id"
+                ).fetchall()
+            )
+        finally:
+            connection.close()
+        assert checkpoint_ids == ("checkpoint.canonical",)
+
+
+def test_strict_store_rejects_unrelated_descriptor_opened_during_connect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -884,8 +953,8 @@ def test_store_ignores_unrelated_regular_descriptor_opened_during_connect(
 
     monkeypatch.setattr(sqlite3, "connect", connect_and_open_unrelated)
     try:
-        with OverseerStore(path, strict_descriptor_binding=True) as store:
-            assert store._connection.execute("PRAGMA schema_version").fetchone()
+        with pytest.raises(ValueError, match="unbound descriptor"):
+            OverseerStore(path, strict_descriptor_binding=True)
     finally:
         if unrelated_fd is not None:
             os.close(unrelated_fd)
@@ -1062,6 +1131,61 @@ def test_strict_store_rejects_permissive_mode_without_chmodding(
         OverseerStore(path, strict_descriptor_binding=True)
 
     assert _mode(path) == 0o640
+
+
+def test_strict_store_rejects_rollback_journal_mode(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE example (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+    path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="requires WAL mode"):
+        OverseerStore(path, strict_descriptor_binding=True)
+
+
+def test_strict_store_rejects_journal_path_after_namespace_binding(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    store = OverseerStore(path, strict_descriptor_binding=True)
+    journal = Path(f"{path}-journal")
+    journal.write_bytes(b"untrusted journal")
+    journal.chmod(0o600)
+    try:
+        with pytest.raises(ValueError, match="rejects journal"):
+            store.verify_strict_connection_namespace()
+    finally:
+        journal.unlink()
+        store.close()
+
+
+def test_strict_store_accepts_owner_group_writable_parent(tmp_path: Path) -> None:
+    parent = tmp_path / "state"
+    parent.mkdir(mode=0o770)
+    path = parent / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+
+    with OverseerStore(path, strict_descriptor_binding=True) as store:
+        assert store._connection.execute("PRAGMA schema_version").fetchone()
+
+
+def test_strict_store_rejects_world_writable_parent(tmp_path: Path) -> None:
+    parent = tmp_path / "state"
+    parent.mkdir(mode=0o700)
+    path = parent / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    parent.chmod(0o702)
+
+    with pytest.raises(PermissionError, match="world writable"):
+        OverseerStore(path, strict_descriptor_binding=True)
 
 
 def test_strict_store_rejects_multithreaded_process(tmp_path: Path) -> None:

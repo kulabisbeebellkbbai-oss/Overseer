@@ -23,14 +23,16 @@ Overseer needs durable coordination state, but runtime databases must remain loc
   concurrent and nested connections; they do not retain process-wide inode
   pins.
 - The one-shot atomic claim transition opts into strict descriptor binding. It
-  requires a pre-existing owner-only, singly linked database in a
-  single-threaded process with no same-inode descriptor already open. It opens
-  through an `O_PATH|O_NOFOLLOW` pin, verifies exactly one new SQLite database
-  descriptor before schema or record work, and retains the non-I/O pin for the
-  short process lifetime. A bounded pin registry fails closed before descriptor
-  exhaustion and never closes an unmanaged database descriptor. Commit recovery
-  reports success only after a fresh retained path pin proves that the current
-  pathname still names the committed inode.
+  requires an absolute path, an owner-controlled non-world-writable parent, and
+  a pre-existing owner-only, singly linked database in a single-threaded process
+  with no same-inode descriptor already open. It retains no-follow pins for the
+  parent, main database, WAL, and SHM; attributes every newly opened regular
+  descriptor to that exact namespace; and rejects rollback-journal mode or any
+  unbound descriptor before schema or record work. A bounded pin registry fails
+  closed before descriptor exhaustion and never closes an unmanaged database
+  descriptor. Normal and recovered commit success revalidate every live
+  connection descriptor plus fresh parent/main/WAL/SHM path pins. A clean close
+  may remove WAL/SHM only after their final live validation.
 - The persistence API stores typed records as JSON payloads so the domain model can continue to evolve before schema hardening.
 - `persistence-security` and `GET /persistence/security` inspect database and SQLite sidecar file permissions without creating missing files or changing modes.
 - The store records schema migrations in `schema_migrations` so on-disk shape changes are auditable before later hardening.

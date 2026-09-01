@@ -902,7 +902,7 @@ def _recognize_committed_transition(
             postconditions=postconditions,
             require_no_transaction=True,
         )
-        store.verify_strict_path_binding()
+        store.verify_strict_connection_namespace()
     except (KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
         return False
     return True
@@ -1110,7 +1110,7 @@ def transition_claim_status(
             postconditions=postconditions,
             require_no_transaction=True,
         )
-        store.verify_strict_path_binding()
+        store.verify_strict_connection_namespace()
         committed = True
         return result
     except Exception:

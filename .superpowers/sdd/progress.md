@@ -70,6 +70,6 @@
 | --- | --- | --- |
 | 1. Add atomic transition tests | Complete (`e80919c`, `16988f9`, `7628529`, `ba9772a`) | Re-reviewed; spec compliant and task quality approved with no remaining findings |
 | 2. Implement the atomic runner | Complete (`0f5993d`, `2bd844a`) | Re-reviewed; spec compliant and task quality approved; no Critical/Important findings remain |
-| 3. Correct linked Dax evidence wording | In progress | Pending |
+| 3. Correct linked Dax evidence wording | Complete (`2f4af68`, `128d300`) | Re-reviewed; spec compliant and task quality approved with no remaining findings |
 | 4. Document and prepare the inert replacement package | Pending | Pending |
 | 5. Verify and review | Pending | Pending |

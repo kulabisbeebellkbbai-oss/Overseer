@@ -43,15 +43,28 @@ The transaction requires:
 - one exact approved ROLE approval for the successor, decided by its owner role;
 - one exact delivered approval continuation with matching owner, lifecycle,
   activation-group, resource, claim, and approval bindings;
-- no unavailable successor resource and no remaining conflict after excluding
-  only the named predecessor.
+- no unavailable successor resource and no remaining claim- or resource-level
+  conflict after excluding only the named predecessor;
+- no collision with the deterministic release or transition audit IDs; and
+- non-empty release evidence.
+
+The current rehearsal claims carry lifecycle and activation-group IDs but have
+no persisted `ClaimActivationGroup` rows. That live shape is supported without
+inventing or registering records. If neither group row exists, claim-level
+bindings remain authoritative. If either group row exists, both must exist as
+exact singleton groups; the predecessor group is released and the successor
+group is activated in the same transaction. A partial, non-singleton, or
+mismatched group topology fails closed. When group rows exist, the runner also
+holds the trusted Psychlo writer lock ahead of the Overseer transaction and
+revalidates the successor lifecycle before mutation.
 
 After validation, the service writes the predecessor as released, clears only
 its resource pointer, writes the successor as active with the exact approval,
 sets only its resource pointer, and writes release plus transition audit events.
-It reloads all four durable records and verifies the final postconditions before
-allowing the transaction to commit. Any exception, conflict, failed write, or
-postcondition mismatch rolls the whole transaction back.
+It also changes both optional group rows when they exist. It reloads every
+changed durable record and verifies the final postconditions before allowing the
+transaction to commit. Any exception, conflict, failed write, audit collision,
+or postcondition mismatch rolls the whole transaction back.
 
 The runner is deliberately non-idempotent. A replay no longer has the required
 active/requested preconditions and fails without mutation. This makes accidental
@@ -93,4 +106,3 @@ control proving true read-only inventory wording is unchanged.
 After focused tests pass, run the full repository suite, compile checks, package
 validation, an ordinary independent review, and a final independent security
 review. No live transition or operational phase is part of verification.
-

@@ -35,7 +35,13 @@ inert, unimported, and unapproved for execution.
       back to active predecessor and requested successor.
 - [ ] Require failure without mutation for mismatched claim/resource/owner/group/
       lifecycle/plan-digest bindings, invalid approval, missing or undelivered
-      continuation, external conflict, unavailable resource, and replay.
+      continuation, external claim or resource-exclusive-group conflict,
+      unavailable resource, empty release evidence, audit-ID collision, and
+      replay.
+- [ ] Cover the live claim-level topology with no group rows, exact optional
+      singleton-group transitions, and partial/mismatched group rejection.
+- [ ] When optional groups exist, prove the trusted Psychlo writer lock spans
+      validation through the Overseer commit.
 - [ ] Add a CLI routing test for the exact explicit argument contract.
 - [ ] Run the focused tests and observe expected failures before implementation.
 
@@ -45,8 +51,12 @@ inert, unimported, and unapproved for execution.
 
 - [ ] Add exact validation helpers and an atomic transition status function.
 - [ ] Recompute successor conflict state while excluding only the named active
-      predecessor.
-- [ ] Apply both claim/resource changes and audit events in one writer transaction.
+      predecessor, including resource-level exclusive groups.
+- [ ] Reject deterministic audit-ID collisions and require release evidence.
+- [ ] Apply both claim/resource changes, optional singleton-group state changes,
+      and audit events in one writer transaction.
+- [ ] Acquire the trusted Psychlo writer lock first and validate lifecycle state
+      whenever persisted activation groups are present.
 - [ ] Reload and verify durable postconditions before commit.
 - [ ] Add the `transition-claim` parser and command routing with no inferred IDs.
 - [ ] Run the focused transition tests to green and refactor without changing
@@ -91,4 +101,3 @@ inert, unimported, and unapproved for execution.
       issues.
 - [ ] Commit the verified source changes without pushing, importing, or executing
       the package.
-

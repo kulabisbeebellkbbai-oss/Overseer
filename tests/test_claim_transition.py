@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from overseer import cli
+import overseer.claim_transition as transition_module
 from overseer.audit import ApprovalStatus, ApprovalRequest, AuditEvent, AuditEventType
 from overseer.claim_continuation import (
     ClaimApprovalContinuation,
@@ -458,13 +459,27 @@ def test_grouped_transition_holds_psychlo_writer_lock_through_overseer_commit(
     psychlo = _seed_psychlo_round(tmp_path / "psychlo.sqlite3")
     arguments = _seed_transition_store(path)
     _seed_optional_groups(path)
-    entered = threading.Event()
-    continue_transition = threading.Event()
+    validation_entered = threading.Event()
+    allow_validation = threading.Event()
+    commit_entered = threading.Event()
+    allow_commit = threading.Event()
+    overseer_commit_completed = threading.Event()
+    competing_writer_started = threading.Event()
+    competing_writer_acquired = threading.Event()
     results: list[dict[str, object]] = []
     errors: list[Exception] = []
+    competing_errors: list[Exception] = []
+    acquisition_after_commit: list[bool] = []
+    original_validate = transition_module._validate_psychlo_round
     original_commit = SQLiteStore._commit
 
+    def blocked_lifecycle_validation(*args: object, **kwargs: object) -> object:
+        validation_entered.set()
+        assert allow_validation.wait(timeout=2)
+        return original_validate(*args, **kwargs)
+
     def blocked_transition_commit(store: SQLiteStore) -> None:
+        is_transition_commit = False
         try:
             predecessor = store.load_claim(PREDECESSOR_CLAIM_ID)
             successor = store.load_claim(SUCCESSOR_CLAIM_ID)
@@ -479,11 +494,18 @@ def test_grouped_transition_holds_psychlo_writer_lock_through_overseer_commit(
             and predecessor_group.state == ClaimActivationGroupState.RELEASED
             and successor_group.state == ClaimActivationGroupState.ACTIVE
         ):
-            entered.set()
-            assert continue_transition.wait(timeout=2)
+            is_transition_commit = True
+            commit_entered.set()
+            assert allow_commit.wait(timeout=2)
         original_commit(store)
+        if is_transition_commit:
+            overseer_commit_completed.set()
 
-    # Block the actual outer SQLite commit after every transition mutation is visible.
+    monkeypatch.setattr(
+        transition_module,
+        "_validate_psychlo_round",
+        blocked_lifecycle_validation,
+    )
     monkeypatch.setattr(SQLiteStore, "_commit", blocked_transition_commit)
 
     def transition() -> None:
@@ -497,20 +519,48 @@ def test_grouped_transition_holds_psychlo_writer_lock_through_overseer_commit(
         except Exception as error:  # pragma: no cover - surfaced below
             errors.append(error)
 
+    def compete_for_psychlo_writer() -> None:
+        connection = sqlite3.connect(psychlo, timeout=10.0)
+        competing_writer_started.set()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            acquisition_after_commit.append(overseer_commit_completed.is_set())
+            competing_writer_acquired.set()
+            connection.rollback()
+        except Exception as error:  # pragma: no cover - surfaced below
+            competing_errors.append(error)
+        finally:
+            connection.close()
+
     worker = threading.Thread(target=transition)
     worker.start()
-    assert entered.wait(timeout=2)
-    competing_writer = sqlite3.connect(psychlo, timeout=0.05)
+    competitor = threading.Thread(target=compete_for_psychlo_writer)
     try:
-        with pytest.raises(sqlite3.OperationalError, match="locked"):
-            competing_writer.execute("BEGIN IMMEDIATE")
+        assert validation_entered.wait(timeout=2)
+        competitor.start()
+        assert competing_writer_started.wait(timeout=2)
+        assert not competing_writer_acquired.wait(timeout=0.1)
+
+        allow_validation.set()
+        assert commit_entered.wait(timeout=2)
+        assert competing_writer_acquired.is_set() is False
+
+        allow_commit.set()
+        worker.join(timeout=2)
+        assert worker.is_alive() is False
+        assert overseer_commit_completed.is_set()
+        assert competing_writer_acquired.wait(timeout=2)
     finally:
-        competing_writer.close()
-    continue_transition.set()
-    worker.join(timeout=2)
+        allow_validation.set()
+        allow_commit.set()
+        worker.join(timeout=2)
+        if competitor.ident is not None:
+            competitor.join(timeout=2)
 
     assert not errors
+    assert not competing_errors
     assert results and results[0]["status"] == "transitioned"
+    assert acquisition_after_commit == [True]
 
 
 def test_transition_rolls_back_after_successor_persistence_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

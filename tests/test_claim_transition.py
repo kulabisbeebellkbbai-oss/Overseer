@@ -708,7 +708,7 @@ def test_transition_preserves_precommit_commit_failure_and_rolls_back(
     )
 
 
-def test_transition_preserves_success_when_close_raises_after_verified_commit(
+def test_transition_returns_close_failure_after_verified_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -729,9 +729,9 @@ def test_transition_preserves_success_when_close_raises_after_verified_commit(
 
     monkeypatch.setattr(SQLiteStore, "close", close_after_verified_commit_raises)
 
-    result = transition_claim_status(**arguments)
+    with pytest.raises(OSError, match="postcommit close hardening/path error"):
+        transition_claim_status(**arguments)
 
-    assert result["status"] == "transitioned"
     assert verified_before_close
     _assert_transition_state(
         path,
@@ -740,6 +740,37 @@ def test_transition_preserves_success_when_close_raises_after_verified_commit(
         predecessor_resource=None,
         successor_resource=SUCCESSOR_CLAIM_ID,
     )
+
+
+def test_transition_does_not_suppress_close_time_sidecar_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    original_close = SQLiteStore.close
+    substituted = False
+
+    def substitute_wal_before_close(store: SQLiteStore) -> None:
+        nonlocal substituted
+        if substituted:
+            original_close(store)
+            return
+        substituted = True
+        wal = Path(f"{path}-wal")
+        held_wal = tmp_path / "held-wal"
+        os.replace(wal, held_wal)
+        wal.write_bytes(b"untrusted replacement")
+        wal.chmod(0o600)
+        original_close(store)
+
+    monkeypatch.setattr(SQLiteStore, "close", substitute_wal_before_close)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        transition_claim_status(**arguments)
+
+    assert substituted
+    assert Path(f"{path}-wal").read_bytes() == b"untrusted replacement"
 
 
 @pytest.mark.parametrize(

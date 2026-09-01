@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import json
+import grp
 import hashlib
 import hmac
+import json
 import os
+import pwd
 import re
 import secrets
 import sqlite3
@@ -602,10 +604,30 @@ class SQLiteStore:
             raise PermissionError(
                 f"strict SQLite parent is not owned by this process: {path}"
             )
-        if stat.S_IMODE(status.st_mode) & 0o002:
+        mode = stat.S_IMODE(status.st_mode)
+        if mode & 0o002:
             raise PermissionError(
                 f"strict SQLite parent must not be world writable: {path}"
             )
+        if mode & 0o020:
+            effective_uid = os.geteuid()
+            try:
+                owner = pwd.getpwuid(effective_uid)
+                group = grp.getgrgid(status.st_gid)
+                primary_members = {
+                    account.pw_name
+                    for account in pwd.getpwall()
+                    if account.pw_gid == status.st_gid
+                }
+            except KeyError as error:
+                raise PermissionError(
+                    f"strict SQLite parent group cannot be verified: {path}"
+                ) from error
+            group_members = primary_members.union(group.gr_mem)
+            if status.st_gid != owner.pw_gid or group_members != {owner.pw_name}:
+                raise PermissionError(
+                    f"strict SQLite parent group is not owner-only: {path}"
+                )
 
     def _acquire_strict_parent_pin(self) -> int:
         """Retain and verify the directory containing the strict namespace."""
@@ -809,6 +831,7 @@ class SQLiteStore:
         parent_fd = self._strict_parent_pin
         if parent_fd is None:
             raise RuntimeError("strict SQLite parent pin is unavailable")
+        all_descriptors = self._regular_descriptor_identities()
         new_descriptors = self._new_strict_regular_descriptors()
         if set(pinned_descriptors) != {strict_pin}:
             raise ValueError("strict SQLite namespace main pin is ambiguous")
@@ -829,7 +852,7 @@ class SQLiteStore:
             identity = (status.st_dev, status.st_ino)
             sidecar_descriptors = frozenset(
                 descriptor
-                for descriptor, descriptor_identity in new_descriptors.items()
+                for descriptor, descriptor_identity in all_descriptors.items()
                 if descriptor_identity == identity
                 and descriptor not in self._strict_instance_pins
             )

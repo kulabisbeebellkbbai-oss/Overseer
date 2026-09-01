@@ -943,7 +943,6 @@ def transition_claim_status(
     }
     store = SQLiteStore(store_path, strict_descriptor_binding=True)
     postconditions: _TransitionPostconditions | None = None
-    committed = False
     try:
         psychlo_store_path = _psychlo_store_path or TRUSTED_PSYCHLO_STORE
         with _transition_transaction(
@@ -1111,17 +1110,10 @@ def transition_claim_status(
             require_no_transaction=True,
         )
         store.verify_strict_connection_namespace()
-        committed = True
         return result
     except Exception:
         if _recognize_committed_transition(store, postconditions):
-            committed = True
             return result
         raise
     finally:
-        try:
-            store.close()
-        except Exception:
-            if not committed:
-                raise
-            store.verify_strict_path_binding()
+        store.close()

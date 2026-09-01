@@ -746,6 +746,32 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+def _leave_valid_wal_sidecars(path: Path) -> None:
+    worker = """
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute("CREATE TABLE IF NOT EXISTS strict_sidecar_probe (id INTEGER PRIMARY KEY)")
+connection.execute("INSERT INTO strict_sidecar_probe DEFAULT VALUES")
+connection.commit()
+os._exit(0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", worker, str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(f"{path}-wal").is_file()
+    assert Path(f"{path}-shm").is_file()
+
+
 def test_store_hardens_new_database_and_sqlite_sidecars_under_public_umask(
     tmp_path: Path,
 ) -> None:
@@ -1101,6 +1127,24 @@ def test_strict_store_rejects_preexisting_connection_to_same_inode(
         outer.close()
 
 
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_strict_store_rejects_preexisting_sidecar_descriptor(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    _leave_valid_wal_sidecars(path)
+    sidecar = Path(f"{path}{suffix}")
+    descriptor = os.open(sidecar, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        with pytest.raises(ValueError, match="namespace descriptor is ambiguous"):
+            OverseerStore(path, strict_descriptor_binding=True)
+    finally:
+        os.close(descriptor)
+
+
 def test_strict_store_rejects_caller_owned_verified_descriptor(
     tmp_path: Path,
 ) -> None:
@@ -1174,6 +1218,31 @@ def test_strict_store_accepts_owner_group_writable_parent(tmp_path: Path) -> Non
 
     with OverseerStore(path, strict_descriptor_binding=True) as store:
         assert store._connection.execute("PRAGMA schema_version").fetchone()
+
+
+def test_strict_store_rejects_group_writable_parent_with_another_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "state"
+    parent.mkdir(mode=0o770)
+    path = parent / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    accounts = list(store_module.pwd.getpwall())
+
+    class ForeignAccount:
+        pw_name = "foreign-account"
+        pw_gid = parent.stat().st_gid
+
+    monkeypatch.setattr(
+        store_module.pwd,
+        "getpwall",
+        lambda: [*accounts, ForeignAccount()],
+    )
+
+    with pytest.raises(PermissionError, match="group is not owner-only"):
+        OverseerStore(path, strict_descriptor_binding=True)
 
 
 def test_strict_store_rejects_world_writable_parent(tmp_path: Path) -> None:

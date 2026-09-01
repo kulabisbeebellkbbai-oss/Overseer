@@ -215,8 +215,8 @@ topology change, failed write, or failed postcondition cannot produce a partial
 handoff.
 
 The transition is a one-shot, single-threaded operation. Its primary Overseer
-store must use an absolute path beneath an owner-controlled, non-world-writable
-parent and must already be an owner-only, singly linked regular file with no
+store must use an absolute path beneath an owner-controlled parent and must
+already be an owner-only, singly linked regular file with no
 same-inode descriptor open in the process. The runner retains no-follow parent,
 main, WAL, and SHM pins and attributes every new regular descriptor to that
 exact namespace. Rollback-journal mode, a replacement path or sidecar, an
@@ -225,7 +225,9 @@ work. Ordinary Overseer stores do not use this strict mode, so normal nested and
 concurrent store behavior remains unchanged. Before reporting a normal or
 recovered commit as successful, the runner revalidates every live connection
 descriptor and retains fresh parent/main/WAL/SHM path pins; a postcommit
-substitution is an error, not success.
+substitution is an error, not success. Group write is allowed only for the
+owner's primary group when that group has no other account members. Any
+close-time integrity failure remains caller-visible even after a durable commit.
 
 ### Commit, rollback, replay, and audit
 

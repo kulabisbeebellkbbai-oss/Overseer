@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 from overseer import cli
-import overseer.claim_transition as transition_module
 from overseer.audit import ApprovalStatus, ApprovalRequest, AuditEvent, AuditEventType
 from overseer.claim_continuation import (
     ClaimApprovalContinuation,
@@ -317,15 +316,23 @@ def _seed_optional_groups(
 def _snapshot(path: Path) -> tuple[Any, ...]:
     store = SQLiteStore(path)
     try:
+        claims = tuple(sorted(store.list_claims(), key=lambda item: item.id))
+        decisions: list[tuple[str, ConflictDecision | None]] = []
+        for claim in claims:
+            try:
+                decision = store.load_decision(claim.id)
+            except KeyError:
+                decision = None
+            decisions.append((claim.id, decision))
         return (
             tuple(sorted(store.list_resources(), key=lambda item: item.id)),
-            tuple(sorted(store.list_claims(), key=lambda item: item.id)),
+            claims,
             tuple(sorted(store.list_approvals(), key=lambda item: item.id)),
             tuple(sorted(store.list_claim_approval_continuations(), key=lambda item: item.id)),
             tuple(sorted(store.list_claim_approval_continuation_attempts(), key=lambda item: item.id)),
             tuple(sorted(store.list_claim_activation_groups(), key=lambda item: item.id)),
             tuple(sorted(store.list_audit_events(), key=lambda item: item.id)),
-            tuple(store.load_decision(claim_id) for claim_id in (PREDECESSOR_CLAIM_ID, SUCCESSOR_CLAIM_ID)),
+            tuple(decisions),
         )
     finally:
         store.close()
@@ -335,7 +342,10 @@ def _assert_transition_state(path: Path, *, predecessor: ClaimStatus, successor:
     store = SQLiteStore(path)
     try:
         assert store.load_claim(PREDECESSOR_CLAIM_ID).status == predecessor
-        assert store.load_claim(SUCCESSOR_CLAIM_ID).status == successor
+        persisted_successor = store.load_claim(SUCCESSOR_CLAIM_ID)
+        assert persisted_successor.status == successor
+        if successor == ClaimStatus.ACTIVE:
+            assert persisted_successor.approval_id == APPROVAL_ID
         assert store.load_resource(PREDECESSOR_RESOURCE_ID).current_claim_id == predecessor_resource
         assert store.load_resource(SUCCESSOR_RESOURCE_ID).current_claim_id == successor_resource
     finally:
@@ -368,12 +378,16 @@ def test_transition_claim_status_atomically_releases_and_activates_with_bound_au
         assert len(transition_events) == 1
         assert release_events[0].id == RELEASE_AUDIT_ID
         assert transition_events[0].id == TRANSITION_AUDIT_ID
+        exact_bound_evidence = {
+            PREDECESSOR_CLAIM_ID,
+            SUCCESSOR_CLAIM_ID,
+            APPROVAL_ID,
+            CONTINUATION_ID,
+            PLAN_DIGEST,
+            *EVIDENCE_IDS,
+        }
         for event in (*release_events, *transition_events):
-            assert set(EVIDENCE_IDS).issubset(event.evidence_ids)
-            assert PLAN_DIGEST in event.evidence_ids
-        assert {PREDECESSOR_CLAIM_ID, SUCCESSOR_CLAIM_ID, APPROVAL_ID, CONTINUATION_ID}.issubset(
-            set(transition_events[0].evidence_ids)
-        )
+            assert exact_bound_evidence.issubset(event.evidence_ids)
     finally:
         store.close()
 
@@ -448,16 +462,29 @@ def test_grouped_transition_holds_psychlo_writer_lock_through_overseer_commit(
     continue_transition = threading.Event()
     results: list[dict[str, object]] = []
     errors: list[Exception] = []
-    original_validate = transition_module._validate_psychlo_round
+    original_commit = SQLiteStore._commit
 
-    def wrapped_validate(*args: object, **kwargs: object) -> object:
-        result = original_validate(*args, **kwargs)
-        entered.set()
-        assert continue_transition.wait(timeout=2)
-        return result
+    def blocked_transition_commit(store: SQLiteStore) -> None:
+        try:
+            predecessor = store.load_claim(PREDECESSOR_CLAIM_ID)
+            successor = store.load_claim(SUCCESSOR_CLAIM_ID)
+            predecessor_group = store.load_claim_activation_group(PREDECESSOR_GROUP_ID)
+            successor_group = store.load_claim_activation_group(ACTIVATION_GROUP_ID)
+        except KeyError:
+            original_commit(store)
+            return
+        if (
+            predecessor.status == ClaimStatus.RELEASED
+            and successor.status == ClaimStatus.ACTIVE
+            and predecessor_group.state == ClaimActivationGroupState.RELEASED
+            and successor_group.state == ClaimActivationGroupState.ACTIVE
+        ):
+            entered.set()
+            assert continue_transition.wait(timeout=2)
+        original_commit(store)
 
-    # This is a synchronization seam only: validation and persistence remain real.
-    monkeypatch.setattr(transition_module, "_validate_psychlo_round", wrapped_validate)
+    # Block the actual outer SQLite commit after every transition mutation is visible.
+    monkeypatch.setattr(SQLiteStore, "_commit", blocked_transition_commit)
 
     def transition() -> None:
         try:
@@ -654,57 +681,103 @@ def _seed_transition_arguments(path: Path) -> dict[str, object]:
     }
 
 
-def test_transition_rejects_external_claim_or_resource_group_conflict_and_unavailable_successor_without_mutation(tmp_path: Path) -> None:
-    for case in ("external conflict", "unavailable resource"):
-        path = tmp_path / f"{case.replace(' ', '-')}.sqlite3"
-        _seed_transition_store(path)
-        store = SQLiteStore(path)
-        try:
-            if case == "external conflict":
-                store.save_resource(
-                    Resource(
-                        id="resource.external-conflict",
-                        name="external conflicting resource",
-                        type=ResourceType.VIRTUAL_ASSET,
-                        owner_domain=OwnerDomain.DAX,
-                        risk_level=RiskLevel.LOW,
-                        state=ResourceState.CHECKED_OUT,
-                        current_claim_id="claim.external-conflict",
-                        exclusive_groups=frozenset({"phase-b-successor"}),
-                    )
-                )
-                store.save_claim(
-                    Claim(
-                        id="claim.external-conflict",
-                        resource_id="resource.external-conflict",
-                        claim_type=ClaimType.LEASE,
-                        owner_thread="thread.external-owner",
-                        owner_role=OwnerDomain.DAX,
-                        intent="unrelated active lease sharing the successor exclusive group",
-                        requested_action="hold the conflicting resource",
-                        risk_level=RiskLevel.LOW,
-                        status=ClaimStatus.ACTIVE,
-                    ),
-                    ConflictDecision(ConflictOutcome.ALLOW, "external claim is active"),
-                )
-            else:
-                resource = store.load_resource(SUCCESSOR_RESOURCE_ID)
-                store.save_resource(replace(resource, state=ResourceState.LOCKED))
-        finally:
-            store.close()
-        before = _snapshot(path)
+def _assert_transition_rejected_without_mutation(path: Path) -> None:
+    before = _snapshot(path)
+    with pytest.raises((KeyError, ValueError), match=""):
+        transition_claim_status(**_seed_transition_arguments(path))
+    assert _snapshot(path) == before
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.ACTIVE,
+        successor=ClaimStatus.REQUESTED,
+        predecessor_resource=PREDECESSOR_CLAIM_ID,
+        successor_resource=None,
+    )
 
-        with pytest.raises((KeyError, ValueError), match=""):
-            transition_claim_status(**_seed_transition_arguments(path))
 
-        assert _snapshot(path) == before
-        _assert_transition_state(
-            path,
-            predecessor=ClaimStatus.ACTIVE,
-            successor=ClaimStatus.REQUESTED,
-            predecessor_resource=PREDECESSOR_CLAIM_ID,
-            successor_resource=None,
+def _seed_external_active_claim(
+    store: SQLiteStore,
+    *,
+    resource_exclusive_groups: frozenset[str] = frozenset(),
+    claim_exclusive_groups: frozenset[str] = frozenset(),
+) -> None:
+    store.save_resource(
+        Resource(
+            id="resource.external-conflict",
+            name="external conflicting resource",
+            type=ResourceType.VIRTUAL_ASSET,
+            owner_domain=OwnerDomain.DAX,
+            risk_level=RiskLevel.LOW,
+            state=ResourceState.CHECKED_OUT,
+            current_claim_id="claim.external-conflict",
+            exclusive_groups=resource_exclusive_groups,
         )
+    )
+    store.save_claim(
+        Claim(
+            id="claim.external-conflict",
+            resource_id="resource.external-conflict",
+            claim_type=ClaimType.LEASE,
+            owner_thread="thread.external-owner",
+            owner_role=OwnerDomain.DAX,
+            intent="unrelated active lease conflicting with the successor",
+            requested_action="hold the conflicting resource",
+            risk_level=RiskLevel.LOW,
+            status=ClaimStatus.ACTIVE,
+            exclusive_groups=claim_exclusive_groups,
+        ),
+        ConflictDecision(ConflictOutcome.ALLOW, "external claim is active"),
+    )
+
+
+def test_transition_rejects_resource_level_external_conflict_without_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        _seed_external_active_claim(
+            store,
+            resource_exclusive_groups=frozenset({"phase-b-successor"}),
+        )
+    finally:
+        store.close()
+
+    _assert_transition_rejected_without_mutation(path)
+
+
+def test_transition_rejects_claim_level_external_conflict_without_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        successor = store.load_claim(SUCCESSOR_CLAIM_ID)
+        decision = store.load_decision(SUCCESSOR_CLAIM_ID)
+        store.save_claim(
+            replace(successor, exclusive_groups=frozenset({"claim-level-successor"})),
+            decision,
+        )
+        _seed_external_active_claim(
+            store,
+            claim_exclusive_groups=frozenset({"claim-level-successor"}),
+        )
+        assert store.load_resource("resource.external-conflict").exclusive_groups == frozenset()
+    finally:
+        store.close()
+
+    _assert_transition_rejected_without_mutation(path)
+
+
+def test_transition_rejects_unavailable_successor_without_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        resource = store.load_resource(SUCCESSOR_RESOURCE_ID)
+        store.save_resource(replace(resource, state=ResourceState.LOCKED))
+    finally:
+        store.close()
+
+    _assert_transition_rejected_without_mutation(path)
 
 
 @pytest.mark.parametrize(

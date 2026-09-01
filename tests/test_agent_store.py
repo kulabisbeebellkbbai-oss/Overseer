@@ -793,6 +793,80 @@ def test_store_rejects_symlink_database_without_chmodding_target(
     assert _mode(target) == 0o644
 
 
+def test_store_rejects_hardlinked_database_without_chmodding_either_name(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    alias = tmp_path / "state-alias.sqlite3"
+    sqlite3.connect(path).close()
+    path.chmod(0o644)
+    os.link(path, alias)
+
+    with pytest.raises(ValueError, match="exactly one link"):
+        OverseerStore(path)
+
+    assert _mode(path) == 0o644
+    assert _mode(alias) == 0o644
+
+
+def test_store_rejects_connection_opened_on_aba_substitute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    substitute = tmp_path / "substitute.sqlite3"
+    held_canonical = tmp_path / "held-canonical.sqlite3"
+    with OverseerStore(path) as store:
+        store.save_agent_checkpoint(_checkpoint("checkpoint.canonical", "epoch.canonical"))
+    with OverseerStore(substitute) as store:
+        store.save_agent_checkpoint(_checkpoint("checkpoint.substitute", "epoch.substitute"))
+
+    original_connect = sqlite3.connect
+
+    def checkpoint_ids(database: Path) -> tuple[str, ...]:
+        connection = original_connect(database)
+        try:
+            return tuple(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT id FROM agent_checkpoints ORDER BY id"
+                ).fetchall()
+            )
+        finally:
+            connection.close()
+
+    canonical_before = checkpoint_ids(path)
+    substitute_before = checkpoint_ids(substitute)
+    injected = False
+
+    def connect_to_substitute(database, *args, **kwargs):
+        nonlocal injected
+        if injected:
+            return original_connect(database, *args, **kwargs)
+        injected = True
+        os.replace(path, held_canonical)
+        os.replace(substitute, path)
+        try:
+            connection = original_connect(path, *args, **kwargs)
+        finally:
+            os.replace(path, substitute)
+            os.replace(held_canonical, path)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect_to_substitute)
+    opened = None
+    try:
+        with pytest.raises(ValueError, match="connection identity"):
+            opened = OverseerStore(path)
+    finally:
+        if opened is not None:
+            opened.close()
+
+    assert injected
+    assert checkpoint_ids(path) == canonical_before
+    assert checkpoint_ids(substitute) == substitute_before
+
+
 def test_store_rejects_fifo_promptly_without_reader(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     os.mkfifo(path, 0o644)

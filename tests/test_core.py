@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import os
 import tempfile
@@ -12512,6 +12513,92 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(second["claim_status"], ClaimStatus.QUEUED.value)
             self.assertEqual(second["blocking_claim_ids"], ["claim.cli.first"])
 
+    def _prepare_replayable_dax_role_approval(self, store_path, suffix):
+        resource_id = f"proxy.role-handoff-{suffix}"
+        claim_id = f"claim.cli.role-handoff-{suffix}"
+        store = SQLiteStore(store_path)
+        store.save_resource(
+            Resource(
+                id=resource_id,
+                name=f"Role Handoff {suffix} Proxy",
+                type=ResourceType.VIRTUAL_ASSET,
+                owner_domain=OwnerDomain.DAX,
+                risk_level=RiskLevel.LOW,
+            )
+        )
+        store.close()
+        requested = request_claim_status(
+            store_path,
+            claim_id,
+            resource_id,
+            ClaimType.LEASE.value,
+            f"thread-role-handoff-{suffix}",
+            OwnerDomain.DAX.value,
+            "run one bounded loopback test",
+            "bind an OS-assigned loopback listener",
+            RiskLevel.LOW.value,
+            activation_group_id=f"group.{claim_id}",
+            lifecycle_id=f"lifecycle.{claim_id}",
+            release_condition="release immediately after the test",
+        )
+        dispatched_at = "2026-08-21T20:06:00+00:00"
+        with patch(
+            "overseer.cli.discover_virtual_listeners_status",
+            return_value={"listeners": 0, "host_mutation_performed": False},
+        ):
+            dispatch_crew_messages_status(
+                store_path,
+                message_id=requested["approval_handoff_id"],
+                dispatched_at=dispatched_at,
+            )
+        store = SQLiteStore(store_path)
+        message = store.load_crew_message(requested["approval_handoff_id"])
+        dispatch_event = next(
+            event
+            for event in store.list_audit_events()
+            if event.id.startswith(f"audit.{message.id}.dispatch.")
+        )
+        store.save_crew_message(
+            replace(
+                message,
+                review_status=CrewReviewStatus.PENDING,
+                decision_reason=None,
+                correction_request=None,
+                decision_evidence_ids=(),
+                decided_by=None,
+                decided_at=None,
+            )
+        )
+        store.close()
+        return requested, dispatch_event
+
+    def _replace_dispatch_audit_event(self, store_path, original_id, replacement):
+        store = SQLiteStore(store_path)
+        if replacement.id != original_id:
+            store._connection.execute("DELETE FROM audit_events WHERE id = ?", (original_id,))
+            store._connection.commit()
+        store.save_audit_event(replacement)
+        store.close()
+
+    def _assert_linked_reconciliation_correction(self, store_path, message_id, dispatch_event_id, reason_fragment):
+        reconciled = reconcile_crew_reviews_status(
+            store_path,
+            message_id=message_id,
+            reconciled_at="2026-08-21T20:07:00+00:00",
+        )
+        store = SQLiteStore(store_path)
+        message = store.load_crew_message(message_id)
+        store.close()
+        self.assertEqual(reconciled["approved"], 0)
+        self.assertEqual(reconciled["correction_requested"], 1)
+        self.assertEqual(message.review_status, CrewReviewStatus.CORRECTION_REQUESTED)
+        self.assertIn(reason_fragment, message.decision_reason)
+        self.assertNotEqual(
+            message.decision_reason,
+            "Dax completed the bounded read-only inventory review without reserving or mutating a resource",
+        )
+        self.assertEqual(message.decision_evidence_ids, (dispatch_event_id,))
+
     def test_role_claim_creates_and_dispatches_exact_dax_approval_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -12657,13 +12744,31 @@ class RuntimeTests(unittest.TestCase):
 
             store = SQLiteStore(store_path)
             message = store.load_crew_message(requested["approval_handoff_id"])
+            dispatch_event = next(
+                event
+                for event in store.list_audit_events()
+                if event.id.startswith(f"audit.{message.id}.dispatch.")
+            )
             store.close()
             dispatch_audit_id = (
                 f"audit.{requested['approval_handoff_id']}.dispatch."
                 f"{overseer_cli._status_id('2026-08-21T20:06:00+00:00')}"
             )
+            action_payload = {
+                "activation_required": True,
+                "approval_id": requested["approval_id"],
+                "approval_status": ApprovalStatus.APPROVED.value,
+                "claim_id": requested["claim"],
+            }
+            action_digest = hashlib.sha256(
+                json.dumps(action_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
             self.assertEqual(reconciled["reviewed"], 1)
             self.assertEqual(reconciled["approved"], 1)
+            self.assertEqual(
+                dispatch_event.evidence_ids,
+                (f"overseer.linked-role-action.sha256:{action_digest}",),
+            )
             self.assertEqual(message.review_status, CrewReviewStatus.APPROVED)
             self.assertEqual(
                 message.decision_reason,
@@ -12674,6 +12779,116 @@ class RuntimeTests(unittest.TestCase):
                 (requested["claim"], requested["approval_id"], dispatch_audit_id),
             )
             self.assertEqual(message.decided_by, OwnerDomain.DAX.value)
+
+    def test_reconciliation_rejects_non_deterministic_linked_dispatch_audit_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            requested, dispatch_event = self._prepare_replayable_dax_role_approval(
+                store_path,
+                "forged-audit-id",
+            )
+            forged_event = replace(dispatch_event, id=f"{dispatch_event.id}.forged")
+            self._replace_dispatch_audit_event(store_path, dispatch_event.id, forged_event)
+
+            self._assert_linked_reconciliation_correction(
+                store_path,
+                requested["approval_handoff_id"],
+                forged_event.id,
+                "deterministic dispatch audit id",
+            )
+
+    def test_reconciliation_rejects_wrong_linked_dispatch_audit_metadata(self):
+        cases = (
+            ("owner", {"owner_domain": OwnerDomain.KIRA}, "owner_domain"),
+            ("risk", {"risk_level": RiskLevel.MEDIUM}, "risk_level"),
+            ("subject", {"subject_id": "crew.dax.forged-subject"}, "subject_id"),
+            ("event-type", {"event_type": AuditEventType.BLOCKED}, "event_type"),
+            ("summary", {"summary": "dax dispatch dispatched: altered linked approval"}, "summary"),
+        )
+        for suffix, changes, reason_fragment in cases:
+            with self.subTest(case=suffix), tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                requested, dispatch_event = self._prepare_replayable_dax_role_approval(
+                    store_path,
+                    f"wrong-audit-{suffix}",
+                )
+                replacement = replace(dispatch_event, **changes)
+                self._replace_dispatch_audit_event(store_path, dispatch_event.id, replacement)
+
+                self._assert_linked_reconciliation_correction(
+                    store_path,
+                    requested["approval_handoff_id"],
+                    replacement.id,
+                    reason_fragment,
+                )
+
+    def test_reconciliation_rejects_missing_or_wrong_linked_action_digest(self):
+        cases = (
+            ("missing", ()),
+            ("wrong", (f"overseer.linked-role-action.sha256:{'0' * 64}",)),
+        )
+        for suffix, evidence_ids in cases:
+            with self.subTest(case=suffix), tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                requested, dispatch_event = self._prepare_replayable_dax_role_approval(
+                    store_path,
+                    f"{suffix}-action-digest",
+                )
+                replacement = replace(dispatch_event, evidence_ids=evidence_ids)
+                self._replace_dispatch_audit_event(store_path, dispatch_event.id, replacement)
+
+                self._assert_linked_reconciliation_correction(
+                    store_path,
+                    requested["approval_handoff_id"],
+                    replacement.id,
+                    "action digest",
+                )
+
+    def test_reconciliation_rejects_tampered_linked_request_evidence_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            requested, dispatch_event = self._prepare_replayable_dax_role_approval(
+                store_path,
+                "tampered-request-evidence",
+            )
+            store = SQLiteStore(store_path)
+            message = store.load_crew_message(requested["approval_handoff_id"])
+            store.save_crew_message(
+                replace(message, request_evidence_ids=("evidence.forged-after-dispatch",))
+            )
+            store.close()
+
+            self._assert_linked_reconciliation_correction(
+                store_path,
+                requested["approval_handoff_id"],
+                dispatch_event.id,
+                "canonical approval request",
+            )
+
+    def test_reconciliation_never_falls_back_to_inventory_for_invalid_linked_dax(self):
+        cases = (
+            ("missing-approval", {"related_approval_id": None}, "both related_claim_id and related_approval_id"),
+            ("missing-claim", {"related_claim_id": None}, "both related_claim_id and related_approval_id"),
+            ("wrong-resource", {"related_resource_id": "proxy.role-handoff-forged"}, "canonical approval request"),
+        )
+        for suffix, changes, reason_fragment in cases:
+            with self.subTest(case=suffix), tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                requested, dispatch_event = self._prepare_replayable_dax_role_approval(
+                    store_path,
+                    f"invalid-linked-{suffix}",
+                )
+                store = SQLiteStore(store_path)
+                message = store.load_crew_message(requested["approval_handoff_id"])
+                store.save_crew_message(replace(message, **changes))
+                store.close()
+
+                self._assert_linked_reconciliation_correction(
+                    store_path,
+                    requested["approval_handoff_id"],
+                    dispatch_event.id,
+                    reason_fragment,
+                )
 
     def test_tampered_role_approval_handoff_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:

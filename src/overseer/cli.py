@@ -229,6 +229,13 @@ from .serialization import to_jsonable
 
 
 _CREW_DISPATCH_LOCK = threading.Lock()
+_LINKED_ROLE_ACTION_DIGEST_PREFIX = "overseer.linked-role-action.sha256:"
+_LINKED_ROLE_ACTION_FIELDS = (
+    "claim_id",
+    "approval_id",
+    "approval_status",
+    "activation_required",
+)
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
 DEFAULT_AGENT_REGISTRY = Path(__file__).parents[2] / "config" / "agent-providers.json"
@@ -7885,23 +7892,39 @@ def reconcile_crew_reviews_status(
             and item.review_status == CrewReviewStatus.PENDING
             and (message_id is None or item.id == message_id)
         ]
+        audit_events = store.list_audit_events()
         dispatch_event_by_message = {
             message.id: next(
                 (
                     event
                     for event in sorted(
-                        store.list_audit_events(
-                            subject_prefix=message.id,
-                            event_type=AuditEventType.EXECUTED,
-                        ),
+                        audit_events,
                         key=lambda item: item.occurred_at or item.id,
                         reverse=True,
                     )
                     if event.subject_id == message.id
+                    and event.event_type == AuditEventType.EXECUTED
                 ),
                 None,
             )
             for message in messages
+        }
+        linked_dispatch_events_by_message = {
+            message.id: tuple(
+                event
+                for event in sorted(
+                    audit_events,
+                    key=lambda item: item.occurred_at or item.id,
+                    reverse=True,
+                )
+                if event.id.startswith(f"audit.{message.id}.dispatch.")
+                or (
+                    event.subject_id == message.id
+                    and event.summary.startswith("dax dispatch ")
+                )
+            )
+            for message in messages
+            if _is_dax_linked_message(message)
         }
         packages = list(store.list_host_security_ids_review_packages())
     finally:
@@ -7913,38 +7936,43 @@ def reconcile_crew_reviews_status(
         decision: tuple[CrewReviewStatus, str, tuple[str, ...], str | None] | None = None
         text = f"{message.subject}\n{message.message}".lower()
         read_only = any(marker in text for marker in ("read-only", "read only", "advisory", "inventory", "review"))
-        linked_role_review = None
-        if (
-            message.owner_domain == OwnerDomain.DAX
-            and dispatch_event is not None
-            and dispatch_event.summary
-            == f"dax dispatch dispatched: dax approved the exact original ROLE approval {message.related_approval_id}; activation remains separate"
-        ):
-            linked_role_review = _exact_dax_role_approval_review(
-                store_path,
-                message,
-                {
-                    "status": "dispatched",
-                    "reason": dispatch_event.summary.split(": ", 1)[1],
-                    "actions": [
-                        {
-                            "claim_id": message.related_claim_id,
-                            "approval_id": message.related_approval_id,
-                            "approval_status": ApprovalStatus.APPROVED.value,
-                            "activation_required": True,
-                        }
-                    ],
-                },
-                dispatch_evidence,
-                now,
-            )
-        if linked_role_review is not None:
-            decision = (
-                CrewReviewStatus.APPROVED,
-                linked_role_review["decision_reason"],
-                linked_role_review["decision_evidence_ids"],
-                None,
-            )
+        if _is_dax_linked_message(message):
+            linked_events = linked_dispatch_events_by_message.get(message.id, ())
+            if len(linked_events) != 1:
+                reason = "linked Dax ROLE approval reconciliation requires exactly one dispatch audit event"
+                evidence = tuple(dict.fromkeys(event.id for event in linked_events))
+                decision = (CrewReviewStatus.CORRECTION_REQUESTED, reason, evidence, reason)
+            else:
+                dispatch_event = linked_events[0]
+                dispatch_evidence = dispatch_event.id
+                reconstructed_result, validation_error = _linked_role_result_from_dispatch_event(
+                    message,
+                    dispatch_event,
+                )
+                linked_role_review = None
+                if reconstructed_result is not None:
+                    linked_role_review, validation_error = _exact_dax_role_approval_review(
+                        store_path,
+                        message,
+                        reconstructed_result,
+                        dispatch_evidence,
+                        now,
+                    )
+                if linked_role_review is not None:
+                    decision = (
+                        CrewReviewStatus.APPROVED,
+                        linked_role_review["decision_reason"],
+                        linked_role_review["decision_evidence_ids"],
+                        None,
+                    )
+                else:
+                    reason = validation_error or "linked Dax ROLE approval evidence is invalid"
+                    decision = (
+                        CrewReviewStatus.CORRECTION_REQUESTED,
+                        reason,
+                        (dispatch_evidence,),
+                        reason,
+                    )
         elif message.owner_domain == OwnerDomain.DAX and read_only and dispatch_evidence:
             decision = (
                 CrewReviewStatus.APPROVED,
@@ -8198,6 +8226,7 @@ def _dispatch_crew_messages_status_unlocked(
                     subject_id=message.id,
                     summary=f"{message.owner_domain.value} dispatch {result['status']}: {result['reason']}",
                     risk_level=message.priority,
+                    evidence_ids=_linked_role_action_evidence(message, result),
                     occurred_at=now,
                 )
             )
@@ -8232,29 +8261,98 @@ def _dispatch_crew_messages_status_unlocked(
     }
 
 
+def _is_dax_linked_message(message) -> bool:
+    return message.owner_domain == OwnerDomain.DAX and bool(
+        message.related_claim_id or message.related_approval_id
+    )
+
+
+def _linked_role_action_payload(result) -> dict[str, object] | None:
+    actions = result.get("actions")
+    if not isinstance(actions, (list, tuple)) or len(actions) != 1 or not isinstance(actions[0], dict):
+        return None
+    action = actions[0]
+    if any(field not in action for field in _LINKED_ROLE_ACTION_FIELDS):
+        return None
+    return {field: action[field] for field in _LINKED_ROLE_ACTION_FIELDS}
+
+
+def _linked_role_action_digest(payload: dict[str, object]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{_LINKED_ROLE_ACTION_DIGEST_PREFIX}{digest}"
+
+
+def _linked_role_action_evidence(message, result) -> tuple[str, ...]:
+    if not _is_dax_linked_message(message) or result.get("status") != "dispatched":
+        return ()
+    payload = _linked_role_action_payload(result)
+    return (_linked_role_action_digest(payload),) if payload is not None else ()
+
+
+def _linked_role_result_from_dispatch_event(message, event) -> tuple[dict[str, object] | None, str | None]:
+    if not (message.related_claim_id and message.related_approval_id):
+        return None, "linked Dax ROLE approval requires both related_claim_id and related_approval_id"
+    if not event.occurred_at:
+        return None, "linked Dax ROLE approval dispatch audit occurred_at is required"
+    expected_event_id = f"audit.{message.id}.dispatch.{_status_id(event.occurred_at)}"
+    if event.id != expected_event_id:
+        return None, "linked Dax ROLE approval requires the deterministic dispatch audit id"
+    if event.owner_domain != OwnerDomain.DAX:
+        return None, "linked Dax ROLE approval dispatch audit owner_domain must be dax"
+    if event.subject_id != message.id:
+        return None, "linked Dax ROLE approval dispatch audit subject_id must match the message"
+    if event.event_type != AuditEventType.EXECUTED:
+        return None, "linked Dax ROLE approval dispatch audit event_type must be executed"
+    if event.risk_level != message.priority:
+        return None, "linked Dax ROLE approval dispatch audit risk_level must match the message"
+    reason = f"dax approved the exact original ROLE approval {message.related_approval_id}; activation remains separate"
+    expected_summary = f"dax dispatch dispatched: {reason}"
+    if event.summary != expected_summary:
+        return None, "linked Dax ROLE approval dispatch audit summary does not match the exact result"
+    action = {
+        "claim_id": message.related_claim_id,
+        "approval_id": message.related_approval_id,
+        "approval_status": ApprovalStatus.APPROVED.value,
+        "activation_required": True,
+    }
+    expected_digest = _linked_role_action_digest(action)
+    if event.evidence_ids != (expected_digest,):
+        return None, "linked Dax ROLE approval dispatch audit action digest is missing or incorrect"
+    return {
+        "status": "dispatched",
+        "reason": reason,
+        "actions": [action],
+    }, None
+
+
 def _exact_dax_role_approval_review(
     store_path,
     message,
     result,
     evidence_id: str | None,
     decided_at: str,
-) -> dict[str, object] | None:
-    if (
-        message.owner_domain != OwnerDomain.DAX
-        or not message.related_claim_id
-        or not message.related_approval_id
-        or result.get("status") != "dispatched"
-        or not evidence_id
-        or _crew_dispatch_result_mutated_host(result)
-    ):
-        return None
+) -> tuple[dict[str, object] | None, str | None]:
+    if message.owner_domain != OwnerDomain.DAX:
+        return None, "linked ROLE approval review owner must be dax"
+    if not (message.related_claim_id and message.related_approval_id):
+        return None, "linked Dax ROLE approval requires both related_claim_id and related_approval_id"
+    if result.get("status") != "dispatched":
+        return None, "linked Dax ROLE approval result status must be dispatched"
+    if not evidence_id:
+        return None, "linked Dax ROLE approval requires dispatch audit evidence"
+    if _crew_dispatch_result_mutated_host(result):
+        return None, "linked Dax ROLE approval result must not mutate the host"
     store = SQLiteStore(store_path)
     try:
         try:
             claim = store.load_claim(message.related_claim_id)
+        except KeyError:
+            return None, "linked Dax ROLE approval claim record is missing"
+        try:
             approval = store.load_approval(message.related_approval_id)
         except KeyError:
-            return None
+            return None, "linked Dax ROLE approval record is missing"
     finally:
         store.close()
     if (
@@ -8267,41 +8365,27 @@ def _exact_dax_role_approval_review(
         or approval.status != ApprovalStatus.APPROVED
         or approval.decided_by != OwnerDomain.DAX.value
     ):
-        return None
+        return None, "linked Dax ROLE approval durable claim or approval binding is invalid"
     expected = role_approval_handoff(claim, approval)
-    if expected is None:
-        return None
-    fields = (
-        "id",
-        "owner_domain",
-        "subject",
-        "message",
-        "priority",
-        "requested_by",
-        "related_resource_id",
-        "related_claim_id",
-        "related_approval_id",
-        "related_plan_id",
-        "related_limit_id",
-        "supersedes_message_id",
-        "acceptance_criteria",
-    )
-    if any(getattr(message, field) != getattr(expected, field) for field in fields):
-        return None
-    actions = result.get("actions")
-    if not isinstance(actions, (list, tuple)) or len(actions) != 1 or not isinstance(actions[0], dict):
-        return None
-    action = actions[0]
-    if (
-        action.get("claim_id") != claim.id
-        or action.get("approval_id") != approval.id
-        or action.get("approval_status") != ApprovalStatus.APPROVED.value
-        or action.get("activation_required") is not True
+    if expected is None or not _canonical_role_handoff_matches(
+        message,
+        expected,
+        allowed_mutable_fields=("status", "review_status"),
     ):
-        return None
+        return None, "linked Dax ROLE approval message does not match the canonical approval request"
+    action = _linked_role_action_payload(result)
+    if action is None:
+        return None, "linked Dax ROLE approval result must contain one exact action payload"
+    if (
+        action["claim_id"] != claim.id
+        or action["approval_id"] != approval.id
+        or action["approval_status"] != ApprovalStatus.APPROVED.value
+        or action["activation_required"] is not True
+    ):
+        return None, "linked Dax ROLE approval action fields do not match the exact approval"
     reason = f"dax approved the exact original ROLE approval {approval.id}; activation remains separate"
     if result.get("reason") != reason:
-        return None
+        return None, "linked Dax ROLE approval result reason does not match the exact approval"
     return {
         "review_status": CrewReviewStatus.APPROVED,
         "decision_reason": reason,
@@ -8310,7 +8394,7 @@ def _exact_dax_role_approval_review(
         ),
         "decided_by": OwnerDomain.DAX.value,
         "decided_at": decided_at,
-    }
+    }, None
 
 
 def _automatic_crew_review(store_path, message, result, delivery_status, evidence_id: str, decided_by: str, decided_at: str) -> dict[str, object]:
@@ -8337,15 +8421,25 @@ def _automatic_crew_review(store_path, message, result, delivery_status, evidenc
             "decided_by": message.owner_domain.value,
             "decided_at": decided_at,
         }
-    linked_role_review = _exact_dax_role_approval_review(
-        store_path,
-        message,
-        result,
-        evidence_id,
-        decided_at,
-    )
-    if linked_role_review is not None:
-        return linked_role_review
+    if _is_dax_linked_message(message):
+        linked_role_review, validation_error = _exact_dax_role_approval_review(
+            store_path,
+            message,
+            result,
+            evidence_id,
+            decided_at,
+        )
+        if linked_role_review is not None:
+            return linked_role_review
+        reason = validation_error or "linked Dax ROLE approval evidence is invalid"
+        return {
+            "review_status": CrewReviewStatus.CORRECTION_REQUESTED,
+            "decision_reason": reason,
+            "correction_request": reason,
+            "decision_evidence_ids": (evidence_id,),
+            "decided_by": OwnerDomain.DAX.value,
+            "decided_at": decided_at,
+        }
     if message.owner_domain == OwnerDomain.DAX and read_only and result.get("status") == "dispatched" and not _crew_dispatch_result_mutated_host(result):
         return {
             "review_status": CrewReviewStatus.APPROVED,
@@ -9529,8 +9623,13 @@ def _reconcile_role_approval_handoffs(
     }
 
 
-def _canonical_role_handoff_matches(existing, expected) -> bool:
-    """Compare durable request identity while ignoring lifecycle/decision fields."""
+def _canonical_role_handoff_matches(
+    existing,
+    expected,
+    *,
+    allowed_mutable_fields: Sequence[str] = (),
+) -> bool:
+    """Compare canonical request identity with explicit lifecycle exceptions."""
     fields = (
         "id",
         "owner_domain",
@@ -9549,7 +9648,13 @@ def _canonical_role_handoff_matches(existing, expected) -> bool:
         "status",
         "review_status",
     )
-    return all(getattr(existing, field) == getattr(expected, field) for field in fields)
+    mutable_fields = frozenset(allowed_mutable_fields)
+    if not mutable_fields.issubset({"status", "review_status"}):
+        raise ValueError("only crew message lifecycle/review fields may be mutable")
+    return all(
+        field in mutable_fields or getattr(existing, field) == getattr(expected, field)
+        for field in fields
+    )
 
 
 def _dispatch_julian_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:

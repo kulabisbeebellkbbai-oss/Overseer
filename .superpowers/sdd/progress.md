@@ -71,5 +71,5 @@
 | 1. Add atomic transition tests | Complete (`e80919c`, `16988f9`, `7628529`, `ba9772a`) | Re-reviewed; spec compliant and task quality approved with no remaining findings |
 | 2. Implement the atomic runner | Complete (`0f5993d`, `2bd844a`) | Re-reviewed; spec compliant and task quality approved; no Critical/Important findings remain |
 | 3. Correct linked Dax evidence wording | Complete (`2f4af68`, `128d300`) | Re-reviewed; spec compliant and task quality approved with no remaining findings |
-| 4. Document and prepare the inert replacement package | Complete (`747d48f`, package `0a17b078...78df`) | Regenerated after ordinary-review repair; canonical payload and exact argv validated without execution; package is unimported, non-executable, and unapproved |
+| 4. Document and prepare the inert replacement package | Complete (`b566c77`, package `07b7dc50...4b8f`) | Security-hardened source archive and replacement environment validated without transition execution; package and archive are unimported, non-executable, and unapproved |
 | 5. Verify and review | Pending | Pending |

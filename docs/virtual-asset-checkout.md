@@ -131,6 +131,7 @@ PYTHONPATH=src python3 -m overseer.cli transition-claim \
   --plan-digest <exact-plan-digest> \
   --transitioned-by <actor> \
   --evidence-id <release-evidence-id> \
+  --evidence-id overseer.claim-transition-record-set-sha256.v1:<record-set-digest> \
   [--evidence-id <additional-evidence-id> ...] \
   --transitioned-at <timestamp>
 ```
@@ -168,6 +169,12 @@ under its writer transaction:
   It must bind the exact claim, approval, resource, thread, role, group, and
   lifecycle; it and its recorded attempt must both be `DELIVERED`, with a
   non-empty attempt ID and matching continuation/thread binding.
+- Exactly one namespaced record-set evidence ID must match the canonical digest
+  recomputed under the writer transaction from the raw stored payloads for both
+  claims, both resources, the approval, continuation, and continuation attempt.
+  The approval and attempt payload IDs must match their row IDs; the attempt
+  must also have a decision time, `prompt_dispatched` result, non-empty reason,
+  and `DELIVERED` state. Package/live-record drift fails before mutation.
 - Recomputed and stored conflict decisions both require exactly `ROLE`
   escalation with no blocking claim IDs. After excluding only the named
   predecessor, there can be no external active-claim or resource
@@ -195,6 +202,11 @@ and bindings are reloaded, the Psychlo lifecycle round is validated, and all
 claim, resource, approval, continuation, conflict, and audit preconditions are
 checked. The Psychlo writer lock remains held through the Overseer commit, then
 is rolled back and released because the transition makes no Psychlo mutation.
+The trusted lifecycle database is opened through retained no-follow directory
+and file descriptors. Its type, owner, permissions, link count, device, inode,
+and directory entry are checked before locking, immediately before the Overseer
+commit, and again when the lock is released. Path replacement or unsafe
+metadata aborts and rolls the transition back.
 For an initially ungrouped transition, Overseer takes its writer lock and
 confirms that no group row appeared before proceeding. Changed durable records
 are reloaded and checked again before commit, so a stale probe, concurrent
@@ -233,6 +245,15 @@ This claim-state command does not itself authorize or perform VM lifecycle
 work, launcher execution, package preparation or import, service changes,
 Phase B, or cutover. Each of those activities remains separately scoped and
 requires its own explicit approval and execution path.
+
+For a digest-bound transition package, do not import `overseer` from a mutable
+worktree and do not inherit the caller's process environment. The prepared
+package must provide an exact replacement environment and execute a reviewed
+source archive only after opening it without following symlinks, verifying its
+approved SHA-256, copying the verified bytes into a sealed in-memory file, and
+importing from that sealed descriptor. Package preparation and source-archive
+verification remain non-execution steps; package import and the transition
+itself still require separate explicit approvals.
 
 ## Live Listener Discovery
 

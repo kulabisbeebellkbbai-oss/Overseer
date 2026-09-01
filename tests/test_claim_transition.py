@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
 from typing import Any
 
@@ -14,6 +16,7 @@ import pytest
 
 from overseer import cli
 import overseer.claim_transition as transition_module
+import overseer.store as store_module
 from overseer.audit import ApprovalStatus, ApprovalRequest, AuditEvent, AuditEventType
 from overseer.claim_continuation import (
     ClaimApprovalContinuation,
@@ -44,6 +47,29 @@ from overseer.store import SQLiteStore
 
 
 PLAN_DIGEST = "a36eb10433ebae40489deb538ef0abb3bf096340d4e11082b246b79fdc4b743f"
+
+
+def _close_one_shot_test_pins() -> None:
+    with store_module._STRICT_DATABASE_PIN_LOCK:
+        descriptors = tuple(store_module._STRICT_DATABASE_PINS)
+        store_module._STRICT_DATABASE_PINS.clear()
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_one_shot_transition_process() -> Any:
+    """Model the production runner's fresh process for every test case."""
+    _close_one_shot_test_pins()
+    try:
+        yield
+    finally:
+        _close_one_shot_test_pins()
+
+
 PREDECESSOR_CLAIM_ID = "claim.phase-b.predecessor"
 SUCCESSOR_CLAIM_ID = "claim.phase-b.successor"
 PREDECESSOR_RESOURCE_ID = "resource.phase-b.predecessor"
@@ -402,6 +428,38 @@ def _snapshot(path: Path) -> tuple[Any, ...]:
         store.close()
 
 
+def _leave_divergent_successor_wal(path: Path) -> None:
+    worker = """
+import json
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+row = connection.execute("SELECT payload FROM claims WHERE id = ?", (sys.argv[2],)).fetchone()
+payload = json.loads(row[0])
+payload["status"] = "active"
+connection.execute(
+    "UPDATE claims SET payload = ? WHERE id = ?",
+    (json.dumps(payload, sort_keys=True, separators=(",", ":")), sys.argv[2]),
+)
+connection.commit()
+os._exit(0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", worker, str(path), SUCCESSOR_CLAIM_ID],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(f"{path}-wal").is_file()
+    assert Path(f"{path}-shm").is_file()
+
+
 def _assert_transition_state(path: Path, *, predecessor: ClaimStatus, successor: ClaimStatus, predecessor_resource: str | None, successor_resource: str | None) -> None:
     store = SQLiteStore(path)
     try:
@@ -636,6 +694,8 @@ def test_transition_rejects_restored_clone_sidecar_namespace_without_mutation(
     before = _snapshot(path)
     shutil.copyfile(path, clone_path)
     clone_path.chmod(0o600)
+    _leave_divergent_successor_wal(clone_path)
+    canonical_main_before = path.read_bytes()
     original_connect = sqlite3.connect
     injected = False
 
@@ -675,8 +735,19 @@ def test_transition_rejects_restored_clone_sidecar_namespace_without_mutation(
         transition_claim_status(**arguments)
 
     assert injected
+    assert path.read_bytes() == canonical_main_before
     assert _snapshot(path) == before
-    assert _snapshot(clone_path) == before
+    clone = sqlite3.connect(clone_path)
+    try:
+        payload = json.loads(
+            clone.execute(
+                "SELECT payload FROM claims WHERE id = ?",
+                (SUCCESSOR_CLAIM_ID,),
+            ).fetchone()[0]
+        )
+    finally:
+        clone.close()
+    assert payload["status"] == "active"
 
 
 def test_transition_preserves_precommit_commit_failure_and_rolls_back(
@@ -771,6 +842,39 @@ def test_transition_does_not_suppress_close_time_sidecar_substitution(
 
     assert substituted
     assert Path(f"{path}-wal").read_bytes() == b"untrusted replacement"
+
+
+@pytest.mark.parametrize("disappearance", ["database", "parent"])
+def test_transition_rejects_close_time_authoritative_path_disappearance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    disappearance: str,
+) -> None:
+    parent = tmp_path / "state"
+    parent.mkdir(mode=0o700)
+    path = parent / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    original_close = SQLiteStore.close
+    disappeared = False
+
+    def disappear_before_close(store: SQLiteStore) -> None:
+        nonlocal disappeared
+        if disappeared:
+            original_close(store)
+            return
+        disappeared = True
+        if disappearance == "database":
+            os.replace(path, tmp_path / "displaced-overseer.sqlite3")
+        else:
+            os.replace(parent, tmp_path / "displaced-state")
+        original_close(store)
+
+    monkeypatch.setattr(SQLiteStore, "close", disappear_before_close)
+
+    with pytest.raises(FileNotFoundError):
+        transition_claim_status(**arguments)
+
+    assert disappeared
 
 
 @pytest.mark.parametrize(

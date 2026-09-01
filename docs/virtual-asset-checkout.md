@@ -228,7 +228,10 @@ descriptor and retains fresh parent/main/WAL/SHM path pins; a postcommit
 substitution is an error, not success. Group write is allowed only for the
 owner's primary group when that group has no other account members. Any
 extended access or default ACL is rejected. Any close-time integrity failure
-remains caller-visible even after a durable commit.
+remains caller-visible even after a durable commit. Rejected namespaces cannot
+checkpoint on close; a successful strict close enables checkpointing only after
+full live namespace validation, then freshly revalidates the parent and main
+path after SQLite has closed.
 
 ### Commit, rollback, replay, and audit
 

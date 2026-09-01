@@ -500,6 +500,7 @@ class SQLiteStore:
                     uri=True,
                     timeout=self._sqlite_timeout_seconds,
                 )
+                self._set_strict_no_checkpoint_on_close(connection, enabled=True)
                 self._verify_strict_connection_binding(
                     connection,
                     strict_pin,
@@ -767,6 +768,25 @@ class SQLiteStore:
             if stat.S_ISREG(status.st_mode):
                 descriptors[descriptor] = (status.st_dev, status.st_ino)
         return descriptors
+
+    @staticmethod
+    def _set_strict_no_checkpoint_on_close(
+        connection: sqlite3.Connection,
+        *,
+        enabled: bool,
+    ) -> None:
+        option = getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)
+        setter = getattr(connection, "setconfig", None)
+        if option is None or setter is None:
+            raise RuntimeError(
+                "strict SQLite namespace requires close-checkpoint control"
+            )
+        try:
+            setter(option, enabled)
+        except sqlite3.Error as error:
+            raise RuntimeError(
+                "strict SQLite close-checkpoint control failed"
+            ) from error
 
     def _database_descriptors(self) -> frozenset[int]:
         """Return only process descriptors bound to the prepared inode."""
@@ -1338,10 +1358,19 @@ class SQLiteStore:
     def close(self) -> None:
         failure: Exception | None = None
         stashed: list[tuple[Path, Path]] = []
+        database_missing_ok = not self._strict_descriptor_binding
         try:
             try:
-                self._harden_database_files(database_missing_ok=True)
-            except (ValueError, PermissionError) as error:
+                self._harden_database_files(
+                    database_missing_ok=database_missing_ok
+                )
+                if self._strict_descriptor_binding:
+                    self.verify_strict_connection_namespace()
+                    self._set_strict_no_checkpoint_on_close(
+                        self._connection,
+                        enabled=False,
+                    )
+            except Exception as error:
                 failure = error
                 stashed = self._stash_compromised_sidecars()
         finally:
@@ -1354,8 +1383,12 @@ class SQLiteStore:
                     os.replace(quarantine, sidecar)
         if failure is None:
             try:
-                self._harden_database_files(database_missing_ok=True)
-            except (ValueError, PermissionError) as error:
+                self._harden_database_files(
+                    database_missing_ok=database_missing_ok
+                )
+                if self._strict_descriptor_binding:
+                    self.verify_strict_path_binding()
+            except Exception as error:
                 failure = error
         if failure is not None:
             raise failure

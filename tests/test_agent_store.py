@@ -906,6 +906,8 @@ def test_strict_store_rejects_sidecars_opened_in_restored_clone_namespace(
         store.save_agent_checkpoint(_checkpoint("checkpoint.canonical", "epoch.canonical"))
     shutil.copyfile(path, clone_path)
     clone_path.chmod(0o600)
+    _leave_valid_wal_sidecars(clone_path)
+    canonical_main_before = path.read_bytes()
     original_connect = sqlite3.connect
     injected = False
 
@@ -945,6 +947,7 @@ def test_strict_store_rejects_sidecars_opened_in_restored_clone_namespace(
         OverseerStore(path, strict_descriptor_binding=True)
 
     assert injected
+    assert path.read_bytes() == canonical_main_before
     for database in (path, clone_path):
         connection = original_connect(database)
         try:
@@ -957,6 +960,18 @@ def test_strict_store_rejects_sidecars_opened_in_restored_clone_namespace(
         finally:
             connection.close()
         assert checkpoint_ids == ("checkpoint.canonical",)
+    canonical = original_connect(path)
+    clone = original_connect(clone_path)
+    try:
+        assert canonical.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='strict_sidecar_probe'"
+        ).fetchone() is None
+        assert clone.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='strict_sidecar_probe'"
+        ).fetchone() is not None
+    finally:
+        canonical.close()
+        clone.close()
 
 
 def test_strict_store_rejects_unrelated_descriptor_opened_during_connect(

@@ -35,8 +35,11 @@ Overseer needs durable coordination state, but runtime databases must remain loc
   before descriptor exhaustion and never closes an unmanaged database
   descriptor. Normal and recovered commit success revalidate every live
   connection descriptor plus fresh parent/main/WAL/SHM path pins. A clean close
-  may remove WAL/SHM only after their final live validation. Any close-time
-  integrity failure is returned as an error even when the transaction committed.
+  may checkpoint and remove WAL/SHM only after their final live validation;
+  rejected namespaces keep checkpoint-on-close disabled. Strict close requires
+  the parent and main path to remain bound before and after connection close.
+  Any close-time integrity failure is returned as an error even when the
+  transaction committed.
 - The persistence API stores typed records as JSON payloads so the domain model can continue to evolve before schema hardening.
 - `persistence-security` and `GET /persistence/security` inspect database and SQLite sidecar file permissions without creating missing files or changing modes.
 - The store records schema migrations in `schema_migrations` so on-disk shape changes are auditable before later hardening.

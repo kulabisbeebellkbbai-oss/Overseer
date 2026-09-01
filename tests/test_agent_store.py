@@ -809,7 +809,7 @@ def test_store_rejects_hardlinked_database_without_chmodding_either_name(
     assert _mode(alias) == 0o644
 
 
-def test_store_rejects_connection_opened_on_aba_substitute(
+def test_store_descriptor_pin_resists_aba_substitute(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -847,24 +847,46 @@ def test_store_rejects_connection_opened_on_aba_substitute(
         os.replace(path, held_canonical)
         os.replace(substitute, path)
         try:
-            connection = original_connect(path, *args, **kwargs)
+            connection = original_connect(database, *args, **kwargs)
         finally:
             os.replace(path, substitute)
             os.replace(held_canonical, path)
         return connection
 
     monkeypatch.setattr(sqlite3, "connect", connect_to_substitute)
-    opened = None
-    try:
-        with pytest.raises(ValueError, match="connection identity"):
-            opened = OverseerStore(path)
-    finally:
-        if opened is not None:
-            opened.close()
+    with pytest.raises(ValueError, match="connection identity"):
+        OverseerStore(path)
 
     assert injected
     assert checkpoint_ids(path) == canonical_before
     assert checkpoint_ids(substitute) == substitute_before
+
+
+def test_store_ignores_unrelated_regular_descriptor_opened_during_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("unrelated", encoding="utf-8")
+    with OverseerStore(path):
+        pass
+    original_connect = sqlite3.connect
+    unrelated_fd = None
+
+    def connect_and_open_unrelated(database, *args, **kwargs):
+        nonlocal unrelated_fd
+        connection = original_connect(database, *args, **kwargs)
+        unrelated_fd = os.open(unrelated, os.O_RDONLY)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect_and_open_unrelated)
+    try:
+        with OverseerStore(path) as store:
+            assert store._connection.execute("PRAGMA schema_version").fetchone()
+    finally:
+        if unrelated_fd is not None:
+            os.close(unrelated_fd)
 
 
 def test_store_rejects_fifo_promptly_without_reader(tmp_path: Path) -> None:
@@ -953,6 +975,47 @@ def test_store_accepts_owner_only_sidecar_rotation_from_nested_connection(
     with OverseerStore(path) as reopened:
         assert reopened.load_agent_checkpoint("checkpoint.nested").id == "checkpoint.nested"
         assert reopened.load_agent_checkpoint("checkpoint.outer").id == "checkpoint.outer"
+
+
+def test_nested_store_close_preserves_outer_writer_lock_for_external_process(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    outer = OverseerStore(path)
+    outer._connection.execute("BEGIN IMMEDIATE")
+    try:
+        with OverseerStore(path) as nested:
+            nested._connection.execute("SELECT COUNT(*) FROM resources").fetchone()
+
+        worker = """
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], timeout=0.1)
+try:
+    connection.execute("BEGIN IMMEDIATE")
+except sqlite3.OperationalError as error:
+    if "locked" not in str(error).lower():
+        raise
+    print("locked")
+else:
+    print("acquired")
+    raise SystemExit(2)
+finally:
+    connection.close()
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", worker, str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "locked"
+    finally:
+        outer._connection.rollback()
+        outer.close()
 
 
 def test_sidecar_disappearance_during_recheck_is_treated_as_checkpoint_race(

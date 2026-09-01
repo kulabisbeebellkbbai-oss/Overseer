@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import threading
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -351,6 +352,8 @@ _AGENT_SECRET_VALUE_RE = re.compile(
     r"(?:\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----|(?:^|[;,\s])(?:session|auth|access)?_?token=\S+)",
     re.IGNORECASE,
 )
+_DATABASE_PIN_LOCK = threading.Lock()
+_DATABASE_PINS: dict[tuple[int, int], int] = {}
 
 
 @dataclass(frozen=True)
@@ -398,89 +401,51 @@ class SQLiteStore:
             else float(timeout_seconds)
         )
         self.path = Path(path)
-        self._owned_verified_fd: int | None = None
-        owned_verified_fd: int | None = None
         if self._collection_deadline is not None and verified_fd is None:
-            if not hasattr(os, "O_PATH"):
-                raise RuntimeError("SQLite descriptor verification requires O_PATH")
-            flags = os.O_PATH
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
             try:
-                owned_verified_fd = os.open(self.path, flags)
+                status = self.path.lstat()
             except FileNotFoundError as error:
                 raise RuntimeError(
                     "collection persistence requires a pre-existing SQLite store"
                 ) from error
-            verified_fd = owned_verified_fd
-        if verified_fd is None:
+            self._validate_artifact_status(self.path, status)
+            self._database_identity = (status.st_dev, status.st_ino)
+        elif verified_fd is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._database_identity = self._prepare_database_file()
-            if not hasattr(os, "O_PATH"):
-                raise RuntimeError("SQLite descriptor verification requires O_PATH")
-            flags = os.O_PATH
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
-            owned_verified_fd = os.open(self.path, flags)
-            try:
-                status = os.fstat(owned_verified_fd)
-                self._validate_artifact_status(self.path, status)
-                if (status.st_dev, status.st_ino) != self._database_identity:
-                    raise ValueError(
-                        f"SQLite artifact identity changed: {self.path}"
-                    )
-            except BaseException:
-                os.close(owned_verified_fd)
-                owned_verified_fd = None
-                raise
-            verified_fd = owned_verified_fd
         else:
-            try:
-                status = os.fstat(verified_fd)
-                self._validate_artifact_status(self.path, status)
-                self._database_identity = (status.st_dev, status.st_ino)
-            except BaseException:
-                if owned_verified_fd is not None:
-                    os.close(owned_verified_fd)
-                    owned_verified_fd = None
-                raise
+            status = os.fstat(verified_fd)
+            self._validate_artifact_status(self.path, status)
+            self._database_identity = (status.st_dev, status.st_ino)
+        verified_fd = self._acquire_database_pin()
         self._sidecar_identities: dict[str, tuple[int, int]] = {}
         self._compromised_sidecars: set[str] = set()
         connection = None
         try:
-            descriptors_before_connect = self._regular_descriptor_bindings()
             connection = sqlite3.connect(
                 f"file:/proc/self/fd/{verified_fd}?mode=rw",
                 uri=True,
                 timeout=self._sqlite_timeout_seconds,
             )
-            connection.execute("PRAGMA schema_version").fetchone()
+            try:
+                connection.execute("PRAGMA schema_version").fetchone()
+            except sqlite3.Error as error:
+                raise ValueError(
+                    f"SQLite connection identity cannot be verified: {self.path}"
+                ) from error
             self._connection = connection
             self._verify_connection_descriptor_bindings(
                 verified_fd,
-                descriptors_before_connect,
-                self._regular_descriptor_bindings(),
+                self._database_descriptors(),
             )
-            self._owned_verified_fd = owned_verified_fd
-            owned_verified_fd = None
         except BaseException:
             if connection is not None:
                 connection.close()
             raise
-        finally:
-            if owned_verified_fd is not None:
-                os.close(owned_verified_fd)
         try:
             self._harden_database_files()
         except Exception:
-            try:
-                self._connection.close()
-            finally:
-                self._close_owned_verified_fd()
+            self._connection.close()
             raise
         self._connection.row_factory = sqlite3.Row
         self._agent_transaction_depth = 0
@@ -496,10 +461,7 @@ class SQLiteStore:
                 self._configure_connection(allow_journal_mode_change=False)
             self._harden_database_files()
         except BaseException:
-            try:
-                self._connection.close()
-            finally:
-                self._close_owned_verified_fd()
+            self._connection.close()
             raise
 
     def _prepare_database_file(self) -> tuple[int, int]:
@@ -543,60 +505,64 @@ class SQLiteStore:
                 f"SQLite artifact must have exactly one link: {path}"
             )
 
-    @staticmethod
-    def _regular_descriptor_bindings() -> dict[int, tuple[int, int, str]]:
-        """Return process regular-file descriptor identities and targets."""
+    def _acquire_database_pin(self) -> int:
+        """Return a process-lifetime O_PATH pin for the prepared inode."""
+        if not hasattr(os, "O_PATH"):
+            raise RuntimeError("SQLite descriptor verification requires O_PATH")
+        with _DATABASE_PIN_LOCK:
+            existing = _DATABASE_PINS.get(self._database_identity)
+            if existing is not None:
+                return existing
+            flags = os.O_PATH
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            descriptor = os.open(self.path, flags)
+            try:
+                status = os.fstat(descriptor)
+                self._validate_artifact_status(self.path, status)
+                if (status.st_dev, status.st_ino) != self._database_identity:
+                    raise ValueError(
+                        f"SQLite artifact identity changed: {self.path}"
+                    )
+            except BaseException:
+                os.close(descriptor)
+                raise
+            _DATABASE_PINS[self._database_identity] = descriptor
+            return descriptor
+
+    def _database_descriptors(self) -> frozenset[int]:
+        """Return only process descriptors bound to the prepared inode."""
         try:
             names = os.listdir("/proc/self/fd")
         except OSError as error:
             raise RuntimeError(
                 "SQLite connection identity cannot be verified"
             ) from error
-        descriptors: dict[int, tuple[int, int, str]] = {}
+        descriptors: set[int] = set()
         for name in names:
             try:
                 descriptor = int(name)
                 status = os.fstat(descriptor)
-                target = os.readlink(f"/proc/self/fd/{descriptor}")
             except (OSError, ValueError):
                 continue
-            if stat.S_ISREG(status.st_mode):
-                descriptors[descriptor] = (status.st_dev, status.st_ino, target)
-        return descriptors
+            if (
+                stat.S_ISREG(status.st_mode)
+                and (status.st_dev, status.st_ino) == self._database_identity
+            ):
+                descriptors.add(descriptor)
+        return frozenset(descriptors)
 
     def _verify_connection_descriptor_bindings(
         self,
         verified_fd: int,
-        before: dict[int, tuple[int, int, str]],
-        after: dict[int, tuple[int, int, str]],
+        database_descriptors: frozenset[int],
     ) -> None:
-        database_descriptors = {
-            descriptor
-            for descriptor, (device, inode, _target) in after.items()
-            if descriptor != verified_fd
-            and (device, inode) == self._database_identity
-        }
-        if not database_descriptors:
+        if not database_descriptors.difference({verified_fd}):
             raise ValueError(
                 f"SQLite connection identity does not match artifact: {self.path}"
             )
-
-        database_path = os.path.abspath(self.path)
-        allowed_sidecars = {
-            f"{database_path}{suffix}"
-            for suffix in ("-wal", "-shm", "-journal")
-        }
-        for descriptor, binding in after.items():
-            if before.get(descriptor) == binding:
-                continue
-            device, inode, target = binding
-            if (device, inode) == self._database_identity:
-                continue
-            target_without_deleted = target.removesuffix(" (deleted)")
-            if target_without_deleted not in allowed_sidecars:
-                raise ValueError(
-                    f"SQLite connection identity does not match artifact: {self.path}"
-                )
 
     def _harden_database_files(
         self, *, database_missing_ok: bool = False
@@ -959,13 +925,10 @@ class SQLiteStore:
                 failure = error
                 stashed = self._stash_compromised_sidecars()
         finally:
-            try:
-                self._connection.close()
-            finally:
-                self._close_owned_verified_fd()
-                for sidecar, quarantine in stashed:
-                    if quarantine.exists():
-                        os.replace(quarantine, sidecar)
+            self._connection.close()
+            for sidecar, quarantine in stashed:
+                if quarantine.exists():
+                    os.replace(quarantine, sidecar)
         if failure is None:
             try:
                 self._harden_database_files(database_missing_ok=True)
@@ -973,12 +936,6 @@ class SQLiteStore:
                 failure = error
         if failure is not None:
             raise failure
-
-    def _close_owned_verified_fd(self) -> None:
-        descriptor = self._owned_verified_fd
-        self._owned_verified_fd = None
-        if descriptor is not None:
-            os.close(descriptor)
 
     def _commit(self) -> None:
         require_collection_time(self._collection_deadline)

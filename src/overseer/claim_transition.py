@@ -313,17 +313,11 @@ def _psychlo_writer(path: str | Path) -> Iterator[sqlite3.Connection]:
             connection.rollback()
             raise
         else:
-            try:
-                revalidate()
-            finally:
-                connection.rollback()
+            connection.rollback()
     finally:
         try:
             if connection is not None:
-                try:
-                    _psychlo_revalidate(connection)
-                finally:
-                    connection.close()
+                connection.close()
         finally:
             try:
                 if file_locked:
@@ -429,11 +423,17 @@ def _transition_transaction(
     except BaseException:
         error = sys.exc_info()
         if psychlo_entered and psychlo_context is not None:
-            psychlo_context.__exit__(*error)
+            try:
+                psychlo_context.__exit__(*error)
+            except BaseException:
+                pass
         raise
     else:
         if psychlo_entered and psychlo_context is not None:
-            psychlo_context.__exit__(None, None, None)
+            try:
+                psychlo_context.__exit__(None, None, None)
+            except BaseException:
+                pass
 
 
 def _validate_group(

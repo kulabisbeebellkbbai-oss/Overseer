@@ -663,6 +663,56 @@ def test_grouped_transition_rejects_psychlo_path_substitution_before_commit_with
     )
 
 
+def test_grouped_transition_succeeds_when_psychlo_path_is_substituted_after_overseer_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    psychlo = _seed_psychlo_round(tmp_path / "psychlo.sqlite3")
+    replacement = _seed_psychlo_round(tmp_path / "psychlo-replacement.sqlite3")
+    renamed = tmp_path / "psychlo-renamed.sqlite3"
+    arguments = _seed_transition_store(path)
+    _seed_optional_groups(path)
+    original_commit = SQLiteStore._commit
+    substituted = False
+
+    def substitute_after_overseer_commit(store: SQLiteStore) -> None:
+        nonlocal substituted
+        is_transition_commit = (
+            store.path == path
+            and store.load_claim(PREDECESSOR_CLAIM_ID).status == ClaimStatus.RELEASED
+            and store.load_claim(SUCCESSOR_CLAIM_ID).status == ClaimStatus.ACTIVE
+        )
+        original_commit(store)
+        if is_transition_commit:
+            psychlo.rename(renamed)
+            replacement.rename(psychlo)
+            substituted = True
+
+    monkeypatch.setattr(SQLiteStore, "_commit", substitute_after_overseer_commit)
+
+    result = transition_claim_status(
+        **arguments,
+        _psychlo_store_path=str(psychlo),
+    )
+
+    assert substituted
+    assert result["status"] == "transitioned"
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.RELEASED,
+        successor=ClaimStatus.ACTIVE,
+        predecessor_resource=None,
+        successor_resource=SUCCESSOR_CLAIM_ID,
+    )
+    store = SQLiteStore(path)
+    try:
+        assert store.load_claim_activation_group(PREDECESSOR_GROUP_ID).state == ClaimActivationGroupState.RELEASED
+        assert store.load_claim_activation_group(ACTIVATION_GROUP_ID).state == ClaimActivationGroupState.ACTIVE
+    finally:
+        store.close()
+
+
 def test_grouped_transition_holds_psychlo_writer_lock_through_overseer_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

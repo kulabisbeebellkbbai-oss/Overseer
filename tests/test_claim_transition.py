@@ -854,22 +854,39 @@ def test_transition_rejects_close_time_authoritative_path_disappearance(
     parent.mkdir(mode=0o700)
     path = parent / "overseer.sqlite3"
     arguments = _seed_transition_store(path)
-    original_close = SQLiteStore.close
+    original_connect = sqlite3.connect
     disappeared = False
 
-    def disappear_before_close(store: SQLiteStore) -> None:
-        nonlocal disappeared
-        if disappeared:
-            original_close(store)
-            return
-        disappeared = True
-        if disappearance == "database":
-            os.replace(path, tmp_path / "displaced-overseer.sqlite3")
-        else:
-            os.replace(parent, tmp_path / "displaced-state")
-        original_close(store)
+    class ConnectionProxy:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
 
-    monkeypatch.setattr(SQLiteStore, "close", disappear_before_close)
+        @property
+        def row_factory(self):
+            return self.connection.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value) -> None:
+            self.connection.row_factory = value
+
+        def close(self) -> None:
+            nonlocal disappeared
+            self.connection.close()
+            if disappeared:
+                return
+            disappeared = True
+            if disappearance == "database":
+                os.replace(path, tmp_path / "displaced-overseer.sqlite3")
+            else:
+                os.replace(parent, tmp_path / "displaced-state")
+
+        def __getattr__(self, name: str):
+            return getattr(self.connection, name)
+
+    def connect_with_post_close_disappearance(database, *args, **kwargs):
+        return ConnectionProxy(original_connect(database, *args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", connect_with_post_close_disappearance)
 
     with pytest.raises(FileNotFoundError):
         transition_claim_status(**arguments)

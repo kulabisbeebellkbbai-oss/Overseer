@@ -1,77 +1,122 @@
 # Task 2 report
 
-Status: repaired after independent rejection; live guest rehearsal intentionally not run.
+## RED
 
-## First implementation
-
-Commit `ef87688` added the initial guest harness. Its original source-level
-suite passed 10 tests, but independent review found five Critical, four
-Important, and one Minor issue. The first implementation was not accepted.
-
-## Repair scope
-
-The repair replaces optimistic controls with observed-evidence gates and adds:
-
-- exact root/systemd/read-only-mount/network/UID/GID preflight validation;
-- production-path rendered units using systemd `LoadCredential=`, the fixed
-  Overseer bridge/executor sockets, and UID/GID 984 canary ownership;
-- a closed three-store canary handoff and exact runtime socket metadata;
-- activation-transition evidence for the socket-activated bridge and executor;
-- the real production hidden-input reader driven through `pty.openpty()`;
-- inspection of the real SQLite-sibling admin-authority lock created by the API;
-- the real API/client, approval verifier, ticket executor, SQLite, and replay
-  controls, including wrong-scope and unlisted negative controls;
-- production activation-package cleanup, state sealing, and approved rollback
-  replay entry points. Only absent owner-package provenance readers are
-  adapted inside the disposable guest;
-- aggregate stop verification for every disposable unit and UID 984 process;
-- durable bounded stage tracking, exact serial output, and guest poweroff on
-  every terminal result;
-- an outer sandbox with individual writable unit files instead of writable
-  access to `/etc/systemd/system`.
-
-## TDD evidence
-
-Repair RED was reproduced in a temporary archive of commit `ef87688` with the
-expanded repair matrix copied in:
+The required initial command was:
 
 ```text
-40 failed, 10 passed in 0.39s
+pytest -q tests/test_claim_transition.py
 ```
 
-The failures covered every independently reported gap: preflight, unit
-credentials/paths, handoff, observed controls, real lock, production PTY,
-production cleanup/replay, fail-closed stop, stage retention, poweroff, and
-the outer sandbox.
-
-Repair GREEN:
+It failed during collection with exit code 2 because `overseer.claim_transition`
+did not exist:
 
 ```text
-50 passed in 0.27s
+ModuleNotFoundError: No module named 'overseer.claim_transition'
 ```
 
-The first repair re-review then identified two remaining Important gaps:
-accepted `overseer-admin-executor@*.service` instances were outside the
-cleanup inventory, and the second-pass failure was classified without first
-being induced and observed. Follow-up TDD produced `3 failed, 49 passed`.
-The final implementation now inventories, stops, and rechecks bounded accepted
-executor instances, and makes the healthy second API instance return the exact
-controlled missing-plan rejection before production cleanup begins. Final
-focused GREEN is `52 passed in 0.30s`.
+## GREEN
 
-## Checks
+Focused transition tests:
 
-- `pytest -q tests/test_phase_b_guest_rehearsal.py`: 52 passed.
-- Python compile check for the guest harness and test: passed.
-- `systemd-analyze verify` for the outer one-shot unit: passed.
-- All six rendered child service/socket units were written to a temporary
-  directory and passed `systemd-analyze verify` together.
-- `git diff --check`: passed.
+```text
+pytest -q tests/test_claim_transition.py
+42 passed
+```
 
-## Safety boundary and remaining gate
+Claim-group regression tests:
 
-No VM image was downloaded, no VM was defined or started, no host systemd unit
-was changed, no activation package was imported or executed, and no live
-staging, canary, cutover, or human verifier secret was used. The production
-systemd/UID/socket/cleanup/replay choreography has not yet run under PID 1;
-that remains the separately approved disposable-VM rehearsal gate.
+```text
+pytest -q tests/test_claim_activation_group.py
+20 passed
+```
+
+Additional checks passed:
+
+```text
+python3 -m py_compile src/overseer/claim_transition.py src/overseer/cli.py
+git diff --check
+```
+
+## Implementation and self-review
+
+- Added the atomic claim transition runner with exact claim, resource, approval,
+  continuation, conflict, audit, and postcondition validation.
+- Added deterministic release and execution audit IDs and targeted collision
+  detection.
+- Grouped transitions probe only the exact predecessor and successor group
+  rows, acquire Psychlo `BEGIN IMMEDIATE` before the Overseer writer
+  transaction, validate lifecycle under that lock, and hold the lock through
+  the Overseer commit. Unrelated group rows are ignored.
+- Ungrouped transitions do not require Psychlo and recheck exact group absence
+  inside the Overseer writer transaction, failing closed if either row appears.
+- Added `transition-claim` with every reviewed binding required and routed as
+  keyword arguments.
+- No API/client exposure or schema migration was added.
+
+## Files changed
+
+- `src/overseer/claim_transition.py`
+- `src/overseer/cli.py`
+- `.superpowers/sdd/task-2-report.md`
+
+The commit stages only the two source files; this report is intentionally left
+outside the commit as requested.
+
+## Critical/Important review follow-up
+
+### RED
+
+Focused tests were added before production changes for canonical ROLE policy,
+resource-owner bindings, sole deterministic continuation, the ungrouped probe
+race, and final owner/continuation postconditions:
+
+```text
+pytest -q tests/test_claim_transition.py
+12 failed, 42 passed in 2.40s
+```
+
+The failures were the expected review gaps: seven cases did not reject, two
+race cases observed typed loads before the final writer transaction, and three
+postcondition-tamper cases did not reject.
+
+### GREEN
+
+```text
+pytest -q tests/test_claim_transition.py
+54 passed in 2.19s
+
+pytest -q tests/test_claim_activation_group.py
+20 passed in 1.04s
+
+python3 -m py_compile src/overseer/claim_transition.py src/overseer/cli.py tests/test_claim_transition.py
+git diff --check
+```
+
+All commands exited successfully.
+
+### Implementation and self-review
+
+- Canonical recomputation and the stored decision must now both be exact
+  `ESCALATE`/`ROLE` decisions with no blocking claims; SECURITY_SURFACE,
+  HIGH-risk, HUMAN/SISKO, ALLOW, BLOCK, QUEUE, and QUARANTINE authority cannot
+  be substituted with an approved ROLE record.
+- Both predecessor and successor resources must remain owned by the exact
+  expected role before mutation and in final postcondition verification.
+- The successor must have one continuation only: the deterministic delivered
+  record and its exact delivered attempt. The sole-record invariant is reloaded
+  and verified before commit.
+- The pre-transaction group check is now a narrow raw lock-selection probe,
+  explicitly not validation. It ignores unrelated groups and performs no typed
+  claim/group loads. If either exact group is observed, Psychlo is locked before
+  Overseer and held through commit; the ungrouped path rechecks both exact rows
+  under Overseer `BEGIN IMMEDIATE` and fails closed on appearance.
+- Deterministic audit collision detection remains a targeted two-ID query.
+- Rollback semantics and `transition-claim` CLI parsing/keyword routing were
+  unchanged.
+
+### Files changed in review follow-up
+
+- `tests/test_claim_transition.py`
+- `src/overseer/claim_transition.py`
+- `.superpowers/sdd/task-2-report.md` (appended evidence only)

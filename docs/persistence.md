@@ -19,12 +19,16 @@ Overseer needs durable coordination state, but runtime databases must remain loc
 - Database files are ignored by `.gitignore`.
 - The store must not persist secrets, credentials, tokens, personal exports, or raw service payloads.
 - Runtime state should live under an ignored operator-selected path such as `state/overseer.sqlite3`.
-- Store open pins the exact database inode with `O_PATH|O_NOFOLLOW`, rejects
-  multiply linked files, opens SQLite through the pinned descriptor, and
-  verifies the connection's process descriptors before schema or record work.
-  One non-I/O pin is retained per inode for the process lifetime so closing a
-  nested store never disturbs process-scoped SQLite locks held by another
-  connection.
+- Ordinary store opens preserve normal SQLite connection semantics, including
+  concurrent and nested connections; they do not retain process-wide inode
+  pins.
+- The one-shot atomic claim transition opts into strict descriptor binding. It
+  requires a pre-existing owner-only, singly linked database in a
+  single-threaded process with no same-inode descriptor already open. It opens
+  through an `O_PATH|O_NOFOLLOW` pin, verifies exactly one new SQLite database
+  descriptor before schema or record work, and retains the non-I/O pin for the
+  short process lifetime. A bounded pin registry fails closed before descriptor
+  exhaustion and never closes an unmanaged database descriptor.
 - The persistence API stores typed records as JSON payloads so the domain model can continue to evolve before schema hardening.
 - `persistence-security` and `GET /persistence/security` inspect database and SQLite sidecar file permissions without creating missing files or changing modes.
 - The store records schema migrations in `schema_migrations` so on-disk shape changes are auditable before later hardening.

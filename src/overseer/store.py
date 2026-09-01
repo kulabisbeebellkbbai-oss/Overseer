@@ -425,7 +425,7 @@ class SQLiteStore:
                 raise ValueError(
                     "strict descriptor binding requires a pre-existing SQLite store"
                 ) from error
-            self._validate_artifact_status(self.path, status)
+            self._validate_strict_artifact_status(self.path, status)
             self._database_identity = (status.st_dev, status.st_ino)
         elif self._collection_deadline is not None and verified_fd is None:
             flags = os.O_RDWR | os.O_NONBLOCK
@@ -561,6 +561,16 @@ class SQLiteStore:
                 f"SQLite artifact must have exactly one link: {path}"
             )
 
+    @classmethod
+    def _validate_strict_artifact_status(
+        cls, path: Path, status: os.stat_result
+    ) -> None:
+        cls._validate_artifact_status(path, status)
+        if stat.S_IMODE(status.st_mode) != 0o600:
+            raise PermissionError(
+                f"strict SQLite artifact must already have owner-only mode: {path}"
+            )
+
     def _acquire_strict_database_pin(self) -> int:
         """Retain one bounded process-lifetime pin for a one-shot transition."""
         if not hasattr(os, "O_PATH"):
@@ -579,15 +589,10 @@ class SQLiteStore:
             # locks through an unmanaged descriptor. The bounded registry and
             # one-shot process contract cap this fail-closed retention.
             _STRICT_DATABASE_PINS.append(descriptor)
-            try:
-                status = os.fstat(descriptor)
-                self._validate_artifact_status(self.path, status)
-                if (status.st_dev, status.st_ino) != self._database_identity:
-                    raise ValueError(
-                        f"SQLite artifact identity changed: {self.path}"
-                    )
-            except BaseException:
-                raise
+            status = os.fstat(descriptor)
+            self._validate_strict_artifact_status(self.path, status)
+            if (status.st_dev, status.st_ino) != self._database_identity:
+                raise ValueError(f"SQLite artifact identity changed: {self.path}")
             return descriptor
 
     def _database_descriptors(self) -> frozenset[int]:
@@ -620,12 +625,15 @@ class SQLiteStore:
     ) -> None:
         database_descriptors = self._database_descriptors()
         connection_descriptors = database_descriptors - pinned_descriptors
-        if pinned_descriptors != frozenset({strict_pin}) or len(connection_descriptors) != 1:
+        if (
+            pinned_descriptors != frozenset({strict_pin})
+            or len(connection_descriptors) != 1
+        ):
             raise ValueError(
                 f"SQLite connection identity does not match artifact: {self.path}"
             )
         path_status = self.path.lstat()
-        self._validate_artifact_status(self.path, path_status)
+        self._validate_strict_artifact_status(self.path, path_status)
         if (path_status.st_dev, path_status.st_ino) != self._database_identity:
             raise ValueError(f"SQLite artifact identity changed: {self.path}")
         try:

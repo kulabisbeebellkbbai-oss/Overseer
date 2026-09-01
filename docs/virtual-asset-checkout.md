@@ -214,6 +214,14 @@ are reloaded and checked again before commit, so a stale probe, concurrent
 topology change, failed write, or failed postcondition cannot produce a partial
 handoff.
 
+The transition is a one-shot, single-threaded operation. Its primary Overseer
+store must already be an owner-only, singly linked regular file with no
+same-inode descriptor open in the process. The runner opens SQLite through a
+retained no-follow inode pin and verifies exactly one new connection descriptor;
+path replacement, an ambiguous descriptor set, or pin-budget exhaustion fails
+before transaction work. Ordinary Overseer stores do not use this strict mode,
+so normal nested and concurrent store behavior remains unchanged.
+
 ### Commit, rollback, replay, and audit
 
 On success, the transaction releases the predecessor and clears only its

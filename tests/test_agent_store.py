@@ -1050,6 +1050,20 @@ def test_strict_store_rejects_caller_owned_verified_descriptor(
         os.close(descriptor)
 
 
+def test_strict_store_rejects_permissive_mode_without_chmodding(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    path.chmod(0o640)
+
+    with pytest.raises(PermissionError, match="owner-only mode"):
+        OverseerStore(path, strict_descriptor_binding=True)
+
+    assert _mode(path) == 0o640
+
+
 def test_strict_store_rejects_multithreaded_process(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     with OverseerStore(path):

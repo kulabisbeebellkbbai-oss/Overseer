@@ -34,12 +34,15 @@ Use independent sequential deadlines:
 | Guest watchdog | 780 seconds | at guest Python entry | emit a bounded failed result before systemd kills a stalled guest |
 | Guest systemd hard stop | 900 seconds | at service entry | final guest process containment |
 | Host result wait | 1020 seconds | after a fixed service-entry marker | allow the guest hard stop plus bounded serial propagation |
-| Owned shutdown | 120 seconds | cleanup | bound graceful VM shutdown and undefine |
+| Owned shutdown | 120 seconds | cleanup | bound the normal graceful VM shutdown wait |
 
 The guest watchdog precedes the systemd hard stop by 120 seconds. The host
-result wait exceeds the systemd hard stop by 120 seconds. The complete host
-lifecycle cap is 1740 seconds (29 minutes): 600 seconds boot, 1020 seconds
-result, and 120 seconds shutdown.
+result wait exceeds the systemd hard stop by 120 seconds. The configured phase
+deadline budget is 1740 seconds (29 minutes): 600 seconds boot, 1020 seconds
+result, and 120 seconds shutdown. This is not a hard wall-clock maximum:
+fail-closed libvirt ownership probes, bounded collector sealing, evidence
+publication, and recovery handling add control-plane overhead outside those
+three phase deadlines.
 
 The fixed service-entry marker is timing evidence only. It cannot satisfy the
 existing passing-result contract.
@@ -61,9 +64,17 @@ OVERSEER_PHASE_B_REHEARSAL_PROGRESS {"schemaVersion":"overseer.phase-b-rehearsal
 
 Only the existing bounded result stages are accepted. Progress contains no
 command, path, argv, environment, exception text, credential, verifier, token,
-or human input. The collector stores only the last valid canonical progress
-record in a dedicated mode-0600 status artifact while retaining its existing
-bounded raw serial log and terminal result status.
+or human input. The collector publishes a private readiness record before VM
+definition, then enforces a phase machine: the service marker must precede
+every progress or result sentinel, and it may occur only once. Marker-prefix
+variants, pre-marker progress, and pre-marker result framing fail closed. The
+collector stores only the last valid canonical progress record in a dedicated
+mode-0600 status artifact while retaining its existing bounded raw serial log
+and terminal result status. The host checks the exact collector child during
+both waits and requires a bounded clean collector seal before accepting
+completion. If the collector cannot be cleanly reaped within its stop budget,
+cleanup returns without an unbounded wait and retains the exact artifacts and
+execution lock for explicit recovery.
 
 The passing contract remains unchanged: a run passes only after the existing
 collector reaches `complete`, the owned VM is inactive and absent, the
@@ -104,12 +115,21 @@ before the record receives its final name.
 
 Evidence is written under the caller-owned mode-0700 directory
 `/home/god/.local/share/overseer/phase-b-rehearsal-evidence`. The writer opens
-directories without following links, creates a mode-0600 temporary file with
-exclusive creation, fsyncs it, removes and verifies absence of the exact raw
-temporary layout after confirmed owned-domain absence, then atomically gives
-the evidence its final `<run-id>.json` name and fsyncs the directory. An
-existing destination, unsafe directory metadata, malformed progress, unknown
-domain state, incomplete raw cleanup, or write failure fails closed.
+directories without following links and reads status children relative to one
+pinned temporary-directory descriptor. Before raw cleanup it creates and
+fsyncs a mode-0600 hidden pending record that accurately reports
+`raw-cleanup-pending` and raw retention, then returns a bounded attestation of
+the root and pending-file identities plus the final-record digest. After
+confirmed owned-domain absence, exact raw cleanup, and verified temporary-path
+absence, publication revalidates those identities, writes and fsyncs a new
+private `raw-cleanup-complete` record, atomically replaces the hidden pending
+name, rechecks target-domain absence, and creates the exact final
+`<run-id>.json` without overwrite. It never truncates the only recovery record
+in place. A final-publication failure therefore leaves either the prior valid
+pending record or the valid completed replacement instead of silently losing
+both raw and sanitized diagnostics. An existing destination, root or hidden
+replacement, unsafe status metadata, malformed progress, unknown domain state,
+incomplete raw cleanup, or write failure fails closed.
 
 Successful runs produce no timeout evidence. If domain ownership or state
 cannot be confirmed, existing behavior remains: do not mutate the domain and
@@ -139,4 +159,3 @@ module.
 - Prove successful and overflow result behavior remains fail closed.
 - Run focused guest/tool tests, the full repository suite, ordinary review,
   and final security review before preparing a replacement package.
-

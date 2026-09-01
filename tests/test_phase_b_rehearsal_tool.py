@@ -446,17 +446,95 @@ def test_constants_pin_image_runtime_and_complete_future_tooling() -> None:
     )
     assert module.DEFAULT_RUNTIME_SITE == RUNTIME_SITE
     assert module.MACHINE_TYPE == MACHINE_TYPE
-    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v8"
+    assert module.REHEARSAL_SCHEMA == "overseer.phase-b-disposable-rehearsal-plan.v10"
+    assert module.BOOT_TIMEOUT_SECONDS == 600
+    assert module.RESULT_TIMEOUT_SECONDS == 1020
+    assert module.SHUTDOWN_TIMEOUT_SECONDS == 120
+    assert module.PHASE_DEADLINE_BUDGET_SECONDS == 1740
+    assert module.PHASE_DEADLINE_BUDGET_MINUTES == 29
+    assert module.COLLECTOR_READY_TIMEOUT_SECONDS == 30
+    assert module.COLLECTOR_STOP_TIMEOUT_SECONDS == 10
+    assert module.TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS == 10
+    assert module.GUEST_WATCHDOG_SECONDS == 780
+    assert module.SYSTEMD_HARD_STOP_SECONDS == 900
+    assert module.COLLECTOR_READY_STATUS == "collector-ready"
+    assert module.TIMEOUT_EVIDENCE_PENDING_SCHEMA == (
+        "overseer.phase-b-rehearsal-timeout-pending.v1"
+    )
+    assert module.TIMEOUT_EVIDENCE_PENDING_NAME == ".<run-id>.pending.json"
+    assert module.TIMEOUT_EVIDENCE_SCHEMA == "overseer.phase-b-rehearsal-timeout-evidence.v1"
     assert module.OWNER_BINDING_SCHEMA == "overseer.phase-b-rehearsal-owner-binding.v2"
     assert module.DEFAULT_CODEX_PROJECTS_REGISTRY == CODEX_PROJECTS_REGISTRY
     assert module.SESSION_RUNTIME_DIR == SESSION_RUNTIME_DIR
     assert module.MINIMAL_ENV["XDG_RUNTIME_DIR"] == str(SESSION_RUNTIME_DIR)
     assert module.MAX_SERIAL_BYTES == 1024 * 1024
     assert module.MAX_SERIAL_LINE_BYTES == 64 * 1024
+    assert module.MAX_TIMEOUT_EVIDENCE_BYTES == 2048
     assert module.EXACT_TOOLS["python"] == "/usr/bin/python3.13"
     assert module.EXACT_TOOLS["genisoimage"] == "/usr/bin/genisoimage"
+    assert module.EXACT_TOOLS["kill"] == "/usr/bin/kill"
     assert "cloud-localds" not in module.EXACT_TOOLS
     assert all(Path(value).is_absolute() for value in module.EXACT_TOOLS.values())
+
+
+def test_second_round_timing_and_embedded_bounds_are_single_source() -> None:
+    module = load_tool()
+
+    assert module.PHASE_DEADLINE_BUDGET_SECONDS == 1740
+    assert module.PHASE_DEADLINE_BUDGET_MINUTES == 29
+    assert module.BOOT_TIMEOUT_SECONDS < module.GUEST_WATCHDOG_SECONDS
+    assert module.GUEST_WATCHDOG_SECONDS < module.SYSTEMD_HARD_STOP_SECONDS
+    assert module.SYSTEMD_HARD_STOP_SECONDS < module.RESULT_TIMEOUT_SECONDS
+    assert module.COLLECTOR_READY_TIMEOUT_SECONDS > 0
+    assert module.COLLECTOR_STOP_TIMEOUT_SECONDS > 0
+    assert module.TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS > 0
+
+    rendered = render(module)["plan"]
+    assert rendered["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v10"
+    assert rendered["timeouts"] == {
+        "bootSeconds": module.BOOT_TIMEOUT_SECONDS,
+        "resultSeconds": module.RESULT_TIMEOUT_SECONDS,
+        "shutdownSeconds": module.SHUTDOWN_TIMEOUT_SECONDS,
+        "configuredPhaseDeadlineBudgetSeconds": module.PHASE_DEADLINE_BUDGET_SECONDS,
+        "configuredPhaseDeadlineBudgetMinutes": module.PHASE_DEADLINE_BUDGET_MINUTES,
+        "collectorReadySeconds": module.COLLECTOR_READY_TIMEOUT_SECONDS,
+        "collectorStopSeconds": module.COLLECTOR_STOP_TIMEOUT_SECONDS,
+        "evidenceHelperSeconds": module.TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS,
+        "guestWatchdogSeconds": module.GUEST_WATCHDOG_SECONDS,
+        "systemdHardStopSeconds": module.SYSTEMD_HARD_STOP_SECONDS,
+    }
+    assert "maximumLifecycleSeconds" not in rendered["timeouts"]
+    assert "maximumLifecycleMinutes" not in rendered["timeouts"]
+    assert rendered["serialLog"]["readyPath"] == "$TEMP_DIR/serial.ready"
+    assert rendered["serialLog"]["maxBytes"] == module.MAX_SERIAL_BYTES
+    assert rendered["serialLog"]["maxLineBytes"] == module.MAX_SERIAL_LINE_BYTES
+    assert rendered["timeoutEvidence"]["maxBytes"] == module.MAX_TIMEOUT_EVIDENCE_BYTES
+    assert rendered["timeoutEvidence"]["pendingSchema"] == module.TIMEOUT_EVIDENCE_PENDING_SCHEMA
+    assert rendered["timeoutEvidence"]["pendingState"] == "raw-cleanup-pending"
+    assert rendered["timeoutEvidence"]["completeState"] == "raw-cleanup-complete"
+
+    script = rendered["futureScript"]
+    assert f"readonly COLLECTOR_READY_TIMEOUT_SECONDS={module.COLLECTOR_READY_TIMEOUT_SECONDS}" in script
+    assert f"readonly COLLECTOR_STOP_TIMEOUT_SECONDS={module.COLLECTOR_STOP_TIMEOUT_SECONDS}" in script
+    assert f"readonly TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS={module.TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}" in script
+    assert f"readonly GUEST_WATCHDOG_SECONDS={module.GUEST_WATCHDOG_SECONDS}" in script
+    assert f"readonly SYSTEMD_HARD_STOP_SECONDS={module.SYSTEMD_HARD_STOP_SECONDS}" in script
+    assert f"readonly MAX_TIMEOUT_EVIDENCE_BYTES={module.MAX_TIMEOUT_EVIDENCE_BYTES}" in script
+    assert f"MAX_RECORD_BYTES={module.MAX_TIMEOUT_EVIDENCE_BYTES}" in module._timeout_evidence_python()
+    assert repr(module.PROGRESS_PREFIX) in module._serial_collector_python()
+    assert repr(module.PROGRESS_SCHEMA) in module._serial_collector_python()
+
+
+def test_docs_describe_configured_budget_and_cleanup_overhead() -> None:
+    docs = (Path(__file__).parents[1] / "docs" / "phase-b-disposable-rehearsal.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "configured phase deadline budget" in docs.lower()
+    assert "not a hard wall-clock maximum" in docs.lower()
+    assert "control-plane cleanup overhead" in docs.lower()
+    assert "legacy virsh" in docs.lower()
+    assert "780" in docs and "900" in docs
 
 
 def test_runtime_artifact_paths_accept_pinned_root_owned_system_runtime(
@@ -2226,7 +2304,7 @@ def test_render_plan_is_read_only_canonical_and_probe_bound(
 
     rendered = render(module)
     plan = rendered["plan"]
-    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v8"
+    assert plan["schemaVersion"] == "overseer.phase-b-disposable-rehearsal-plan.v10"
     assert module.canonical_json(rendered) == json.dumps(rendered, sort_keys=True, separators=(",", ":"))
     assert rendered["planDigest"] == hashlib.sha256(module.canonical_json(plan).encode()).hexdigest()
     assert plan["sourceArtifact"]["manifest"] == artifact_manifest("source")
@@ -2244,6 +2322,45 @@ def test_render_plan_is_read_only_canonical_and_probe_bound(
         module.canonical_json(capability_probe()).encode()
     ).hexdigest()
     assert plan["futureScriptSha256"] == hashlib.sha256(plan["futureScript"].encode()).hexdigest()
+    assert plan["timeouts"] == {
+        "bootSeconds": 600,
+        "resultSeconds": 1020,
+        "shutdownSeconds": 120,
+        "configuredPhaseDeadlineBudgetSeconds": 1740,
+        "configuredPhaseDeadlineBudgetMinutes": 29,
+        "collectorReadySeconds": 30,
+        "collectorStopSeconds": 10,
+        "evidenceHelperSeconds": 10,
+        "guestWatchdogSeconds": 780,
+        "systemdHardStopSeconds": 900,
+    }
+    assert plan["serialLog"]["serviceStartedPath"] == "$TEMP_DIR/serial.service-started"
+    assert plan["serialLog"]["progressPath"] == "$TEMP_DIR/serial.progress"
+    assert plan["serialLog"]["serviceEntryMarker"] == module.SERVICE_ENTRY_MARKER
+    assert plan["serialLog"]["progressSchema"] == module.PROGRESS_SCHEMA
+    assert plan["serialLog"]["readyPath"] == "$TEMP_DIR/serial.ready"
+    assert plan["timeoutEvidence"]["maxBytes"] == module.MAX_TIMEOUT_EVIDENCE_BYTES
+    assert plan["timeoutEvidence"] == {
+        "schemaVersion": module.TIMEOUT_EVIDENCE_SCHEMA,
+        "root": str(module.TIMEOUT_EVIDENCE_ROOT),
+        "directoryMode": "0700",
+        "fileMode": "0600",
+        "maxBytes": module.MAX_TIMEOUT_EVIDENCE_BYTES,
+        "finalName": "<run-id>.json",
+        "temporaryName": ".<run-id>.pending.json",
+        "pendingSchema": module.TIMEOUT_EVIDENCE_PENDING_SCHEMA,
+        "pendingState": "raw-cleanup-pending",
+        "completeState": "raw-cleanup-complete",
+        "attestationFields": [
+            "rootDevice",
+            "rootInode",
+            "pendingDevice",
+            "pendingInode",
+            "finalRecordSha256",
+        ],
+        "rawSerialRetained": False,
+        "secretValuesRecorded": False,
+    }
     assert plan["executionCommand"][:2] == ["/usr/bin/env", "-i"]
     assert plan["executionCommand"][-2:] == [
         "/usr/bin/bash",
@@ -2758,7 +2875,9 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
     assert script.index("ACTUAL_RUNTIME_PROBE_JSON=") < script.index("qemu-img create")
     assert script.index("ACTUAL_CAPABILITY_PROBE_JSON=") < script.index("qemu-img create")
     assert "virsh console" not in script
-    assert "readonly RESULT_TIMEOUT_SECONDS=960" in script
+    assert "readonly BOOT_TIMEOUT_SECONDS=600" in script
+    assert "readonly RESULT_TIMEOUT_SECONDS=1020" in script
+    assert "readonly SHUTDOWN_TIMEOUT_SECONDS=120" in script
     assert "wait_for_inactive" in script
     assert 'shutdown "$VM_UUID"' in script
     assert 'undefine "$VM_UUID" --nvram' in script
@@ -2788,6 +2907,9 @@ def test_future_script_has_valid_persistent_lifecycle_strict_traps_and_exact_cle
         "$SEED_ISO",
         "$NVRAM",
         "$SERIAL_LOG",
+        "$SERIAL_READY_STATUS",
+        "$SERIAL_SERVICE_STATUS",
+        "$SERIAL_PROGRESS_STATUS",
     ):
         assert exact in cleanup_line
     assert "$BASE_IMAGE" not in cleanup_line and "$SOURCE_ROOT" not in cleanup_line and "$RUNTIME_SITE" not in cleanup_line
@@ -2867,9 +2989,16 @@ def _run_cleanup_harness(
     virsh_function: str,
     *,
     domain_xml: str | None = None,
-    vm_name: str = "overseer-phase-b-rehearsal-54a53bc",
+    vm_name: str = "overseer-phase-b-rehearsal-54a53bc34078-111111111111",
     vm_uuid: str = "00000000-0000-5000-8000-000000000000",
     run_id: str = "a" * 64,
+    timeout_kind: str = "",
+    service_status: str | None = "fixture",
+    terminal_status: str | None = "fixture",
+    progress_status: str | None = "fixture",
+    original_status: int = 0,
+    evidence_root: Path | None = None,
+    collector_setup: str = "",
 ) -> subprocess.CompletedProcess[str]:
     start = script.index("domain_presence() {")
     end = script.index("trap 'cleanup $?' EXIT")
@@ -2880,7 +3009,10 @@ def _run_cleanup_harness(
         "NVRAM": temp_dir / "nvram.fd",
         "SERIAL_PIPE": temp_dir / "serial",
         "SERIAL_LOG": temp_dir / "serial.log",
+        "SERIAL_READY_STATUS": temp_dir / "serial.ready",
         "SERIAL_STATUS": temp_dir / "serial.status",
+        "SERIAL_SERVICE_STATUS": temp_dir / "serial.service-started",
+        "SERIAL_PROGRESS_STATUS": temp_dir / "serial.progress",
         "SERIAL_STOP": temp_dir / "serial.stop",
         "SERIAL_COLLECTOR": temp_dir / "serial-collector.py",
         "DOMAIN_XML": temp_dir / "domain.xml",
@@ -2891,26 +3023,49 @@ def _run_cleanup_harness(
         "SOURCE_MANIFEST_FILE": temp_dir / "source-manifest.json",
         "RUNTIME_MANIFEST_FILE": temp_dir / "runtime-manifest.json",
     }
-    temp_dir.mkdir()
+    temp_dir.mkdir(mode=0o700)
     for name, path in paths.items():
         if name != "SERIAL_PIPE":
             content = domain_xml if name == "DOMAIN_XML" and domain_xml is not None else "fixture"
             path.write_text(content, encoding="utf-8")
     for suffix in (".in", ".out"):
         Path(str(paths["SERIAL_PIPE"]) + suffix).write_text("fixture", encoding="utf-8")
+    for name, content in (
+        ("SERIAL_READY_STATUS", "collector-ready\n"),
+        ("SERIAL_SERVICE_STATUS", service_status),
+        ("SERIAL_STATUS", terminal_status),
+        ("SERIAL_PROGRESS_STATUS", progress_status),
+    ):
+        if content is None:
+            paths[name].unlink()
+        else:
+            paths[name].write_text(content, encoding="utf-8")
+            paths[name].chmod(0o600)
     run_lock = temp_dir.parent / (temp_dir.name + "-lock")
     run_lock.mkdir()
     (run_lock / "run-id").write_text(run_id, encoding="ascii")
+    selected_evidence_root = evidence_root or (temp_dir.parent / "evidence")
+    evidence_temp = selected_evidence_root / f".{run_id}.pending.json"
+    evidence_final = selected_evidence_root / f"{run_id}.json"
     assignments = [
         "set -Eeuo pipefail",
         "LIBVIRT_URI=qemu:///session",
         f"VM_NAME={shlex.quote(vm_name)}",
         f"VM_UUID={shlex.quote(vm_uuid)}",
         f"RUN_ID={shlex.quote(run_id)}",
+        f"SOURCE_COMMIT={'b' * 40}",
         f"BASE_IMAGE={shlex.quote(str(BASE_IMAGE))}",
         f"FIRMWARE_CODE={shlex.quote(str(FIRMWARE_CODE))}",
         f"FIRMWARE_VARS_TEMPLATE={shlex.quote(str(FIRMWARE_VARS_TEMPLATE))}",
+        "BOOT_TIMEOUT_SECONDS=1",
+        "RESULT_TIMEOUT_SECONDS=1",
         "SHUTDOWN_TIMEOUT_SECONDS=1",
+        "COLLECTOR_STOP_TIMEOUT_SECONDS=1",
+        "TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS=1",
+        f"TIMEOUT_KIND={shlex.quote(timeout_kind)}",
+        f"EVIDENCE_ROOT={shlex.quote(str(selected_evidence_root))}",
+        f"TIMEOUT_EVIDENCE_TEMP={shlex.quote(str(evidence_temp))}",
+        f"TIMEOUT_EVIDENCE_FINAL={shlex.quote(str(evidence_final))}",
         "COLLECTOR_PID=",
         "LOCK_HELD=1",
         f"RUN_LOCK={shlex.quote(str(run_lock))}",
@@ -2918,7 +3073,8 @@ def _run_cleanup_harness(
         *(f"{name}={shlex.quote(str(path))}" for name, path in paths.items()),
         virsh_function,
         helpers,
-        "cleanup 0",
+        collector_setup,
+        f"cleanup {original_status}",
     ]
     return subprocess.run(
         ("bash", "-c", "\n".join(assignments)),
@@ -2955,7 +3111,10 @@ def test_cleanup_retains_every_artifact_when_libvirt_state_is_unknown(
         "serial.in",
         "serial.out",
         "serial.log",
+        "serial.ready",
         "serial.status",
+        "serial.service-started",
+        "serial.progress",
         "serial.stop",
         "serial-collector.py",
         "domain.xml",
@@ -3025,7 +3184,7 @@ def test_cleanup_deletes_exact_artifacts_only_after_authoritative_absence(tmp_pa
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert not temp_dir.exists()
+    assert not temp_dir.exists(), completed.stderr
 
 
 def test_cleanup_never_mutates_a_same_name_foreign_domain(tmp_path: Path) -> None:
@@ -3165,11 +3324,44 @@ def test_streaming_result_validator_rejects_bounded_and_framing_attacks(
 
 def test_serial_collector_upgrades_complete_to_late_overflow(tmp_path: Path) -> None:
     module = load_tool()
-    pipe = tmp_path / "serial.out"
-    log = tmp_path / "serial.log"
-    status = tmp_path / "serial.status"
-    stop = tmp_path / "serial.stop"
-    os.mkfifo(pipe, 0o600)
+    paths, completed = _run_collector(
+        module,
+        tmp_path,
+        _passing_serial_record(module) + b"x\n" * (module.MAX_SERIAL_BYTES // 2 + 1),
+    )
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert paths["status"].read_text(encoding="ascii").strip() == "overflow"
+    assert paths["log"].stat().st_size <= module.MAX_SERIAL_BYTES
+
+
+def _progress_line(module, stage: str = "provisioning") -> bytes:
+    record = {
+        "schemaVersion": module.PROGRESS_SCHEMA,
+        "secretValuesRecorded": False,
+        "stage": stage,
+    }
+    return (
+        module.PROGRESS_PREFIX.encode("ascii")
+        + b" "
+        + module.canonical_json(record).encode("ascii")
+        + b"\n"
+    )
+
+
+def _run_collector(
+    module, tmp_path: Path, payload: bytes
+) -> tuple[dict[str, Path], subprocess.CompletedProcess[bytes]]:
+    paths = {
+        "pipe": tmp_path / "serial.out",
+        "log": tmp_path / "serial.log",
+        "ready": tmp_path / "serial.ready",
+        "status": tmp_path / "serial.status",
+        "service": tmp_path / "serial.service-started",
+        "progress": tmp_path / "serial.progress",
+        "stop": tmp_path / "serial.stop",
+    }
+    os.mkfifo(paths["pipe"], 0o600)
     process = subprocess.Popen(
         (
             sys.executable,
@@ -3178,30 +3370,1329 @@ def test_serial_collector_upgrades_complete_to_late_overflow(tmp_path: Path) -> 
             "-P",
             "-c",
             module._serial_collector_python(),
-            str(pipe),
-            str(log),
-            str(status),
-            str(stop),
+            str(paths["pipe"]),
+            str(paths["log"]),
+            str(paths["ready"]),
+            str(paths["status"]),
+            str(paths["service"]),
+            str(paths["progress"]),
+            str(paths["stop"]),
             str(module.MAX_SERIAL_BYTES),
             str(module.MAX_SERIAL_LINE_BYTES),
         ),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=False,
     )
-    with pipe.open("wb", buffering=0) as stream:
-        stream.write(_passing_serial_record(module))
-        stream.write(b"x\n" * (module.MAX_SERIAL_BYTES // 2 + 1))
-    deadline = time.monotonic() + 5
-    while (not status.exists() or status.read_text(encoding="ascii").strip() != "overflow") and time.monotonic() < deadline:
+    ready_deadline = time.monotonic() + 5
+    while (
+        not paths["ready"].exists()
+        and process.poll() is None
+        and time.monotonic() < ready_deadline
+    ):
         time.sleep(0.01)
-    stop.write_text("stop\n", encoding="ascii")
+    if process.poll() is not None:
+        stdout, stderr = process.communicate(timeout=5)
+        raise AssertionError(
+            f"collector exited before FIFO readiness: rc={process.returncode}, "
+            f"stdout={stdout!r}, stderr={stderr!r}"
+        )
+    if not paths["ready"].exists():
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=5)
+        raise AssertionError(
+            f"collector did not become FIFO-ready: stdout={stdout!r}, stderr={stderr!r}"
+        )
+    with paths["pipe"].open("wb", buffering=0) as stream:
+        stream.write(payload)
+    deadline = time.monotonic() + 5
+    while not paths["status"].exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    paths["stop"].write_text("stop\n", encoding="ascii")
     stdout, stderr = process.communicate(timeout=5)
+    return paths, subprocess.CompletedProcess(
+        process.args, process.returncode, stdout=stdout, stderr=stderr
+    )
 
-    assert process.returncode == 0, (stdout, stderr)
-    assert status.read_text(encoding="ascii").strip() == "overflow"
-    assert log.stat().st_size <= module.MAX_SERIAL_BYTES
+
+def test_serial_collector_publishes_exact_marker_and_last_canonical_progress(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    payload = (
+        f"{module.SERVICE_ENTRY_MARKER}\n".encode("ascii")
+        + _progress_line(module, "canary-start")
+        + _progress_line(module, "canary-acceptance")
+        + _passing_serial_record(module)
+    )
+
+    paths, completed = _run_collector(module, tmp_path, payload)
+
+    assert completed.returncode == 0, completed.stderr
+    assert paths["service"].read_text(encoding="ascii") == "service-started\n"
+    expected_progress = {
+        "schemaVersion": module.PROGRESS_SCHEMA,
+        "secretValuesRecorded": False,
+        "stage": "canary-acceptance",
+    }
+    assert paths["progress"].read_text(encoding="ascii") == (
+        module.canonical_json(expected_progress) + "\n"
+    )
+    assert paths["status"].read_text(encoding="ascii") == "complete\n"
+
+
+@pytest.mark.parametrize(
+    "payload_builder",
+    (
+        lambda module: module.PROGRESS_PREFIX.encode("ascii")
+        + b" {\"schemaVersion\":\"wrong\"}\n",
+        lambda module: module.PROGRESS_PREFIX.encode("ascii") + b" malformed\n",
+    ),
+)
+def test_serial_collector_rejects_malformed_exact_progress_prefix(
+    tmp_path: Path, payload_builder
+) -> None:
+    module = load_tool()
+
+    paths, completed = _run_collector(module, tmp_path, payload_builder(module))
+
+    assert completed.returncode == 0, completed.stderr
+    assert paths["status"].read_text(encoding="ascii") == "overflow\n"
+
+
+def test_serial_collector_does_not_overflow_for_unrelated_nearby_log_line(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    unrelated = b"prefix OVERSEER_PHASE_B_REHEARSAL_PROGRESS {not-a-record}\n"
+
+    paths, completed = _run_collector(module, tmp_path, unrelated)
+
+    assert completed.returncode == 0, completed.stderr
+    assert not paths["status"].exists()
+
+
+def test_serial_collector_rejects_duplicate_service_marker(tmp_path: Path) -> None:
+    module = load_tool()
+    marker = f"{module.SERVICE_ENTRY_MARKER}\n".encode("ascii")
+
+    paths, completed = _run_collector(module, tmp_path, marker + marker)
+
+    assert completed.returncode == 0, completed.stderr
+    assert paths["status"].read_text(encoding="ascii") == "overflow\n"
+
+
+def test_serial_collector_publishes_ready_status_after_setup(tmp_path: Path) -> None:
+    module = load_tool()
+
+    paths, completed = _run_collector(module, tmp_path, b"ordinary boot output\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert paths["ready"].read_text(encoding="ascii") == "collector-ready\n"
+    assert stat.S_IMODE(paths["ready"].stat().st_mode) == 0o600
+    assert not paths["status"].exists()
+
+
+@pytest.mark.parametrize(
+    "payload_builder",
+    (
+        lambda module: _progress_line(module, "preflight"),
+        lambda module: b"OVERSEER_PHASE_B_REHEARSAL_RESULT_BEGIN\n",
+        lambda module: b"OVERSEER_PHASE_B_REHEARSAL_RESULT_END\n",
+        lambda module: module.SERVICE_ENTRY_MARKER.encode("ascii") + b"-variant\n",
+        lambda module: b"OVERSEER_PHASE_B_REHEARSAL_RESULT_BEGIN-extra\n",
+        lambda module: b"OVERSEER_PHASE_B_REHEARSAL_RESULT_END-extra\n",
+    ),
+)
+def test_serial_collector_rejects_protocol_lines_before_service_marker(
+    tmp_path: Path, payload_builder
+) -> None:
+    module = load_tool()
+
+    paths, completed = _run_collector(module, tmp_path, payload_builder(module))
+
+    assert completed.returncode == 0, completed.stderr
+    assert paths["status"].read_text(encoding="ascii") == "overflow\n"
+
+
+def test_serial_collector_passing_frame_before_marker_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    marker = f"{module.SERVICE_ENTRY_MARKER}\n".encode("ascii")
+
+    paths, completed = _run_collector(module, tmp_path, _passing_serial_record(module) + marker)
+
+    assert completed.returncode == 0, completed.stderr
+    assert paths["status"].read_text(encoding="ascii") == "overflow\n"
+    assert paths["service"].read_text(encoding="ascii") == "service-started\n"
+
+
+def test_serial_collector_rejects_marker_prefix_variant_after_marker(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    marker = f"{module.SERVICE_ENTRY_MARKER}\n".encode("ascii")
+
+    paths, completed = _run_collector(
+        module,
+        tmp_path,
+        marker + module.SERVICE_ENTRY_MARKER.encode("ascii") + b"-variant\n",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert paths["status"].read_text(encoding="ascii") == "overflow\n"
+
+
+def test_future_script_has_independent_boot_and_result_waits_without_real_waiting() -> None:
+    module = load_tool()
+    script = render(module)["plan"]["futureScript"]
+
+    assert script.index('start "$VM_UUID"') < script.index(
+        "wait_for_service_entry\nwait_status=$?"
+    )
+    assert "if ! wait_for_service_entry" not in script
+    boot_wait = script.index("bounded rehearsal boot wait expired")
+    result_wait = script.index("bounded rehearsal result wait expired")
+    assert boot_wait < result_wait
+    assert "deadline=$((SECONDS + BOOT_TIMEOUT_SECONDS))" in script
+    assert "deadline=$((SECONDS + RESULT_TIMEOUT_SECONDS))" in script
+    assert "TIMEOUT_KIND=boot-timeout" in script
+    assert "TIMEOUT_KIND=result-timeout" in script
+    assert module.SERVICE_ENTRY_MARKER in script
+    assert module.PROGRESS_PREFIX in script
+    assert "service-started" in script
+    assert "lastStage" in script
+    assert "marker" in script.lower()
+    assert "progress" in script.lower()
+    assert module.SERVICE_ENTRY_MARKER not in module._result_validator_python()
+
+    cleanup_start = script.index("cleanup() {")
+    cleanup_end = script.index("trap 'cleanup $?' EXIT")
+    cleanup = script[cleanup_start:cleanup_end]
+    prepare = cleanup.index("prepare_timeout_evidence")
+    remove = cleanup.index("remove_timeout_raw_artifacts")
+    rmdir = cleanup.index('/usr/bin/rmdir -- "$TEMP_DIR"')
+    publish = cleanup.index("publish_timeout_evidence")
+    assert prepare < remove < rmdir < publish
+    assert 'if [[ -n "$TIMEOUT_KIND" ]]' in cleanup
+    assert 'TIMEOUT_KIND=""' in script
+    assert script.index('TIMEOUT_KIND=""') < script.index("cleanup() {")
+
+
+def test_future_script_passes_bash_syntax_validation() -> None:
+    module = load_tool()
+    script = render(module)["plan"]["futureScript"]
+
+    completed = subprocess.run(
+        ("/usr/bin/bash", "-n"),
+        input=script,
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=None,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_future_script_has_collector_readiness_liveness_and_ordered_cleanup() -> None:
+    module = load_tool()
+    script = render(module)["plan"]["futureScript"]
+    main_start = script.index('/usr/bin/virsh --connect "$LIBVIRT_URI" start "$VM_UUID"')
+    main = script[main_start:]
+
+    assert "collector_is_alive()" in script
+    assert "collector_process_state()" in script
+    assert "wait_for_collector_ready()" in script
+    assert "COLLECTOR_READY_STATUS" in script
+    readiness_call = script.index("wait_for_collector_ready\nwait_status=$?")
+    assert readiness_call < script.index("define --validate")
+    assert readiness_call < main_start
+    assert "if ! wait_for_service_entry" not in main
+    assert "if ! wait_for_terminal_status" not in main
+    assert "wait_for_service_entry\nwait_status=$?" in main
+    assert "wait_for_terminal_status\nwait_status=$?" in main
+    assert "wait_status -eq 124" in main
+    assert "collector died during boot" in main
+    assert "collector died during result" in main
+    assert "collector readiness failed" in script
+    ready_function = script[
+        script.index("wait_for_collector_ready() {") : script.index(
+            "wait_for_service_entry() {"
+        )
+    ]
+    assert ready_function.index("collector_is_alive || return") < ready_function.index(
+        "return 0"
+    )
+    assert script.index("collector died before domain definition") < script.index(
+        'define --validate "$DOMAIN_XML"'
+    )
+    assert script.index("collector died before VM start") < script.index(
+        'start "$VM_UUID"'
+    )
+    assert "stop_collector" in script
+    assert "COLLECTOR_STOP_TIMEOUT_SECONDS" in script
+    assert "TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS" in script
+    assert "SERIAL_READY_STATUS" in script
+    assert "collector-ready" in script
+    assert "revalidate_domain_absence_before_publish" in script
+
+    cleanup_start = script.index("cleanup() {")
+    cleanup = script[cleanup_start : script.index("trap 'cleanup $?' EXIT")]
+    assert cleanup.index("shutdown_and_undefine") < cleanup.index("stop_collector")
+    assert "collector stop timed out" in cleanup
+    assert "collector_stopped == 1" in cleanup
+    assert "collector stop was not confirmed" in cleanup
+    assert cleanup.index("remove_timeout_raw_artifacts") < cleanup.index(
+        "revalidate_domain_absence_before_publish"
+    )
+    assert cleanup.index("revalidate_domain_absence_before_publish") < cleanup.index(
+        "publish_timeout_evidence"
+    )
+    assert "timeout" in cleanup[cleanup.index("prepare_timeout_evidence") :]
+    assert "timeout" in cleanup[cleanup.index("publish_timeout_evidence") :]
+
+
+def _run_future_control_harness(
+    script: str, tmp_path: Path, body: str
+) -> subprocess.CompletedProcess[str]:
+    start = script.index("stop_collector() {")
+    end = script.index("cleanup() {")
+    helpers = script[start:end]
+    ready = tmp_path / "serial.ready"
+    service = tmp_path / "serial.service-started"
+    terminal = tmp_path / "serial.status"
+    stop = tmp_path / "serial.stop"
+    assignments = [
+        "set -u",
+        "BOOT_TIMEOUT_SECONDS=1",
+        "RESULT_TIMEOUT_SECONDS=1",
+        "COLLECTOR_READY_TIMEOUT_SECONDS=1",
+        "COLLECTOR_STOP_TIMEOUT_SECONDS=1",
+        "COLLECTOR_DEAD_EXIT_STATUS=75",
+        "COLLECTOR_INVALID_EXIT_STATUS=76",
+        "COLLECTOR_READY_STATUS=collector-ready",
+        f"SERIAL_READY_STATUS={shlex.quote(str(ready))}",
+        f"SERIAL_SERVICE_STATUS={shlex.quote(str(service))}",
+        f"SERIAL_STATUS={shlex.quote(str(terminal))}",
+        f"SERIAL_STOP={shlex.quote(str(stop))}",
+        "COLLECTOR_PID=",
+        helpers,
+        body,
+    ]
+    return subprocess.run(
+        ("bash", "-c", "\n".join(assignments)),
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=5,
+    )
+
+
+def test_generated_wait_distinguishes_collector_dead_before_ready(tmp_path: Path) -> None:
+    module = load_tool()
+    script = render(module)["plan"]["futureScript"]
+    body = "\n".join(
+        (
+            "set +e",
+            "/usr/bin/bash -c 'exit 17' &",
+            "COLLECTOR_PID=$!",
+            "wait_for_collector_ready",
+            "observed=$?",
+            "wait \"$COLLECTOR_PID\" 2>/dev/null",
+            "printf '%s\\n' \"$observed\"",
+            "[[ \"$observed\" == \"$COLLECTOR_DEAD_EXIT_STATUS\" ]]",
+        )
+    )
+    completed = _run_future_control_harness(script, tmp_path, body)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout.strip() == "75"
+
+
+def test_generated_wait_rejects_ready_file_from_dead_collector(tmp_path: Path) -> None:
+    module = load_tool()
+    script = render(module)["plan"]["futureScript"]
+    (tmp_path / "serial.ready").write_text("collector-ready\n", encoding="ascii")
+    body = "\n".join(
+        (
+            "set +e",
+            "/usr/bin/bash -c 'exit 17' &",
+            "COLLECTOR_PID=$!",
+            "/usr/bin/sleep 0.1",
+            "wait_for_collector_ready",
+            "observed=$?",
+            "wait \"$COLLECTOR_PID\" 2>/dev/null",
+            "printf '%s\\n' \"$observed\"",
+            "[[ \"$observed\" == \"$COLLECTOR_DEAD_EXIT_STATUS\" ]]",
+        )
+    )
+    completed = _run_future_control_harness(script, tmp_path, body)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout.strip() == "75"
+
+
+def test_generated_wait_detects_collector_death_during_boot(tmp_path: Path) -> None:
+    module = load_tool()
+    script = render(module)["plan"]["futureScript"]
+    body = "\n".join(
+        (
+            "set +e",
+            "/usr/bin/bash -c 'sleep 0.1; exit 17' &",
+            "COLLECTOR_PID=$!",
+            "wait_for_service_entry",
+            "observed=$?",
+            "wait \"$COLLECTOR_PID\" 2>/dev/null",
+            "printf '%s\\n' \"$observed\"",
+            "[[ \"$observed\" == \"$COLLECTOR_DEAD_EXIT_STATUS\" ]]",
+        )
+    )
+    completed = _run_future_control_harness(script, tmp_path, body)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout.strip() == "75"
+
+
+def test_generated_stop_rejects_collector_death_after_complete(tmp_path: Path) -> None:
+    module = load_tool()
+    script = render(module)["plan"]["futureScript"]
+    (tmp_path / "serial.status").write_text("complete\n", encoding="ascii")
+    body = "\n".join(
+        (
+            "set +e",
+            "/usr/bin/bash -c 'exit 17' &",
+            "COLLECTOR_PID=$!",
+            "stop_collector",
+            "observed=$?",
+            "printf '%s\\n' \"$observed\"",
+            "[[ \"$observed\" != 0 ]]",
+        )
+    )
+    completed = _run_future_control_harness(script, tmp_path, body)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout.strip() != "0"
+
+
+def test_generated_collector_stop_is_bounded_without_long_wait(tmp_path: Path) -> None:
+    module = load_tool()
+    script = render(module)["plan"]["futureScript"]
+    body = "\n".join(
+        (
+            "set +e",
+            "/usr/bin/bash -c 'sleep 10' &",
+            "child=$!",
+            "COLLECTOR_PID=$child",
+            "stop_collector",
+            "observed=$?",
+            "kill \"$child\" 2>/dev/null",
+            "wait \"$child\" 2>/dev/null",
+            "printf '%s\\n' \"$observed\"",
+            "[[ \"$observed\" != 0 ]]",
+        )
+    )
+    completed = _run_future_control_harness(script, tmp_path, body)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout.strip() != "0"
+
+    stop = script[script.index("stop_collector() {") : script.index("verify_lock() {")]
+    deadline = stop.index("if (( SECONDS >= deadline ))")
+    assert stop.index("return 1", deadline) < stop.index('wait "$pid"')
+
+
+def _run_timeout_evidence(
+    module,
+    mode: str,
+    evidence_root: Path,
+    run_id: str,
+    vm_name: str,
+    source_commit: str,
+    failure: str,
+    service_path: Path,
+    terminal_path: Path,
+    progress_path: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-s",
+            "-P",
+            "-S",
+            "-c",
+            module._timeout_evidence_python(),
+            mode,
+            str(evidence_root),
+            run_id,
+            vm_name,
+            source_commit,
+            failure,
+            str(service_path.parent),
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=5,
+    )
+
+
+def _write_timeout_statuses(
+    tmp_path: Path,
+    module,
+    *,
+    service: str | None = "service-started\n",
+    terminal: str | None = None,
+    progress: str | None = None,
+) -> tuple[Path, Path, Path]:
+    temp_dir = tmp_path / "temp"
+    temp_dir.mkdir(mode=0o700)
+    service_path = temp_dir / "serial.service-started"
+    terminal_path = temp_dir / "serial.status"
+    progress_path = temp_dir / "serial.progress"
+    for path, value in (
+        (service_path, service),
+        (terminal_path, terminal),
+        (progress_path, progress),
+    ):
+        if value is not None:
+            path.write_text(value, encoding="utf-8")
+            path.chmod(0o600)
+    return service_path, terminal_path, progress_path
+
+
+def _expected_timeout_record(
+    module,
+    *,
+    run_id: str,
+    vm_name: str,
+    source_commit: str,
+    failure: str,
+    service_started: bool,
+    result_status: str,
+    last_stage: str | None,
+) -> dict[str, object]:
+    return {
+        "schemaVersion": module.TIMEOUT_EVIDENCE_SCHEMA,
+        "status": "failed",
+        "failure": failure,
+        "runId": run_id,
+        "vmName": vm_name,
+        "sourceCommit": source_commit,
+        "serviceStarted": service_started,
+        "resultStatus": result_status,
+        "lastStage": last_stage,
+        "domainAbsent": True,
+        "rawSerialRetained": False,
+        "secretValuesRecorded": False,
+    }
+
+
+def test_timeout_evidence_prepare_writes_durable_pending_attestation(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    run_id = "7" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-777777777777"
+    source_commit = "8" * 40
+    service_path, terminal_path, progress_path = _write_timeout_statuses(
+        tmp_path,
+        module,
+        progress=_progress_line(module, "provisioning").decode("ascii").split(" ", 1)[1],
+    )
+    root = tmp_path / "evidence"
+
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "result-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert prepared.returncode == 0, prepared.stderr
+    pending = root / f".{run_id}.pending.json"
+    assert pending.exists()
+    record = json.loads(pending.read_text(encoding="ascii"))
+    final_record = _expected_timeout_record(
+        module,
+        run_id=run_id,
+        vm_name=vm_name,
+        source_commit=source_commit,
+        failure="result-timeout",
+        service_started=True,
+        result_status="absent",
+        last_stage="provisioning",
+    )
+    assert record == {
+        "schemaVersion": module.TIMEOUT_EVIDENCE_PENDING_SCHEMA,
+        **{key: value for key, value in final_record.items() if key != "schemaVersion"},
+        "status": "pending",
+        "state": "raw-cleanup-pending",
+        "rawSerialRetained": True,
+        "rootDevice": root.stat().st_dev,
+        "rootInode": root.stat().st_ino,
+        "pendingDevice": pending.stat().st_dev,
+        "pendingInode": pending.stat().st_ino,
+        "finalRecordSha256": hashlib.sha256(
+            (module.canonical_json(final_record) + "\n").encode("ascii")
+        ).hexdigest(),
+    }
+    assert stat.S_IMODE(pending.stat().st_mode) == 0o600
+    assert len(pending.read_bytes()) <= module.MAX_TIMEOUT_EVIDENCE_BYTES
+    helper = module._timeout_evidence_python()
+    assert "os.ftruncate" not in helper
+    assert "os.replace(staging,hidden" in helper
+
+
+def test_timeout_evidence_publish_transforms_pending_before_final_collision(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    run_id = "9" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-999999999999"
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        "a" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    pending = root / f".{run_id}.pending.json"
+    pending_inode = pending.stat().st_ino
+    final = root / f"{run_id}.json"
+    final.write_text("existing\n", encoding="ascii")
+    shutil.rmtree(service_path.parent)
+
+    published = _run_timeout_evidence(
+        module,
+        "publish",
+        root,
+        run_id,
+        vm_name,
+        "a" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert published.returncode != 0
+    recovery = json.loads(pending.read_text(encoding="ascii"))
+    assert recovery["schemaVersion"] == module.TIMEOUT_EVIDENCE_PENDING_SCHEMA
+    assert recovery["state"] == "raw-cleanup-complete"
+    assert recovery["rawSerialRetained"] is False
+    assert pending.stat().st_ino != pending_inode
+    assert recovery["pendingDevice"] == pending.stat().st_dev
+    assert recovery["pendingInode"] == pending.stat().st_ino
+    assert final.read_text(encoding="ascii") == "existing\n"
+
+
+@pytest.mark.parametrize("staging_kind", ("complete", "partial"))
+def test_timeout_evidence_recovers_interrupted_complete_staging(
+    tmp_path: Path,
+    staging_kind: str,
+) -> None:
+    module = load_tool()
+    run_id = "4" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-444444444444"
+    source_commit = "5" * 40
+    service_path, terminal_path, progress_path = _write_timeout_statuses(
+        tmp_path,
+        module,
+        service="service-started\n",
+    )
+    root = tmp_path / "evidence"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "result-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    hidden = root / f".{run_id}.pending.json"
+    staging = root / f".{run_id}.pending.json.next"
+    staging.touch(mode=0o600)
+    if staging_kind == "complete":
+        record = json.loads(hidden.read_text(encoding="ascii"))
+        record["state"] = "raw-cleanup-complete"
+        record["rawSerialRetained"] = False
+        record["pendingDevice"] = staging.stat().st_dev
+        record["pendingInode"] = staging.stat().st_ino
+        staging.write_text(module.canonical_json(record) + "\n", encoding="ascii")
+    else:
+        staging.write_text("partial", encoding="ascii")
+    staging.chmod(0o600)
+    shutil.rmtree(service_path.parent)
+
+    published = _run_timeout_evidence(
+        module,
+        "publish",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "result-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert published.returncode == 0, published.stderr
+    assert (root / f"{run_id}.json").is_file()
+    assert not hidden.exists()
+    assert not staging.exists()
+
+
+@pytest.mark.parametrize("unsafe_staging", ("symlink", "wrong-mode"))
+def test_timeout_evidence_rejects_unsafe_interrupted_staging(
+    tmp_path: Path,
+    unsafe_staging: str,
+) -> None:
+    module = load_tool()
+    run_id = "6" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-666666666666"
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        "7" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    hidden = root / f".{run_id}.pending.json"
+    original = hidden.read_bytes()
+    staging = root / f".{run_id}.pending.json.next"
+    if unsafe_staging == "symlink":
+        staging.symlink_to(hidden)
+    else:
+        staging.write_text("partial", encoding="ascii")
+        staging.chmod(0o640)
+    shutil.rmtree(service_path.parent)
+
+    published = _run_timeout_evidence(
+        module,
+        "publish",
+        root,
+        run_id,
+        vm_name,
+        "7" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert published.returncode != 0
+    assert hidden.read_bytes() == original
+    assert not (root / f"{run_id}.json").exists()
+
+
+def test_timeout_evidence_rejects_replaced_root_and_hidden_pending(tmp_path: Path) -> None:
+    module = load_tool()
+    for replacement in ("root", "hidden"):
+        case = tmp_path / replacement
+        case.mkdir()
+        service_path, terminal_path, progress_path = _write_timeout_statuses(case, module)
+        root = case / "evidence"
+        run_id = "b" * 64
+        vm_name = "overseer-phase-b-rehearsal-54a53bc34078-bbbbbbbbbbbb"
+        prepared = _run_timeout_evidence(
+            module,
+            "prepare",
+            root,
+            run_id,
+            vm_name,
+            "c" * 40,
+            "result-timeout",
+            service_path,
+            terminal_path,
+            progress_path,
+        )
+        assert prepared.returncode == 0, prepared.stderr
+        pending = root / f".{run_id}.pending.json"
+        shutil.rmtree(service_path.parent)
+        if replacement == "root":
+            old_root = case / "old-evidence"
+            root.rename(old_root)
+            root.mkdir(mode=0o700)
+        else:
+            original = pending.read_bytes()
+            pending.unlink()
+            pending.write_bytes(original)
+            pending.chmod(0o600)
+
+        published = _run_timeout_evidence(
+            module,
+            "publish",
+            root,
+            run_id,
+            vm_name,
+            "c" * 40,
+            "result-timeout",
+            service_path,
+            terminal_path,
+            progress_path,
+        )
+        assert published.returncode != 0
+        assert not (root / f"{run_id}.json").exists()
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo", "swap"))
+def test_timeout_evidence_rejects_unsafe_or_swapped_status_child(
+    tmp_path: Path, unsafe_kind: str
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    if unsafe_kind == "symlink":
+        replacement = tmp_path / "service-target"
+        replacement.write_text("service-started\n", encoding="ascii")
+        replacement.chmod(0o600)
+        service_path.unlink()
+        service_path.symlink_to(replacement)
+    elif unsafe_kind == "fifo":
+        service_path.unlink()
+        os.mkfifo(service_path, 0o600)
+    else:
+        replacement = tmp_path / "service-replacement"
+        replacement.write_text("wrong\n", encoding="ascii")
+        replacement.chmod(0o600)
+        os.replace(replacement, service_path)
+
+    result = _run_timeout_evidence(
+        module,
+        "prepare",
+        tmp_path / "evidence",
+        "d" * 64,
+        "overseer-phase-b-rehearsal-54a53bc34078-dddddddddddd",
+        "e" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert result.returncode != 0
+
+
+def test_cleanup_retains_raw_artifacts_when_timeout_prepare_fails(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    temp_dir = tmp_path / "prepare-failure"
+    evidence_root = tmp_path / "evidence"
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"],
+        temp_dir,
+        "virsh() { case \"$*\" in *\" list --all --name\") return 0;; *\" list --all --uuid\") return 0;; *) return 9;; esac; }",
+        timeout_kind="result-timeout",
+        service_status="bad-status\n",
+        terminal_status=None,
+        progress_status=None,
+        original_status=1,
+        evidence_root=evidence_root,
+    )
+
+    assert completed.returncode != 0
+    assert temp_dir.is_dir()
+    assert not (evidence_root / ("a" * 64 + ".json")).exists()
+
+
+def test_cleanup_rechecks_domain_absence_before_evidence_publish(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    temp_dir = tmp_path / "domain-reappeared"
+    evidence_root = tmp_path / "evidence"
+    calls = tmp_path / "virsh.calls"
+    presence_state = tmp_path / "presence.state"
+    virsh = (
+        f"virsh() {{ printf '%s\\n' \"$*\" >>{shlex.quote(str(calls))}; "
+        "local presence_phase=''; "
+        f"if [[ -f {shlex.quote(str(presence_state))} ]]; then IFS= read -r presence_phase <{shlex.quote(str(presence_state))}; fi; "
+        "case \"$*\" in "
+        f"*\" list --all --name\") if [[ \"$presence_phase\" == done ]]; then printf '%s\\n' \"$VM_NAME\"; else printf '%s\\n' first >{shlex.quote(str(presence_state))}; fi; return 0;; "
+        f"*\" list --all --uuid\") if [[ \"$presence_phase\" == first ]]; then printf '%s\\n' done >{shlex.quote(str(presence_state))}; else printf '%s\\n' \"$VM_UUID\"; fi; return 0;; "
+        "*) return 9;; esac; }"
+    )
+    progress = _progress_line(module, "cleanup").decode("ascii").split(" ", 1)[1]
+
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"],
+        temp_dir,
+        virsh,
+        timeout_kind="result-timeout",
+        service_status="service-started\n",
+        terminal_status=None,
+        progress_status=progress,
+        original_status=1,
+        evidence_root=evidence_root,
+    )
+
+    assert completed.returncode != 0
+    assert not temp_dir.exists(), completed.stderr
+    assert not (evidence_root / ("a" * 64 + ".json")).exists()
+    recovery = evidence_root / ("." + "a" * 64 + ".pending.json")
+    assert recovery.exists()
+    assert json.loads(recovery.read_text(encoding="ascii"))["state"] == (
+        "raw-cleanup-complete"
+    )
+
+
+def test_cleanup_retains_artifacts_and_lock_after_unclean_collector_exit(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    temp_dir = tmp_path / "collector-failure"
+    evidence_root = tmp_path / "evidence"
+
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"],
+        temp_dir,
+        "virsh() { case \"$*\" in *\" list --all --name\") return 0;; *\" list --all --uuid\") return 0;; *) return 9;; esac; }",
+        timeout_kind="result-timeout",
+        service_status="service-started\n",
+        terminal_status=None,
+        progress_status=_progress_line(module, "cleanup")
+        .decode("ascii")
+        .split(" ", 1)[1],
+        original_status=1,
+        evidence_root=evidence_root,
+        collector_setup="/usr/bin/bash -c 'exit 17' & COLLECTOR_PID=$!",
+    )
+
+    assert completed.returncode != 0
+    assert temp_dir.is_dir()
+    assert (temp_dir.parent / (temp_dir.name + "-lock")).is_dir()
+    assert not evidence_root.exists()
+    assert "collector stop was not confirmed" in completed.stderr
+
+
+def test_timeout_evidence_is_canonical_bounded_and_redacted(tmp_path: Path) -> None:
+    module = load_tool()
+    run_id = "a" * 64
+    vm_name = "overseer-phase-b-rehearsal-54a53bc34078-111111111111"
+    source_commit = "b" * 40
+    progress = module.canonical_json(
+        {
+            "schemaVersion": module.PROGRESS_SCHEMA,
+            "secretValuesRecorded": False,
+            "stage": "canary-acceptance",
+        }
+    ) + "\n"
+    service_path, terminal_path, progress_path = _write_timeout_statuses(
+        tmp_path, module, progress=progress
+    )
+    root = tmp_path / "evidence"
+
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "result-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert prepared.returncode == 0, prepared.stderr
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    hidden = root / f".{run_id}.pending.json"
+    assert hidden.exists()
+    assert stat.S_IMODE(hidden.stat().st_mode) == 0o600
+    record = json.loads(hidden.read_text(encoding="ascii"))
+    assert hidden.read_text(encoding="ascii") == module.canonical_json(record) + "\n"
+    assert record == {
+        "schemaVersion": module.TIMEOUT_EVIDENCE_PENDING_SCHEMA,
+        "status": "pending",
+        "state": "raw-cleanup-pending",
+        "failure": "result-timeout",
+        "runId": run_id,
+        "vmName": vm_name,
+        "sourceCommit": source_commit,
+        "serviceStarted": True,
+        "resultStatus": "absent",
+        "lastStage": "canary-acceptance",
+        "domainAbsent": True,
+        "rawSerialRetained": True,
+        "secretValuesRecorded": False,
+        "rootDevice": root.stat().st_dev,
+        "rootInode": root.stat().st_ino,
+        "pendingDevice": hidden.stat().st_dev,
+        "pendingInode": hidden.stat().st_ino,
+        "finalRecordSha256": hashlib.sha256(
+            (
+                module.canonical_json(
+                    _expected_timeout_record(
+                        module,
+                        run_id=run_id,
+                        vm_name=vm_name,
+                        source_commit=source_commit,
+                        failure="result-timeout",
+                        service_started=True,
+                        result_status="absent",
+                        last_stage="canary-acceptance",
+                    )
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest(),
+    }
+    assert len(hidden.read_bytes()) <= module.MAX_TIMEOUT_EVIDENCE_BYTES
+    evidence_text = hidden.read_text(encoding="ascii").lower()
+    assert all(
+        forbidden not in evidence_text
+        for forbidden in ("serial.log", "argv", "environment", "password", "token", "/tmp/")
+    )
+
+    shutil.rmtree(service_path.parent)
+    published = _run_timeout_evidence(
+        module,
+        "publish",
+        root,
+        run_id,
+        vm_name,
+        source_commit,
+        "result-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert published.returncode == 0, published.stderr
+    final = root / f"{run_id}.json"
+    assert final.exists()
+    final_record = json.loads(final.read_text(encoding="ascii"))
+    assert set(final_record) == {
+        "schemaVersion",
+        "status",
+        "failure",
+        "runId",
+        "vmName",
+        "sourceCommit",
+        "serviceStarted",
+        "resultStatus",
+        "lastStage",
+        "domainAbsent",
+        "rawSerialRetained",
+        "secretValuesRecorded",
+    }
+    assert final_record == _expected_timeout_record(
+        module,
+        run_id=run_id,
+        vm_name=vm_name,
+        source_commit=source_commit,
+        failure="result-timeout",
+        service_started=True,
+        result_status="absent",
+        last_stage="canary-acceptance",
+    )
+    assert not hidden.exists()
+
+
+@pytest.mark.parametrize(
+    ("failure", "service", "terminal", "progress"),
+    (
+        ("boot-timeout", None, None, None),
+        ("result-timeout", "service-started\n", "complete\n", None),
+    ),
+)
+def test_timeout_evidence_accepts_bounded_timeout_states(
+    tmp_path: Path,
+    failure: str,
+    service: str | None,
+    terminal: str | None,
+    progress: str | None,
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(
+        tmp_path,
+        module,
+        service=service,
+        terminal=terminal,
+        progress=progress,
+    )
+    root = tmp_path / "evidence"
+    run_id = "c" * 64
+    result = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        "overseer-phase-b-rehearsal-54a53bc34078-222222222222",
+        "d" * 40,
+        failure,
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("failure", "service", "terminal"),
+    (
+        ("boot-timeout", None, "complete\n"),
+        ("result-timeout", None, None),
+    ),
+)
+def test_timeout_evidence_rejects_impossible_marker_terminal_states(
+    tmp_path: Path,
+    failure: str,
+    service: str | None,
+    terminal: str | None,
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(
+        tmp_path,
+        module,
+        service=service,
+        terminal=terminal,
+        progress=None,
+    )
+
+    result = _run_timeout_evidence(
+        module,
+        "prepare",
+        tmp_path / "evidence",
+        "2" * 64,
+        "overseer-phase-b-rehearsal-54a53bc34078-222222222222",
+        "3" * 40,
+        failure,
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "wrong-mode", "collision"))
+def test_timeout_evidence_rejects_unsafe_root_or_destination(
+    tmp_path: Path, unsafe_kind: str
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    real_root = tmp_path / "real-evidence"
+    root = tmp_path / "evidence"
+    if unsafe_kind == "symlink":
+        real_root.mkdir(mode=0o700)
+        root.symlink_to(real_root, target_is_directory=True)
+    elif unsafe_kind == "wrong-mode":
+        root.mkdir(mode=0o755)
+    else:
+        root.mkdir(mode=0o700)
+        (root / f".{('e' * 64)}.pending.json").write_text("collision\n", encoding="ascii")
+
+    result = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        "e" * 64,
+        "overseer-phase-b-rehearsal-54a53bc34078-333333333333",
+        "f" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert result.returncode != 0
+
+
+def test_timeout_evidence_publish_rejects_final_destination_collision(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    run_id = "e" * 64
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        "overseer-phase-b-rehearsal-54a53bc34078-555555555555",
+        "f" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    final = root / f"{run_id}.json"
+    final.write_text("existing\n", encoding="ascii")
+    shutil.rmtree(service_path.parent)
+
+    published = _run_timeout_evidence(
+        module,
+        "publish",
+        root,
+        run_id,
+        "overseer-phase-b-rehearsal-54a53bc34078-555555555555",
+        "f" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert published.returncode != 0
+    assert final.read_text(encoding="ascii") == "existing\n"
+
+
+@pytest.mark.parametrize("mutation", ("content", "mode"))
+def test_timeout_evidence_publish_revalidates_hidden_artifact(
+    tmp_path: Path, mutation: str
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(tmp_path, module)
+    root = tmp_path / "evidence"
+    run_id = "f" * 64
+    prepared = _run_timeout_evidence(
+        module,
+        "prepare",
+        root,
+        run_id,
+        "overseer-phase-b-rehearsal-54a53bc34078-666666666666",
+        "1" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    hidden = root / f".{run_id}.pending.json"
+    if mutation == "content":
+        hidden.write_text('{"status":"tampered"}\n', encoding="ascii")
+    else:
+        hidden.chmod(0o640)
+    shutil.rmtree(service_path.parent)
+
+    published = _run_timeout_evidence(
+        module,
+        "publish",
+        root,
+        run_id,
+        "overseer-phase-b-rehearsal-54a53bc34078-666666666666",
+        "1" * 40,
+        "boot-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+
+    assert published.returncode != 0
+    assert not (root / f"{run_id}.json").exists()
+
+
+def test_timeout_evidence_rejects_malformed_progress_and_secret_bearing_values(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    service_path, terminal_path, progress_path = _write_timeout_statuses(
+        tmp_path,
+        module,
+        progress=(module.PROGRESS_PREFIX + " {\"stage\":\"password\"}\n"),
+    )
+    result = _run_timeout_evidence(
+        module,
+        "prepare",
+        tmp_path / "evidence",
+        "1" * 64,
+        "overseer-phase-b-rehearsal-54a53bc34078-444444444444",
+        "2" * 40,
+        "result-timeout",
+        service_path,
+        terminal_path,
+        progress_path,
+    )
+    assert result.returncode != 0
+
+
+def test_cleanup_timeout_publishes_only_sanitized_evidence_after_raw_deletion(
+    tmp_path: Path,
+) -> None:
+    module = load_tool()
+    run_id = "a" * 64
+    progress = module.canonical_json(
+        {
+            "schemaVersion": module.PROGRESS_SCHEMA,
+            "secretValuesRecorded": False,
+            "stage": "provisioning",
+        }
+    ) + "\n"
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"],
+        tmp_path / "timeout-state",
+        "virsh() { case \"$*\" in *\" list --all --name\") return 0;; *\" list --all --uuid\") return 0;; *) return 9;; esac; }",
+        run_id=run_id,
+        timeout_kind="result-timeout",
+        service_status="service-started\n",
+        terminal_status=None,
+        progress_status=progress,
+        original_status=1,
+    )
+    evidence_root = tmp_path / "evidence"
+
+    assert completed.returncode != 0, completed.stderr
+    assert not (tmp_path / "timeout-state").exists()
+    final = evidence_root / f"{run_id}.json"
+    assert final.exists()
+    assert not list(evidence_root.glob(".*.pending.json"))
+    record = json.loads(final.read_text(encoding="ascii"))
+    assert record["status"] == "failed"
+    assert record["failure"] == "result-timeout"
+    assert record["domainAbsent"] is True
+    assert record["rawSerialRetained"] is False
+    assert record["secretValuesRecorded"] is False
+
+
+def test_success_cleanup_creates_no_timeout_evidence(tmp_path: Path) -> None:
+    module = load_tool()
+    temp_dir = tmp_path / "success-state"
+    evidence_root = tmp_path / "evidence"
+    completed = _run_cleanup_harness(
+        render(module)["plan"]["futureScript"],
+        temp_dir,
+        "virsh() { case \"$*\" in *\" list --all --name\") return 0;; *\" list --all --uuid\") return 0;; *) return 9;; esac; }",
+        evidence_root=evidence_root,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert not temp_dir.exists()
+    assert not evidence_root.exists()
 
 
 def test_guest_extractor_rejects_manifest_or_archive_tampering(tmp_path: Path) -> None:

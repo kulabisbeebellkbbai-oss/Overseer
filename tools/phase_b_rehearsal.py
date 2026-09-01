@@ -51,12 +51,53 @@ DEFAULT_RUNTIME_SITE = Path("/usr/lib/python3/dist-packages")
 DEFAULT_TEMP_PARENT = Path("/var/tmp")
 DEFAULT_CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
 SESSION_RUNTIME_DIR = Path("/run/user") / str(os.geteuid())
-REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v8"
+REHEARSAL_SCHEMA = "overseer.phase-b-disposable-rehearsal-plan.v10"
 OWNER_BINDING_SCHEMA = "overseer.phase-b-rehearsal-owner-binding.v2"
 ARTIFACT_MANIFEST_SCHEMA = "overseer.rehearsal-artifact-manifest.v1"
 RESULT_SCHEMA = "overseer.phase-b-disposable-rehearsal.v1"
-RESULT_TIMEOUT_SECONDS = 960
+BOOT_TIMEOUT_SECONDS = 600
+RESULT_TIMEOUT_SECONDS = 1020
 SHUTDOWN_TIMEOUT_SECONDS = 120
+PHASE_DEADLINE_BUDGET_SECONDS = (
+    BOOT_TIMEOUT_SECONDS + RESULT_TIMEOUT_SECONDS + SHUTDOWN_TIMEOUT_SECONDS
+)
+PHASE_DEADLINE_BUDGET_MINUTES = PHASE_DEADLINE_BUDGET_SECONDS // 60
+COLLECTOR_READY_TIMEOUT_SECONDS = 30
+COLLECTOR_STOP_TIMEOUT_SECONDS = 10
+TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS = 10
+GUEST_WATCHDOG_SECONDS = 780
+SYSTEMD_HARD_STOP_SECONDS = 900
+COLLECTOR_DEAD_EXIT_STATUS = 75
+COLLECTOR_INVALID_EXIT_STATUS = 76
+SERVICE_ENTRY_MARKER = "OVERSEER_PHASE_B_REHEARSAL_SERVICE_STARTED"
+SERVICE_STARTED_STATUS = "service-started"
+COLLECTOR_READY_STATUS = "collector-ready"
+PROGRESS_PREFIX = "OVERSEER_PHASE_B_REHEARSAL_PROGRESS"
+PROGRESS_SCHEMA = "overseer.phase-b-rehearsal-progress.v1"
+RESULT_BEGIN = "OVERSEER_PHASE_B_REHEARSAL_RESULT_BEGIN"
+RESULT_END = "OVERSEER_PHASE_B_REHEARSAL_RESULT_END"
+PROGRESS_STAGES = frozenset(
+    {
+        "preflight",
+        "provisioning",
+        "authorization",
+        "canary-start",
+        "canary-acceptance",
+        "quiescent-stop",
+        "evidence-seal",
+        "cleanup",
+        "rollback-replay",
+        "phase-complete",
+    }
+)
+TIMEOUT_EVIDENCE_SCHEMA = "overseer.phase-b-rehearsal-timeout-evidence.v1"
+TIMEOUT_EVIDENCE_PENDING_SCHEMA = "overseer.phase-b-rehearsal-timeout-pending.v1"
+TIMEOUT_EVIDENCE_PENDING_NAME = ".<run-id>.pending.json"
+TIMEOUT_EVIDENCE_ROOT = Path(
+    "/home/god/.local/share/overseer/phase-b-rehearsal-evidence"
+)
+MAX_TIMEOUT_EVIDENCE_BYTES = 2048
+MAX_TIMEOUT_STATUS_BYTES = 512
 MAX_SERIAL_BYTES = 1024 * 1024
 MAX_SERIAL_LINE_BYTES = 64 * 1024
 MAX_SOURCE_FILES = 2048
@@ -78,6 +119,7 @@ EXACT_TOOLS = {
     "grep": "/usr/bin/grep",
     "id": "/usr/bin/id",
     "install": "/usr/bin/install",
+    "kill": "/usr/bin/kill",
     "mkfifo": "/usr/bin/mkfifo",
     "mkdir": "/usr/bin/mkdir",
     "mktemp": "/usr/bin/mktemp",
@@ -2737,50 +2779,718 @@ finally:
 
 
 def _serial_collector_python() -> str:
-    return r"""import os,select,sys
-pipe,log,status,stop,max_bytes,max_line=sys.argv[1:]
-max_bytes=int(max_bytes);max_line=int(max_line)
-fd=os.open(pipe,os.O_RDWR|os.O_NONBLOCK|os.O_CLOEXEC)
-out=os.open(log,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    stages = "{" + ",".join(repr(stage) for stage in sorted(PROGRESS_STAGES)) + "}"
+    template = r"""import json,os,select,stat,sys
+
+pipe,log,ready,status,service_status,progress_status,stop,max_bytes,max_line=sys.argv[1:]
+max_bytes=int(max_bytes)
+max_line=int(max_line)
+SERVICE_MARKER=__SERVICE_MARKER__
+SERVICE_STATUS=__SERVICE_STATUS__
+READY_STATUS=__READY_STATUS__
+PROGRESS_PREFIX=__PROGRESS_PREFIX__
+PROGRESS_SCHEMA=__PROGRESS_SCHEMA__
+PROGRESS_STAGES=frozenset(__PROGRESS_STAGES__)
+RESULT_BEGIN=__RESULT_BEGIN__
+RESULT_END=__RESULT_END__
+
+def write_all(descriptor,payload):
+    view=memoryview(payload)
+    while view:
+        written=os.write(descriptor,view)
+        if written<=0:
+            raise OSError("collector write made no progress")
+        view=view[written:]
+
+def status_path_safe(path):
+    try:
+        state=os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (not stat.S_ISREG(state.st_mode) or state.st_uid!=os.geteuid()
+            or state.st_nlink!=1 or stat.S_IMODE(state.st_mode)!=0o600):
+        raise OSError("collector status path is unsafe")
+
+def publish_file(path,payload):
+    status_path_safe(path)
+    temporary=path+".tmp"
+    if os.path.lexists(temporary):
+        raise OSError("collector status temporary path already exists")
+    descriptor=os.open(
+        temporary,
+        os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        write_all(descriptor,payload.encode("ascii"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary,path)
+
+def publish_terminal(value):
+    global terminal
+    if terminal is None or (value=="overflow" and terminal!="overflow"):
+        publish_file(status,value+"\n")
+        terminal=value
+
+def mark_overflow():
+    publish_terminal("overflow")
+
+def publish_service():
+    global service_started
+    if service_started:
+        mark_overflow()
+        return
+    publish_file(service_status,SERVICE_STATUS+"\n")
+    service_started=True
+
+def publish_progress(raw):
+    global progress_record
+    suffix=raw[len(PROGRESS_PREFIX):]
+    if suffix != b" " + suffix[1:]:
+        mark_overflow()
+        return
+    try:
+        payload=suffix[1:].decode("ascii","strict")
+        record=json.loads(payload)
+        if (not isinstance(record,dict)
+                or set(record)!={"schemaVersion","secretValuesRecorded","stage"}
+                or record.get("schemaVersion")!=PROGRESS_SCHEMA
+                or record.get("secretValuesRecorded") is not False
+                or not isinstance(record.get("stage"),str)
+                or record["stage"] not in PROGRESS_STAGES):
+            raise ValueError
+        canonical=json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+        if canonical!=payload:
+            raise ValueError
+    except (UnicodeError,ValueError,TypeError,json.JSONDecodeError):
+        mark_overflow()
+        return
+    publish_file(progress_status,canonical+"\n")
+    progress_record=canonical
+
+def process_line(raw):
+    global result_started,result_ended
+    try:
+        raw.decode("utf-8","strict")
+    except UnicodeError:
+        mark_overflow()
+        return
+    if raw==SERVICE_MARKER:
+        publish_service()
+        return
+    if raw.startswith(SERVICE_MARKER):
+        mark_overflow()
+        return
+    if raw.startswith(PROGRESS_PREFIX):
+        if not service_started or result_started or result_ended:
+            mark_overflow()
+        else:
+            publish_progress(raw)
+        return
+    if raw.startswith(RESULT_BEGIN):
+        if raw!=RESULT_BEGIN or not service_started or result_started or result_ended:
+            mark_overflow()
+        else:
+            result_started=True
+        return
+    if raw.startswith(RESULT_END):
+        if raw!=RESULT_END or not service_started or not result_started or result_ended:
+            mark_overflow()
+        else:
+            result_ended=True
+            publish_terminal("complete")
+
+fd=None
+out=None
 total=0
 line=bytearray()
 terminal=None
-def publish(value):
-    global terminal
-    if terminal is None or (value=="overflow" and terminal!="overflow"):
-        temp=status+".tmp"
-        try: os.unlink(temp)
-        except FileNotFoundError: pass
-        with open(temp,"x",encoding="ascii") as stream:
-            stream.write(value+"\n");stream.flush();os.fsync(stream.fileno())
-        os.replace(temp,status)
-        terminal=value
+service_started=False
+result_started=False
+result_ended=False
+progress_record=None
 try:
+    fd=os.open(pipe,os.O_RDWR|os.O_NONBLOCK|os.O_CLOEXEC)
+    out=os.open(log,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    publish_file(ready,READY_STATUS+"\n")
     while True:
         had_data=False
-        ready,_,_=select.select([fd],[],[],0.2)
-        if ready:
-            try: block=os.read(fd,65536)
-            except BlockingIOError: block=b""
+        readable,_,_=select.select([fd],[],[],0.2)
+        if readable:
+            try:
+                block=os.read(fd,65536)
+            except BlockingIOError:
+                block=b""
             if block:
                 had_data=True
                 remaining=max_bytes-total
                 if remaining>0:
                     written=block[:remaining]
-                    os.write(out,written)
+                    write_all(out,written)
                     total+=len(written)
-                if len(block)>remaining: publish("overflow")
+                if len(block)>remaining:
+                    mark_overflow()
                 for byte in block:
                     if byte==10:
-                        if bytes(line)==b"OVERSEER_PHASE_B_REHEARSAL_RESULT_END": publish("complete")
+                        process_line(bytes(line))
                         line.clear()
-                    elif len(line)<=max_line:
+                    elif len(line)<max_line:
                         line.append(byte)
-                    if len(line)>max_line: publish("overflow")
-        if os.path.exists(stop) and not had_data: break
+                    else:
+                        mark_overflow()
+        if os.path.exists(stop) and not had_data:
+            break
 finally:
-    os.fsync(out);os.close(out);os.close(fd)
+    if out is not None:
+        os.fsync(out)
+        os.close(out)
+    if fd is not None:
+        os.close(fd)
 """
+    return (
+        template.replace("__SERVICE_MARKER__", repr(SERVICE_ENTRY_MARKER.encode("ascii")))
+        .replace("__SERVICE_STATUS__", repr(SERVICE_STARTED_STATUS))
+        .replace("__READY_STATUS__", repr(COLLECTOR_READY_STATUS))
+        .replace("__PROGRESS_PREFIX__", repr(PROGRESS_PREFIX.encode("ascii")))
+        .replace("__PROGRESS_SCHEMA__", repr(PROGRESS_SCHEMA))
+        .replace("__PROGRESS_STAGES__", stages)
+        .replace("__RESULT_BEGIN__", repr(RESULT_BEGIN.encode("ascii")))
+        .replace("__RESULT_END__", repr(RESULT_END.encode("ascii")))
+    )
+
+
+def _timeout_evidence_python() -> str:
+    stages = "{" + ",".join(repr(stage) for stage in sorted(PROGRESS_STAGES)) + "}"
+    template = r"""import hashlib,json,os,re,stat,sys
+
+SCHEMA=__SCHEMA__
+PENDING_SCHEMA=__PENDING_SCHEMA__
+MAX_RECORD_BYTES=__MAX_RECORD_BYTES__
+MAX_CHILD_BYTES=__MAX_CHILD_BYTES__
+SERVICE_STATUS=__SERVICE_STATUS__
+RESULT_STATUSES={"absent","complete","overflow"}
+PROGRESS_SCHEMA=__PROGRESS_SCHEMA__
+PROGRESS_STAGES=frozenset(__PROGRESS_STAGES__)
+KEYS={"schemaVersion","status","failure","runId","vmName","sourceCommit","serviceStarted","resultStatus","lastStage","domainAbsent","rawSerialRetained","secretValuesRecorded"}
+PENDING_KEYS=KEYS|{"state","rootDevice","rootInode","pendingDevice","pendingInode","finalRecordSha256"}
+RUN_ID_RE=re.compile(r"[0-9a-f]{64}\Z")
+VM_NAME_RE=re.compile(r"overseer-phase-b-rehearsal-[0-9a-f]{12}-[0-9a-f]{12}\Z")
+COMMIT_RE=re.compile(r"[0-9a-f]{40}\Z")
+DIR_FLAGS=os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW
+READ_FLAGS=os.O_RDONLY|os.O_NONBLOCK|os.O_CLOEXEC|os.O_NOFOLLOW
+WRITE_FLAGS=os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW
+CHILD_NAMES=("serial.service-started","serial.status","serial.progress")
+PENDING_STATE="raw-cleanup-pending"
+COMPLETE_STATE="raw-cleanup-complete"
+
+def fail():
+    raise SystemExit(1)
+
+def path_parts(path):
+    if not isinstance(path,str) or not path.startswith("/") or path.startswith("//"):
+        fail()
+    parts=path.split("/")[1:]
+    if not parts or any(not part or part in {".",".."} for part in parts):
+        fail()
+    return parts
+
+def metadata(state):
+    return (state.st_dev,state.st_ino,state.st_mode,state.st_uid,state.st_gid,
+            state.st_nlink,state.st_size,state.st_mtime_ns,state.st_ctime_ns)
+
+def close_quietly(descriptor):
+    if descriptor is not None:
+        try: os.close(descriptor)
+        except OSError: pass
+
+def validate_directory(descriptor,exact_mode=None):
+    state=os.fstat(descriptor)
+    if (not stat.S_ISDIR(state.st_mode) or state.st_uid!=os.geteuid()
+            or state.st_mode&(stat.S_IWGRP|stat.S_IWOTH)):
+        fail()
+    if exact_mode is not None and stat.S_IMODE(state.st_mode)!=exact_mode:
+        fail()
+    return state
+
+def open_directory(path,create,exact_mode=None):
+    parts=path_parts(path)
+    descriptor=os.open("/",DIR_FLAGS)
+    try:
+        for part in parts:
+            try:
+                next_descriptor=os.open(part,DIR_FLAGS,dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create: raise
+                os.mkdir(part,0o700,dir_fd=descriptor)
+                next_descriptor=os.open(part,DIR_FLAGS,dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor=next_descriptor
+        validate_directory(descriptor,exact_mode)
+        return descriptor
+    except BaseException:
+        close_quietly(descriptor)
+        raise
+
+def open_parent(path):
+    parts=path_parts(path)
+    parent=os.open("/",DIR_FLAGS)
+    try:
+        for part in parts[:-1]:
+            next_parent=os.open(part,DIR_FLAGS,dir_fd=parent)
+            os.close(parent)
+            parent=next_parent
+        validate_directory(parent)
+        return parent,parts[-1]
+    except BaseException:
+        close_quietly(parent)
+        raise
+
+def require_absent(path):
+    parent,name=open_parent(path)
+    try:
+        try: os.stat(name,dir_fd=parent,follow_symlinks=False)
+        except FileNotFoundError: return
+        fail()
+    finally:
+        os.close(parent)
+
+def write_all(descriptor,payload):
+    view=memoryview(payload)
+    while view:
+        written=os.write(descriptor,view)
+        if written<=0: fail()
+        view=view[written:]
+
+def canonical_payload(record):
+    return (json.dumps(record,ensure_ascii=True,sort_keys=True,separators=(",",":"))+"\n").encode("ascii")
+
+def read_child(temp_descriptor,name):
+    try:
+        entry_before=os.stat(name,dir_fd=temp_descriptor,follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    descriptor=None
+    try:
+        descriptor=os.open(name,READ_FLAGS,dir_fd=temp_descriptor)
+        state=os.fstat(descriptor)
+        if (metadata(entry_before)!=metadata(state) or not stat.S_ISREG(state.st_mode)
+                or state.st_uid!=os.geteuid() or state.st_nlink!=1
+                or stat.S_IMODE(state.st_mode)!=0o600 or state.st_size>MAX_CHILD_BYTES):
+            fail()
+        chunks=[]
+        total=0
+        while True:
+            block=os.read(descriptor,MAX_CHILD_BYTES)
+            if not block: break
+            total+=len(block)
+            if total>MAX_CHILD_BYTES: fail()
+            chunks.append(block)
+        after=os.fstat(descriptor)
+        try: entry_after=os.stat(name,dir_fd=temp_descriptor,follow_symlinks=False)
+        except FileNotFoundError: fail()
+        if metadata(state)!=metadata(after) or metadata(after)!=metadata(entry_after):
+            fail()
+        try: return b"".join(chunks).decode("ascii")
+        except UnicodeError: fail()
+    finally:
+        close_quietly(descriptor)
+
+def validate_progress(value):
+    if value is None: return None
+    if not value.endswith("\n"): fail()
+    payload=value[:-1]
+    try: record=json.loads(payload)
+    except (TypeError,ValueError,json.JSONDecodeError): fail()
+    if (not isinstance(record,dict)
+            or set(record)!={"schemaVersion","secretValuesRecorded","stage"}
+            or record.get("schemaVersion")!=PROGRESS_SCHEMA
+            or record.get("secretValuesRecorded") is not False
+            or not isinstance(record.get("stage"),str)
+            or record["stage"] not in PROGRESS_STAGES):
+        fail()
+    if canonical_payload(record)[:-1].decode("ascii")!=payload: fail()
+    return record["stage"]
+
+def validate_inputs(run_id,vm_name,source_commit,failure):
+    if (RUN_ID_RE.fullmatch(run_id) is None
+            or VM_NAME_RE.fullmatch(vm_name) is None
+            or COMMIT_RE.fullmatch(source_commit) is None
+            or failure not in {"boot-timeout","result-timeout"}):
+        fail()
+
+def read_state(temp_descriptor):
+    service=read_child(temp_descriptor,"serial.service-started")
+    terminal=read_child(temp_descriptor,"serial.status")
+    progress=read_child(temp_descriptor,"serial.progress")
+    if service is not None and service!=SERVICE_STATUS+"\n": fail()
+    if terminal is not None and terminal not in {"complete\n","overflow\n"}: fail()
+    if service is None and progress is not None: fail()
+    last_stage=validate_progress(progress)
+    return service==SERVICE_STATUS+"\n", "absent" if terminal is None else terminal[:-1], last_stage
+
+def make_record(run_id,vm_name,source_commit,failure,temp_dir):
+    validate_inputs(run_id,vm_name,source_commit,failure)
+    descriptor=open_directory(temp_dir,False)
+    try:
+        service_started,result_status,last_stage=read_state(descriptor)
+    finally:
+        os.close(descriptor)
+    if result_status=="complete" and not service_started: fail()
+    if failure=="result-timeout" and not service_started: fail()
+    record={
+        "schemaVersion":SCHEMA,
+        "status":"failed",
+        "failure":failure,
+        "runId":run_id,
+        "vmName":vm_name,
+        "sourceCommit":source_commit,
+        "serviceStarted":service_started,
+        "resultStatus":result_status,
+        "lastStage":last_stage,
+        "domainAbsent":True,
+        "rawSerialRetained":False,
+        "secretValuesRecorded":False,
+    }
+    payload=canonical_payload(record)
+    if len(payload)>MAX_RECORD_BYTES: fail()
+    return record,payload
+
+def validate_record(payload,run_id,vm_name,source_commit,failure):
+    if len(payload)>MAX_RECORD_BYTES or not payload.endswith(b"\n"): fail()
+    try:
+        record=json.loads(payload[:-1].decode("ascii"))
+    except (UnicodeError,ValueError,json.JSONDecodeError): fail()
+    if not isinstance(record,dict) or set(record)!=KEYS: fail()
+    if (record.get("schemaVersion")!=SCHEMA or record.get("status")!="failed"
+            or record.get("failure")!=failure or record.get("runId")!=run_id
+            or record.get("vmName")!=vm_name or record.get("sourceCommit")!=source_commit):
+        fail()
+    if (type(record.get("serviceStarted")) is not bool
+            or record.get("resultStatus") not in RESULT_STATUSES
+            or (record.get("lastStage") is not None and record.get("lastStage") not in PROGRESS_STAGES)
+            or record.get("domainAbsent") is not True
+            or record.get("rawSerialRetained") is not False
+            or record.get("secretValuesRecorded") is not False):
+        fail()
+    if canonical_payload(record)!=payload: fail()
+    return record
+
+def pending_record(record,root_state,pending_state,pending_identity,final_digest):
+    return {
+        "schemaVersion":PENDING_SCHEMA,
+        "status":"pending",
+        "state":pending_state,
+        **{key:value for key,value in record.items() if key not in {"schemaVersion","status","state","rawSerialRetained"}},
+        "rawSerialRetained":pending_state==PENDING_STATE,
+        "rootDevice":root_state.st_dev,
+        "rootInode":root_state.st_ino,
+        "pendingDevice":pending_identity[0],
+        "pendingInode":pending_identity[1],
+        "finalRecordSha256":final_digest,
+    }
+
+def validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,pending_state):
+    if len(payload)>MAX_RECORD_BYTES or not payload.endswith(b"\n"): fail()
+    try:
+        record=json.loads(payload[:-1].decode("ascii"))
+    except (UnicodeError,ValueError,json.JSONDecodeError): fail()
+    if not isinstance(record,dict) or set(record)!=PENDING_KEYS: fail()
+    if (record.get("schemaVersion")!=PENDING_SCHEMA or record.get("status")!="pending"
+            or record.get("state")!=pending_state or record.get("runId")!=run_id
+            or record.get("vmName")!=vm_name or record.get("sourceCommit")!=source_commit
+            or record.get("failure")!=failure):
+        fail()
+    if record.get("rawSerialRetained") is not (pending_state==PENDING_STATE): fail()
+    if record.get("rootDevice")!=root_state.st_dev or record.get("rootInode")!=root_state.st_ino: fail()
+    if (type(record.get("pendingDevice")) is not int or type(record.get("pendingInode")) is not int
+            or not re.fullmatch(r"[0-9a-f]{64}",record.get("finalRecordSha256",""))):
+        fail()
+    semantic=dict(record)
+    semantic["schemaVersion"]=SCHEMA
+    semantic.pop("state",None)
+    for key in ("rootDevice","rootInode","pendingDevice","pendingInode","finalRecordSha256"):
+        semantic.pop(key,None)
+    semantic["status"]="failed"
+    semantic["rawSerialRetained"]=False
+    final_payload=canonical_payload(semantic)
+    validate_record(final_payload,run_id,vm_name,source_commit,failure)
+    if hashlib.sha256(final_payload).hexdigest()!=record["finalRecordSha256"]: fail()
+    if canonical_payload(record)!=payload: fail()
+    return record,final_payload
+
+def read_pending(descriptor,hidden):
+    try: entry_before=os.stat(hidden,dir_fd=descriptor,follow_symlinks=False)
+    except FileNotFoundError: fail()
+    source=None
+    try:
+        source=os.open(hidden,READ_FLAGS,dir_fd=descriptor)
+        state=os.fstat(source)
+        if (metadata(entry_before)!=metadata(state) or not stat.S_ISREG(state.st_mode)
+                or state.st_uid!=os.geteuid() or state.st_nlink!=1
+                or stat.S_IMODE(state.st_mode)!=0o600 or state.st_size>MAX_RECORD_BYTES):
+            fail()
+        chunks=[]
+        total=0
+        while True:
+            block=os.read(source,MAX_RECORD_BYTES)
+            if not block: break
+            total+=len(block)
+            if total>MAX_RECORD_BYTES: fail()
+            chunks.append(block)
+        after=os.fstat(source)
+        try: entry_after=os.stat(hidden,dir_fd=descriptor,follow_symlinks=False)
+        except FileNotFoundError: fail()
+        if metadata(state)!=metadata(after) or metadata(after)!=metadata(entry_after): fail()
+        return b"".join(chunks),state
+    finally:
+        close_quietly(source)
+
+def ensure_root_identity(root,descriptor,expected):
+    current=validate_directory(descriptor,0o700)
+    if (current.st_dev,current.st_ino)!=(expected.st_dev,expected.st_ino): fail()
+    reopened=open_directory(root,False,0o700)
+    try:
+        reopened_state=os.fstat(reopened)
+        if (reopened_state.st_dev,reopened_state.st_ino)!=(expected.st_dev,expected.st_ino): fail()
+    finally:
+        os.close(reopened)
+
+def write_pending(descriptor,name,payload):
+    output=os.open(name,WRITE_FLAGS,0o600,dir_fd=descriptor)
+    try:
+        state=os.fstat(output)
+        if (not stat.S_ISREG(state.st_mode) or state.st_uid!=os.geteuid()
+                or state.st_nlink!=1 or stat.S_IMODE(state.st_mode)!=0o600): fail()
+        write_all(output,payload)
+        os.fsync(output)
+        after=os.fstat(output)
+        if (after.st_dev,after.st_ino)!=(state.st_dev,state.st_ino) or after.st_nlink!=1 or stat.S_IMODE(after.st_mode)!=0o600: fail()
+    finally:
+        os.close(output)
+
+def prepare(root,run_id,vm_name,source_commit,failure,temp_dir):
+    record,final_payload=make_record(run_id,vm_name,source_commit,failure,temp_dir)
+    descriptor=open_directory(root,True,0o700)
+    hidden="."+run_id+".pending.json"
+    final=run_id+".json"
+    try:
+        try: os.stat(final,dir_fd=descriptor,follow_symlinks=False)
+        except FileNotFoundError: pass
+        else: fail()
+        try: os.stat(hidden,dir_fd=descriptor,follow_symlinks=False)
+        except FileNotFoundError: pass
+        else: fail()
+        output=os.open(hidden,WRITE_FLAGS,0o600,dir_fd=descriptor)
+        try:
+            state=os.fstat(output)
+            if (not stat.S_ISREG(state.st_mode) or state.st_uid!=os.geteuid()
+                    or state.st_nlink!=1 or stat.S_IMODE(state.st_mode)!=0o600): fail()
+            pending=pending_record(record,os.fstat(descriptor),PENDING_STATE,(state.st_dev,state.st_ino),hashlib.sha256(final_payload).hexdigest())
+            pending_payload=canonical_payload(pending)
+            if len(pending_payload)>MAX_RECORD_BYTES: fail()
+            write_all(output,pending_payload)
+            os.fsync(output)
+            after=os.fstat(output)
+            if (after.st_dev,after.st_ino)!=(state.st_dev,state.st_ino) or after.st_nlink!=1 or stat.S_IMODE(after.st_mode)!=0o600 or after.st_size!=len(pending_payload): fail()
+        finally:
+            os.close(output)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+def safe_staging_identity(descriptor,name):
+    try: before=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+    except FileNotFoundError: fail()
+    source=None
+    try:
+        source=os.open(name,READ_FLAGS,dir_fd=descriptor)
+        state=os.fstat(source)
+        if (metadata(before)!=metadata(state) or not stat.S_ISREG(state.st_mode)
+                or state.st_uid!=os.geteuid() or state.st_nlink!=1
+                or stat.S_IMODE(state.st_mode)!=0o600): fail()
+        try: after=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+        except FileNotFoundError: fail()
+        if metadata(state)!=metadata(after): fail()
+        return state
+    finally:
+        close_quietly(source)
+
+def discard_safe_staging(descriptor,name):
+    expected=safe_staging_identity(descriptor,name)
+    current=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+    if metadata(current)!=metadata(expected): fail()
+    os.unlink(name,dir_fd=descriptor)
+    os.fsync(descriptor)
+
+def load_complete_staging(descriptor,name,root_state,run_id,vm_name,source_commit,failure):
+    try: os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+    except FileNotFoundError: return None
+    try:
+        payload,state=read_pending(descriptor,name)
+        record,_=validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
+        if (state.st_dev,state.st_ino)!=(record["pendingDevice"],record["pendingInode"]): fail()
+        source=os.open(name,READ_FLAGS,dir_fd=descriptor)
+        try:
+            synced=os.fstat(source)
+            if metadata(synced)!=metadata(state): fail()
+            os.fsync(source)
+        finally:
+            os.close(source)
+        payload_after,state_after=read_pending(descriptor,name)
+        record_after,_=validate_pending(payload_after,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
+        if (metadata(state_after)!=metadata(state)
+                or (state_after.st_dev,state_after.st_ino)!=(record_after["pendingDevice"],record_after["pendingInode"])):
+            fail()
+        return state_after
+    except SystemExit:
+        discard_safe_staging(descriptor,name)
+        return None
+
+def rewrite_pending_complete(descriptor,hidden,pending,root_state,expected_identity,
+        run_id,vm_name,source_commit,failure):
+    staging=hidden+".next"
+    state=load_complete_staging(
+        descriptor,staging,root_state,run_id,vm_name,source_commit,failure,
+    )
+    if state is None:
+        output=None
+        try:
+            output=os.open(staging,WRITE_FLAGS,0o600,dir_fd=descriptor)
+            state=os.fstat(output)
+            if (not stat.S_ISREG(state.st_mode)
+                    or state.st_uid!=os.geteuid() or state.st_nlink!=1
+                    or stat.S_IMODE(state.st_mode)!=0o600): fail()
+            complete=dict(pending)
+            complete["state"]=COMPLETE_STATE
+            complete["rawSerialRetained"]=False
+            complete["pendingDevice"]=state.st_dev
+            complete["pendingInode"]=state.st_ino
+            payload=canonical_payload(complete)
+            if len(payload)>MAX_RECORD_BYTES: fail()
+            validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
+            write_all(output,payload)
+            os.fsync(output)
+            after=os.fstat(output)
+            if ((after.st_dev,after.st_ino)!=(state.st_dev,state.st_ino) or after.st_nlink!=1
+                    or stat.S_IMODE(after.st_mode)!=0o600 or after.st_size!=len(payload)): fail()
+            state=after
+        finally:
+            close_quietly(output)
+    current_payload,current_state=read_pending(descriptor,hidden)
+    validate_pending(current_payload,run_id,vm_name,source_commit,failure,root_state,PENDING_STATE)
+    if (current_state.st_dev,current_state.st_ino)!=expected_identity: fail()
+    staging_payload,staging_state=read_pending(descriptor,staging)
+    staging_record,_=validate_pending(staging_payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
+    if (metadata(staging_state)!=metadata(state)
+            or (staging_state.st_dev,staging_state.st_ino)!=(staging_record["pendingDevice"],staging_record["pendingInode"])):
+        fail()
+    os.replace(staging,hidden,src_dir_fd=descriptor,dst_dir_fd=descriptor)
+    os.fsync(descriptor)
+    replaced_payload,replaced_state=read_pending(descriptor,hidden)
+    validate_pending(replaced_payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
+    if (replaced_state.st_dev,replaced_state.st_ino)!=(state.st_dev,state.st_ino): fail()
+
+def complete_pending(root,run_id,vm_name,source_commit,failure,temp_dir):
+    validate_inputs(run_id,vm_name,source_commit,failure)
+    require_absent(temp_dir)
+    descriptor=open_directory(root,False,0o700)
+    hidden="."+run_id+".pending.json"
+    try:
+        root_state=os.fstat(descriptor)
+        ensure_root_identity(root,descriptor,root_state)
+        payload,pending_file_state=read_pending(descriptor,hidden)
+        try: state_hint=json.loads(payload[:-1].decode("ascii"))["state"]
+        except (KeyError,UnicodeError,ValueError,json.JSONDecodeError): fail()
+        if state_hint not in {PENDING_STATE,COMPLETE_STATE}: fail()
+        pending,_=validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,state_hint)
+        expected_identity=(pending["pendingDevice"],pending["pendingInode"])
+        if (pending_file_state.st_dev,pending_file_state.st_ino)!=expected_identity: fail()
+        if state_hint==PENDING_STATE:
+            ensure_root_identity(root,descriptor,root_state)
+            current_payload,current_state=read_pending(descriptor,hidden)
+            validate_pending(current_payload,run_id,vm_name,source_commit,failure,root_state,PENDING_STATE)
+            if (current_state.st_dev,current_state.st_ino)!=expected_identity: fail()
+            rewrite_pending_complete(
+                descriptor,hidden,pending,root_state,expected_identity,
+                run_id,vm_name,source_commit,failure,
+            )
+        else:
+            validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
+    finally:
+        os.close(descriptor)
+
+def publish(root,run_id,vm_name,source_commit,failure,temp_dir):
+    validate_inputs(run_id,vm_name,source_commit,failure)
+    require_absent(temp_dir)
+    descriptor=open_directory(root,False,0o700)
+    hidden="."+run_id+".pending.json"
+    final=run_id+".json"
+    final_temp="."+run_id+".final.json"
+    try:
+        root_state=os.fstat(descriptor)
+        ensure_root_identity(root,descriptor,root_state)
+        payload,pending_file_state=read_pending(descriptor,hidden)
+        try:
+            state_hint=json.loads(payload[:-1].decode("ascii"))["state"]
+        except (KeyError,UnicodeError,ValueError,json.JSONDecodeError):
+            fail()
+        if state_hint not in {PENDING_STATE,COMPLETE_STATE}:
+            fail()
+        pending,final_payload=validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,state_hint)
+        expected_identity=(pending["pendingDevice"],pending["pendingInode"])
+        if (pending_file_state.st_dev,pending_file_state.st_ino)!=expected_identity: fail()
+        if pending["state"]==PENDING_STATE:
+            ensure_root_identity(root,descriptor,root_state)
+            current_payload,current_state=read_pending(descriptor,hidden)
+            validate_pending(current_payload,run_id,vm_name,source_commit,failure,root_state,PENDING_STATE)
+            if (current_state.st_dev,current_state.st_ino)!=expected_identity: fail()
+            rewrite_pending_complete(
+                descriptor,hidden,pending,root_state,expected_identity,
+                run_id,vm_name,source_commit,failure,
+            )
+        else:
+            validate_pending(payload,run_id,vm_name,source_commit,failure,root_state,COMPLETE_STATE)
+        ensure_root_identity(root,descriptor,root_state)
+        try: os.stat(final,dir_fd=descriptor,follow_symlinks=False)
+        except FileNotFoundError: pass
+        else: fail()
+        try: os.stat(final_temp,dir_fd=descriptor,follow_symlinks=False)
+        except FileNotFoundError: pass
+        else: fail()
+        write_pending(descriptor,final_temp,final_payload)
+        try:
+            os.link(final_temp,final,src_dir_fd=descriptor,dst_dir_fd=descriptor,follow_symlinks=False)
+            os.fsync(descriptor)
+            os.unlink(final_temp,dir_fd=descriptor)
+            os.fsync(descriptor)
+            os.unlink(hidden,dir_fd=descriptor)
+            os.fsync(descriptor)
+        except BaseException:
+            raise
+    finally:
+        os.close(descriptor)
+
+if len(sys.argv)!=8: fail()
+mode,root,run_id,vm_name,source_commit,failure,temp_dir=sys.argv[1:]
+try:
+    if mode=="prepare": prepare(root,run_id,vm_name,source_commit,failure,temp_dir)
+    elif mode=="complete": complete_pending(root,run_id,vm_name,source_commit,failure,temp_dir)
+    elif mode=="publish": publish(root,run_id,vm_name,source_commit,failure,temp_dir)
+    else: fail()
+except (OSError,ValueError,TypeError):
+    raise SystemExit(1)
+"""
+    return (
+        template.replace("__SCHEMA__", repr(TIMEOUT_EVIDENCE_SCHEMA))
+        .replace("__PENDING_SCHEMA__", repr(TIMEOUT_EVIDENCE_PENDING_SCHEMA))
+        .replace("__MAX_RECORD_BYTES__", str(MAX_TIMEOUT_EVIDENCE_BYTES))
+        .replace("__MAX_CHILD_BYTES__", str(MAX_TIMEOUT_STATUS_BYTES))
+        .replace("__SERVICE_STATUS__", repr(SERVICE_STARTED_STATUS))
+        .replace("__PROGRESS_SCHEMA__", repr(PROGRESS_SCHEMA))
+        .replace("__PROGRESS_STAGES__", stages)
+    )
 
 
 def _ownership_validator_python() -> str:
@@ -3160,6 +3870,7 @@ def _future_script(
 ) -> str:
     validator = _result_validator_python()
     collector = _serial_collector_python()
+    timeout_evidence = _timeout_evidence_python()
     archive_builder = _archive_builder_python()
     ownership_validator = _ownership_validator_python()
     firmware_validator = _firmware_validator_python()
@@ -3210,8 +3921,27 @@ readonly EXPECTED_RUNTIME_PROBE_JSON={shlex.quote(runtime_probe_json)}
 readonly EXPECTED_RUNTIME_PROBE_SHA256={shlex.quote(runtime_probe_digest)}
 readonly EXPECTED_CAPABILITY_PROBE_JSON={shlex.quote(capability_probe_json)}
 readonly EXPECTED_CAPABILITY_PROBE_SHA256={shlex.quote(capability_probe_digest)}
+readonly BOOT_TIMEOUT_SECONDS={BOOT_TIMEOUT_SECONDS}
 readonly RESULT_TIMEOUT_SECONDS={RESULT_TIMEOUT_SECONDS}
 readonly SHUTDOWN_TIMEOUT_SECONDS={SHUTDOWN_TIMEOUT_SECONDS}
+readonly PHASE_DEADLINE_BUDGET_SECONDS={PHASE_DEADLINE_BUDGET_SECONDS}
+readonly PHASE_DEADLINE_BUDGET_MINUTES={PHASE_DEADLINE_BUDGET_MINUTES}
+readonly COLLECTOR_READY_TIMEOUT_SECONDS={COLLECTOR_READY_TIMEOUT_SECONDS}
+readonly COLLECTOR_STOP_TIMEOUT_SECONDS={COLLECTOR_STOP_TIMEOUT_SECONDS}
+readonly TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS={TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}
+readonly GUEST_WATCHDOG_SECONDS={GUEST_WATCHDOG_SECONDS}
+readonly SYSTEMD_HARD_STOP_SECONDS={SYSTEMD_HARD_STOP_SECONDS}
+readonly COLLECTOR_DEAD_EXIT_STATUS={COLLECTOR_DEAD_EXIT_STATUS}
+readonly COLLECTOR_INVALID_EXIT_STATUS={COLLECTOR_INVALID_EXIT_STATUS}
+readonly SERVICE_ENTRY_MARKER={shlex.quote(SERVICE_ENTRY_MARKER)}
+readonly SERVICE_STARTED_STATUS={shlex.quote(SERVICE_STARTED_STATUS)}
+readonly COLLECTOR_READY_STATUS={shlex.quote(COLLECTOR_READY_STATUS)}
+readonly PROGRESS_PREFIX={shlex.quote(PROGRESS_PREFIX)}
+readonly PROGRESS_SCHEMA={shlex.quote(PROGRESS_SCHEMA)}
+readonly TIMEOUT_EVIDENCE_SCHEMA={shlex.quote(TIMEOUT_EVIDENCE_SCHEMA)}
+readonly TIMEOUT_EVIDENCE_PENDING_SCHEMA={shlex.quote(TIMEOUT_EVIDENCE_PENDING_SCHEMA)}
+readonly TIMEOUT_EVIDENCE_ROOT={shlex.quote(str(TIMEOUT_EVIDENCE_ROOT))}
+readonly MAX_TIMEOUT_EVIDENCE_BYTES={MAX_TIMEOUT_EVIDENCE_BYTES}
 readonly MAX_SERIAL_BYTES={MAX_SERIAL_BYTES}
 readonly MAX_SERIAL_LINE_BYTES={MAX_SERIAL_LINE_BYTES}
 readonly EXPECTED_SESSION_RUNTIME_DIR={shlex.quote(str(SESSION_RUNTIME_DIR))}
@@ -3223,7 +3953,10 @@ SEED_ISO=""
 NVRAM=""
 SERIAL_PIPE=""
 SERIAL_LOG=""
+SERIAL_READY_STATUS=""
 SERIAL_STATUS=""
+SERIAL_SERVICE_STATUS=""
+SERIAL_PROGRESS_STATUS=""
 SERIAL_STOP=""
 SERIAL_COLLECTOR=""
 COLLECTOR_PID=""
@@ -3234,6 +3967,10 @@ SOURCE_ARCHIVE=""
 RUNTIME_ARCHIVE=""
 SOURCE_MANIFEST_FILE=""
 RUNTIME_MANIFEST_FILE=""
+TIMEOUT_KIND=""
+TIMEOUT_EVIDENCE_TEMP=""
+TIMEOUT_EVIDENCE_FINAL=""
+EVIDENCE_ROOT="$TIMEOUT_EVIDENCE_ROOT"
 LOCK_HELD=0
 
 validate_firmware_runtime() {{
@@ -3328,10 +4065,13 @@ temp_layout_is_exact() {{
   [[ "$OVERLAY" == "$TEMP_DIR/overlay.qcow2" ]] &&
   [[ "$SEED_ISO" == "$TEMP_DIR/seed.iso" ]] &&
   [[ "$NVRAM" == "$TEMP_DIR/nvram.fd" ]] &&
-  [[ "$SERIAL_PIPE" == "$TEMP_DIR/serial" ]] &&
-  [[ "$SERIAL_LOG" == "$TEMP_DIR/serial.log" ]] &&
-  [[ "$SERIAL_STATUS" == "$TEMP_DIR/serial.status" ]] &&
-  [[ "$SERIAL_STOP" == "$TEMP_DIR/serial.stop" ]] &&
+    [[ "$SERIAL_PIPE" == "$TEMP_DIR/serial" ]] &&
+    [[ "$SERIAL_LOG" == "$TEMP_DIR/serial.log" ]] &&
+    [[ "$SERIAL_READY_STATUS" == "$TEMP_DIR/serial.ready" ]] &&
+    [[ "$SERIAL_STATUS" == "$TEMP_DIR/serial.status" ]] &&
+    [[ "$SERIAL_SERVICE_STATUS" == "$TEMP_DIR/serial.service-started" ]] &&
+    [[ "$SERIAL_PROGRESS_STATUS" == "$TEMP_DIR/serial.progress" ]] &&
+    [[ "$SERIAL_STOP" == "$TEMP_DIR/serial.stop" ]] &&
   [[ "$SERIAL_COLLECTOR" == "$TEMP_DIR/serial-collector.py" ]] &&
   [[ "$DOMAIN_XML" == "$TEMP_DIR/domain.xml" ]] &&
   [[ "$USER_DATA" == "$TEMP_DIR/user-data" ]] &&
@@ -3343,11 +4083,34 @@ temp_layout_is_exact() {{
 }}
 
 stop_collector() {{
-  if [[ -n "$COLLECTOR_PID" ]]; then
-    : >"$SERIAL_STOP"
-    wait "$COLLECTOR_PID" 2>/dev/null || true
+  local pid deadline wait_status restore_errexit=0 state
+  [[ -n "$COLLECTOR_PID" ]] || return 0
+  pid="$COLLECTOR_PID"
+  : >"$SERIAL_STOP" || return 1
+  [[ "$-" == *e* ]] && restore_errexit=1
+  set +e
+  deadline=$((SECONDS + COLLECTOR_STOP_TIMEOUT_SECONDS))
+  while true; do
+    if state="$(collector_process_state)"; then
+      [[ "$state" == "running" ]] || break
+    fi
+    if (( SECONDS >= deadline )); then
+      /usr/bin/kill -TERM "$pid" 2>/dev/null
+      /usr/bin/kill -KILL "$pid" 2>/dev/null
+      if (( restore_errexit == 1 )); then set -e; fi
+      printf '%s\n' 'collector stop timed out' >&2
+      return 1
+    fi
+    /usr/bin/sleep 0.1
+  done
+  wait "$pid" 2>/dev/null
+  wait_status=$?
+  if (( restore_errexit == 1 )); then set -e; fi
+  if [[ $wait_status -eq 0 ]]; then
     COLLECTOR_PID=""
+    return 0
   fi
+  return 1
 }}
 
 verify_lock() {{
@@ -3365,19 +4128,152 @@ release_lock() {{
   fi
 }}
 
+remove_timeout_raw_artifacts() {{
+  local path
+  for path in "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$NVRAM" "$SERIAL_LOG" "$SERIAL_READY_STATUS" "$SERIAL_STATUS" "$SERIAL_SERVICE_STATUS" "$SERIAL_PROGRESS_STATUS" "$SERIAL_STOP" "$SERIAL_COLLECTOR" "${{SERIAL_PIPE}}.in" "${{SERIAL_PIPE}}.out" "$SOURCE_ARCHIVE" "$RUNTIME_ARCHIVE" "$SOURCE_MANIFEST_FILE" "$RUNTIME_MANIFEST_FILE"; do
+    [[ ! -L "$path" ]] || return 1
+    if [[ -e "$path" ]]; then
+      [[ -f "$path" || -p "$path" ]] || return 1
+    fi
+  done
+  /usr/bin/rm -f -- "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$NVRAM" "$SERIAL_LOG" "$SERIAL_READY_STATUS" "$SERIAL_STATUS" "$SERIAL_SERVICE_STATUS" "$SERIAL_PROGRESS_STATUS" "$SERIAL_STOP" "$SERIAL_COLLECTOR" "${{SERIAL_PIPE}}.in" "${{SERIAL_PIPE}}.out" "$SOURCE_ARCHIVE" "$RUNTIME_ARCHIVE" "$SOURCE_MANIFEST_FILE" "$RUNTIME_MANIFEST_FILE"
+  for path in "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$NVRAM" "$SERIAL_LOG" "$SERIAL_READY_STATUS" "$SERIAL_STATUS" "$SERIAL_SERVICE_STATUS" "$SERIAL_PROGRESS_STATUS" "$SERIAL_STOP" "$SERIAL_COLLECTOR" "${{SERIAL_PIPE}}.in" "${{SERIAL_PIPE}}.out" "$SOURCE_ARCHIVE" "$RUNTIME_ARCHIVE" "$SOURCE_MANIFEST_FILE" "$RUNTIME_MANIFEST_FILE"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+}}
+
+prepare_timeout_evidence() {{
+  [[ "$TIMEOUT_KIND" == "boot-timeout" || "$TIMEOUT_KIND" == "result-timeout" ]] || return 1
+  /usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(timeout_evidence)} prepare "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR"
+}}
+
+publish_timeout_evidence() {{
+  [[ "$TIMEOUT_KIND" == "boot-timeout" || "$TIMEOUT_KIND" == "result-timeout" ]] || return 1
+  /usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(timeout_evidence)} publish "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR"
+}}
+
+recover_timeout_evidence() {{
+  [[ "$TIMEOUT_KIND" == "boot-timeout" || "$TIMEOUT_KIND" == "result-timeout" ]] || return 1
+  /usr/bin/timeout --foreground "${{TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS}}s" /usr/bin/python3.13 -B -s -P -S -c {shlex.quote(timeout_evidence)} complete "$EVIDENCE_ROOT" "$RUN_ID" "$VM_NAME" "$SOURCE_COMMIT" "$TIMEOUT_KIND" "$TEMP_DIR"
+}}
+
+collector_process_state() {{
+  local pid="${{COLLECTOR_PID:-}}" state
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 ]] || return 1
+  if ! /usr/bin/kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' exited
+    return 0
+  fi
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  state="$(/usr/bin/awk '{{sub(/^.*\\) /,"",$0); print $1}}' "/proc/$pid/stat" 2>/dev/null)" || return 1
+  if [[ "$state" == "Z" ]]; then printf '%s\n' zombie; else printf '%s\n' running; fi
+}}
+
+collector_is_alive() {{
+  local state
+  state="$(collector_process_state)" || return 1
+  [[ "$state" == "running" ]]
+}}
+
+wait_for_collector_ready() {{
+  local deadline=$((SECONDS + COLLECTOR_READY_TIMEOUT_SECONDS)) value
+  while true; do
+    if [[ -e "$SERIAL_READY_STATUS" ]]; then
+      [[ -f "$SERIAL_READY_STATUS" ]] || return $COLLECTOR_INVALID_EXIT_STATUS
+      value="$(<"$SERIAL_READY_STATUS")"
+      [[ "$value" == "$COLLECTOR_READY_STATUS" ]] || return $COLLECTOR_INVALID_EXIT_STATUS
+      collector_is_alive || return $COLLECTOR_DEAD_EXIT_STATUS
+      return 0
+    fi
+    collector_is_alive || return $COLLECTOR_DEAD_EXIT_STATUS
+    (( SECONDS < deadline )) || return 124
+    /usr/bin/sleep 1
+  done
+}}
+
+wait_for_service_entry() {{
+  # SERVICE_STARTED_STATUS is published only for the exact SERVICE_ENTRY_MARKER.
+  local deadline=$((SECONDS + BOOT_TIMEOUT_SECONDS)) value
+  while true; do
+    if [[ -e "$SERIAL_SERVICE_STATUS" ]]; then
+      [[ -f "$SERIAL_SERVICE_STATUS" ]] || return $COLLECTOR_INVALID_EXIT_STATUS
+      value="$(<"$SERIAL_SERVICE_STATUS")"
+      [[ "$value" == "$SERVICE_STARTED_STATUS" ]] || return $COLLECTOR_INVALID_EXIT_STATUS
+      return 0
+    fi
+    if [[ -s "$SERIAL_STATUS" && "$(<"$SERIAL_STATUS")" == "overflow" ]]; then
+      return $COLLECTOR_INVALID_EXIT_STATUS
+    fi
+    collector_is_alive || return $COLLECTOR_DEAD_EXIT_STATUS
+    (( SECONDS < deadline )) || return 124
+    /usr/bin/sleep 1
+  done
+}}
+
+wait_for_terminal_status() {{
+  local deadline=$((SECONDS + RESULT_TIMEOUT_SECONDS)) value
+  while true; do
+    if [[ -e "$SERIAL_STATUS" ]]; then
+      [[ -f "$SERIAL_STATUS" ]] || return $COLLECTOR_INVALID_EXIT_STATUS
+      value="$(<"$SERIAL_STATUS")"
+      [[ "$value" == "complete" || "$value" == "overflow" ]] || return $COLLECTOR_INVALID_EXIT_STATUS
+      return 0
+    fi
+    collector_is_alive || return $COLLECTOR_DEAD_EXIT_STATUS
+    (( SECONDS < deadline )) || return 124
+    /usr/bin/sleep 1
+  done
+}}
+
+revalidate_domain_absence_before_publish() {{
+  verify_lock || return 1
+  if domain_presence; then
+    return 1
+  else
+    [[ $? -eq 1 ]]
+  fi
+}}
+
 cleanup() {{
-  local original_status="${{1:-1}}" cleanup_status=0 confirmed_absent=0
+  local original_status="${{1:-1}}" cleanup_status=0 confirmed_absent=0 collector_stopped=0 evidence_prepared=0
   trap - EXIT INT TERM
   set +e
-  stop_collector
   if shutdown_and_undefine; then confirmed_absent=1; else cleanup_status=1; fi
-  if (( confirmed_absent == 1 )) && temp_layout_is_exact; then
-    /usr/bin/rm -f -- "$DOMAIN_XML" "$USER_DATA" "$META_DATA" "$OVERLAY" "$SEED_ISO" "$NVRAM" "$SERIAL_LOG" "$SERIAL_STATUS" "$SERIAL_STOP" "$SERIAL_COLLECTOR" "$SERIAL_PIPE.in" "$SERIAL_PIPE.out" "$SOURCE_ARCHIVE" "$RUNTIME_ARCHIVE" "$SOURCE_MANIFEST_FILE" "$RUNTIME_MANIFEST_FILE"
-    /usr/bin/rmdir -- "$TEMP_DIR" || cleanup_status=1
-  elif [[ -n "$TEMP_DIR" ]]; then
-    printf '%s\\n' 'cleanup retained exact temporary artifacts because domain ownership/state was not confirmed' >&2
+  if stop_collector; then
+    collector_stopped=1
+  else
+    printf '%s\\n' 'collector stop timed out or failed' >&2
+    cleanup_status=1
   fi
-  if (( confirmed_absent == 1 )); then release_lock || cleanup_status=1; fi
+  if (( confirmed_absent == 1 && collector_stopped == 1 )) && temp_layout_is_exact; then
+    if [[ -n "$TIMEOUT_KIND" ]]; then
+      if prepare_timeout_evidence; then
+        evidence_prepared=1
+      else
+        cleanup_status=1
+      fi
+    fi
+    if [[ -z "$TIMEOUT_KIND" || "$evidence_prepared" == 1 ]]; then
+      if remove_timeout_raw_artifacts && /usr/bin/rmdir -- "$TEMP_DIR" && [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
+        if [[ "$evidence_prepared" == 1 ]]; then
+          if revalidate_domain_absence_before_publish; then
+            publish_timeout_evidence || cleanup_status=1
+          else
+            recover_timeout_evidence || cleanup_status=1
+          fi
+        fi
+      else
+        cleanup_status=1
+      fi
+    fi
+  elif [[ -n "$TEMP_DIR" ]]; then
+    if (( confirmed_absent == 1 && collector_stopped == 0 )); then
+      printf '%s\\n' 'cleanup retained exact temporary artifacts because collector stop was not confirmed' >&2
+    else
+      printf '%s\\n' 'cleanup retained exact temporary artifacts because domain ownership/state was not confirmed' >&2
+    fi
+  fi
+  if (( confirmed_absent == 1 && collector_stopped == 1 )); then release_lock || cleanup_status=1; fi
   if (( original_status == 0 && cleanup_status != 0 )); then original_status=1; fi
   exit "$original_status"
 }}
@@ -3417,7 +4313,10 @@ SEED_ISO="$TEMP_DIR/seed.iso"
 NVRAM="$TEMP_DIR/nvram.fd"
 SERIAL_PIPE="$TEMP_DIR/serial"
 SERIAL_LOG="$TEMP_DIR/serial.log"
+SERIAL_READY_STATUS="$TEMP_DIR/serial.ready"
 SERIAL_STATUS="$TEMP_DIR/serial.status"
+SERIAL_SERVICE_STATUS="$TEMP_DIR/serial.service-started"
+SERIAL_PROGRESS_STATUS="$TEMP_DIR/serial.progress"
 SERIAL_STOP="$TEMP_DIR/serial.stop"
 SERIAL_COLLECTOR="$TEMP_DIR/serial-collector.py"
 DOMAIN_XML="$TEMP_DIR/domain.xml"
@@ -3453,9 +4352,25 @@ printf '%s  %s\n' "$FIRMWARE_VARS_SHA256" "$NVRAM" | /usr/bin/sha256sum --check 
 /usr/bin/genisoimage -quiet -output "$SEED_ISO" -volid cidata -joliet -rock -graft-points "user-data=$USER_DATA" "meta-data=$META_DATA" "source.zip=$SOURCE_ARCHIVE" "runtime.zip=$RUNTIME_ARCHIVE" "source-manifest.json=$SOURCE_MANIFEST_FILE" "runtime-manifest.json=$RUNTIME_MANIFEST_FILE"
 
 /usr/bin/mkfifo -m 0600 "$SERIAL_PIPE.in" "$SERIAL_PIPE.out"
-/usr/bin/python3.13 -B -s -P -S "$SERIAL_COLLECTOR" "$SERIAL_PIPE.out" "$SERIAL_LOG" "$SERIAL_STATUS" "$SERIAL_STOP" "$MAX_SERIAL_BYTES" "$MAX_SERIAL_LINE_BYTES" &
+/usr/bin/python3.13 -B -s -P -S "$SERIAL_COLLECTOR" "$SERIAL_PIPE.out" "$SERIAL_LOG" "$SERIAL_READY_STATUS" "$SERIAL_STATUS" "$SERIAL_SERVICE_STATUS" "$SERIAL_PROGRESS_STATUS" "$SERIAL_STOP" "$MAX_SERIAL_BYTES" "$MAX_SERIAL_LINE_BYTES" &
 COLLECTOR_PID=$!
 
+set +e
+wait_for_collector_ready
+wait_status=$?
+set -e
+if [[ $wait_status -eq 124 ]]; then
+  printf '%s\\n' 'collector readiness wait expired' >&2
+  exit 1
+elif [[ $wait_status -eq "$COLLECTOR_DEAD_EXIT_STATUS" ]]; then
+  printf '%s\\n' 'collector readiness failed because the collector died' >&2
+  exit 1
+elif [[ $wait_status -ne 0 ]]; then
+  printf '%s\\n' 'collector readiness failed' >&2
+  exit 1
+fi
+
+collector_is_alive || {{ printf '%s\\n' 'collector died before domain definition' >&2; exit 1; }}
 /usr/bin/cat >"$DOMAIN_XML" <<DOMAIN_XML
 {domain_xml}DOMAIN_XML
 verify_lock
@@ -3465,13 +4380,46 @@ verify_domain_ownership
 /usr/bin/virsh --connect "$LIBVIRT_URI" autostart --disable "$VM_UUID"
 /usr/bin/virsh --connect "$LIBVIRT_URI" dominfo "$VM_UUID" | /usr/bin/awk -F: '/^Autostart/ {{gsub(/[[:space:]]/, "", $2); print $2}}' | /usr/bin/grep -qx disable
 verify_domain_ownership
+collector_is_alive || {{ printf '%s\\n' 'collector died before VM start' >&2; exit 1; }}
 /usr/bin/virsh --connect "$LIBVIRT_URI" start "$VM_UUID"
 
-if ! /usr/bin/timeout --foreground "${{RESULT_TIMEOUT_SECONDS}}s" /usr/bin/bash -c '
-  status="$1"
-  while [[ ! -s "$status" ]]; do /usr/bin/sleep 1; done
-' /usr/bin/bash "$SERIAL_STATUS"; then
+set +e
+wait_for_service_entry
+wait_status=$?
+set -e
+if [[ $wait_status -eq 124 ]]; then
+  TIMEOUT_KIND=boot-timeout
+  printf '%s\\n' 'bounded rehearsal boot wait expired' >&2
+  exit 1
+elif [[ $wait_status -eq "$COLLECTOR_DEAD_EXIT_STATUS" ]]; then
+  printf '%s\\n' 'collector died during boot' >&2
+  exit 1
+elif [[ $wait_status -ne 0 ]]; then
+  if [[ -s "$SERIAL_STATUS" && "$(<"$SERIAL_STATUS")" == "overflow" ]]; then
+    printf '%s\\n' 'serial output exceeded the bounded limit during boot' >&2
+  else
+    printf '%s\\n' 'service-entry status was invalid' >&2
+  fi
+  exit 1
+fi
+
+set +e
+wait_for_terminal_status
+wait_status=$?
+set -e
+if [[ $wait_status -eq 124 ]]; then
+  TIMEOUT_KIND=result-timeout
   printf '%s\\n' 'bounded rehearsal result wait expired' >&2
+  exit 1
+elif [[ $wait_status -eq "$COLLECTOR_DEAD_EXIT_STATUS" ]]; then
+  printf '%s\\n' 'collector died during result' >&2
+  exit 1
+elif [[ $wait_status -ne 0 ]]; then
+  if [[ -s "$SERIAL_STATUS" && "$(<"$SERIAL_STATUS")" == "overflow" ]]; then
+    printf '%s\\n' 'serial output exceeded the bounded limit during result' >&2
+  else
+    printf '%s\\n' 'terminal result status was invalid' >&2
+  fi
   exit 1
 fi
 SERIAL_RESULT="$(<"$SERIAL_STATUS")"
@@ -3600,13 +4548,54 @@ def render_plan(
         "hostFilesystemShares": [],
         "networkDevices": [],
         "tempParent": str(temp_parent),
+        "timeouts": {
+            "bootSeconds": BOOT_TIMEOUT_SECONDS,
+            "resultSeconds": RESULT_TIMEOUT_SECONDS,
+            "shutdownSeconds": SHUTDOWN_TIMEOUT_SECONDS,
+            "configuredPhaseDeadlineBudgetSeconds": PHASE_DEADLINE_BUDGET_SECONDS,
+            "configuredPhaseDeadlineBudgetMinutes": PHASE_DEADLINE_BUDGET_MINUTES,
+            "collectorReadySeconds": COLLECTOR_READY_TIMEOUT_SECONDS,
+            "collectorStopSeconds": COLLECTOR_STOP_TIMEOUT_SECONDS,
+            "evidenceHelperSeconds": TIMEOUT_EVIDENCE_HELPER_TIMEOUT_SECONDS,
+            "guestWatchdogSeconds": GUEST_WATCHDOG_SECONDS,
+            "systemdHardStopSeconds": SYSTEMD_HARD_STOP_SECONDS,
+        },
         "serialLog": {
             "directory": "<fresh-mktemp-dir>",
             "path": "$TEMP_DIR/serial.log",
+            "readyPath": "$TEMP_DIR/serial.ready",
+            "serviceStartedPath": "$TEMP_DIR/serial.service-started",
+            "progressPath": "$TEMP_DIR/serial.progress",
             "mode": "0600",
             "transport": "bounded-pipe-collector",
+            "serviceEntryMarker": SERVICE_ENTRY_MARKER,
+            "serviceStartedStatus": SERVICE_STARTED_STATUS,
+            "progressPrefix": PROGRESS_PREFIX,
+            "progressSchema": PROGRESS_SCHEMA,
+            "progressStages": sorted(PROGRESS_STAGES),
             "maxBytes": MAX_SERIAL_BYTES,
             "maxLineBytes": MAX_SERIAL_LINE_BYTES,
+        },
+        "timeoutEvidence": {
+            "schemaVersion": TIMEOUT_EVIDENCE_SCHEMA,
+            "root": str(TIMEOUT_EVIDENCE_ROOT),
+            "directoryMode": "0700",
+            "fileMode": "0600",
+            "maxBytes": MAX_TIMEOUT_EVIDENCE_BYTES,
+            "finalName": "<run-id>.json",
+            "temporaryName": TIMEOUT_EVIDENCE_PENDING_NAME,
+            "pendingSchema": TIMEOUT_EVIDENCE_PENDING_SCHEMA,
+            "pendingState": "raw-cleanup-pending",
+            "completeState": "raw-cleanup-complete",
+            "attestationFields": [
+                "rootDevice",
+                "rootInode",
+                "pendingDevice",
+                "pendingInode",
+                "finalRecordSha256",
+            ],
+            "rawSerialRetained": False,
+            "secretValuesRecorded": False,
         },
         "runtimeProbe": validated_probe,
         "runtimeProbeDigest": probe_digest,

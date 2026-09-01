@@ -47,25 +47,26 @@ before any future execution.
 - Modify: `tests/test_phase_b_rehearsal_tool.py`
 - Modify: `docs/phase-b-disposable-rehearsal.md`
 
-- [ ] Add failing tests for 600-second boot, 1020-second result, and 120-second
+- [x] Add failing tests for 600-second boot, 1020-second result, and 120-second
   shutdown budgets; independent marker/result waits; collector marker/progress
   parsing; and unchanged passing-result validation.
-- [ ] Add failing schema, redaction, metadata, atomic-write, cleanup-order, and
+- [x] Add failing schema, redaction, metadata, atomic-write, cleanup-order, and
   success-no-evidence tests for timeout evidence.
-- [ ] Run the focused tool tests and record the expected failures.
-- [ ] Implement the smallest fail-closed collector, wait, evidence writer, and
+- [x] Run the focused tool tests and record the expected failures.
+- [x] Implement the smallest fail-closed collector, wait, evidence writer, and
   cleanup changes that satisfy the tests.
-- [ ] Update operator documentation with the exact 29-minute maximum lifecycle,
-  phase-specific timeout messages, retained evidence location, and explicit
-  statement that a marker or progress record is never passing evidence.
-- [ ] Run focused tool and cross-layer suites and require them to pass.
-- [ ] Commit the task after independent review approves it.
+- [x] Update operator documentation with the exact 29-minute configured phase
+  deadline budget, phase-specific timeout messages, retained evidence
+  location, and explicit statements that control-plane cleanup overhead is
+  additional and a marker or progress record is never passing evidence.
+- [x] Run focused tool and cross-layer suites and require them to pass.
+- [x] Commit the task after independent review approves it.
 
 ### Task 3: Verify, review, and prepare the inert replacement package
 
-- [ ] Run syntax checks, `git diff --check`, focused guest/tool tests, and the
+- [x] Run syntax checks, `git diff --check`, focused guest/tool tests, and the
   complete repository test suite from the clean isolated worktree.
-- [ ] Obtain an ordinary `gpt-5.6-terra` review and fix all findings.
+- [x] Obtain an ordinary `gpt-5.6-terra` review and fix all findings.
 - [ ] Obtain a final `gpt-daybreak-blue-latest` security review and fix all
   findings; use `gpt-5.6-terra` only if Daybreak is unavailable.
 - [ ] Commit the fully reviewed source and verify the worktree is clean.

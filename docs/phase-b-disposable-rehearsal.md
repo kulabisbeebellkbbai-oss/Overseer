@@ -12,6 +12,98 @@ URL: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-
 SHA-512: 184761b0dad0f9ace02f9298050ca96ce3caa39a461a47706d47ff9698b59933918b91b40177fbd4d392f6446af8b4d18ecb94caca988169b19641606bf34003
 ```
 
+## v10 timing and timeout evidence
+
+The rendered future script uses independent, bounded phases. The boot budget
+starts immediately after the owned domain is started and waits only for the
+exact guest service-entry marker. The result budget starts only after that
+marker has been accepted and waits only for the collector's terminal result
+status.
+
+```text
+boot wait:     600 seconds
+result wait:  1020 seconds
+shutdown:      120 seconds
+configured phase deadline budget: 1740 seconds (29 minutes)
+collector readiness: 30 seconds
+collector stop:      10 seconds
+evidence helper:      10 seconds
+guest watchdog:      780 seconds
+systemd hard stop:   900 seconds
+```
+
+The 1740-second/29-minute configured phase deadline budget is derived from
+600 + 1020 + 120. It is not a hard wall-clock maximum: bounded control-plane cleanup overhead
+is additional. Legacy virsh and filesystem `fsync` work is
+not claimed to fit inside that 29-minute budget. The guest watchdog is shorter
+than the systemd hard stop, and both are before the result deadline.
+
+The fixed marker is timing evidence only. A marker never represents a passing
+rehearsal. The canonical progress record is also diagnostic evidence only and
+cannot satisfy result validation. A passing run still requires the unchanged
+canonical result frame, terminal `complete` status, post-shutdown collector
+validation, and every existing control.
+
+The operator-facing timeout messages identify the phase:
+
+```text
+bounded rehearsal boot wait expired
+bounded rehearsal result wait expired
+serial output exceeded the bounded limit during boot
+serial output exceeded the bounded limit during result
+```
+
+The first two messages set the timeout failure class to `boot-timeout` or
+`result-timeout`. An overflow, malformed marker/progress record, invalid
+terminal status, duplicate service marker, or late overflow fails closed and
+is not converted into a passing result.
+
+When and only when the owned domain has been authoritatively confirmed absent,
+a timeout run prepares one bounded canonical record under:
+
+```text
+/home/god/.local/share/overseer/phase-b-rehearsal-evidence/<run-id>.json
+```
+
+The directory is mode `0700` and the final record is mode `0600`; evidence is
+bounded to 2048 bytes. Preparation reads the exact status children through one
+validated temporary-directory descriptor, then writes the hidden
+`.run-id.pending.json` record exclusively and durably. That pending record has
+schema `overseer.phase-b-rehearsal-timeout-pending.v1`, state
+`raw-cleanup-pending`, and `rawSerialRetained: true`, and binds the evidence
+root device/inode, pending-file device/inode, and final-record digest.
+
+Raw serial and temporary files are then removed through the exact enumerated
+cleanup, the temporary directory is removed and its absence verified, and
+domain absence is revalidated immediately before publication. Publication
+reopens and reattests the evidence root and pending file, writes and fsyncs a
+new private `raw-cleanup-complete` record with `rawSerialRetained: false`, then
+atomically replaces the hidden pending name. It never truncates the only
+recovery record in place. Publication then uses an exclusive no-overwrite link
+for the final exact record. A collision, identity change, malformed
+status/progress, unsafe metadata, incomplete cleanup, or any
+write/link/fsync/unlink failure fails closed while retaining either the prior
+valid pending record or the valid completed replacement. A changed or unknown
+target-domain state produces no final record.
+
+The timeout record schema is
+`overseer.phase-b-rehearsal-timeout-evidence.v1` and its exact fields are:
+
+```text
+schemaVersion,status,failure,runId,vmName,sourceCommit,serviceStarted,
+resultStatus,lastStage,domainAbsent,rawSerialRetained,secretValuesRecorded
+```
+
+`status` is always `failed`; `failure` is `boot-timeout` or
+`result-timeout`; `resultStatus` is `absent`, `complete`, or `overflow`; and
+`lastStage` is null or an existing allowlisted guest stage. The record always
+sets `domainAbsent` to true, `rawSerialRetained` to false, and
+`secretValuesRecorded` to false. It never contains raw serial, QEMU output,
+paths, argv, environment, exception text, credentials, tokens, verifier
+values, or human input. Successful runs create no timeout-evidence directory
+or record. Unknown ownership/state retains the exact raw artifacts and creates
+no timeout evidence.
+
 ## Read-only preflight
 
 Preflight fails closed unless:
@@ -88,7 +180,7 @@ helper or refresh the index during the read-only probe.
 
 ## Immutable host-to-guest handoff
 
-The v8 plan has no host filesystem share. It binds canonical source and runtime
+The v10 plan has no host filesystem share. It binds canonical source and runtime
 manifests, their SHA-256 digests, deterministic stored-ZIP digests, the runtime
 probe, KVM capability probe, source commit, exact owner attestation, domain XML,
 cloud-init, and future script under `planDigest`. The owner attestation contains
@@ -214,12 +306,38 @@ deletes and never touches the base image or source/runtime origins.
 
 ## Bounded serial evidence
 
-The serial device writes through a FIFO pair to a dedicated collector. The
-collector continuously drains the pipe, stores no more than 1 MiB, enforces a
-64 KiB line bound, and upgrades a previously seen completion to overflow if
-later data crosses either bound. After the owned VM is inactive, a streaming
-validator rereads the collector's terminal status and requires it still be
-`complete`, then requires exactly one begin/end pair framing one canonical JSON line.
+The serial device writes through a FIFO pair to a dedicated collector. After
+FIFO and log setup, the collector publishes one mode-`0600` `collector-ready`
+status. The future script waits for that status, and checks the exact collector
+child liveness during readiness, boot, and result waits, before it defines or
+starts the VM.
+
+The collector continuously drains the pipe, stores no more than 1 MiB, enforces
+a 64 KiB line bound, and upgrades a previously seen completion to overflow if
+later data crosses either bound. Before the exact line
+`OVERSEER_PHASE_B_REHEARSAL_SERVICE_STARTED`, exact-prefix progress, result
+begin/end, and marker-prefix variants are overflow. Unrelated nearby lines
+remain ordinary bounded serial output. The exact marker publishes the exact
+`service-started` status once; a duplicate marker fails closed. Progress and
+result framing are accepted only after that marker. Lines that begin with
+`OVERSEER_PHASE_B_REHEARSAL_PROGRESS` must contain one canonical JSON record
+with schema `overseer.phase-b-rehearsal-progress.v1`, the exact three-field key
+set, `secretValuesRecorded: false`, and an allowlisted stage. The collector
+publishes only the last such canonical progress record. A fixed marker or
+progress record is timing/diagnostic evidence only and is never a passing
+result.
+
+Collector death or readiness failure is distinct from a boot/result timeout and
+creates no timeout evidence. Collector stop is bounded to 10 seconds and must
+reap a clean child exit before a complete result is accepted. A timeout or
+unclean collector exit returns without an unbounded `wait`, retains the exact
+temporary artifacts and execution lock, and requires explicit recovery.
+Shutdown is attempted before waiting on a collector so guest chatter cannot
+block owned VM cleanup.
+
+After the owned VM is inactive, a streaming validator rereads the collector's
+terminal status and requires it still be `complete`, then requires exactly one
+begin/end pair framing one canonical JSON line.
 It rejects over-limit output, oversized lines, duplicate or flooded sentinels,
 invalid UTF-8, incomplete frames, noncanonical JSON, missing controls, failure
 state, and secret markers. It never reads the complete serial file into memory.

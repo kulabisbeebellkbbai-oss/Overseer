@@ -8228,25 +8228,51 @@ def _dispatch_crew_messages_status_unlocked(
         store = SQLiteStore(store_path)
         try:
             dispatch_audit_id = f"audit.{message.id}.dispatch.{_status_id(now)}"
-            review = _automatic_crew_review(store_path, message, result, final_status, dispatch_audit_id, dispatched_by, now)
-            updated = replace(message, status=final_status, updated_at=now, **review)
-            dispatch_audit_event = AuditEvent(
-                id=dispatch_audit_id,
-                event_type=AuditEventType.BLOCKED if result.get("status") == "blocked" else AuditEventType.EXECUTED,
-                owner_domain=message.owner_domain,
-                subject_id=message.id,
-                summary=f"{message.owner_domain.value} dispatch {result['status']}: {result['reason']}",
-                risk_level=message.priority,
-                evidence_ids=_linked_role_action_evidence(message, result),
-                occurred_at=now,
-            )
             if _is_dax_linked_message(message):
                 with store.agent_transaction():
+                    latest = store.load_crew_message(message.id)
+                    if not _canonical_role_handoff_matches(latest, message):
+                        raise ValueError(
+                            "linked Dax ROLE approval message changed before final persistence"
+                        )
+                    review = _automatic_crew_review(
+                        store_path,
+                        latest,
+                        result,
+                        final_status,
+                        dispatch_audit_id,
+                        dispatched_by,
+                        now,
+                        store=store,
+                    )
+                    updated = replace(latest, status=final_status, updated_at=now, **review)
+                    dispatch_audit_event = AuditEvent(
+                        id=dispatch_audit_id,
+                        event_type=AuditEventType.BLOCKED if result.get("status") == "blocked" else AuditEventType.EXECUTED,
+                        owner_domain=latest.owner_domain,
+                        subject_id=latest.id,
+                        summary=f"{latest.owner_domain.value} dispatch {result['status']}: {result['reason']}",
+                        risk_level=latest.priority,
+                        evidence_ids=_linked_role_action_evidence(latest, result),
+                        occurred_at=now,
+                    )
                     if any(event.id == dispatch_audit_id for event in store.list_audit_events()):
                         raise ValueError("linked Dax ROLE approval dispatch audit id already exists")
                     store.save_crew_message(updated)
                     store.save_audit_event(dispatch_audit_event)
             else:
+                review = _automatic_crew_review(store_path, message, result, final_status, dispatch_audit_id, dispatched_by, now)
+                updated = replace(message, status=final_status, updated_at=now, **review)
+                dispatch_audit_event = AuditEvent(
+                    id=dispatch_audit_id,
+                    event_type=AuditEventType.BLOCKED if result.get("status") == "blocked" else AuditEventType.EXECUTED,
+                    owner_domain=message.owner_domain,
+                    subject_id=message.id,
+                    summary=f"{message.owner_domain.value} dispatch {result['status']}: {result['reason']}",
+                    risk_level=message.priority,
+                    evidence_ids=_linked_role_action_evidence(message, result),
+                    occurred_at=now,
+                )
                 store.save_crew_message(updated)
                 store.save_audit_event(dispatch_audit_event)
             result["message_status"] = updated.status.value
@@ -8522,7 +8548,17 @@ def _save_reconciliation_review_audit_event(store: SQLiteStore, event: AuditEven
     store.save_audit_event(event)
 
 
-def _automatic_crew_review(store_path, message, result, delivery_status, evidence_id: str, decided_by: str, decided_at: str) -> dict[str, object]:
+def _automatic_crew_review(
+    store_path,
+    message,
+    result,
+    delivery_status,
+    evidence_id: str,
+    decided_by: str,
+    decided_at: str,
+    *,
+    store: SQLiteStore | None = None,
+) -> dict[str, object]:
     if delivery_status != CrewMessageStatus.ACKNOWLEDGED:
         return {}
     text = f"{message.subject}\n{message.message}".lower()
@@ -8553,6 +8589,7 @@ def _automatic_crew_review(store_path, message, result, delivery_status, evidenc
             result,
             evidence_id,
             decided_at,
+            store=store,
         )
         if linked_role_review is not None:
             return linked_role_review

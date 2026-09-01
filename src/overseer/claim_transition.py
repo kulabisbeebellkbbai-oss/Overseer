@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import hmac
@@ -16,11 +16,12 @@ import sqlite3
 import sys
 from typing import Iterable, Iterator
 
-from .audit import ApprovalStatus, AuditEvent, AuditEventType
+from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
 from .claim_continuation import (
     ClaimActivationGroup,
     ClaimActivationGroupState,
     ClaimApprovalContinuation,
+    ClaimApprovalContinuationAttempt,
     ContinuationState,
     TRUSTED_PSYCHLO_STORE,
     _validate_psychlo_round,
@@ -58,6 +59,23 @@ _RECORD_SET_TABLES = (
     "claim_approval_continuations",
     "claim_approval_continuation_attempts",
 )
+
+
+@dataclass(frozen=True)
+class _TransitionPostconditions:
+    predecessor: Claim
+    successor: Claim
+    predecessor_resource: Resource
+    successor_resource: Resource
+    approval: ApprovalRequest
+    continuation: ClaimApprovalContinuation
+    attempt: ClaimApprovalContinuationAttempt
+    predecessor_group_id: str
+    predecessor_group: ClaimActivationGroup | None
+    successor_group_id: str
+    successor_group: ClaimActivationGroup | None
+    release_audit: AuditEvent
+    transition_audit: AuditEvent
 
 
 def canonical_claim_transition_record_set_digest(
@@ -590,7 +608,17 @@ def _validate_inputs(
     expected_lifecycle_id: str,
     plan_digest: str,
     evidence_ids: tuple[str, ...],
-) -> tuple[Claim, Claim, Resource, Resource, OwnerDomain, ApprovalStatus, ClaimApprovalContinuation]:
+) -> tuple[
+    Claim,
+    Claim,
+    Resource,
+    Resource,
+    OwnerDomain,
+    ApprovalStatus,
+    ClaimApprovalContinuation,
+    ApprovalRequest,
+    ClaimApprovalContinuationAttempt,
+]:
     for value, name in (
         (predecessor_claim_id, "predecessor_claim_id"),
         (successor_claim_id, "successor_claim_id"),
@@ -738,6 +766,8 @@ def _validate_inputs(
         owner_role,
         approval.status,
         continuation,
+        approval,
+        attempt,
     )
 
 
@@ -786,79 +816,95 @@ def _event_evidence(
 def _verify_transition(
     store: SQLiteStore,
     *,
-    predecessor_claim_id: str,
-    successor_claim_id: str,
-    approval_id: str,
-    expected_resource_id: str,
-    expected_owner_role: OwnerDomain,
-    expected_continuation: ClaimApprovalContinuation,
-    release_group_id: str | None,
-    successor_group_id: str,
-    release_audit_id: str,
-    transition_audit_id: str,
-    evidence_ids: tuple[str, ...],
+    postconditions: _TransitionPostconditions,
+    require_no_transaction: bool = False,
 ) -> None:
-    predecessor = store.load_claim(predecessor_claim_id)
-    successor = store.load_claim(successor_claim_id)
-    predecessor_resource = store.load_resource(predecessor.resource_id)
-    successor_resource = store.load_resource(expected_resource_id)
+    if require_no_transaction and store._connection.in_transaction:
+        raise ValueError("claim transition postconditions are not committed")
+
+    predecessor = store.load_claim(postconditions.predecessor.id)
+    successor = store.load_claim(postconditions.successor.id)
+    predecessor_resource = store.load_resource(postconditions.predecessor_resource.id)
+    successor_resource = store.load_resource(postconditions.successor_resource.id)
     if (
-        predecessor.status != ClaimStatus.RELEASED
-        or predecessor_resource.current_claim_id is not None
-        or predecessor_resource.owner_domain != expected_owner_role
-        or successor.status != ClaimStatus.ACTIVE
-        or successor.approval_id != approval_id
-        or successor_resource.current_claim_id != successor_claim_id
-        or successor_resource.owner_domain != expected_owner_role
+        predecessor != postconditions.predecessor
+        or successor != postconditions.successor
+        or predecessor_resource != postconditions.predecessor_resource
+        or successor_resource != postconditions.successor_resource
     ):
         raise ValueError("claim transition postcondition failed")
-    approval = store.load_approval(approval_id)
-    if (
-        approval.id != approval_id
-        or approval.subject_id != successor_claim_id
-        or approval.requester_thread != successor.owner_thread
-        or approval.owner_domain != expected_owner_role
-        or approval.approval_level != ApprovalLevel.ROLE
-        or approval.status != ApprovalStatus.APPROVED
-        or approval.decided_by != expected_owner_role.value
-        or not approval.decided_at
-    ):
+
+    approval = store.load_approval(postconditions.approval.id)
+    if approval != postconditions.approval:
         raise ValueError("successor approval postcondition failed")
+
     successor_continuations = tuple(
         continuation
         for continuation in store.list_claim_approval_continuations()
-        if continuation.claim_id == successor_claim_id
+        if continuation.claim_id == postconditions.successor.id
     )
-    if successor_continuations != (expected_continuation,):
+    if successor_continuations != (postconditions.continuation,):
         raise ValueError("successor continuation postcondition failed")
-    if not expected_continuation.attempt_id:
+    if not postconditions.continuation.attempt_id:
         raise ValueError("successor continuation delivery postcondition failed")
-    attempt = store.load_claim_approval_continuation_attempt(expected_continuation.attempt_id)
-    if (
-        attempt.id != expected_continuation.attempt_id
-        or attempt.continuation_id != expected_continuation.id
-        or attempt.owner_thread != expected_continuation.owner_thread
-        or attempt.state != ContinuationState.DELIVERED
-        or not attempt.attempted_at
-        or attempt.result_status != "prompt_dispatched"
-        or not attempt.result_reason
+    attempt = store.load_claim_approval_continuation_attempt(
+        postconditions.continuation.attempt_id
+    )
+    if attempt != postconditions.attempt:
+        raise ValueError("successor continuation delivery postcondition failed")
+
+    groups = {
+        group.id: group for group in store.list_claim_activation_groups()
+    }
+    for group_id, expected_group, failure in (
+        (
+            postconditions.predecessor_group_id,
+            postconditions.predecessor_group,
+            "predecessor group transition postcondition failed",
+        ),
+        (
+            postconditions.successor_group_id,
+            postconditions.successor_group,
+            "successor group transition postcondition failed",
+        ),
     ):
-        raise ValueError("successor continuation delivery postcondition failed")
-    if release_group_id is not None:
-        if store.load_claim_activation_group(release_group_id).state != ClaimActivationGroupState.RELEASED:
-            raise ValueError("predecessor group transition postcondition failed")
-        if store.load_claim_activation_group(successor_group_id).state != ClaimActivationGroupState.ACTIVE:
-            raise ValueError("successor group transition postcondition failed")
+        if groups.get(group_id) != expected_group:
+            raise ValueError(failure)
+
     events = {event.id: event for event in store.list_audit_events()}
-    for event_id, event_type, subject_id in (
-        (release_audit_id, AuditEventType.RELEASED, predecessor_claim_id),
-        (transition_audit_id, AuditEventType.EXECUTED, successor_claim_id),
+    for event_id, expected_event, failure in (
+        (
+            postconditions.release_audit.id,
+            postconditions.release_audit,
+            "claim transition audit postcondition failed",
+        ),
+        (
+            postconditions.transition_audit.id,
+            postconditions.transition_audit,
+            "claim transition audit postcondition failed",
+        ),
     ):
         event = events.get(event_id)
-        if event is None or event.event_type != event_type or event.subject_id != subject_id:
-            raise ValueError("claim transition audit postcondition failed")
-        if not set(evidence_ids).issubset(event.evidence_ids):
-            raise ValueError("claim transition audit evidence postcondition failed")
+        if event != expected_event:
+            raise ValueError(failure)
+
+
+def _recognize_committed_transition(
+    store: SQLiteStore,
+    postconditions: _TransitionPostconditions | None,
+) -> bool:
+    """Recognize only a complete transition visible outside a transaction."""
+    if postconditions is None:
+        return False
+    try:
+        _verify_transition(
+            store,
+            postconditions=postconditions,
+            require_no_transaction=True,
+        )
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        return False
+    return True
 
 
 def transition_claim_status(
@@ -886,7 +932,17 @@ def transition_claim_status(
     _require_text(transitioned_at, "transitioned_at")
     release_audit_id = f"audit.claim-transition.{successor_claim_id}.predecessor-released"
     transition_audit_id = f"audit.claim-transition.{successor_claim_id}.executed"
+    result = {
+        "status": "transitioned",
+        "predecessor_claim_id": predecessor_claim_id,
+        "successor_claim_id": successor_claim_id,
+        "approval_id": approval_id,
+        "transitioned_at": transitioned_at,
+        "audit_event_ids": [release_audit_id, transition_audit_id],
+    }
     store = SQLiteStore(store_path)
+    postconditions: _TransitionPostconditions | None = None
+    committed = False
     try:
         psychlo_store_path = _psychlo_store_path or TRUSTED_PSYCHLO_STORE
         with _transition_transaction(
@@ -903,6 +959,8 @@ def transition_claim_status(
                     owner_role,
                     _approval_status,
                     continuation,
+                    approval,
+                    attempt,
                 ) = _validate_inputs(
                     store,
                     predecessor_claim_id=predecessor_claim_id,
@@ -973,6 +1031,55 @@ def transition_claim_status(
                     transitioned_by=transitioned_by,
                     transitioned_at=transitioned_at,
                 )
+                release_audit = AuditEvent(
+                    id=release_audit_id,
+                    event_type=AuditEventType.RELEASED,
+                    owner_domain=owner_role,
+                    subject_id=predecessor_claim_id,
+                    summary=f"released predecessor for atomic claim transition by {transitioned_by}",
+                    risk_level=predecessor.risk_level,
+                    evidence_ids=bound_evidence,
+                    occurred_at=transitioned_at,
+                )
+                transition_audit = AuditEvent(
+                    id=transition_audit_id,
+                    event_type=AuditEventType.EXECUTED,
+                    owner_domain=owner_role,
+                    subject_id=successor_claim_id,
+                    summary=f"activated successor for atomic claim transition by {transitioned_by}",
+                    risk_level=successor.risk_level,
+                    evidence_ids=bound_evidence,
+                    occurred_at=transitioned_at,
+                )
+                postconditions = _TransitionPostconditions(
+                    predecessor=released_predecessor,
+                    successor=active_successor,
+                    predecessor_resource=released_predecessor_resource,
+                    successor_resource=active_successor_resource,
+                    approval=approval,
+                    continuation=continuation,
+                    attempt=attempt,
+                    predecessor_group_id=expected_predecessor_activation_group_id,
+                    predecessor_group=(
+                        replace(
+                            group_pair[0],
+                            state=ClaimActivationGroupState.RELEASED,
+                        )
+                        if group_pair is not None
+                        else None
+                    ),
+                    successor_group_id=expected_activation_group_id,
+                    successor_group=(
+                        replace(
+                            group_pair[1],
+                            state=ClaimActivationGroupState.ACTIVE,
+                        )
+                        if group_pair is not None
+                        else None
+                    ),
+                    release_audit=release_audit,
+                    transition_audit=transition_audit,
+                )
                 store.save_claim(released_predecessor, store.load_decision(predecessor_claim_id))
                 store.save_resource(released_predecessor_resource)
                 store.save_claim(active_successor, store.load_decision(successor_claim_id))
@@ -986,50 +1093,32 @@ def transition_claim_status(
                         replace(successor_group, state=ClaimActivationGroupState.ACTIVE)
                     )
                 store.save_audit_event(
-                    AuditEvent(
-                        id=release_audit_id,
-                        event_type=AuditEventType.RELEASED,
-                        owner_domain=owner_role,
-                        subject_id=predecessor_claim_id,
-                        summary=f"released predecessor for atomic claim transition by {transitioned_by}",
-                        risk_level=predecessor.risk_level,
-                        evidence_ids=bound_evidence,
-                        occurred_at=transitioned_at,
-                    )
+                    release_audit
                 )
                 store.save_audit_event(
-                    AuditEvent(
-                        id=transition_audit_id,
-                        event_type=AuditEventType.EXECUTED,
-                        owner_domain=owner_role,
-                        subject_id=successor_claim_id,
-                        summary=f"activated successor for atomic claim transition by {transitioned_by}",
-                        risk_level=successor.risk_level,
-                        evidence_ids=bound_evidence,
-                        occurred_at=transitioned_at,
-                    )
+                    transition_audit
                 )
                 _verify_transition(
                     store,
-                    predecessor_claim_id=predecessor_claim_id,
-                    successor_claim_id=successor_claim_id,
-                    approval_id=approval_id,
-                    expected_resource_id=expected_resource_id,
-                    expected_owner_role=owner_role,
-                    expected_continuation=continuation,
-                    release_group_id=group_pair[0].id if group_pair is not None else None,
-                    successor_group_id=expected_activation_group_id,
-                    release_audit_id=release_audit_id,
-                    transition_audit_id=transition_audit_id,
-                    evidence_ids=bound_evidence,
+                    postconditions=postconditions,
                 )
-        return {
-            "status": "transitioned",
-            "predecessor_claim_id": predecessor_claim_id,
-            "successor_claim_id": successor_claim_id,
-            "approval_id": approval_id,
-            "transitioned_at": transitioned_at,
-            "audit_event_ids": [release_audit_id, transition_audit_id],
-        }
+        if postconditions is None:
+            raise ValueError("claim transition postconditions are unavailable")
+        _verify_transition(
+            store,
+            postconditions=postconditions,
+            require_no_transaction=True,
+        )
+        committed = True
+        return result
+    except Exception:
+        if _recognize_committed_transition(store, postconditions):
+            committed = True
+            return result
+        raise
     finally:
-        store.close()
+        try:
+            store.close()
+        except Exception:
+            if not committed:
+                raise

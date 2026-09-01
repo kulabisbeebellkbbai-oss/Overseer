@@ -12513,6 +12513,35 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(second["claim_status"], ClaimStatus.QUEUED.value)
             self.assertEqual(second["blocking_claim_ids"], ["claim.cli.first"])
 
+    def _prepare_open_dax_role_approval(self, store_path, suffix):
+        resource_id = f"proxy.dispatch-toctou-{suffix}"
+        claim_id = f"claim.cli.dispatch-toctou-{suffix}"
+        store = SQLiteStore(store_path)
+        store.save_resource(
+            Resource(
+                id=resource_id,
+                name=f"Dispatch TOCTOU {suffix} Proxy",
+                type=ResourceType.VIRTUAL_ASSET,
+                owner_domain=OwnerDomain.DAX,
+                risk_level=RiskLevel.LOW,
+            )
+        )
+        store.close()
+        return request_claim_status(
+            store_path,
+            claim_id,
+            resource_id,
+            ClaimType.LEASE.value,
+            f"thread-dispatch-toctou-{suffix}",
+            OwnerDomain.DAX.value,
+            "run one bounded loopback test",
+            "bind an OS-assigned loopback listener",
+            RiskLevel.LOW.value,
+            activation_group_id=f"group.{claim_id}",
+            lifecycle_id=f"lifecycle.{claim_id}",
+            release_condition="release immediately after the test",
+        )
+
     def _prepare_replayable_dax_role_approval(self, store_path, suffix):
         resource_id = f"proxy.role-handoff-{suffix}"
         claim_id = f"claim.cli.role-handoff-{suffix}"
@@ -12793,6 +12822,133 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(message.status, CrewMessageStatus.OPEN)
             self.assertEqual(message.review_status, CrewReviewStatus.PENDING)
             self.assertEqual(dispatch_events, [dispatch_event])
+
+    def test_linked_dax_dispatch_revalidates_dispatch_gap_mutations(self):
+        cases = ("message", "claim", "approval", "action")
+        for mutation in cases:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                requested = self._prepare_open_dax_role_approval(store_path, mutation)
+                result_holder = []
+                armed = False
+                injected = False
+                original_dispatch = overseer_cli._dispatch_crew_message
+                original_agent_transaction = SQLiteStore.agent_transaction
+
+                def dispatch_and_arm(dispatch_store_path, message, dispatched_by, dispatched_at):
+                    nonlocal armed
+                    result = original_dispatch(
+                        dispatch_store_path,
+                        message,
+                        dispatched_by,
+                        dispatched_at,
+                    )
+                    result_holder.append(result)
+                    armed = True
+                    return result
+
+                @contextlib.contextmanager
+                def inject_before_final_transaction(store):
+                    nonlocal injected
+                    if armed and not injected:
+                        injected = True
+                        if mutation == "message":
+                            current = store.load_crew_message(requested["approval_handoff_id"])
+                            writer = SQLiteStore(store_path)
+                            try:
+                                writer.save_crew_message(
+                                    replace(
+                                        current,
+                                        subject="Newer canonical approval handoff",
+                                        request_evidence_ids=("evidence.newer-message",),
+                                    )
+                                )
+                            finally:
+                                writer.close()
+                        elif mutation == "claim":
+                            writer = SQLiteStore(store_path)
+                            try:
+                                claim = writer.load_claim(requested["claim"])
+                                writer.save_claim(
+                                    replace(claim, status=ClaimStatus.ACTIVE)
+                                )
+                            finally:
+                                writer.close()
+                        elif mutation == "approval":
+                            writer = SQLiteStore(store_path)
+                            try:
+                                approval = writer.load_approval(requested["approval_id"])
+                                writer.save_approval(replace(approval, decided_by="forged-dax"))
+                            finally:
+                                writer.close()
+                        else:
+                            result_holder[0]["actions"][0]["claim_id"] = "claim.forged-in-dispatch-gap"
+                    with original_agent_transaction(store):
+                        yield
+
+                with patch.object(
+                    overseer_cli,
+                    "_dispatch_crew_message",
+                    new=dispatch_and_arm,
+                ), patch.object(
+                    SQLiteStore,
+                    "agent_transaction",
+                    new=inject_before_final_transaction,
+                ), patch(
+                    "overseer.cli.discover_virtual_listeners_status",
+                    return_value={"listeners": 0, "host_mutation_performed": False},
+                ):
+                    if mutation == "message":
+                        with self.assertRaisesRegex(ValueError, "changed before final persistence"):
+                            dispatch_crew_messages_status(
+                                store_path,
+                                message_id=requested["approval_handoff_id"],
+                                dispatched_at="2026-08-21T20:08:00+00:00",
+                            )
+                        dispatched = None
+                    else:
+                        dispatched = dispatch_crew_messages_status(
+                            store_path,
+                            message_id=requested["approval_handoff_id"],
+                            dispatched_at="2026-08-21T20:08:00+00:00",
+                        )
+
+                self.assertTrue(injected)
+                store = SQLiteStore(store_path)
+                try:
+                    message = store.load_crew_message(requested["approval_handoff_id"])
+                    claim = store.load_claim(requested["claim"])
+                    approval = store.load_approval(requested["approval_id"])
+                    dispatch_events = [
+                        event
+                        for event in store.list_audit_events()
+                        if event.id.startswith(f"audit.{message.id}.dispatch.")
+                    ]
+                finally:
+                    store.close()
+
+                if mutation == "message":
+                    self.assertEqual(message.subject, "Newer canonical approval handoff")
+                    self.assertEqual(message.request_evidence_ids, ("evidence.newer-message",))
+                    self.assertEqual(message.status, CrewMessageStatus.OPEN)
+                    self.assertEqual(message.review_status, CrewReviewStatus.PENDING)
+                    self.assertEqual(dispatch_events, [])
+                    continue
+                self.assertEqual(dispatched["processed"], 1, mutation)
+                self.assertEqual(dispatched["approved"], 0, mutation)
+                self.assertEqual(dispatched["correction_requested"], 1, mutation)
+                self.assertEqual(message.review_status, CrewReviewStatus.CORRECTION_REQUESTED, mutation)
+                self.assertNotEqual(
+                    message.decision_reason,
+                    f"dax approved the exact original ROLE approval {requested['approval_id']}; activation remains separate",
+                )
+                self.assertEqual(len(dispatch_events), 1, mutation)
+                if mutation == "claim":
+                    self.assertEqual(claim.status, ClaimStatus.ACTIVE)
+                elif mutation == "approval":
+                    self.assertEqual(approval.decided_by, "forged-dax")
+                else:
+                    self.assertIn("action fields", message.decision_reason)
 
     def test_reconciliation_replays_exact_dax_role_approval_review(self):
         with tempfile.TemporaryDirectory() as directory:

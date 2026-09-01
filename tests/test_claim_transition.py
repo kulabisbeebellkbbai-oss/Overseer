@@ -469,6 +469,185 @@ def test_transition_claim_status_atomically_releases_and_activates_with_bound_au
         store.close()
 
 
+def _assert_exact_transition_on_open_store(store: SQLiteStore) -> None:
+    assert not store._connection.in_transaction
+
+    predecessor = store.load_claim(PREDECESSOR_CLAIM_ID)
+    successor = store.load_claim(SUCCESSOR_CLAIM_ID)
+    assert predecessor.status == ClaimStatus.RELEASED
+    assert predecessor.resource_id == PREDECESSOR_RESOURCE_ID
+    assert predecessor.activation_group_id == PREDECESSOR_GROUP_ID
+    assert predecessor.lifecycle_id == PREDECESSOR_LIFECYCLE_ID
+    assert successor.status == ClaimStatus.ACTIVE
+    assert successor.resource_id == SUCCESSOR_RESOURCE_ID
+    assert successor.approval_id == APPROVAL_ID
+    assert successor.activation_group_id == ACTIVATION_GROUP_ID
+    assert successor.lifecycle_id == LIFECYCLE_ID
+
+    assert store.load_resource(PREDECESSOR_RESOURCE_ID).current_claim_id is None
+    assert store.load_resource(SUCCESSOR_RESOURCE_ID).current_claim_id == SUCCESSOR_CLAIM_ID
+    assert store.list_claim_activation_groups() == ()
+
+    approval = store.load_approval(APPROVAL_ID)
+    assert approval.subject_id == SUCCESSOR_CLAIM_ID
+    assert approval.owner_domain == OwnerDomain.DAX
+    assert approval.approval_level == ApprovalLevel.ROLE
+    assert approval.status == ApprovalStatus.APPROVED
+    assert approval.decided_by == OWNER_ROLE
+    assert approval.decided_at == "2026-09-01T11:50:00+00:00"
+
+    continuations = tuple(
+        continuation
+        for continuation in store.list_claim_approval_continuations()
+        if continuation.claim_id == SUCCESSOR_CLAIM_ID
+    )
+    assert len(continuations) == 1
+    continuation = continuations[0]
+    assert continuation.id == CONTINUATION_ID
+    assert continuation.approval_id == APPROVAL_ID
+    assert continuation.resource_id == SUCCESSOR_RESOURCE_ID
+    assert continuation.owner_thread == OWNER_THREAD
+    assert continuation.owner_role == OwnerDomain.DAX
+    assert continuation.activation_group_id == ACTIVATION_GROUP_ID
+    assert continuation.lifecycle_id == LIFECYCLE_ID
+    assert continuation.state == ContinuationState.DELIVERED
+    assert continuation.attempt_id == CONTINUATION_ATTEMPT_ID
+
+    attempt = store.load_claim_approval_continuation_attempt(CONTINUATION_ATTEMPT_ID)
+    assert attempt.continuation_id == CONTINUATION_ID
+    assert attempt.owner_thread == OWNER_THREAD
+    assert attempt.state == ContinuationState.DELIVERED
+    assert attempt.attempted_at == "2026-09-01T11:55:00+00:00"
+    assert attempt.result_status == "prompt_dispatched"
+    assert attempt.result_reason == "delivered to the exact owner thread"
+
+    events = {event.id: event for event in store.list_audit_events()}
+    assert events[RELEASE_AUDIT_ID].event_type == AuditEventType.RELEASED
+    assert events[RELEASE_AUDIT_ID].subject_id == PREDECESSOR_CLAIM_ID
+    assert events[TRANSITION_AUDIT_ID].event_type == AuditEventType.EXECUTED
+    assert events[TRANSITION_AUDIT_ID].subject_id == SUCCESSOR_CLAIM_ID
+    assert all(
+        {
+            PREDECESSOR_CLAIM_ID,
+            SUCCESSOR_CLAIM_ID,
+            APPROVAL_ID,
+            CONTINUATION_ID,
+            PLAN_DIGEST,
+            *EVIDENCE_IDS,
+        }.issubset(events[event_id].evidence_ids)
+        for event_id in (RELEASE_AUDIT_ID, TRANSITION_AUDIT_ID)
+    )
+
+
+def test_transition_recognizes_real_commit_before_postcommit_hardening_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    original_commit = SQLiteStore._commit
+    original_close = SQLiteStore.close
+    committed_store: SQLiteStore | None = None
+    committed_connection: sqlite3.Connection | None = None
+    verified_before_close = False
+
+    def commit_then_raise_hardening_error(store: SQLiteStore) -> None:
+        nonlocal committed_store, committed_connection
+        original_commit(store)
+        if store.path == path:
+            committed_store = store
+            committed_connection = store._connection
+            raise OSError("simulated postcommit hardening/path error")
+
+    def verify_original_connection_before_close(store: SQLiteStore) -> None:
+        nonlocal verified_before_close
+        if store is committed_store:
+            assert store._connection is committed_connection
+            _assert_exact_transition_on_open_store(store)
+            verified_before_close = True
+        original_close(store)
+
+    monkeypatch.setattr(SQLiteStore, "_commit", commit_then_raise_hardening_error)
+    monkeypatch.setattr(SQLiteStore, "close", verify_original_connection_before_close)
+
+    result = transition_claim_status(**arguments)
+
+    assert result["status"] == "transitioned"
+    assert committed_store is not None
+    assert committed_connection is not None
+    assert verified_before_close
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.RELEASED,
+        successor=ClaimStatus.ACTIVE,
+        predecessor_resource=None,
+        successor_resource=SUCCESSOR_CLAIM_ID,
+    )
+
+
+def test_transition_preserves_precommit_commit_failure_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    before = _snapshot(path)
+    original_commit = SQLiteStore._commit
+
+    def fail_before_sqlite_commit(store: SQLiteStore) -> None:
+        if store.path == path:
+            raise OSError("simulated precommit hardening/path error")
+        original_commit(store)
+
+    monkeypatch.setattr(SQLiteStore, "_commit", fail_before_sqlite_commit)
+
+    with pytest.raises(OSError, match="precommit hardening/path error"):
+        transition_claim_status(**arguments)
+
+    assert _snapshot(path) == before
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.ACTIVE,
+        successor=ClaimStatus.REQUESTED,
+        predecessor_resource=PREDECESSOR_CLAIM_ID,
+        successor_resource=None,
+    )
+
+
+def test_transition_preserves_success_when_close_raises_after_verified_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    original_close = SQLiteStore.close
+    verified_before_close = False
+
+    def close_after_verified_commit_raises(store: SQLiteStore) -> None:
+        nonlocal verified_before_close
+        if verified_before_close:
+            original_close(store)
+            return
+        _assert_exact_transition_on_open_store(store)
+        verified_before_close = True
+        original_close(store)
+        raise OSError("simulated postcommit close hardening/path error")
+
+    monkeypatch.setattr(SQLiteStore, "close", close_after_verified_commit_raises)
+
+    result = transition_claim_status(**arguments)
+
+    assert result["status"] == "transitioned"
+    assert verified_before_close
+    _assert_transition_state(
+        path,
+        predecessor=ClaimStatus.RELEASED,
+        successor=ClaimStatus.ACTIVE,
+        predecessor_resource=None,
+        successor_resource=SUCCESSOR_CLAIM_ID,
+    )
+
+
 @pytest.mark.parametrize(
     "record_set_case",
     ["missing", "duplicate", "malformed", "wrong"],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import grp
 import hashlib
 import hmac
@@ -629,6 +630,26 @@ class SQLiteStore:
                     f"strict SQLite parent group is not owner-only: {path}"
                 )
 
+    @staticmethod
+    def _validate_strict_parent_acl(path: Path, descriptor: int) -> None:
+        unsupported = {errno.ENOTSUP, errno.EOPNOTSUPP}
+        missing = {errno.ENODATA}
+        if hasattr(errno, "ENOATTR"):
+            missing.add(errno.ENOATTR)
+        for name in ("system.posix_acl_access", "system.posix_acl_default"):
+            try:
+                value = os.getxattr(descriptor, name)
+            except OSError as error:
+                if error.errno in missing or error.errno in unsupported:
+                    continue
+                raise PermissionError(
+                    f"strict SQLite parent ACL cannot be verified: {path}"
+                ) from error
+            if value:
+                raise PermissionError(
+                    f"strict SQLite parent must not have an extended ACL: {path}"
+                )
+
     def _acquire_strict_parent_pin(self) -> int:
         """Retain and verify the directory containing the strict namespace."""
         if not hasattr(os, "O_PATH"):
@@ -636,7 +657,7 @@ class SQLiteStore:
         with _STRICT_DATABASE_PIN_LOCK:
             if len(_STRICT_DATABASE_PINS) >= _STRICT_DATABASE_PIN_LIMIT:
                 raise RuntimeError("strict SQLite descriptor pin limit reached")
-            flags = os.O_PATH | os.O_DIRECTORY
+            flags = os.O_RDONLY | os.O_DIRECTORY
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             if hasattr(os, "O_CLOEXEC"):
@@ -646,6 +667,7 @@ class SQLiteStore:
             self._strict_instance_pins.add(descriptor)
             status = os.fstat(descriptor)
             self._validate_strict_parent_status(self.path.parent, status)
+            self._validate_strict_parent_acl(self.path.parent, descriptor)
             identity = (status.st_dev, status.st_ino)
             if (
                 self._strict_parent_identity is not None

@@ -1212,6 +1212,7 @@ def test_strict_store_rejects_journal_path_after_namespace_binding(
 def test_strict_store_accepts_owner_group_writable_parent(tmp_path: Path) -> None:
     parent = tmp_path / "state"
     parent.mkdir(mode=0o770)
+    parent.chmod(0o770)
     path = parent / "state.sqlite3"
     with OverseerStore(path):
         pass
@@ -1226,6 +1227,7 @@ def test_strict_store_rejects_group_writable_parent_with_another_member(
 ) -> None:
     parent = tmp_path / "state"
     parent.mkdir(mode=0o770)
+    parent.chmod(0o770)
     path = parent / "state.sqlite3"
     with OverseerStore(path):
         pass
@@ -1242,6 +1244,30 @@ def test_strict_store_rejects_group_writable_parent_with_another_member(
     )
 
     with pytest.raises(PermissionError, match="group is not owner-only"):
+        OverseerStore(path, strict_descriptor_binding=True)
+
+
+def test_strict_store_rejects_parent_with_extended_access_acl(
+    tmp_path: Path,
+) -> None:
+    setfacl = shutil.which("setfacl")
+    if setfacl is None:
+        pytest.skip("setfacl is unavailable")
+    parent = tmp_path / "state"
+    parent.mkdir(mode=0o700)
+    path = parent / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+    result = subprocess.run(
+        [setfacl, "-m", "u:daemon:rwx", str(parent)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+    with pytest.raises(PermissionError, match="extended ACL"):
         OverseerStore(path, strict_descriptor_binding=True)
 
 

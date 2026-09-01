@@ -30,7 +30,8 @@ Overseer needs durable coordination state, but runtime databases must remain loc
   descriptor to that exact namespace; and rejects rollback-journal mode or any
   unbound descriptor before schema or record work. Group write is accepted only
   when the parent group is the owner's primary group and has no other account
-  members; world write is always rejected. A bounded pin registry fails closed
+  members; world write and extended access/default ACLs are always rejected. A
+  bounded pin registry fails closed
   before descriptor exhaustion and never closes an unmanaged database
   descriptor. Normal and recovered commit success revalidate every live
   connection descriptor plus fresh parent/main/WAL/SHM path pins. A clean close

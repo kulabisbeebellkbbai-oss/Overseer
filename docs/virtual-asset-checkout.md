@@ -227,7 +227,8 @@ recovered commit as successful, the runner revalidates every live connection
 descriptor and retains fresh parent/main/WAL/SHM path pins; a postcommit
 substitution is an error, not success. Group write is allowed only for the
 owner's primary group when that group has no other account members. Any
-close-time integrity failure remains caller-visible even after a durable commit.
+extended access or default ACL is rejected. Any close-time integrity failure
+remains caller-visible even after a durable commit.
 
 ### Commit, rollback, replay, and audit
 

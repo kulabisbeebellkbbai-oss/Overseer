@@ -102,6 +102,138 @@ PYTHONPATH=src python3 -m overseer.cli virtual-summary --store state/overseer.sq
 
 `virtual-summary` is Dax's compact read model for persisted virtual resources. It reports asset counts, checkout readiness, active and queued claims, reserved ports, counts by virtual kind, state, and risk, plus per-asset topology identity details.
 
+## Atomic Claim Transition
+
+`transition-claim` is the fail-closed handoff for replacing one active virtual
+asset claim with one exact requested successor claim. It performs only the
+durable Overseer claim-state transition: predecessor release and successor
+activation are one SQLite transaction, never two independently committed CLI
+operations.
+
+The command has no inferred identity or authority fields. Every argument below
+is required, and every string value, including each repeated evidence ID, must
+be non-empty:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli transition-claim \
+  --store state/overseer.sqlite3 \
+  --predecessor-claim-id <active-predecessor-claim-id> \
+  --successor-claim-id <requested-successor-claim-id> \
+  --approval-id <approved-successor-role-approval-id> \
+  --expected-predecessor-resource-id <predecessor-resource-id> \
+  --expected-predecessor-activation-group-id <predecessor-activation-group-id> \
+  --expected-predecessor-lifecycle-id <predecessor-lifecycle-id> \
+  --expected-resource-id <successor-resource-id> \
+  --expected-owner-thread <owner-thread-id> \
+  --expected-owner-role <owner-domain> \
+  --expected-activation-group-id <successor-activation-group-id> \
+  --expected-lifecycle-id <successor-lifecycle-id> \
+  --plan-digest <exact-plan-digest> \
+  --transitioned-by <actor> \
+  --evidence-id <release-evidence-id> \
+  [--evidence-id <additional-evidence-id> ...] \
+  --transitioned-at <timestamp>
+```
+
+`--expected-owner-role` must be one of Overseer's `OwnerDomain` values. A
+successful command prints JSON with `status: "transitioned"`, both claim IDs,
+the approval ID, transition time, and the two audit event IDs. This command
+must be covered by a separate, explicit transition-execution approval; the
+presence of a valid successor ROLE approval is a necessary stored precondition,
+not authorization to run an arbitrary transition.
+
+### Preconditions and validation
+
+Before it can write anything, the transition validates all of the following
+under its writer transaction:
+
+- The predecessor and successor IDs differ; the predecessor is `ACTIVE`, its
+  resource points back to it, and the successor is `REQUESTED` on a different
+  resource.
+- Both claims have the expected owner thread and owner role. The predecessor
+  has its supplied resource, activation-group, and lifecycle IDs; the successor
+  has its independently supplied resource, activation-group, and lifecycle IDs.
+  A replacement plan may use a different lifecycle from its predecessor.
+- Both resources belong to the expected owner role. The predecessor resource
+  is pointed at the predecessor; the successor resource is `AVAILABLE`, has no
+  current claim, and has the exact `planDigest` identifier supplied by
+  `--plan-digest`.
+- The supplied approval is an approved `ROLE` approval for exactly the
+  successor, requested by the expected thread and owned and decided by the
+  expected role, with a non-empty decision time. The successor resource's exact
+  `planDigest` is the transition's digest binding; the claim-eligibility ROLE
+  approval does not have to duplicate that digest in its optional
+  `evidence_required` list.
+- The successor has exactly one continuation, named `continuation.<approval-id>`.
+  It must bind the exact claim, approval, resource, thread, role, group, and
+  lifecycle; it and its recorded attempt must both be `DELIVERED`, with a
+  non-empty attempt ID and matching continuation/thread binding.
+- Recomputed and stored conflict decisions both require exactly `ROLE`
+  escalation with no blocking claim IDs. After excluding only the named
+  predecessor, there can be no external active-claim or resource
+  exclusive-group conflict.
+- Neither deterministic audit ID already exists, and release evidence contains
+  at least one non-empty ID.
+
+### Optional activation-group topology and locking
+
+Activation-group rows are optional. If neither the predecessor's group nor the
+successor's expected group has a persisted row, claim-level bindings remain
+authoritative and the transition does not invent a group row. If either row is
+present, both must be present and exact singleton groups: the predecessor group
+must be `ACTIVE`, the successor group must be `REQUESTED`, and their lifecycle,
+owner, claim, approval, resource, project, plan, and plan-version bindings must
+match the transition. Each group is checked against its own expected lifecycle;
+the predecessor and successor lifecycle IDs need not be the same. Partial,
+non-singleton, or mismatched topology is rejected without mutation.
+
+The initial group probe selects a lock order only; it is not accepted as record
+validation. For grouped transitions, the trusted Psychlo lifecycle database is
+opened with `BEGIN IMMEDIATE` first, then Overseer's SQLite store is opened
+with `BEGIN IMMEDIATE`. While both writer locks are held, exact group presence
+and bindings are reloaded, the Psychlo lifecycle round is validated, and all
+claim, resource, approval, continuation, conflict, and audit preconditions are
+checked. The Psychlo writer lock remains held through the Overseer commit, then
+is rolled back and released because the transition makes no Psychlo mutation.
+For an initially ungrouped transition, Overseer takes its writer lock and
+confirms that no group row appeared before proceeding. Changed durable records
+are reloaded and checked again before commit, so a stale probe, concurrent
+topology change, failed write, or failed postcondition cannot produce a partial
+handoff.
+
+### Commit, rollback, replay, and audit
+
+On success, the transaction releases the predecessor and clears only its
+resource pointer; activates the successor with the exact approval and sets only
+its resource pointer; and, when exact optional groups exist, releases the
+predecessor group and activates the successor group. Any validation error,
+conflict, write failure, audit collision, or postcondition failure rolls the
+entire Overseer transaction back. There is no state where a committed command
+has released the predecessor without activating the successor.
+
+The command is intentionally non-idempotent. A replay fails without mutation:
+the active/requested preconditions no longer hold and the deterministic audit
+IDs are already present. It does not turn an ambiguous second invocation into a
+synthetic success.
+
+Every committed transition writes two deterministic audit events:
+
+- `audit.claim-transition.<successor-claim-id>.predecessor-released` with type
+  `RELEASED` for the predecessor.
+- `audit.claim-transition.<successor-claim-id>.executed` with type `EXECUTED`
+  for the successor.
+
+Both events carry the transition's bound identities and supplied release
+evidence, including the claims, resources, approval, continuation, expected
+owner/thread/group/lifecycle, plan digest, actor, and timestamp. The final
+postcondition check requires both events and confirms that the supplied
+evidence is present.
+
+This claim-state command does not itself authorize or perform VM lifecycle
+work, launcher execution, package preparation or import, service changes,
+Phase B, or cutover. Each of those activities remains separately scoped and
+requires its own explicit approval and execution path.
+
 ## Live Listener Discovery
 
 Dax can discover local TCP listeners as virtual assets from read-only host inspection evidence:

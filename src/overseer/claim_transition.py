@@ -902,7 +902,8 @@ def _recognize_committed_transition(
             postconditions=postconditions,
             require_no_transaction=True,
         )
-    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        store.verify_strict_path_binding()
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
         return False
     return True
 
@@ -1109,6 +1110,7 @@ def transition_claim_status(
             postconditions=postconditions,
             require_no_transaction=True,
         )
+        store.verify_strict_path_binding()
         committed = True
         return result
     except Exception:
@@ -1122,3 +1124,4 @@ def transition_claim_status(
         except Exception:
             if not committed:
                 raise
+            store.verify_strict_path_binding()

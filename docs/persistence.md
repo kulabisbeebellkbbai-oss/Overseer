@@ -28,7 +28,9 @@ Overseer needs durable coordination state, but runtime databases must remain loc
   through an `O_PATH|O_NOFOLLOW` pin, verifies exactly one new SQLite database
   descriptor before schema or record work, and retains the non-I/O pin for the
   short process lifetime. A bounded pin registry fails closed before descriptor
-  exhaustion and never closes an unmanaged database descriptor.
+  exhaustion and never closes an unmanaged database descriptor. Commit recovery
+  reports success only after a fresh retained path pin proves that the current
+  pathname still names the committed inode.
 - The persistence API stores typed records as JSON payloads so the domain model can continue to evolve before schema hardening.
 - `persistence-security` and `GET /persistence/security` inspect database and SQLite sidecar file permissions without creating missing files or changing modes.
 - The store records schema migrations in `schema_migrations` so on-disk shape changes are auditable before later hardening.

@@ -585,6 +585,41 @@ def test_transition_recognizes_real_commit_before_postcommit_hardening_error(
     )
 
 
+def test_transition_does_not_recognize_commit_after_primary_path_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    displaced = tmp_path / "displaced-overseer.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    arguments = _seed_transition_store(path)
+    replacement.write_text("unrelated replacement", encoding="utf-8")
+    replacement.chmod(0o600)
+    original_commit = SQLiteStore._commit
+
+    def substitute_between_precheck_and_commit(store: SQLiteStore) -> None:
+        if store.path != path:
+            original_commit(store)
+            return
+        store._harden_database_files()
+        os.replace(path, displaced)
+        os.replace(replacement, path)
+        store._connection.commit()
+        store._harden_database_files()
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "_commit",
+        substitute_between_precheck_and_commit,
+    )
+
+    with pytest.raises(ValueError, match="identity changed"):
+        transition_claim_status(**arguments)
+
+    assert path.read_text(encoding="utf-8") == "unrelated replacement"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
 def test_transition_preserves_precommit_commit_failure_and_rolls_back(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -220,7 +220,10 @@ same-inode descriptor open in the process. The runner opens SQLite through a
 retained no-follow inode pin and verifies exactly one new connection descriptor;
 path replacement, an ambiguous descriptor set, or pin-budget exhaustion fails
 before transaction work. Ordinary Overseer stores do not use this strict mode,
-so normal nested and concurrent store behavior remains unchanged.
+so normal nested and concurrent store behavior remains unchanged. Before
+reporting a normal or recovered commit as successful, the runner opens and
+retains a fresh no-follow path pin and proves the current pathname still names
+the committed inode; a postcommit substitution is an error, not success.
 
 ### Commit, rollback, replay, and audit
 

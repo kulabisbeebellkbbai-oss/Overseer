@@ -401,6 +401,7 @@ class SQLiteStore:
             raise ValueError(
                 "strict descriptor binding rejects caller-owned verified_fd"
             )
+        self._strict_descriptor_binding = strict_descriptor_binding
         self._collection_deadline = current_collection_deadline()
         if strict_descriptor_binding and self._collection_deadline is not None:
             raise RuntimeError(
@@ -642,6 +643,16 @@ class SQLiteStore:
             raise ValueError(
                 f"SQLite connection identity cannot be verified: {self.path}"
             ) from error
+
+    def verify_strict_path_binding(self) -> None:
+        """Prove the current pathname still names the strict store inode."""
+        if not self._strict_descriptor_binding:
+            raise RuntimeError("strict descriptor binding is not enabled")
+        self._acquire_strict_database_pin()
+        path_status = self.path.lstat()
+        self._validate_strict_artifact_status(self.path, path_status)
+        if (path_status.st_dev, path_status.st_ino) != self._database_identity:
+            raise ValueError(f"SQLite artifact identity changed: {self.path}")
 
     def _harden_database_files(
         self, *, database_missing_ok: bool = False

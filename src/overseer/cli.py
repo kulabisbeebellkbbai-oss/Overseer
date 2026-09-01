@@ -8217,19 +8217,25 @@ def _dispatch_crew_messages_status_unlocked(
             dispatch_audit_id = f"audit.{message.id}.dispatch.{_status_id(now)}"
             review = _automatic_crew_review(store_path, message, result, final_status, dispatch_audit_id, dispatched_by, now)
             updated = replace(message, status=final_status, updated_at=now, **review)
-            store.save_crew_message(updated)
-            store.save_audit_event(
-                AuditEvent(
-                    id=dispatch_audit_id,
-                    event_type=AuditEventType.BLOCKED if result.get("status") == "blocked" else AuditEventType.EXECUTED,
-                    owner_domain=message.owner_domain,
-                    subject_id=message.id,
-                    summary=f"{message.owner_domain.value} dispatch {result['status']}: {result['reason']}",
-                    risk_level=message.priority,
-                    evidence_ids=_linked_role_action_evidence(message, result),
-                    occurred_at=now,
-                )
+            dispatch_audit_event = AuditEvent(
+                id=dispatch_audit_id,
+                event_type=AuditEventType.BLOCKED if result.get("status") == "blocked" else AuditEventType.EXECUTED,
+                owner_domain=message.owner_domain,
+                subject_id=message.id,
+                summary=f"{message.owner_domain.value} dispatch {result['status']}: {result['reason']}",
+                risk_level=message.priority,
+                evidence_ids=_linked_role_action_evidence(message, result),
+                occurred_at=now,
             )
+            if _is_dax_linked_message(message):
+                with store.agent_transaction():
+                    if any(event.id == dispatch_audit_id for event in store.list_audit_events()):
+                        raise ValueError("linked Dax ROLE approval dispatch audit id already exists")
+                    store.save_crew_message(updated)
+                    store.save_audit_event(dispatch_audit_event)
+            else:
+                store.save_crew_message(updated)
+                store.save_audit_event(dispatch_audit_event)
             result["message_status"] = updated.status.value
             result["review_status"] = updated.review_status.value
             result["decision_reason"] = updated.decision_reason

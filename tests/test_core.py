@@ -12681,6 +12681,119 @@ class RuntimeTests(unittest.TestCase):
             )
             self.assertEqual(message.decided_by, OwnerDomain.DAX.value)
 
+    def test_linked_dax_dispatch_rolls_back_message_when_dispatch_audit_save_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.role-handoff-audit-failure",
+                    name="Role Handoff Audit Failure Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.role-handoff-audit-failure",
+                "proxy.role-handoff-audit-failure",
+                ClaimType.LEASE.value,
+                "thread-role-handoff-audit-failure",
+                OwnerDomain.DAX.value,
+                "run one bounded loopback test",
+                "bind an OS-assigned loopback listener",
+                RiskLevel.LOW.value,
+                activation_group_id="group.claim.cli.role-handoff-audit-failure",
+                lifecycle_id="lifecycle.claim.cli.role-handoff-audit-failure",
+                release_condition="release immediately after the test",
+            )
+            dispatched_at = "2026-08-21T20:00:00+00:00"
+            dispatch_audit_id = (
+                f"audit.{requested['approval_handoff_id']}.dispatch."
+                f"{overseer_cli._status_id(dispatched_at)}"
+            )
+            original_save_audit_event = SQLiteStore.save_audit_event
+
+            def fail_dispatch_audit(store, event):
+                if event.id == dispatch_audit_id:
+                    raise RuntimeError("injected dispatch audit persistence failure")
+                return original_save_audit_event(store, event)
+
+            with patch.object(SQLiteStore, "save_audit_event", new=fail_dispatch_audit):
+                with patch(
+                    "overseer.cli.discover_virtual_listeners_status",
+                    return_value={"listeners": 0, "host_mutation_performed": False},
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected dispatch audit persistence failure"):
+                        dispatch_crew_messages_status(
+                            store_path,
+                            message_id=requested["approval_handoff_id"],
+                            dispatched_at=dispatched_at,
+                        )
+
+            store = SQLiteStore(store_path)
+            message = store.load_crew_message(requested["approval_handoff_id"])
+            dispatch_events = [
+                event for event in store.list_audit_events() if event.id == dispatch_audit_id
+            ]
+            store.close()
+
+            self.assertEqual(message.status, CrewMessageStatus.OPEN)
+            self.assertEqual(message.review_status, CrewReviewStatus.PENDING)
+            self.assertIsNone(message.decision_reason)
+            self.assertEqual(message.decision_evidence_ids, ())
+            self.assertIsNone(message.decided_by)
+            self.assertIsNone(message.decided_at)
+            self.assertEqual(dispatch_events, [])
+
+    def test_linked_dax_dispatch_rejects_existing_dispatch_audit_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            requested, dispatch_event = self._prepare_replayable_dax_role_approval(
+                store_path,
+                "audit-id-collision",
+            )
+            store = SQLiteStore(store_path)
+            message = store.load_crew_message(requested["approval_handoff_id"])
+            store.save_crew_message(
+                replace(
+                    message,
+                    status=CrewMessageStatus.OPEN,
+                    review_status=CrewReviewStatus.PENDING,
+                    decision_reason=None,
+                    correction_request=None,
+                    decision_evidence_ids=(),
+                    decided_by=None,
+                    decided_at=None,
+                )
+            )
+            store.close()
+
+            with patch(
+                "overseer.cli.discover_virtual_listeners_status",
+                return_value={"listeners": 0, "host_mutation_performed": False},
+            ):
+                with self.assertRaisesRegex(ValueError, "dispatch audit id already exists"):
+                    dispatch_crew_messages_status(
+                        store_path,
+                        message_id=requested["approval_handoff_id"],
+                        dispatched_at="2026-08-21T20:06:00+00:00",
+                    )
+
+            store = SQLiteStore(store_path)
+            message = store.load_crew_message(requested["approval_handoff_id"])
+            dispatch_events = [
+                event for event in store.list_audit_events() if event.id == dispatch_event.id
+            ]
+            store.close()
+
+            self.assertEqual(message.status, CrewMessageStatus.OPEN)
+            self.assertEqual(message.review_status, CrewReviewStatus.PENDING)
+            self.assertEqual(dispatch_events, [dispatch_event])
+
     def test_reconciliation_replays_exact_dax_role_approval_review(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -222,17 +223,35 @@ def _seed_psychlo_round(path: Path) -> Path:
     return path
 
 
-def _seed_optional_groups(
-    path: Path,
-    *,
-    present: str = "both",
-    mismatch: bool = False,
-    non_singleton: bool = False,
+def _insert_duplicate_successor_continuation(
+    store: SQLiteStore,
+    continuation_id: str,
 ) -> None:
-    """Persist exact singleton groups, or a deliberately unsafe topology."""
-    store = SQLiteStore(path)
-    try:
-        predecessor = ClaimActivationGroup(
+    row = store._connection.execute(
+        "SELECT payload FROM claim_approval_continuations WHERE id = ?",
+        (CONTINUATION_ID,),
+    ).fetchone()
+    assert row is not None
+    payload = json.loads(str(row["payload"]))
+    payload["id"] = continuation_id
+    store._connection.execute(
+        """
+        INSERT INTO claim_approval_continuations (id, claim_id, approval_id, payload)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            continuation_id,
+            f"index-bypass.{continuation_id}",
+            f"index-bypass.{continuation_id}",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        ),
+    )
+    store._commit_agent_mutation()
+
+
+def _exact_optional_groups() -> tuple[ClaimActivationGroup, ClaimActivationGroup]:
+    return (
+        ClaimActivationGroup(
             id=PREDECESSOR_GROUP_ID,
             lifecycle_id=LIFECYCLE_ID,
             project_id="phase-b",
@@ -244,8 +263,8 @@ def _seed_optional_groups(
             approval_ids=(PREDECESSOR_APPROVAL_ID,),
             resource_ids=(PREDECESSOR_RESOURCE_ID,),
             state=ClaimActivationGroupState.ACTIVE,
-        )
-        successor = ClaimActivationGroup(
+        ),
+        ClaimActivationGroup(
             id=ACTIVATION_GROUP_ID,
             lifecycle_id=LIFECYCLE_ID,
             project_id="phase-b",
@@ -256,7 +275,21 @@ def _seed_optional_groups(
             claim_ids=(SUCCESSOR_CLAIM_ID,),
             approval_ids=(APPROVAL_ID,),
             resource_ids=(SUCCESSOR_RESOURCE_ID,),
-        )
+        ),
+    )
+
+
+def _seed_optional_groups(
+    path: Path,
+    *,
+    present: str = "both",
+    mismatch: bool = False,
+    non_singleton: bool = False,
+) -> None:
+    """Persist exact singleton groups, or a deliberately unsafe topology."""
+    store = SQLiteStore(path)
+    try:
+        predecessor, successor = _exact_optional_groups()
         if mismatch:
             successor = replace(
                 successor,
@@ -372,6 +405,16 @@ def test_transition_claim_status_atomically_releases_and_activates_with_bound_au
     store = SQLiteStore(path)
     try:
         assert store.list_claim_activation_groups() == ()
+        assert store.load_resource(PREDECESSOR_RESOURCE_ID).owner_domain == OwnerDomain.DAX
+        assert store.load_resource(SUCCESSOR_RESOURCE_ID).owner_domain == OwnerDomain.DAX
+        successor_continuations = tuple(
+            continuation
+            for continuation in store.list_claim_approval_continuations()
+            if continuation.claim_id == SUCCESSOR_CLAIM_ID
+        )
+        assert len(successor_continuations) == 1
+        assert successor_continuations[0].id == CONTINUATION_ID
+        assert successor_continuations[0].attempt_id == CONTINUATION_ATTEMPT_ID
         events = store.list_audit_events()
         release_events = [event for event in events if event.subject_id == PREDECESSOR_CLAIM_ID and event.event_type == AuditEventType.RELEASED]
         transition_events = [event for event in events if event.subject_id == SUCCESSOR_CLAIM_ID and event.event_type == AuditEventType.EXECUTED]
@@ -588,6 +631,211 @@ def test_transition_rolls_back_after_successor_persistence_failure(tmp_path: Pat
         predecessor_resource=PREDECESSOR_CLAIM_ID,
         successor_resource=None,
     )
+
+
+@pytest.mark.parametrize("policy_case", ["security surface", "high-risk claim"])
+def test_transition_rejects_non_role_canonical_policy_without_mutation(
+    tmp_path: Path,
+    policy_case: str,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        if policy_case == "security surface":
+            resource = store.load_resource(SUCCESSOR_RESOURCE_ID)
+            store.save_resource(replace(resource, type=ResourceType.SECURITY_SURFACE))
+        else:
+            successor = store.load_claim(SUCCESSOR_CLAIM_ID)
+            store.save_claim(
+                replace(successor, risk_level=RiskLevel.HIGH),
+                store.load_decision(SUCCESSOR_CLAIM_ID),
+            )
+    finally:
+        store.close()
+    before = _snapshot(path)
+
+    with pytest.raises(ValueError):
+        transition_claim_status(**arguments)
+
+    assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("resource_id", [PREDECESSOR_RESOURCE_ID, SUCCESSOR_RESOURCE_ID])
+def test_transition_rejects_resource_owner_mismatch_without_mutation(
+    tmp_path: Path,
+    resource_id: str,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        resource = store.load_resource(resource_id)
+        store.save_resource(replace(resource, owner_domain=OwnerDomain.ODO))
+    finally:
+        store.close()
+    before = _snapshot(path)
+
+    with pytest.raises(ValueError):
+        transition_claim_status(**arguments)
+
+    assert _snapshot(path) == before
+
+
+def test_transition_rejects_second_successor_continuation_without_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        _insert_duplicate_successor_continuation(
+            store,
+            "continuation.duplicate-successor",
+        )
+    finally:
+        store.close()
+    before = _snapshot(path)
+
+    with pytest.raises(ValueError):
+        transition_claim_status(**arguments)
+
+    assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize(
+    ("outcome", "approval_level"),
+    [
+        (ConflictOutcome.ESCALATE, ApprovalLevel.HUMAN),
+        (ConflictOutcome.ALLOW, ApprovalLevel.ROLE),
+    ],
+)
+def test_transition_rejects_incompatible_stored_authority_decision_without_mutation(
+    tmp_path: Path,
+    outcome: ConflictOutcome,
+    approval_level: ApprovalLevel,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    store = SQLiteStore(path)
+    try:
+        successor = store.load_claim(SUCCESSOR_CLAIM_ID)
+        store.save_claim(
+            successor,
+            ConflictDecision(
+                outcome,
+                "forged stored authority decision",
+                approval_level,
+            ),
+        )
+    finally:
+        store.close()
+    before = _snapshot(path)
+
+    with pytest.raises(ValueError):
+        transition_claim_status(**arguments)
+
+    assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("appearing_group", ["predecessor", "successor"])
+def test_ungrouped_transition_rejects_exact_group_appearing_before_writer_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    appearing_group: str,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    predecessor_group, successor_group = _exact_optional_groups()
+    group = predecessor_group if appearing_group == "predecessor" else successor_group
+    original_agent_transaction = SQLiteStore.agent_transaction
+    original_load_claim = SQLiteStore.load_claim
+    original_load_group = SQLiteStore.load_claim_activation_group
+    guard_typed_loads = True
+    injected = False
+    raced_snapshots: list[tuple[Any, ...]] = []
+
+    def guarded_load_claim(self: SQLiteStore, claim_id: str) -> Claim:
+        if guard_typed_loads and self.path == path and not self._connection.in_transaction:
+            raise AssertionError("typed claim load occurred before final writer transaction")
+        return original_load_claim(self, claim_id)
+
+    def guarded_load_group(self: SQLiteStore, group_id: str) -> ClaimActivationGroup:
+        if guard_typed_loads and self.path == path and not self._connection.in_transaction:
+            raise AssertionError("typed group load occurred before final writer transaction")
+        return original_load_group(self, group_id)
+
+    @contextmanager
+    def raced_agent_transaction(self: SQLiteStore) -> Any:
+        nonlocal guard_typed_loads, injected
+        if guard_typed_loads and self.path == path and not injected:
+            injected = True
+            self.save_claim_activation_group(group)
+            guard_typed_loads = False
+            raced_snapshots.append(_snapshot(path))
+            guard_typed_loads = True
+        with original_agent_transaction(self):
+            yield
+
+    monkeypatch.setattr(SQLiteStore, "load_claim", guarded_load_claim)
+    monkeypatch.setattr(SQLiteStore, "load_claim_activation_group", guarded_load_group)
+    monkeypatch.setattr(SQLiteStore, "agent_transaction", raced_agent_transaction)
+    try:
+        with pytest.raises(ValueError):
+            transition_claim_status(**arguments)
+    finally:
+        guard_typed_loads = False
+
+    assert injected
+    assert len(raced_snapshots) == 1
+    assert _snapshot(path) == raced_snapshots[0]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["predecessor resource owner", "successor resource owner", "second continuation"],
+)
+def test_transition_postconditions_reject_owner_or_continuation_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    path = tmp_path / "overseer.sqlite3"
+    arguments = _seed_transition_store(path)
+    before = _snapshot(path)
+    original_save_resource = SQLiteStore.save_resource
+    original_save_audit_event = SQLiteStore.save_audit_event
+    injected = False
+
+    if tamper.endswith("resource owner"):
+        target_resource_id = (
+            PREDECESSOR_RESOURCE_ID
+            if tamper.startswith("predecessor")
+            else SUCCESSOR_RESOURCE_ID
+        )
+
+        def tampered_save_resource(self: SQLiteStore, resource: Resource) -> None:
+            if resource.id == target_resource_id:
+                resource = replace(resource, owner_domain=OwnerDomain.ODO)
+            original_save_resource(self, resource)
+
+        monkeypatch.setattr(SQLiteStore, "save_resource", tampered_save_resource)
+    else:
+
+        def tampered_save_audit_event(self: SQLiteStore, event: AuditEvent) -> None:
+            nonlocal injected
+            original_save_audit_event(self, event)
+            if event.id == RELEASE_AUDIT_ID and not injected:
+                injected = True
+                _insert_duplicate_successor_continuation(
+                    self,
+                    "continuation.postcondition-duplicate",
+                )
+
+        monkeypatch.setattr(SQLiteStore, "save_audit_event", tampered_save_audit_event)
+
+    with pytest.raises(ValueError):
+        transition_claim_status(**arguments)
+
+    assert _snapshot(path) == before
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import json
 from pathlib import Path
 import sqlite3
 import sys
@@ -58,6 +59,46 @@ def _psychlo_writer(path: str | Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def _raw_group_lock_required(
+    store: SQLiteStore,
+    predecessor_claim_id: str,
+    successor_group_id: str,
+) -> bool:
+    """Select the lock order only; this raw probe is not record validation."""
+    predecessor_group_id = None
+    row = store._connection.execute(
+        "SELECT payload FROM claims WHERE id = ?",
+        (predecessor_claim_id,),
+    ).fetchone()
+    if row is not None:
+        try:
+            payload = json.loads(str(row["payload"]))
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            candidate = payload.get("activation_group_id")
+            if isinstance(candidate, str) and candidate:
+                predecessor_group_id = candidate
+
+    group_ids = tuple(
+        dict.fromkeys(
+            group_id
+            for group_id in (predecessor_group_id, successor_group_id)
+            if isinstance(group_id, str) and group_id
+        )
+    )
+    if not group_ids:
+        return False
+    placeholders = ", ".join("?" for _ in group_ids)
+    return (
+        store._connection.execute(
+            f"SELECT 1 FROM claim_activation_groups WHERE id IN ({placeholders}) LIMIT 1",
+            group_ids,
+        ).fetchone()
+        is not None
+    )
+
+
 @contextmanager
 def _transition_transaction(
     store: SQLiteStore,
@@ -66,9 +107,13 @@ def _transition_transaction(
     psychlo_store_path: str | Path,
 ) -> Iterator[tuple[bool, sqlite3.Connection | None]]:
     """Keep an optional Psychlo writer lock through the Overseer commit."""
-    store.load_claim(predecessor_claim_id)
+    initial_grouped = _raw_group_lock_required(
+        store,
+        predecessor_claim_id,
+        successor_group_id,
+    )
 
-    def exact_group_presence() -> tuple[bool, bool]:
+    def exact_group_presence_under_writer_lock() -> tuple[bool, bool]:
         predecessor = store.load_claim(predecessor_claim_id)
         predecessor_group_id = predecessor.activation_group_id
         predecessor_present = False
@@ -87,8 +132,6 @@ def _transition_transaction(
             successor_present = True
         return predecessor_present, successor_present
 
-    initial_predecessor_present, initial_successor_present = exact_group_presence()
-    initial_grouped = initial_predecessor_present or initial_successor_present
     psychlo_context = None
     psychlo_entered = False
     try:
@@ -98,7 +141,7 @@ def _transition_transaction(
             psychlo_connection = psychlo_context.__enter__()
             psychlo_entered = True
         with store.agent_transaction():
-            predecessor_present, successor_present = exact_group_presence()
+            predecessor_present, successor_present = exact_group_presence_under_writer_lock()
             if initial_grouped:
                 if not (predecessor_present and successor_present):
                     raise ValueError("claim transition requires both exact activation groups")
@@ -216,14 +259,20 @@ def _validate_conflicts(
         for claim in claims
         if claim.id != predecessor_claim_id and claim.is_active_like()
     ]
-    decision = decide_claim(
+    canonical_decision = decide_claim(
         successor_resource,
         successor,
         active_claims,
         resources,
     )
-    if decision.outcome == ConflictOutcome.QUEUE or decision.blocking_claim_ids:
-        raise ValueError("successor claim has an external claim conflict")
+    stored_decision = store.load_decision(successor.id)
+    for decision in (canonical_decision, stored_decision):
+        if (
+            decision.outcome != ConflictOutcome.ESCALATE
+            or decision.approval_level != ApprovalLevel.ROLE
+            or decision.blocking_claim_ids
+        ):
+            raise ValueError("successor claim does not have exact ROLE transition authority")
     for active_claim in active_claims:
         if successor.exclusive_groups & active_claim.exclusive_groups:
             raise ValueError("successor claim has an external claim exclusive-group conflict")
@@ -294,6 +343,11 @@ def _validate_inputs(
 
     predecessor_resource = store.load_resource(predecessor.resource_id)
     successor_resource = store.load_resource(expected_resource_id)
+    if (
+        predecessor_resource.owner_domain != owner_role
+        or successor_resource.owner_domain != owner_role
+    ):
+        raise ValueError("claim resource owner binding is invalid")
     if predecessor_resource.current_claim_id != predecessor_claim_id:
         raise ValueError("predecessor resource pointer is not active")
     if successor_resource.current_claim_id is not None:
@@ -317,7 +371,14 @@ def _validate_inputs(
         raise ValueError("successor approval binding is invalid")
 
     continuation_id = f"continuation.{approval_id}"
-    continuation = store.load_claim_approval_continuation(continuation_id)
+    successor_continuations = tuple(
+        continuation
+        for continuation in store.list_claim_approval_continuations()
+        if continuation.claim_id == successor_claim_id
+    )
+    if len(successor_continuations) != 1:
+        raise ValueError("successor must have exactly one approval continuation")
+    continuation = successor_continuations[0]
     if (
         continuation.id != continuation_id
         or continuation.claim_id != successor_claim_id
@@ -398,6 +459,8 @@ def _verify_transition(
     successor_claim_id: str,
     approval_id: str,
     expected_resource_id: str,
+    expected_owner_role: OwnerDomain,
+    expected_continuation: ClaimApprovalContinuation,
     release_group_id: str | None,
     successor_group_id: str,
     release_audit_id: str,
@@ -411,11 +474,29 @@ def _verify_transition(
     if (
         predecessor.status != ClaimStatus.RELEASED
         or predecessor_resource.current_claim_id is not None
+        or predecessor_resource.owner_domain != expected_owner_role
         or successor.status != ClaimStatus.ACTIVE
         or successor.approval_id != approval_id
         or successor_resource.current_claim_id != successor_claim_id
+        or successor_resource.owner_domain != expected_owner_role
     ):
         raise ValueError("claim transition postcondition failed")
+    successor_continuations = tuple(
+        continuation
+        for continuation in store.list_claim_approval_continuations()
+        if continuation.claim_id == successor_claim_id
+    )
+    if successor_continuations != (expected_continuation,):
+        raise ValueError("successor continuation postcondition failed")
+    if not expected_continuation.attempt_id:
+        raise ValueError("successor continuation delivery postcondition failed")
+    attempt = store.load_claim_approval_continuation_attempt(expected_continuation.attempt_id)
+    if (
+        attempt.continuation_id != expected_continuation.id
+        or attempt.owner_thread != expected_continuation.owner_thread
+        or attempt.state != ContinuationState.DELIVERED
+    ):
+        raise ValueError("successor continuation delivery postcondition failed")
     if release_group_id is not None:
         if store.load_claim_activation_group(release_group_id).state != ClaimActivationGroupState.RELEASED:
             raise ValueError("predecessor group transition postcondition failed")
@@ -575,6 +656,8 @@ def transition_claim_status(
                     successor_claim_id=successor_claim_id,
                     approval_id=approval_id,
                     expected_resource_id=expected_resource_id,
+                    expected_owner_role=owner_role,
+                    expected_continuation=continuation,
                     release_group_id=group_pair[0].id if group_pair is not None else None,
                     successor_group_id=expected_activation_group_id,
                     release_audit_id=release_audit_id,

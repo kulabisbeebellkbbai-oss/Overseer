@@ -612,7 +612,9 @@ def _validate_argv(
     if any(name in forbidden_names for name in names):
         _fail(f"{label} contains a forbidden command")
     lowered = [argument.lower() for argument in argv]
-    if any("claim" in argument or "claims" in argument for argument in lowered):
+    if argv[0] != "/usr/bin/install" and any(
+        "claim" in argument or "claims" in argument for argument in lowered
+    ):
         _fail(f"{label} contains a forbidden claims command")
     if any(
         marker in argument

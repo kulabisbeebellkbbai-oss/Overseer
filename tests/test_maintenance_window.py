@@ -434,6 +434,30 @@ def test_contract_rejects_arbitrary_options_after_allowlisted_helper() -> None:
         validate_maintenance_contract(contract)
 
 
+def test_argv_accepts_an_allowlisted_release_file_named_for_claim_logic() -> None:
+    source = (
+        f"{PACKAGE_ROOT}/public/release/replacement/"
+        "app/src/overseer/claim_transition.py"
+    )
+    target = (
+        "/opt/overseer/releases/replacement/"
+        "app/src/overseer/claim_transition.py"
+    )
+    argv = [
+        "/usr/bin/install",
+        "-o",
+        "root",
+        "-g",
+        "root",
+        "-m",
+        "0444",
+        source,
+        target,
+    ]
+
+    assert _validate_argv(argv, "claim source install", PACKAGE_ROOT) == argv
+
+
 def test_contract_rejects_removed_prepare_final_store_helper() -> None:
     contract = _contract()
     contract["stages"][0]["commands"] = [[

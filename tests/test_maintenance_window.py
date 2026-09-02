@@ -458,6 +458,47 @@ def test_argv_accepts_an_allowlisted_release_file_named_for_claim_logic() -> Non
     assert _validate_argv(argv, "claim source install", PACKAGE_ROOT) == argv
 
 
+def test_argv_accepts_a_sealed_rollback_file_with_interior_spaces() -> None:
+    digest = "a" * 64
+    relative = (
+        "v1.1.5-release/docs/"
+        "overseer-pending-approval-gates-executive-summary - completed.md"
+    )
+    argv = [
+        "/usr/bin/install",
+        "-o",
+        "root",
+        "-g",
+        "god",
+        "-m",
+        "0440",
+        f"{PACKAGE_ROOT}/private/rollback-inputs/{relative}",
+        f"/opt/overseer/rollback/{digest}/{relative}",
+    ]
+
+    assert _validate_argv(argv, "rollback install", PACKAGE_ROOT) == argv
+
+
+@pytest.mark.parametrize("unsafe_name", (" leading.md", "trailing.md ", "tab\tname.md"))
+def test_argv_rejects_unsafe_whitespace_in_rollback_names(unsafe_name: str) -> None:
+    digest = "a" * 64
+    relative = f"v1.1.5-release/docs/{unsafe_name}"
+    argv = [
+        "/usr/bin/install",
+        "-o",
+        "root",
+        "-g",
+        "god",
+        "-m",
+        "0440",
+        f"{PACKAGE_ROOT}/private/rollback-inputs/{relative}",
+        f"/opt/overseer/rollback/{digest}/{relative}",
+    ]
+
+    with pytest.raises(ValueError, match="rollback|install"):
+        _validate_argv(argv, "rollback install", PACKAGE_ROOT)
+
+
 def test_contract_rejects_removed_prepare_final_store_helper() -> None:
     contract = _contract()
     contract["stages"][0]["commands"] = [[

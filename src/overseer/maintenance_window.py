@@ -387,6 +387,25 @@ def _safe_named_path_suffix(path: str, prefix: str, label: str) -> bool:
     return True
 
 
+def _safe_rollback_path_suffix(path: str, prefix: str, label: str) -> bool:
+    """Allow historical rollback names with interior spaces, never shell syntax."""
+
+    if not path.startswith(prefix):
+        return False
+    suffix = path[len(prefix) :]
+    parts = suffix.split("/")
+    if not suffix or any(
+        not part
+        or part in {".", ".."}
+        or part != part.strip(" ")
+        or re.fullmatch(r"[A-Za-z0-9_.@ -]+", part) is None
+        for part in parts
+    ):
+        return False
+    _require_canonical_absolute_path(path, label)
+    return True
+
+
 def _validate_python_env_argv(
     argv: list[str], label: str, package_root: str = _MAINTENANCE_PACKAGE_ROOT
 ) -> None:
@@ -514,7 +533,11 @@ def _maintenance_release_parts(path: str) -> tuple[str, list[str]] | None:
 
 
 def _maintenance_rollback_parts(path: str) -> tuple[str, list[str]] | None:
-    if not _safe_named_path_suffix(path, _MAINTENANCE_ROLLBACK_PREFIX, "rollback path"):
+    if not _safe_rollback_path_suffix(
+        path,
+        _MAINTENANCE_ROLLBACK_PREFIX,
+        "rollback path",
+    ):
         return None
     parts = path[len(_MAINTENANCE_ROLLBACK_PREFIX) :].split("/")
     if re.fullmatch(r"[0-9a-f]{64}", parts[0]) is None:
@@ -557,7 +580,11 @@ def _validate_install_argv(
     elif kind == "release":
         target_parts = _maintenance_release_parts(target)
         source_prefix = f"{package_root}/public/release/"
-        if target_parts is None or not _safe_named_path_suffix(source, source_prefix, f"{label} install source"):
+        if target_parts is None or not _safe_named_path_suffix(
+            source,
+            source_prefix,
+            f"{label} install source",
+        ):
             _fail(f"{label} contains an unapproved release source")
         source_parts = source[len(source_prefix) :].split("/")
         if source_parts != [target_parts[0], *target_parts[1]]:
@@ -568,7 +595,11 @@ def _validate_install_argv(
     elif kind == "rollback":
         target_parts = _maintenance_rollback_parts(target)
         source_prefix = f"{package_root}/private/rollback-inputs/"
-        if target_parts is None or not _safe_named_path_suffix(source, source_prefix, f"{label} install source"):
+        if target_parts is None or not _safe_rollback_path_suffix(
+            source,
+            source_prefix,
+            f"{label} install source",
+        ):
             _fail(f"{label} contains an unapproved rollback source")
         source_parts = source[len(source_prefix) :].split("/")
         if source_parts != target_parts[1]:

@@ -60,6 +60,9 @@ cutover state are not authority for this runner.
 - [x] Give rollback API readiness the same bounded retry profile as forward
   acceptance, with an outer command timeout that includes a shutdown/startup
   scheduling margin.
+- [x] Persist unresolved destination-namespace failures and require full
+  rollback to root-lock that namespace, reject dedicated-principal processes
+  or open migrated SQLite artifacts, and fail before legacy writer restart.
 - [x] Document outage behavior, no-reboot policy, exact approvals, stop
   conditions, acceptance, and rollback.
 - [ ] Build and verify a new owner-scoped package without importing or executing

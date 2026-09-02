@@ -937,12 +937,257 @@ def test_restore_maintenance_store_access_restores_all_bound_authorities(
         "_restore_legacy_store_access_unchecked",
         lambda **kwargs: restored.append(kwargs) or {"restored": True},
     )
+    locked: list[list[object]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_lock_maintenance_destination_namespace_for_rollback",
+        lambda received: locked.append(received) or (-1, []),
+    )
 
     result = activation_package_module.restore_maintenance_store_access(package)
 
     assert result["status"] == "maintenance_store_access_restored"
+    assert result["destinationNamespace"] == "root-locked-and-process-free"
+    assert result["resolvedUnsafeMarkers"] == []
+    assert locked == [bindings]
     assert [Path(str(call["source_store"])).name for call in restored] == [
         "overseer-main.sqlite3",
         "psychlo-bridge.sqlite3",
         "roadex-relay.sqlite3",
     ]
+
+
+def test_restore_maintenance_store_access_blocks_sources_when_destination_is_unsafe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    bindings = [
+        {
+            "name": name,
+            "sourceDb": str(tmp_path / f"{name}.sqlite3"),
+            "backupDb": str(tmp_path / "backup" / f"{name}.sqlite3"),
+            "destinationDb": str(tmp_path / "destination" / f"{name}.sqlite3"),
+            "sourceIdentity": {
+                "device": 1,
+                "inode": index + 20,
+                "uid": os.getuid(),
+                "gid": os.getgid(),
+                "mode": 0o600,
+                "parentDevice": 1,
+                "parentInode": 2,
+                "parentMode": 0o700,
+            },
+        }
+        for index, name in enumerate(
+            ("overseer-main", "psychlo-bridge", "roadex-relay")
+        )
+    ]
+    restored: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_rollback_command",
+        lambda *_args, **_kwargs: {"storeBindings": bindings},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_lock_maintenance_destination_namespace_for_rollback",
+        lambda _bindings: (_ for _ in ()).throw(
+            ActivationPackageError("destination namespace is unsafe")
+        ),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_restore_legacy_store_access_unchecked",
+        lambda **kwargs: restored.append(kwargs) or {"restored": True},
+    )
+
+    with pytest.raises(ActivationPackageError, match="destination namespace is unsafe"):
+        activation_package_module.restore_maintenance_store_access(package)
+
+    assert restored == []
+
+
+def test_restore_maintenance_store_access_holds_destination_lock_through_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    destination_parent = tmp_path / "destination"
+    destination_parent.mkdir()
+    descriptor = os.open(destination_parent, os.O_RDONLY | os.O_DIRECTORY)
+    bindings = [
+        {
+            "name": name,
+            "sourceDb": str(tmp_path / f"{name}.sqlite3"),
+            "backupDb": str(tmp_path / "backup" / f"{name}.sqlite3"),
+            "destinationDb": str(destination_parent / f"{name}.sqlite3"),
+            "sourceIdentity": {
+                "device": 1,
+                "inode": index + 20,
+                "uid": os.getuid(),
+                "gid": os.getgid(),
+                "mode": 0o600,
+                "parentDevice": 1,
+                "parentInode": 2,
+                "parentMode": 0o700,
+            },
+        }
+        for index, name in enumerate(
+            ("overseer-main", "psychlo-bridge", "roadex-relay")
+        )
+    ]
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_rollback_command",
+        lambda *_args, **_kwargs: {"storeBindings": bindings},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_lock_maintenance_destination_namespace_for_rollback",
+        lambda _bindings: (descriptor, []),
+    )
+    observed: list[int] = []
+
+    def restore(**_kwargs: object) -> dict[str, object]:
+        observed.append(os.fstat(descriptor).st_ino)
+        return {"restored": True}
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_restore_legacy_store_access_unchecked",
+        restore,
+    )
+
+    activation_package_module.restore_maintenance_store_access(package)
+
+    assert len(observed) == 3
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_root_rollback_destination_lock_blocks_service_principal_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires root to exercise the real ownership boundary")
+    try:
+        account = pwd.getpwnam("overseer")
+    except KeyError:
+        pytest.skip("requires the dedicated overseer account")
+
+    destination_parent = tmp_path / "destination"
+    destination_parent.mkdir(mode=0o700)
+    os.chown(destination_parent, account.pw_uid, account.pw_gid)
+    bindings: list[object] = []
+    for name in ("overseer", "psychlo", "roadex"):
+        destination = destination_parent / f"{name}.sqlite3"
+        destination.write_bytes(b"failed successor store")
+        destination.chmod(0o600)
+        os.chown(destination, account.pw_uid, account.pw_gid)
+        bindings.append(
+            {
+                "destinationDb": str(destination),
+                "backupDb": str(tmp_path / "backup" / f"{name}.sqlite3"),
+            }
+        )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda uid: (4242,) if uid == account.pw_uid else (),
+    )
+
+    with pytest.raises(ActivationPackageError, match="process exists"):
+        activation_package_module._lock_maintenance_destination_namespace_for_rollback(
+            bindings
+        )
+
+    assert (destination_parent.stat().st_uid, destination_parent.stat().st_gid) == (
+        0,
+        0,
+    )
+    assert stat.S_IMODE(destination_parent.stat().st_mode) == 0o700
+
+
+def test_root_rollback_destination_lock_rejects_real_open_store_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires root to exercise the real process scan")
+    destination_parent = tmp_path / "destination"
+    destination_parent.mkdir(mode=0o700)
+    destination = destination_parent / "overseer.sqlite3"
+    destination.write_bytes(b"failed successor store")
+    destination.chmod(0o600)
+    bindings: list[object] = [
+        {
+            "destinationDb": str(destination),
+            "backupDb": str(tmp_path / "backup" / "overseer.sqlite3"),
+        }
+    ]
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda _uid: (),
+    )
+
+    with destination.open("rb"):
+        with pytest.raises(ActivationPackageError, match="remains open"):
+            activation_package_module._lock_maintenance_destination_namespace_for_rollback(
+                bindings
+            )
+
+
+def test_rollback_destination_lock_rejects_missing_namespace_with_unsafe_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup = tmp_path / "backup" / "overseer.sqlite3"
+    backup.parent.mkdir()
+    marker = backup.with_suffix(
+        f"{backup.suffix}.destination-namespace-unsafe.json"
+    )
+    marker.write_text("{}\n", encoding="utf-8")
+    marker.chmod(0o600)
+    bindings: list[object] = [
+        {
+            "destinationDb": str(tmp_path / "missing" / "overseer.sqlite3"),
+            "backupDb": str(backup),
+        }
+    ]
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda _uid: (),
+    )
+
+    with pytest.raises(ActivationPackageError, match="missing with an unsafe marker"):
+        activation_package_module._lock_maintenance_destination_namespace_for_rollback(
+            bindings
+        )
+
+
+def test_rollback_destination_lock_rejects_process_when_namespace_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bindings: list[object] = [
+        {
+            "destinationDb": str(tmp_path / "missing" / "overseer.sqlite3"),
+            "backupDb": str(tmp_path / "backup" / "overseer.sqlite3"),
+        }
+    ]
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda uid: (4242,) if uid == 984 else (),
+    )
+
+    with pytest.raises(ActivationPackageError, match="process exists"):
+        activation_package_module._lock_maintenance_destination_namespace_for_rollback(
+            bindings
+        )

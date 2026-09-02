@@ -11,6 +11,7 @@ import pty
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import termios
@@ -10760,5 +10761,126 @@ def test_manual_maintenance_rollback_rejects_terminal_rollback_failure_without_n
     monkeypatch.setattr(activation_package_module, "_activation_execution_lock", Lock)
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
 
-    with pytest.raises(ActivationPackageError, match="not eligible"):
+    with pytest.raises(ActivationPackageError, match="retry approval"):
         activation_package_module.execute_approved_maintenance_rollback(package)
+
+
+def test_failed_maintenance_rollback_retries_from_zero_with_exact_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    plan_digest = activation_package_module.maintenance_plan_digest(contract)
+    current: dict[str, object] = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": "c" * 64,
+        "planDigest": plan_digest,
+        "status": "rollback_failed",
+        "stage": "rollback",
+        "writersStopped": True,
+        "failure": "ActivationPackageError",
+    }
+    written: list[dict[str, object]] = []
+    calls: list[tuple[str, ...]] = []
+
+    class Lock:
+        def __enter__(self) -> "Lock":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_activation_execution_lock", Lock)
+    monkeypatch.setattr(activation_package_module, "_load_maintenance_state", lambda: current)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_rollback_retry_approval",
+        lambda _package, _state: {"failedStateDigest": "d" * 64},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_maintenance_state",
+        lambda document: (written.append(dict(document)), current.update(document)),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: {
+            "schemaVersion": "overseer.maintenance-window-approval.v1",
+            "packageRoot": str(package.resolve()),
+            "packageDigest": "c" * 64,
+            "planDigest": plan_digest,
+            "scope": "maintenance-window-for-this-package-only",
+            "allowReboot": False,
+        },
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_maintenance_contract",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_maintenance_contract_command",
+        lambda command, _timeout: calls.append(tuple(command)) or 0,
+    )
+
+    result = activation_package_module.execute_approved_maintenance_rollback(package)
+
+    assert result["status"] == "rolled_back"
+    assert result["retryApproved"] is True
+    assert calls == [tuple(command) for command in contract["rollbackCommands"]]
+    assert written[0]["commandIndex"] == 0
+    assert written[-1]["status"] == "rolled_back"
+
+
+def test_record_maintenance_rollback_retry_approval_binds_exact_failed_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    state = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": "c" * 64,
+        "planDigest": "d" * 64,
+        "status": "rollback_failed",
+        "stage": "rollback",
+        "writersStopped": True,
+        "failure": "ActivationPackageError",
+    }
+    state_digest = activation_package_module._sha256(
+        activation_package_module._canonical(state)
+    )
+    target = tmp_path / "retry-approval.json"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_load_maintenance_state", lambda: state)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: {
+            "packageDigest": "c" * 64,
+            "planDigest": "d" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_rollback_retry_approval_path",
+        lambda _digest: target,
+    )
+
+    result = activation_package_module.record_maintenance_rollback_retry_approval(
+        package,
+        "c" * 64,
+        state_digest,
+    )
+
+    assert result["scope"] == (
+        "maintenance-rollback-retry-for-this-failed-state-only"
+    )
+    assert result["failedStateDigest"] == state_digest
+    assert json.loads(target.read_text(encoding="utf-8")) == result
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600

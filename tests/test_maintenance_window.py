@@ -872,6 +872,31 @@ def test_rollback_never_restarts_legacy_units_after_prerequisite_failure() -> No
     assert states[-1]["status"] == "rollback_failed"
 
 
+def test_destination_namespace_relock_failure_blocks_outer_writer_restart() -> None:
+    contract = _contract()
+    calls: list[tuple[str, ...]] = []
+    states: list[dict[str, Any]] = []
+
+    def execute(argv: list[str], _timeout_seconds: int) -> None:
+        calls.append(tuple(argv))
+        if argv[1] == "acceptance":
+            raise RuntimeError("acceptance failed")
+        if argv[1] == "rollback-cleanup":
+            raise RuntimeError("destination namespace relock failed")
+
+    with pytest.raises(RuntimeError, match="destination namespace relock failed"):
+        _execute_placeholder_contract(
+            contract,
+            PACKAGE_DIGEST,
+            execute,
+            states.append,
+        )
+
+    assert ("/usr/bin/true", "rollback-restart") not in calls
+    assert states[-1]["status"] == "rollback_failed"
+    assert states[-1]["writersStopped"] is True
+
+
 def test_global_window_deadline_exits_without_touching_writers() -> None:
     calls: list[tuple[str, ...]] = []
     states: list[dict[str, Any]] = []

@@ -68,6 +68,9 @@ PACKAGE_MANIFEST_SCHEMA = "overseer.dedicated-principal-package.v1"
 ACTIVATION_APPROVAL_SCHEMA = "overseer.activation-package-approval.v2"
 ACTIVATION_PHASE_APPROVAL_SCHEMA = "overseer.activation-phase-approval.v1"
 ACTIVATION_RUNNER_STATE_SCHEMA = "overseer.activation-runner-state.v2"
+MAINTENANCE_ROLLBACK_RETRY_APPROVAL_SCHEMA = (
+    "overseer.maintenance-rollback-retry-approval.v1"
+)
 LEGACY_ACTIVATION_APPROVAL_SCHEMA = "overseer.activation-package-approval.v1"
 LEGACY_ACTIVATION_CONTRACT_SCHEMA = "overseer.dedicated-principal-activation-contract.v1"
 LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA = "overseer.activation-runner-state.v1"
@@ -2905,9 +2908,16 @@ def _prepare_store_migration_unchecked(
     destination_sidecars = tuple(
         Path(f"{destination}{suffix}") for suffix in ("-wal", "-shm")
     )
+    destination_unsafe_marker = backup.with_suffix(
+        f"{backup.suffix}.destination-namespace-unsafe.json"
+    )
     if any(path.exists() or path.is_symlink() for path in destination_sidecars):
         raise ActivationPackageError(
             "final migrated store sidecar destination already exists"
+        )
+    if destination_unsafe_marker.exists() or destination_unsafe_marker.is_symlink():
+        raise ActivationPackageError(
+            "migration destination unsafe marker already exists"
         )
 
     root_uid, root_gid = _activation_root_identity()
@@ -3389,6 +3399,26 @@ def _prepare_store_migration_unchecked(
                     ),
                 )
             )
+        if not destination_recovery_safe:
+            try:
+                _write_new(
+                    destination_unsafe_marker,
+                    _canonical(
+                        {
+                            "schemaVersion": (
+                                "overseer.maintenance-destination-namespace-unsafe.v1"
+                            ),
+                            "status": "destination_namespace_unsafe",
+                            "destinationDb": str(destination.resolve()),
+                        }
+                    )
+                    + b"\n",
+                    0o600,
+                )
+            except BaseException as error:
+                recovery_failures.append(
+                    ("destination unsafe marker persistence", error)
+                )
         if destination_recovery_safe:
             try:
                 if destination_parent_descriptor is not None:
@@ -3403,6 +3433,7 @@ def _prepare_store_migration_unchecked(
                 backup,
                 *backup_sidecars,
                 backup.with_suffix(f"{backup.suffix}.report.json"),
+                destination_unsafe_marker,
             ]
             if destination_parent_descriptor is not None:
                 cleanup_targets.insert(0, destination)
@@ -3636,6 +3667,165 @@ def _require_maintenance_active_rollback_command(
     return contract
 
 
+def _lock_maintenance_destination_namespace_for_rollback(
+    bindings: list[object],
+) -> tuple[int, list[str]]:
+    """Quarantine failed successor stores before restoring legacy writers."""
+
+    destinations: list[Path] = []
+    markers: list[Path] = []
+    for binding in bindings:
+        if not isinstance(binding, Mapping):
+            raise ActivationPackageError(
+                "maintenance rollback store binding is invalid"
+            )
+        destination = Path(str(binding.get("destinationDb", ""))).resolve()
+        backup = Path(str(binding.get("backupDb", ""))).resolve()
+        if not destination.is_absolute() or not backup.is_absolute():
+            raise ActivationPackageError(
+                "maintenance rollback destination binding is invalid"
+            )
+        destinations.append(destination)
+        markers.append(
+            backup.with_suffix(f"{backup.suffix}.destination-namespace-unsafe.json")
+        )
+    parents = {destination.parent for destination in destinations}
+    if len(parents) != 1:
+        raise ActivationPackageError(
+            "maintenance rollback destinations do not share one namespace"
+        )
+    target_parent = next(iter(parents))
+    root_uid, root_gid = _activation_root_identity()
+    try:
+        initial = target_parent.lstat()
+    except FileNotFoundError:
+        if any(marker.exists() or marker.is_symlink() for marker in markers):
+            raise ActivationPackageError(
+                "maintenance rollback destination namespace is missing with an unsafe marker"
+            )
+        if _processes_for_uid(APPROVED_OVERSEER_UID):
+            raise ActivationPackageError(
+                "service principal process exists while rollback destination is missing"
+            )
+        if any(
+            path.exists() or path.is_symlink()
+            for destination in destinations
+            for path in _legacy_store_paths(destination)
+        ):
+            raise ActivationPackageError(
+                "maintenance rollback destination namespace disappeared"
+            )
+        return -1, []
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance rollback destination namespace could not be inspected"
+        ) from error
+    if (
+        target_parent.is_symlink()
+        or not stat.S_ISDIR(initial.st_mode)
+        or (initial.st_uid, initial.st_gid)
+        not in {
+            (root_uid, root_gid),
+            (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID),
+        }
+        or stat.S_IMODE(initial.st_mode) not in {0, 0o700}
+    ):
+        raise ActivationPackageError(
+            "maintenance rollback destination namespace is unsafe"
+        )
+    descriptor = os.open(
+        target_parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    identity = (initial.st_dev, initial.st_ino)
+    try:
+        opened = os.fstat(descriptor)
+        lexical = target_parent.lstat()
+        if (
+            (opened.st_dev, opened.st_ino) != identity
+            or (lexical.st_dev, lexical.st_ino) != identity
+        ):
+            raise ActivationPackageError(
+                "maintenance rollback destination namespace changed while opening"
+            )
+        _relock_migration_destination_directory(
+            descriptor,
+            target_parent,
+            expected_identity=identity,
+            destination_uid=APPROVED_OVERSEER_UID,
+            destination_gid=APPROVED_OVERSEER_GID,
+            executor_uid=root_uid,
+            executor_gid=root_gid,
+        )
+        running = _processes_for_uid(APPROVED_OVERSEER_UID)
+        if running:
+            raise ActivationPackageError(
+                "service principal process exists during maintenance rollback"
+            )
+        artifact_identities: list[tuple[int, int]] = []
+        for destination in destinations:
+            for path in _legacy_store_paths(destination):
+                if not path.exists() and not path.is_symlink():
+                    continue
+                metadata = _validate_store_artifact(
+                    path,
+                    label="maintenance rollback destination SQLite artifact",
+                )
+                if (metadata.st_uid, metadata.st_gid) not in {
+                    (root_uid, root_gid),
+                    (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID),
+                }:
+                    raise ActivationPackageError(
+                        "maintenance rollback destination SQLite owner is unsafe"
+                    )
+                artifact_identities.append((metadata.st_dev, metadata.st_ino))
+        if artifact_identities and _legacy_inode_activity(
+            tuple(artifact_identities),
+            include_open_files=True,
+        ):
+            raise ActivationPackageError(
+                "maintenance rollback destination SQLite artifact remains open"
+            )
+        resolved_markers: list[str] = []
+        for marker, destination in zip(markers, destinations, strict=True):
+            if not marker.exists() and not marker.is_symlink():
+                continue
+            metadata = _validate_store_artifact(
+                marker,
+                label="maintenance destination unsafe marker",
+                expected_uid=root_uid,
+            )
+            if metadata.st_gid != root_gid:
+                raise ActivationPackageError(
+                    "maintenance destination unsafe marker group is invalid"
+                )
+            raw, _metadata = _stable_read(marker)
+            try:
+                document = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ActivationPackageError(
+                    "maintenance destination unsafe marker is invalid"
+                ) from error
+            if document != {
+                "schemaVersion": (
+                    "overseer.maintenance-destination-namespace-unsafe.v1"
+                ),
+                "status": "destination_namespace_unsafe",
+                "destinationDb": str(destination),
+            }:
+                raise ActivationPackageError(
+                    "maintenance destination unsafe marker drifted"
+                )
+            resolved_markers.append(str(marker))
+        return descriptor, resolved_markers
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def restore_maintenance_store_access(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
@@ -3651,25 +3841,39 @@ def restore_maintenance_store_access(
     bindings = contract.get("storeBindings")
     if not isinstance(bindings, list) or len(bindings) != 3:
         raise ActivationPackageError("maintenance rollback store bindings are invalid")
-    for binding in bindings:
-        if not isinstance(binding, Mapping) or not isinstance(
-            binding.get("sourceIdentity"), Mapping
-        ):
-            raise ActivationPackageError("maintenance rollback store binding is invalid")
-        identity = binding["sourceIdentity"]
-        restored.append(
-            _restore_legacy_store_access_unchecked(
-                source_store=str(binding.get("sourceDb", "")),
-                expected_source_uid=int(identity["uid"]),
-                expected_source_gid=int(identity["gid"]),
-                expected_source_device=int(identity["device"]),
-                expected_source_inode=int(identity["inode"]),
-                expected_parent_device=int(identity["parentDevice"]),
-                expected_parent_inode=int(identity["parentInode"]),
-                expected_parent_mode=int(identity["parentMode"]),
+    destination_descriptor, resolved_markers = (
+        _lock_maintenance_destination_namespace_for_rollback(bindings)
+    )
+    try:
+        for binding in bindings:
+            if not isinstance(binding, Mapping) or not isinstance(
+                binding.get("sourceIdentity"), Mapping
+            ):
+                raise ActivationPackageError(
+                    "maintenance rollback store binding is invalid"
+                )
+            identity = binding["sourceIdentity"]
+            restored.append(
+                _restore_legacy_store_access_unchecked(
+                    source_store=str(binding.get("sourceDb", "")),
+                    expected_source_uid=int(identity["uid"]),
+                    expected_source_gid=int(identity["gid"]),
+                    expected_source_device=int(identity["device"]),
+                    expected_source_inode=int(identity["inode"]),
+                    expected_parent_device=int(identity["parentDevice"]),
+                    expected_parent_inode=int(identity["parentInode"]),
+                    expected_parent_mode=int(identity["parentMode"]),
+                )
             )
-        )
-    return {"status": "maintenance_store_access_restored", "stores": restored}
+    finally:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+    return {
+        "status": "maintenance_store_access_restored",
+        "stores": restored,
+        "destinationNamespace": "root-locked-and-process-free",
+        "resolvedUnsafeMarkers": resolved_markers,
+    }
 
 
 def stage_release_payload(
@@ -6125,6 +6329,17 @@ def _maintenance_state_path() -> Path:
     return Path("/var/lib/overseer-executor/maintenance-window-state.json")
 
 
+def _maintenance_rollback_retry_approval_path(state_digest: str) -> Path:
+    if len(state_digest) != 64 or set(state_digest) - _HEX:
+        raise ActivationPackageError(
+            "maintenance rollback retry state digest is invalid"
+        )
+    return Path(
+        "/var/lib/overseer-executor/"
+        f"approved-maintenance-rollback-retry-{state_digest}.json"
+    )
+
+
 def _activation_phase_approval_record_path(phase: str) -> Path:
     if phase not in ACTIVATION_PHASES:
         raise ActivationPackageError("unsupported activation phase")
@@ -6737,6 +6952,112 @@ def record_maintenance_window_approval(
         )
     except ValueError as error:
         raise ActivationPackageError("maintenance approval binding is invalid") from error
+    _write_new(target, _canonical(document) + b"\n", 0o600)
+    return document
+
+
+def _maintenance_rollback_retry_approval_document(
+    package: Path,
+    state: Mapping[str, object],
+) -> tuple[dict[str, object], str]:
+    if (
+        state.get("schemaVersion") != MAINTENANCE_RUNNER_STATE_SCHEMA
+        or state.get("status") != "rollback_failed"
+        or state.get("stage") not in {"rollback", "earlyRollback"}
+        or state.get("writersStopped") is not True
+        or not isinstance(state.get("packageDigest"), str)
+        or not isinstance(state.get("planDigest"), str)
+    ):
+        raise ActivationPackageError(
+            "maintenance state is not eligible for rollback retry approval"
+        )
+    state_digest = _sha256(_canonical(dict(state)))
+    return (
+        {
+            "schemaVersion": MAINTENANCE_ROLLBACK_RETRY_APPROVAL_SCHEMA,
+            "scope": "maintenance-rollback-retry-for-this-failed-state-only",
+            "packageRoot": str(package),
+            "packageDigest": state["packageDigest"],
+            "planDigest": state["planDigest"],
+            "failedStateDigest": state_digest,
+        },
+        state_digest,
+    )
+
+
+def _load_maintenance_rollback_retry_approval(
+    package: Path,
+    state: Mapping[str, object],
+) -> dict[str, object]:
+    expected, state_digest = _maintenance_rollback_retry_approval_document(
+        package,
+        state,
+    )
+    target = _maintenance_rollback_retry_approval_path(state_digest)
+    try:
+        raw, metadata = _stable_read(target)
+        document = json.loads(raw)
+    except (
+        ActivationPackageError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ActivationPackageError(
+            "maintenance rollback retry approval is required"
+        ) from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        metadata.st_uid != root_uid
+        or metadata.st_gid != root_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or document != expected
+    ):
+        raise ActivationPackageError(
+            "maintenance rollback retry approval is invalid"
+        )
+    return expected
+
+
+def record_maintenance_rollback_retry_approval(
+    package_root: str | os.PathLike[str],
+    expected_package_digest: str,
+    expected_state_digest: str,
+) -> dict[str, object]:
+    """Approve one retry for one exact terminal failed rollback state."""
+
+    _require_root_activation()
+    package = Path(package_root).resolve()
+    state = _load_maintenance_state()
+    if state is None:
+        raise ActivationPackageError(
+            "maintenance rollback retry requires a failed runner state"
+        )
+    document, state_digest = _maintenance_rollback_retry_approval_document(
+        package,
+        state,
+    )
+    if document["packageDigest"] != expected_package_digest:
+        raise ActivationPackageError(
+            "maintenance rollback retry package digest does not match"
+        )
+    if state_digest != expected_state_digest:
+        raise ActivationPackageError(
+            "maintenance rollback retry state digest does not match"
+        )
+    approval = _load_maintenance_approval(package)
+    if (
+        approval.get("packageDigest") != document["packageDigest"]
+        or approval.get("planDigest") != document["planDigest"]
+    ):
+        raise ActivationPackageError(
+            "maintenance rollback retry is not bound to the active approval"
+        )
+    target = _maintenance_rollback_retry_approval_path(state_digest)
+    if target.exists() or target.is_symlink():
+        raise ActivationPackageError(
+            "maintenance rollback retry approval already exists"
+        )
     _write_new(target, _canonical(document) + b"\n", 0o600)
     return document
 
@@ -13168,11 +13489,16 @@ def execute_approved_maintenance_rollback(
         state = _load_maintenance_state()
         if state is None:
             raise ActivationPackageError("maintenance state is required for rollback")
+        retry_approval: dict[str, object] | None = None
+        if state.get("status") == "rollback_failed":
+            retry_approval = _load_maintenance_rollback_retry_approval(
+                package,
+                state,
+            )
         if state.get("status") in {
             "complete",
             "rolled_back",
             "failed_before_stopWriters",
-            "rollback_failed",
         }:
             if state.get("status") == "rolled_back":
                 return {
@@ -13295,7 +13621,12 @@ def execute_approved_maintenance_rollback(
                 "writersStopped": True,
             }
         )
-        return {"status": "rolled_back", "packageDigest": digest, "replayed": False}
+        return {
+            "status": "rolled_back",
+            "packageDigest": digest,
+            "replayed": False,
+            "retryApproved": retry_approval is not None,
+        }
 
 
 def execute_approved_staging_canary(
@@ -13504,6 +13835,13 @@ def _main(argv: list[str] | None = None) -> int:
     )
     record_maintenance_approval.add_argument("--package-root", required=True)
     record_maintenance_approval.add_argument("--expected-package-digest", required=True)
+    record_maintenance_retry = commands.add_parser(
+        "record-maintenance-rollback-retry-approval",
+        help="approve one retry for one exact failed maintenance rollback state",
+    )
+    record_maintenance_retry.add_argument("--package-root", required=True)
+    record_maintenance_retry.add_argument("--expected-package-digest", required=True)
+    record_maintenance_retry.add_argument("--expected-state-digest", required=True)
     verify_maintenance = commands.add_parser(
         "verify-approved-maintenance-window",
         help="verify the separate maintenance approval and sealed contract",
@@ -13849,6 +14187,14 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "record-maintenance-rollback-retry-approval":
+        result = record_maintenance_rollback_retry_approval(
+            args.package_root,
+            args.expected_package_digest,
+            args.expected_state_digest,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "verify-approved-maintenance-window":
         result = verify_approved_maintenance_window(
             args.package_root,
@@ -13969,6 +14315,7 @@ __all__ = [
     "ActivationPackageError",
     "MAINTENANCE_APPROVAL_SCHEMA",
     "MAINTENANCE_CONTRACT_SCHEMA",
+    "MAINTENANCE_ROLLBACK_RETRY_APPROVAL_SCHEMA",
     "MAINTENANCE_RUNNER_STATE_SCHEMA",
     "PACKAGE_MANIFEST_SCHEMA",
     "RELEASE_SCHEMA",
@@ -13989,6 +14336,7 @@ __all__ = [
     "recover_activation_approval_import",
     "record_activation_approval",
     "record_activation_phase_approval",
+    "record_maintenance_rollback_retry_approval",
     "rehearse_store_migration",
     "render_activation_contract",
     "render_maintenance_window_contract",

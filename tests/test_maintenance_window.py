@@ -571,6 +571,16 @@ def test_contract_rejects_successor_unit_baseline_drift() -> None:
         validate_maintenance_contract(unknown)
 
 
+def test_contract_rejects_store_destination_drift() -> None:
+    contract = _contract()
+    contract["storeBindings"][0]["destinationDb"] = (
+        "/var/lib/overseer/unsealed.sqlite3"
+    )
+
+    with pytest.raises(ValueError, match="store destination"):
+        validate_maintenance_contract(contract)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

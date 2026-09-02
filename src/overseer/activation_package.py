@@ -50,6 +50,7 @@ from .maintenance_window import (
     MAINTENANCE_CONTRACT_SCHEMA,
     MAINTENANCE_EXPECTED_ACTIVE_UNITS,
     MAINTENANCE_RUNNER_STATE_SCHEMA,
+    MAINTENANCE_STORE_DESTINATIONS,
     MAINTENANCE_SUCCESSOR_SYSTEM_UNITS,
     MAINTENANCE_WRITER_UNITS,
     execute_maintenance_contract,
@@ -1697,9 +1698,71 @@ def _hash_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _copy_store(source: Path, target: Path) -> None:
+def _validate_migration_destination_directory(
+    target_parent: Path,
+    *,
+    destination_uid: int,
+    destination_gid: int,
+) -> os.stat_result:
+    try:
+        parent_metadata = target_parent.lstat()
+    except OSError as error:
+        raise ActivationPackageError(
+            "migration destination directory could not be inspected"
+        ) from error
+    if (
+        target_parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or (parent_metadata.st_uid, parent_metadata.st_gid)
+        != (destination_uid, destination_gid)
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+    ):
+        raise ActivationPackageError(
+            "migration destination directory identity or mode is invalid"
+        )
+    return parent_metadata
+
+
+def _ensure_migration_destination_directory(
+    target_parent: Path,
+    *,
+    destination_uid: int,
+    destination_gid: int,
+) -> None:
+    """Require the sealed owner, creating only a current-user destination."""
+
+    try:
+        target_parent.lstat()
+    except FileNotFoundError:
+        if destination_uid != os.geteuid() or destination_gid != os.getegid():
+            raise ActivationPackageError(
+                "migration destination directory must be provisioned for its sealed owner"
+            )
+        _ensure_directory(target_parent)
+    except OSError as error:
+        raise ActivationPackageError(
+            "migration destination directory could not be inspected"
+        ) from error
+    _validate_migration_destination_directory(
+        target_parent,
+        destination_uid=destination_uid,
+        destination_gid=destination_gid,
+    )
+
+
+def _copy_store(
+    source: Path,
+    target: Path,
+    *,
+    destination_uid: int,
+    destination_gid: int,
+) -> None:
     source_metadata = _validate_store_artifact(source, label="rehearsal backup")
-    _ensure_directory(target.parent)
+    _ensure_migration_destination_directory(
+        target.parent,
+        destination_uid=destination_uid,
+        destination_gid=destination_gid,
+    )
     source_fd = os.open(
         source,
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -1992,7 +2055,12 @@ def rehearse_store_migration(
     backup_integrity = _integrity_check(backup)
     row_counts_before, schema_before = _migration_evidence(backup)
     backup_digest, backup_size = _hash_file(backup)
-    _copy_store(backup, migrated)
+    _copy_store(
+        backup,
+        migrated,
+        destination_uid=os.geteuid(),
+        destination_gid=os.getegid(),
+    )
     store = SQLiteStore(migrated)
     store.close()
     migrated_integrity = _integrity_check(migrated)
@@ -2844,7 +2912,12 @@ def _prepare_store_migration_unchecked(
         backup_integrity = _integrity_check(backup)
         before_counts, schema_before = _migration_evidence(backup)
         backup_digest, backup_size = _hash_file(backup)
-        _copy_store(backup, destination)
+        _copy_store(
+            backup,
+            destination,
+            destination_uid=destination_uid,
+            destination_gid=destination_gid,
+        )
         if store_kind == "overseer":
             migrated_store = SQLiteStore(destination)
             migrated_store.close()
@@ -3026,9 +3099,10 @@ def prepare_maintenance_store_copy(
         Path(backup_store).resolve().parent,
         enforce_existing_mode=False,
     )
-    _ensure_directory(
+    _ensure_migration_destination_directory(
         Path(destination_store).resolve().parent,
-        enforce_existing_mode=False,
+        destination_uid=destination_uid,
+        destination_gid=destination_gid,
     )
     return _prepare_store_migration_unchecked(
         package_root=package_root,
@@ -3076,7 +3150,11 @@ def prepare_maintenance_stores(
         backup = Path(str(binding.get("backupDb", ""))).resolve()
         destination = Path(str(binding.get("destinationDb", ""))).resolve()
         _ensure_directory(backup.parent, enforce_existing_mode=False)
-        _ensure_directory(destination.parent, enforce_existing_mode=False)
+        _ensure_migration_destination_directory(
+            destination.parent,
+            destination_uid=APPROVED_OVERSEER_UID,
+            destination_gid=APPROVED_OVERSEER_GID,
+        )
         reports.append(
             _prepare_store_migration_unchecked(
                 package_root=package,
@@ -10926,6 +11004,39 @@ def _maintenance_store_binding_identity_valid(binding: Mapping[str, object]) -> 
     )
 
 
+def _maintenance_destination_preflight(bindings: list[object]) -> None:
+    """Read-only validation of the fixed empty dedicated-principal targets."""
+
+    if len(bindings) != len(MAINTENANCE_STORE_DESTINATIONS):
+        raise ActivationPackageError("maintenance destination bindings are invalid")
+    for binding, (expected_name, expected_path) in zip(
+        bindings,
+        MAINTENANCE_STORE_DESTINATIONS,
+        strict=True,
+    ):
+        if (
+            not isinstance(binding, Mapping)
+            or binding.get("name") != expected_name
+            or binding.get("destinationDb") != expected_path
+        ):
+            raise ActivationPackageError("maintenance destination binding is invalid")
+        destination = Path(expected_path)
+        _validate_migration_destination_directory(
+            destination.parent,
+            destination_uid=APPROVED_OVERSEER_UID,
+            destination_gid=APPROVED_OVERSEER_GID,
+        )
+        for candidate in (
+            destination,
+            Path(f"{destination}-wal"),
+            Path(f"{destination}-shm"),
+        ):
+            if candidate.exists() or candidate.is_symlink():
+                raise ActivationPackageError(
+                    "maintenance destination namespace is not empty"
+                )
+
+
 def verify_maintenance_preflight(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
@@ -10958,6 +11069,7 @@ def verify_maintenance_preflight(
         for binding in all_bindings
     ):
         raise ActivationPackageError("maintenance source identity drifted before writer stop")
+    _maintenance_destination_preflight(bindings)
     required_bytes = _maintenance_preservation_required_bytes(all_bindings, inputs)
     evidence_root = Path(evidence_value)
     if evidence_root.exists() or evidence_root.is_symlink():
@@ -12583,10 +12695,21 @@ def execute_approved_maintenance_window(
                     "planDigest": plan_digest,
                     "replayed": True,
                 }
-            if not (
-                prior.get("status") == "failed_before_stopWriters"
+            preflight_command = contract["stages"][0]["commands"][0]
+            retryable_pre_stop = (
+                prior.get("status")
+                in {
+                    "before_command",
+                    "after_command",
+                    "failed_before_stopWriters",
+                }
+                and prior.get("stage") == "preflight"
+                and prior.get("commandIndex") == 0
+                and prior.get("commandDigest")
+                == _sha256(_canonical(preflight_command))
                 and prior.get("writersStopped") is False
-            ):
+            )
+            if not retryable_pre_stop:
                 raise ActivationPackageError("maintenance runner state already exists")
 
         def checkpoint(state: dict[str, object]) -> None:

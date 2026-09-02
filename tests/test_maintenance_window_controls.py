@@ -78,7 +78,7 @@ def _contract(tmp_path: Path) -> dict[str, Any]:
             {
                 "name": name,
                 "sourceDb": str(source_stores[name]),
-                "destination": str(destinations[name]),
+                "destinationDb": str(destinations[name]),
             }
             for name in STORE_NAMES
         ],
@@ -200,11 +200,18 @@ def test_maintenance_preflight_is_read_only_and_checks_every_store_before_stop(
         "MIN_APPROVED_PACKAGE_IMPORT_HEADROOM_BYTES",
         0,
     )
+    destination_calls: list[list[object]] = []
+    monkeypatch.setattr(
+        activation_package,
+        "_maintenance_destination_preflight",
+        lambda bindings: destination_calls.append(bindings),
+    )
 
     result = activation_package.verify_maintenance_preflight(package_root)
 
     assert result["status"] == "preflight_passed"
     assert calls == ["verify-maintenance-preflight"]
+    assert destination_calls == [contract["storeBindings"]]
     assert _artifact_snapshot(tmp_path) == before
 
 
@@ -222,6 +229,61 @@ def test_maintenance_preflight_rejects_store_identity_drift_before_stop(
 
     with pytest.raises(Exception, match="identity drifted"):
         activation_package.verify_maintenance_preflight(package_root)
+
+
+def test_destination_preflight_accepts_exact_empty_dedicated_principal_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination_root = tmp_path / "dedicated-principal"
+    destination_root.mkdir(mode=0o700)
+    destinations = tuple(
+        (name, str(destination_root / f"{name}.sqlite3"))
+        for name in STORE_NAMES
+    )
+    bindings = [
+        {"name": name, "destinationDb": destination}
+        for name, destination in destinations
+    ]
+    before = _artifact_snapshot(tmp_path)
+    monkeypatch.setattr(
+        activation_package,
+        "MAINTENANCE_STORE_DESTINATIONS",
+        destinations,
+    )
+    monkeypatch.setattr(activation_package, "APPROVED_OVERSEER_UID", os.geteuid())
+    monkeypatch.setattr(activation_package, "APPROVED_OVERSEER_GID", os.getegid())
+
+    activation_package._maintenance_destination_preflight(bindings)
+
+    assert _artifact_snapshot(tmp_path) == before
+
+
+def test_destination_preflight_rejects_existing_sqlite_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination_root = tmp_path / "dedicated-principal"
+    destination_root.mkdir(mode=0o700)
+    destinations = tuple(
+        (name, str(destination_root / f"{name}.sqlite3"))
+        for name in STORE_NAMES
+    )
+    bindings = [
+        {"name": name, "destinationDb": destination}
+        for name, destination in destinations
+    ]
+    Path(f"{destinations[1][1]}-wal").write_bytes(b"stale")
+    monkeypatch.setattr(
+        activation_package,
+        "MAINTENANCE_STORE_DESTINATIONS",
+        destinations,
+    )
+    monkeypatch.setattr(activation_package, "APPROVED_OVERSEER_UID", os.geteuid())
+    monkeypatch.setattr(activation_package, "APPROVED_OVERSEER_GID", os.getegid())
+
+    with pytest.raises(Exception, match="namespace is not empty"):
+        activation_package._maintenance_destination_preflight(bindings)
 
 
 def test_stop_maintenance_writers_includes_optional_coordination_writer(

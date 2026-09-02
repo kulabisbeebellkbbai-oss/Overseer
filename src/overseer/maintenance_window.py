@@ -51,6 +51,11 @@ MAINTENANCE_SUCCESSOR_SYSTEM_UNITS = (
     "overseer-admin-executor.socket",
     "overseer-codex-user-bridge.socket",
 )
+MAINTENANCE_STORE_DESTINATIONS = (
+    ("overseer-main", "/var/lib/overseer/overseer.sqlite3"),
+    ("psychlo-bridge", "/var/lib/overseer/psychlo-bridge.sqlite3"),
+    ("roadex-relay", "/var/lib/overseer/roadex-relay.sqlite3"),
+)
 _OPTIONAL_ABSENT_WRITER_UNITS = {
     "overseer-psychlo-coordination-tick.timer",
     "overseer-psychlo-coordination-tick.service",
@@ -1083,10 +1088,8 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
             _fail("contract successor unit baseline does not match the inactive profile")
 
     bindings = document["storeBindings"]
-    expected_store_names = (
-        "overseer-main",
-        "psychlo-bridge",
-        "roadex-relay",
+    expected_store_names = tuple(
+        name for name, _path in MAINTENANCE_STORE_DESTINATIONS
     )
     if (
         not isinstance(bindings, Sequence)
@@ -1116,6 +1119,8 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
         expected_kind = "overseer" if index == 0 else "copy-only"
         if store["name"] != expected_store_names[index] or store["storeKind"] != expected_kind:
             _fail("contract store name or kind is invalid")
+        if store["destinationDb"] != MAINTENANCE_STORE_DESTINATIONS[index][1]:
+            _fail("contract store destination is invalid")
         for field in ("sourceDb", "backupDb", "destinationDb"):
             path = _require_absolute_path(
                 store[field],

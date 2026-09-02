@@ -112,6 +112,46 @@ def _prepare(**kwargs: object) -> dict[str, object]:
     return activation_package_module.prepare_maintenance_store_copy(**kwargs)
 
 
+def test_copy_store_accepts_an_existing_exact_non_executor_destination_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "backup.sqlite3"
+    source.write_bytes(b"sealed backup")
+    source.chmod(0o600)
+    destination_parent = tmp_path / "dedicated-principal"
+    destination_parent.mkdir(mode=0o700)
+    destination = destination_parent / "overseer.sqlite3"
+    expected_uid = destination_parent.stat().st_uid
+    expected_gid = destination_parent.stat().st_gid
+    source_metadata = source.stat()
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_store_artifact",
+        lambda *_args, **_kwargs: source_metadata,
+    )
+    monkeypatch.setattr(
+        activation_package_module.os,
+        "geteuid",
+        lambda: expected_uid + 1,
+    )
+    monkeypatch.setattr(
+        activation_package_module.os,
+        "getegid",
+        lambda: expected_gid + 1,
+    )
+
+    activation_package_module._copy_store(
+        source,
+        destination,
+        destination_uid=expected_uid,
+        destination_gid=expected_gid,
+    )
+
+    assert destination.read_bytes() == b"sealed backup"
+
+
 def _schema_and_counts(path: Path) -> tuple[list[tuple[object, ...]], dict[str, int]]:
     connection = sqlite3.connect(path)
     try:
@@ -359,6 +399,11 @@ def test_prepare_maintenance_stores_uses_exact_ordered_contract_bindings(
     monkeypatch.setattr(
         activation_package_module,
         "_ensure_directory",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_ensure_migration_destination_directory",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(

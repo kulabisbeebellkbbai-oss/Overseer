@@ -9680,7 +9680,7 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
                 "name": "overseer-main",
                 "sourceDb": str(package / "legacy.sqlite3"),
                 "backupDb": str(package / "backup-main.sqlite3"),
-                "destinationDb": str(package / "destination-main.sqlite3"),
+                "destinationDb": "/var/lib/overseer/overseer.sqlite3",
                 "storeKind": "overseer",
                 "sourceIdentity": {
                     "device": 1,
@@ -9696,7 +9696,7 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
                 "name": "psychlo-bridge",
                 "sourceDb": str(package / "psychlo.sqlite3"),
                 "backupDb": str(package / "backup-psychlo.sqlite3"),
-                "destinationDb": str(package / "destination-psychlo.sqlite3"),
+                "destinationDb": "/var/lib/overseer/psychlo-bridge.sqlite3",
                 "storeKind": "copy-only",
                 "sourceIdentity": {
                     "device": 1,
@@ -9712,7 +9712,7 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
                 "name": "roadex-relay",
                 "sourceDb": str(package / "roadex.sqlite3"),
                 "backupDb": str(package / "backup-roadex.sqlite3"),
-                "destinationDb": str(package / "destination-roadex.sqlite3"),
+                "destinationDb": "/var/lib/overseer/roadex-relay.sqlite3",
                 "storeKind": "copy-only",
                 "sourceIdentity": {
                     "device": 1,
@@ -10372,9 +10372,14 @@ def test_maintenance_window_rollback_accepts_only_maintenance_state_and_cli_has_
     assert observed == ["record", "verify", "execute", "rollback"]
 
 
+@pytest.mark.parametrize(
+    "prior_status",
+    ("before_command", "after_command", "failed_before_stopWriters"),
+)
 def test_maintenance_window_retries_an_exact_pre_stop_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    prior_status: str,
 ) -> None:
     package = tmp_path / "package"
     package.mkdir()
@@ -10392,8 +10397,14 @@ def test_maintenance_window_retries_an_exact_pre_stop_failure(
         "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
         "packageDigest": "c" * 64,
         "planDigest": plan_digest,
-        "status": "failed_before_stopWriters",
+        "status": prior_status,
         "stage": "preflight",
+        "commandIndex": 0,
+        "commandDigest": activation_package_module._sha256(
+            activation_package_module._canonical(
+                contract["stages"][0]["commands"][0]
+            )
+        ),
         "writersStopped": False,
     }
     calls: list[tuple[str, ...]] = []
@@ -10436,6 +10447,10 @@ def test_maintenance_window_retries_an_exact_pre_stop_failure(
     assert calls
     assert calls[0] == tuple(contract["stages"][0]["commands"][0])
     assert written[-1]["status"] == "complete"
+
+    prior["commandDigest"] = "e" * 64
+    with pytest.raises(ActivationPackageError, match="state already exists"):
+        activation_package_module.execute_approved_maintenance_window(package)
 
 
 def test_writer_stop_command_accepts_the_pre_effect_uncertain_checkpoint(

@@ -713,6 +713,85 @@ def test_root_maintenance_copy_keeps_destination_locked_through_report_persisten
     assert not destination.exists()
 
 
+def test_root_maintenance_copy_relocks_destination_before_partial_handoff_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires root to exercise the real ownership boundary")
+    try:
+        account = pwd.getpwnam("overseer")
+    except KeyError:
+        pytest.skip("requires the dedicated overseer account")
+
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    destination = tmp_path / "destination" / "overseer.sqlite3"
+    destination.parent.mkdir(mode=0o700)
+    os.chown(destination.parent, account.pw_uid, account.pw_gid)
+    args = _source_args(
+        tmp_path,
+        source,
+        store_kind="overseer",
+        destination_uid=account.pw_uid,
+        destination_gid=account.pw_gid,
+    )
+    args["destination_store"] = destination
+    real_fsync = activation_package_module.os.fsync
+    fsync_failure_injected = False
+
+    def fail_first_fsync_after_destination_exposure(descriptor: int) -> None:
+        nonlocal fsync_failure_injected
+        metadata = os.fstat(descriptor)
+        if (
+            not fsync_failure_injected
+            and stat.S_ISDIR(metadata.st_mode)
+            and (metadata.st_uid, metadata.st_gid)
+            == (account.pw_uid, account.pw_gid)
+            and stat.S_IMODE(metadata.st_mode) == 0o700
+        ):
+            fsync_failure_injected = True
+            raise OSError("injected destination handoff fsync failure")
+        real_fsync(descriptor)
+
+    real_restore_source = (
+        activation_package_module._restore_legacy_store_access_unchecked
+    )
+    observed_destination_before_source_restore: list[tuple[int, int, int]] = []
+
+    def observe_source_restore(**kwargs: object) -> dict[str, object]:
+        metadata = destination.parent.stat()
+        observed_destination_before_source_restore.append(
+            (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode))
+        )
+        return real_restore_source(**kwargs)
+
+    monkeypatch.setattr(
+        activation_package_module.os,
+        "fsync",
+        fail_first_fsync_after_destination_exposure,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_restore_legacy_store_access_unchecked",
+        observe_source_restore,
+    )
+
+    with pytest.raises(OSError, match="injected destination handoff fsync failure"):
+        _prepare(**args)
+
+    assert fsync_failure_injected is True
+    assert observed_destination_before_source_restore == [(0, 0, 0o700)]
+    assert (destination.parent.stat().st_uid, destination.parent.stat().st_gid) == (
+        account.pw_uid,
+        account.pw_gid,
+    )
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    assert not destination.exists()
+
+
 def test_maintenance_copy_removes_destination_sidecars_when_handoff_sealing_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

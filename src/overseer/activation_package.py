@@ -1896,6 +1896,81 @@ def _restore_migration_destination_directory(
         )
 
 
+def _relock_migration_destination_directory(
+    descriptor: int,
+    target_parent: Path,
+    *,
+    expected_identity: tuple[int, int],
+    destination_uid: int,
+    destination_gid: int,
+    executor_uid: int,
+    executor_gid: int,
+) -> None:
+    """Revoke destination access again before any migration recovery work."""
+
+    opened = os.fstat(descriptor)
+    lexical = target_parent.lstat()
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != expected_identity
+        or (lexical.st_dev, lexical.st_ino) != expected_identity
+        or (opened.st_uid, opened.st_gid)
+        not in {
+            (executor_uid, executor_gid),
+            (destination_uid, destination_gid),
+        }
+        or stat.S_IMODE(opened.st_mode) not in {0, 0o700}
+    ):
+        raise ActivationPackageError(
+            "migration destination directory changed before recovery relock"
+        )
+    os.fchmod(descriptor, 0)
+    os.fchown(descriptor, executor_uid, executor_gid)
+    os.fchmod(descriptor, 0o700)
+    os.fsync(descriptor)
+    opened = os.fstat(descriptor)
+    lexical = target_parent.lstat()
+    if (
+        (opened.st_dev, opened.st_ino) != expected_identity
+        or (lexical.st_dev, lexical.st_ino) != expected_identity
+        or (opened.st_uid, opened.st_gid) != (executor_uid, executor_gid)
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        raise ActivationPackageError(
+            "migration destination directory recovery relock failed"
+        )
+
+
+def _migration_destination_recovery_is_quiesced(
+    descriptor: int,
+    target_parent: Path,
+    *,
+    expected_identity: tuple[int, int],
+    executor_uid: int,
+    executor_gid: int,
+) -> bool:
+    """Return whether recovery may proceed without destination-principal writes."""
+
+    try:
+        opened = os.fstat(descriptor)
+        lexical = target_parent.lstat()
+    except OSError:
+        return False
+    mode = stat.S_IMODE(opened.st_mode)
+    return (
+        stat.S_ISDIR(opened.st_mode)
+        and (opened.st_dev, opened.st_ino) == expected_identity
+        and (lexical.st_dev, lexical.st_ino) == expected_identity
+        and (
+            mode == 0
+            or (
+                (opened.st_uid, opened.st_gid) == (executor_uid, executor_gid)
+                and mode == 0o700
+            )
+        )
+    )
+
+
 def _copy_store(
     source: Path,
     target: Path,
@@ -3264,7 +3339,34 @@ def _prepare_store_migration_unchecked(
         return report
     except BaseException as original_error:
         recovery_failures: list[tuple[str, BaseException]] = []
-        if lock_acquired:
+        destination_recovery_safe = True
+        if (
+            destination_parent_locked
+            and destination_parent_descriptor is not None
+            and destination_parent_identity is not None
+        ):
+            try:
+                _relock_migration_destination_directory(
+                    destination_parent_descriptor,
+                    destination.parent,
+                    expected_identity=destination_parent_identity,
+                    destination_uid=destination_uid,
+                    destination_gid=destination_gid,
+                    executor_uid=root_uid,
+                    executor_gid=root_gid,
+                )
+            except BaseException as error:
+                recovery_failures.append(("destination namespace relock", error))
+                destination_recovery_safe = (
+                    _migration_destination_recovery_is_quiesced(
+                        destination_parent_descriptor,
+                        destination.parent,
+                        expected_identity=destination_parent_identity,
+                        executor_uid=root_uid,
+                        executor_gid=root_gid,
+                    )
+                )
+        if lock_acquired and destination_recovery_safe:
             try:
                 _restore_legacy_store_access_unchecked(
                     source_store=source,
@@ -3278,46 +3380,59 @@ def _prepare_store_migration_unchecked(
                 )
             except BaseException as error:
                 recovery_failures.append(("legacy store access restoration", error))
-        try:
-            _remove_executor_migration_sidecars(
-                destination_sidecars,
-                executor_uid=root_uid,
-                executor_gid=root_gid,
+        elif lock_acquired:
+            recovery_failures.append(
+                (
+                    "legacy store access restoration skipped",
+                    ActivationPackageError(
+                        "destination namespace is not safely quiesced"
+                    ),
+                )
             )
-        except BaseException as error:
-            recovery_failures.append(("destination sidecar cleanup", error))
-        for target in (
-            destination,
-            backup,
-            *backup_sidecars,
-            backup.with_suffix(f"{backup.suffix}.report.json"),
-        ):
+        if destination_recovery_safe:
             try:
-                target.unlink()
-            except FileNotFoundError:
-                pass
+                if destination_parent_descriptor is not None:
+                    _remove_executor_migration_sidecars(
+                        destination_sidecars,
+                        executor_uid=root_uid,
+                        executor_gid=root_gid,
+                    )
             except BaseException as error:
-                recovery_failures.append(("migration artifact cleanup", error))
-        if (
-            destination_parent_locked
-            and destination_parent_descriptor is not None
-            and destination_parent_identity is not None
-        ):
-            try:
-                _restore_migration_destination_directory(
-                    destination_parent_descriptor,
-                    destination.parent,
-                    expected_identity=destination_parent_identity,
-                    destination_uid=destination_uid,
-                    destination_gid=destination_gid,
-                    executor_uid=root_uid,
-                    executor_gid=root_gid,
-                )
-                destination_parent_locked = False
-            except BaseException as error:
-                recovery_failures.append(
-                    ("destination ownership restoration", error)
-                )
+                recovery_failures.append(("destination sidecar cleanup", error))
+            cleanup_targets = [
+                backup,
+                *backup_sidecars,
+                backup.with_suffix(f"{backup.suffix}.report.json"),
+            ]
+            if destination_parent_descriptor is not None:
+                cleanup_targets.insert(0, destination)
+            for target in cleanup_targets:
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+                except BaseException as error:
+                    recovery_failures.append(("migration artifact cleanup", error))
+            if (
+                destination_parent_locked
+                and destination_parent_descriptor is not None
+                and destination_parent_identity is not None
+            ):
+                try:
+                    _restore_migration_destination_directory(
+                        destination_parent_descriptor,
+                        destination.parent,
+                        expected_identity=destination_parent_identity,
+                        destination_uid=destination_uid,
+                        destination_gid=destination_gid,
+                        executor_uid=root_uid,
+                        executor_gid=root_gid,
+                    )
+                    destination_parent_locked = False
+                except BaseException as error:
+                    recovery_failures.append(
+                        ("destination ownership restoration", error)
+                    )
         if recovery_failures:
             labels = ", ".join(label for label, _error in recovery_failures)
             failure = ActivationPackageError(

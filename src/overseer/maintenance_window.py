@@ -689,17 +689,6 @@ def _validate_argv(
                 "--silent",
                 "--show-error",
                 "--connect-timeout",
-                "2",
-                "--max-time",
-                "5",
-                "http://127.0.0.1:8766/health",
-            ),
-            (
-                "/usr/bin/curl",
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--connect-timeout",
                 "1",
                 "--max-time",
                 "3",
@@ -1015,11 +1004,7 @@ def _validate_maintenance_stage_profiles(
         _fail("contract rollback profile has invalid second daemon reload")
     if rollback[7][13:] != ["restore-maintenance-writers", "--package-root", package_root]:
         _fail("contract rollback profile has invalid writer restoration order")
-    if rollback[8] != [
-        "/usr/bin/curl", "--fail", "--silent", "--show-error",
-        "--connect-timeout", "2", "--max-time", "5",
-        "http://127.0.0.1:8766/health",
-    ]:
+    if rollback[8] != expected_acceptance_curl:
         _fail("contract rollback profile must end with the exact health check")
     if any(
         _python_release_root(rollback[index]) != package_release_root
@@ -1338,6 +1323,12 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
         )
     ):
         _fail("contract rollback timeouts are invalid")
+    rollback_health = document["rollbackCommands"][-1]
+    retry_max_seconds = int(
+        rollback_health[rollback_health.index("--retry-max-time") + 1]
+    )
+    if rollback_timeouts[-1] < retry_max_seconds + 15:
+        _fail("contract rollback health timeout lacks readiness retry margin")
     if (
         type(document["rollbackWindowTimeoutSeconds"]) is not int
         or not 1 <= document["rollbackWindowTimeoutSeconds"] <= 3600

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import sqlite3
 import stat
 from contextlib import contextmanager
@@ -152,6 +153,33 @@ def test_copy_store_accepts_an_existing_exact_non_executor_destination_owner(
     assert destination.read_bytes() == b"sealed backup"
 
 
+def test_destination_namespace_lock_restores_mode_when_owner_change_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination_parent = tmp_path / "dedicated-principal"
+    destination_parent.mkdir(mode=0o700)
+    metadata = destination_parent.stat()
+
+    def fail_owner_change(_descriptor: int, _uid: int, _gid: int) -> None:
+        raise OSError("injected owner-change failure")
+
+    monkeypatch.setattr(activation_package_module.os, "fchown", fail_owner_change)
+
+    with pytest.raises(OSError, match="injected owner-change failure"):
+        activation_package_module._lock_migration_destination_directory(
+            destination_parent,
+            destination_uid=metadata.st_uid,
+            destination_gid=metadata.st_gid,
+            executor_uid=metadata.st_uid,
+            executor_gid=metadata.st_gid,
+        )
+
+    restored = destination_parent.stat()
+    assert (restored.st_uid, restored.st_gid) == (metadata.st_uid, metadata.st_gid)
+    assert stat.S_IMODE(restored.st_mode) == 0o700
+
+
 def _schema_and_counts(path: Path) -> tuple[list[tuple[object, ...]], dict[str, int]]:
     connection = sqlite3.connect(path)
     try:
@@ -226,6 +254,204 @@ def test_maintenance_copy_runs_sqlite_store_migration_only_for_overseer(
     assert destination.stat().st_gid == os.getgid()
     assert stat.S_IMODE(destination.stat().st_mode) == 0o600
     assert _schema_and_counts(destination)[1]["retained_items"] == 3
+
+
+def test_maintenance_copy_seals_destination_without_executor_sidecars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    args = _source_args(tmp_path, source, store_kind="overseer")
+
+    _prepare(**args)
+
+    destination = Path(args["destination_store"])
+    with sqlite3.connect(f"file:{destination}?mode=ro", uri=True) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+    assert not Path(f"{destination}-wal").exists()
+    assert not Path(f"{destination}-shm").exists()
+
+
+def test_root_maintenance_copy_removes_root_sidecars_before_principal_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires root to exercise the real ownership transition")
+    try:
+        account = pwd.getpwnam("overseer")
+    except KeyError:
+        pytest.skip("requires the dedicated overseer account")
+
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    destination = tmp_path / "destination" / "overseer.sqlite3"
+    destination.parent.mkdir(mode=0o700)
+    os.chown(destination.parent, account.pw_uid, account.pw_gid)
+    args = _source_args(
+        tmp_path,
+        source,
+        store_kind="overseer",
+        destination_uid=account.pw_uid,
+        destination_gid=account.pw_gid,
+    )
+    args["destination_store"] = destination
+    real_store = activation_package_module.SQLiteStore
+    executor_sidecar_owners: list[tuple[int, int]] = []
+
+    class RootMigrationStore:
+        def __init__(self, path: Path) -> None:
+            self._store = real_store(path)
+            for suffix in ("-wal", "-shm"):
+                metadata = Path(f"{path}{suffix}").stat()
+                executor_sidecar_owners.append((metadata.st_uid, metadata.st_gid))
+
+        def close(self) -> None:
+            self._store.close()
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "SQLiteStore",
+        RootMigrationStore,
+    )
+
+    _prepare(**args)
+
+    assert executor_sidecar_owners == [(0, 0), (0, 0)]
+    assert (destination.stat().st_uid, destination.stat().st_gid) == (
+        account.pw_uid,
+        account.pw_gid,
+    )
+    assert not Path(f"{destination}-wal").exists()
+    assert not Path(f"{destination}-shm").exists()
+
+
+def test_root_maintenance_copy_locks_destination_namespace_through_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires root to exercise the real ownership boundary")
+    try:
+        account = pwd.getpwnam("overseer")
+    except KeyError:
+        pytest.skip("requires the dedicated overseer account")
+
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    destination = tmp_path / "destination" / "overseer.sqlite3"
+    destination.parent.mkdir(mode=0o700)
+    os.chown(destination.parent, account.pw_uid, account.pw_gid)
+    args = _source_args(
+        tmp_path,
+        source,
+        store_kind="overseer",
+        destination_uid=account.pw_uid,
+        destination_gid=account.pw_gid,
+    )
+    args["destination_store"] = destination
+    real_evidence = activation_package_module._migration_evidence
+    observed_parent: list[tuple[int, int, int]] = []
+
+    def introduce_foreign_sidecar(
+        path: Path,
+        *,
+        counted_tables: tuple[str, ...] | None = None,
+    ) -> tuple[dict[str, int], dict[str, object]]:
+        result = real_evidence(path, counted_tables=counted_tables)
+        if Path(path) == destination:
+            metadata = destination.parent.stat()
+            observed_parent.append(
+                (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode))
+            )
+            sidecar = Path(f"{path}-wal")
+            sidecar.write_bytes(b"foreign handoff sidecar")
+            sidecar.chmod(0o600)
+            os.chown(sidecar, account.pw_uid, account.pw_gid)
+        return result
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_migration_evidence",
+        introduce_foreign_sidecar,
+    )
+
+    with pytest.raises(ActivationPackageError, match="before ownership handoff"):
+        _prepare(**args)
+
+    assert observed_parent == [(0, 0, 0o700)]
+    foreign_sidecar = Path(f"{destination}-wal")
+    assert foreign_sidecar.exists()
+    assert (foreign_sidecar.stat().st_uid, foreign_sidecar.stat().st_gid) == (
+        account.pw_uid,
+        account.pw_gid,
+    )
+    assert (destination.parent.stat().st_uid, destination.parent.stat().st_gid) == (
+        account.pw_uid,
+        account.pw_gid,
+    )
+    foreign_sidecar.unlink()
+
+
+def test_maintenance_copy_rechecks_sidecars_immediately_before_owner_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    args = _source_args(tmp_path, source, store_kind="overseer")
+    destination = Path(args["destination_store"])
+    real_evidence = activation_package_module._migration_evidence
+
+    def introduce_late_sidecar(
+        path: Path,
+        *,
+        counted_tables: tuple[str, ...] | None = None,
+    ) -> tuple[dict[str, int], dict[str, object]]:
+        result = real_evidence(path, counted_tables=counted_tables)
+        if Path(path) == destination:
+            sidecar = Path(f"{path}-wal")
+            sidecar.write_bytes(b"late executor sidecar")
+            sidecar.chmod(0o600)
+        return result
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_migration_evidence",
+        introduce_late_sidecar,
+    )
+
+    with pytest.raises(ActivationPackageError, match="before ownership handoff"):
+        _prepare(**args)
+
+    assert not destination.exists()
+    assert not Path(f"{destination}-wal").exists()
+
+
+def test_migration_sidecar_cleanup_preserves_nonexecutor_artifacts(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "destination.sqlite3-wal"
+    sidecar.write_bytes(b"foreign sidecar")
+    sidecar.chmod(0o600)
+
+    removed = activation_package_module._remove_executor_migration_sidecars(
+        (sidecar,),
+        executor_uid=os.geteuid() + 1,
+        executor_gid=os.getegid() + 1,
+    )
+
+    assert removed == []
+    assert sidecar.read_bytes() == b"foreign sidecar"
 
 
 def test_maintenance_copy_preserves_copy_only_schema_and_rows_without_store_migration(
@@ -313,12 +539,34 @@ def test_maintenance_copy_fails_closed_when_a_target_exists(
     _install_guard_seams(monkeypatch)
     args = _source_args(tmp_path, source, store_kind="overseer")
     destination = Path(args["destination_store"])
-    destination.parent.mkdir()
+    destination.parent.mkdir(mode=0o700)
     destination.write_bytes(b"pre-existing")
 
     with pytest.raises(ActivationPackageError, match="already exists|destination"):
         _prepare(**args)
     assert destination.read_bytes() == b"pre-existing"
+
+
+def test_maintenance_copy_rejects_a_preexisting_destination_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    args = _source_args(tmp_path, source, store_kind="overseer")
+    destination = Path(args["destination_store"])
+    destination.parent.mkdir(mode=0o700)
+    stale_wal = Path(f"{destination}-wal")
+    stale_wal.write_bytes(b"pre-existing sidecar")
+    stale_wal.chmod(0o600)
+
+    with pytest.raises(ActivationPackageError, match="sidecar destination already exists"):
+        _prepare(**args)
+
+    assert stale_wal.read_bytes() == b"pre-existing sidecar"
+    assert not destination.exists()
 
 
 def test_maintenance_copy_restores_source_access_and_removes_partial_outputs_on_migration_failure(
@@ -353,6 +601,96 @@ def test_maintenance_copy_restores_source_access_and_removes_partial_outputs_on_
     assert not Path(args["backup_store"]).exists()
     assert not Path(args["destination_store"]).exists()
     assert not Path(f"{args['backup_store']}.report.json").exists()
+
+
+def test_root_maintenance_copy_restores_destination_owner_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires root to exercise the real ownership boundary")
+    try:
+        account = pwd.getpwnam("overseer")
+    except KeyError:
+        pytest.skip("requires the dedicated overseer account")
+
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    destination = tmp_path / "destination" / "overseer.sqlite3"
+    destination.parent.mkdir(mode=0o700)
+    os.chown(destination.parent, account.pw_uid, account.pw_gid)
+    args = _source_args(
+        tmp_path,
+        source,
+        store_kind="overseer",
+        destination_uid=account.pw_uid,
+        destination_gid=account.pw_gid,
+    )
+    args["destination_store"] = destination
+
+    class FailingStore:
+        def __init__(self, _path: Path) -> None:
+            raise RuntimeError("injected migration failure")
+
+    real_unlink = Path.unlink
+
+    def fail_destination_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        if path == destination:
+            raise OSError("injected cleanup failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(activation_package_module, "SQLiteStore", FailingStore)
+    monkeypatch.setattr(Path, "unlink", fail_destination_cleanup)
+
+    with pytest.raises(ActivationPackageError, match="recovery also failed") as captured:
+        _prepare(**args)
+
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert str(captured.value.__cause__) == "injected migration failure"
+    assert (destination.parent.stat().st_uid, destination.parent.stat().st_gid) == (
+        account.pw_uid,
+        account.pw_gid,
+    )
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    real_unlink(destination)
+
+
+def test_maintenance_copy_removes_destination_sidecars_when_handoff_sealing_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    args = _source_args(tmp_path, source, store_kind="overseer")
+    destination = Path(args["destination_store"])
+    real_normalize = activation_package_module._normalize_copied_expression_indexes
+
+    def fail_destination_handoff(path: Path) -> dict[str, object]:
+        result = real_normalize(path)
+        if Path(path) == destination:
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{path}{suffix}")
+                sidecar.write_bytes(b"executor-owned partial sidecar")
+                sidecar.chmod(0o600)
+            raise RuntimeError("injected handoff sealing failure")
+        return result
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_normalize_copied_expression_indexes",
+        fail_destination_handoff,
+    )
+
+    with pytest.raises(RuntimeError, match="injected handoff sealing failure"):
+        _prepare(**args)
+
+    assert not destination.exists()
+    assert not Path(f"{destination}-wal").exists()
+    assert not Path(f"{destination}-shm").exists()
 
 
 def test_prepare_maintenance_stores_uses_exact_ordered_contract_bindings(

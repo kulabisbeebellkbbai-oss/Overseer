@@ -9554,7 +9554,8 @@ def _maintenance_command_profiles(package: Path) -> dict[str, object]:
         helper("restore-maintenance-writers"),
         [
             "/usr/bin/curl", "--fail", "--silent", "--show-error",
-            "--connect-timeout", "2", "--max-time", "5",
+            "--connect-timeout", "1", "--max-time", "3", "--retry", "15",
+            "--retry-delay", "2", "--retry-max-time", "45", "--retry-all-errors",
             "http://127.0.0.1:8766/health",
         ],
     ]
@@ -9873,6 +9874,18 @@ def test_maintenance_contract_rejects_installed_runtime_before_install_stage(
         activation_package_module.validate_maintenance_contract(contract)
 
 
+def test_maintenance_contract_rejects_rollback_health_timeout_without_retry_margin(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    contract["rollbackTimeoutSeconds"][-1] = 45
+
+    with pytest.raises(ValueError, match="readiness retry margin"):
+        activation_package_module.validate_maintenance_contract(contract)
+
+
 def test_render_maintenance_window_contract_is_digest_bound_sibling_with_safe_order(
     tmp_path: Path,
 ) -> None:
@@ -9971,6 +9984,16 @@ def test_render_activation_contract_emits_real_maintenance_window_plan(
         for command in maintenance["rollbackCommands"]
     )
     rollback = maintenance["rollbackCommands"]
+    rollback_health = rollback[-1]
+    assert rollback_health[0] == "/usr/bin/curl"
+    assert rollback_health[rollback_health.index("--retry") + 1] == "15"
+    assert rollback_health[rollback_health.index("--retry-delay") + 1] == "2"
+    assert rollback_health[rollback_health.index("--retry-max-time") + 1] == "45"
+    assert "--retry-all-errors" in rollback_health
+    retry_max_time = int(
+        rollback_health[rollback_health.index("--retry-max-time") + 1]
+    )
+    assert maintenance["rollbackTimeoutSeconds"][-1] >= retry_max_time + 15
     handoff_restore_index = next(
         index
         for index, command in enumerate(rollback)

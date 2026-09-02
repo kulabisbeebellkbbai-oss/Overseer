@@ -1754,6 +1754,148 @@ def _ensure_migration_destination_directory(
     )
 
 
+def _lock_migration_destination_directory(
+    target_parent: Path,
+    *,
+    destination_uid: int,
+    destination_gid: int,
+    executor_uid: int,
+    executor_gid: int,
+) -> tuple[int, tuple[int, int]]:
+    """Revoke destination-principal writes and bind the directory inode."""
+
+    expected = _validate_migration_destination_directory(
+        target_parent,
+        destination_uid=destination_uid,
+        destination_gid=destination_gid,
+    )
+    descriptor = -1
+    transition_started = False
+    try:
+        descriptor = os.open(
+            target_parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        lexical = target_parent.lstat()
+        if (
+            target_parent.is_symlink()
+            or not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+            or (lexical.st_dev, lexical.st_ino) != (expected.st_dev, expected.st_ino)
+            or (opened.st_uid, opened.st_gid)
+            != (destination_uid, destination_gid)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise ActivationPackageError(
+                "migration destination directory changed while opening"
+            )
+        # Revoke all access before ownership changes so a partial transition
+        # never leaves the destination principal with a writable namespace.
+        os.fchmod(descriptor, 0)
+        transition_started = True
+        os.fchown(descriptor, executor_uid, executor_gid)
+        os.fchmod(descriptor, 0o700)
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        lexical = target_parent.lstat()
+        if (
+            (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+            or (lexical.st_dev, lexical.st_ino) != (expected.st_dev, expected.st_ino)
+            or (opened.st_uid, opened.st_gid) != (executor_uid, executor_gid)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise ActivationPackageError(
+                "migration destination directory lock could not be verified"
+            )
+        return descriptor, (expected.st_dev, expected.st_ino)
+    except BaseException:
+        restore_error: BaseException | None = None
+        if transition_started:
+            owner_error: BaseException | None = None
+            try:
+                os.fchmod(descriptor, 0)
+                os.fchown(descriptor, destination_uid, destination_gid)
+            except BaseException as failure:
+                owner_error = failure
+            try:
+                current = os.fstat(descriptor)
+                os.fchmod(
+                    descriptor,
+                    0o700
+                    if (current.st_uid, current.st_gid)
+                    == (destination_uid, destination_gid)
+                    else 0,
+                )
+                os.fsync(descriptor)
+            except BaseException as failure:
+                restore_error = failure
+            current = os.fstat(descriptor)
+            if (
+                (current.st_uid, current.st_gid)
+                != (destination_uid, destination_gid)
+                or stat.S_IMODE(current.st_mode) != 0o700
+            ):
+                restore_error = restore_error or owner_error or ActivationPackageError(
+                    "migration destination ownership was not restored"
+                )
+        if descriptor >= 0:
+            os.close(descriptor)
+        if restore_error is not None:
+            raise ActivationPackageError(
+                "migration destination lock failed and ownership restoration failed"
+            ) from restore_error
+        raise
+
+
+def _restore_migration_destination_directory(
+    descriptor: int,
+    target_parent: Path,
+    *,
+    expected_identity: tuple[int, int],
+    destination_uid: int,
+    destination_gid: int,
+    executor_uid: int,
+    executor_gid: int,
+) -> None:
+    """Restore the sealed destination owner after the offline handoff."""
+
+    opened = os.fstat(descriptor)
+    lexical = target_parent.lstat()
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != expected_identity
+        or (lexical.st_dev, lexical.st_ino) != expected_identity
+        or (opened.st_uid, opened.st_gid)
+        not in {
+            (executor_uid, executor_gid),
+            (destination_uid, destination_gid),
+        }
+        or stat.S_IMODE(opened.st_mode) not in {0, 0o700}
+    ):
+        raise ActivationPackageError(
+            "migration destination directory changed before ownership restoration"
+        )
+    os.fchmod(descriptor, 0)
+    os.fchown(descriptor, destination_uid, destination_gid)
+    os.fchmod(descriptor, 0o700)
+    os.fsync(descriptor)
+    opened = os.fstat(descriptor)
+    lexical = target_parent.lstat()
+    if (
+        (opened.st_dev, opened.st_ino) != expected_identity
+        or (lexical.st_dev, lexical.st_ino) != expected_identity
+        or (opened.st_uid, opened.st_gid) != (destination_uid, destination_gid)
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        raise ActivationPackageError(
+            "migration destination directory ownership restoration failed"
+        )
+
+
 def _copy_store(
     source: Path,
     target: Path,
@@ -2343,6 +2485,57 @@ def _artifact_identity(path: Path) -> tuple[int, ...] | None:
     return _metadata_identity(metadata)
 
 
+def _remove_executor_migration_sidecars(
+    paths: tuple[Path, ...],
+    *,
+    executor_uid: int,
+    executor_gid: int,
+) -> list[str]:
+    """Remove only owner-only sidecars attributable to this executor."""
+
+    removed: list[str] = []
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (metadata.st_uid, metadata.st_gid)
+            != (executor_uid, executor_gid)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            continue
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            if _metadata_identity(os.fstat(descriptor)) != _metadata_identity(
+                metadata
+            ):
+                continue
+            try:
+                lexical = path.lstat()
+            except FileNotFoundError:
+                continue
+            if _metadata_identity(lexical) != _metadata_identity(metadata):
+                continue
+            path.unlink()
+            removed.append(str(path))
+        except FileNotFoundError:
+            continue
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    return removed
+
+
 def _require_root_activation() -> None:
     if os.geteuid() != 0:
         raise ActivationPackageError("final store migration must run as root after explicit activation approval")
@@ -2634,10 +2827,20 @@ def _prepare_store_migration_unchecked(
     backup_sidecars = tuple(Path(f"{backup}{suffix}") for suffix in ("-wal", "-shm"))
     if any(path.exists() or path.is_symlink() for path in backup_sidecars):
         raise ActivationPackageError("final backup sidecar destination already exists")
+    destination_sidecars = tuple(
+        Path(f"{destination}{suffix}") for suffix in ("-wal", "-shm")
+    )
+    if any(path.exists() or path.is_symlink() for path in destination_sidecars):
+        raise ActivationPackageError(
+            "final migrated store sidecar destination already exists"
+        )
 
     root_uid, root_gid = _activation_root_identity()
     lock_acquired = False
     parent_descriptor: int | None = None
+    destination_parent_descriptor: int | None = None
+    destination_parent_identity: tuple[int, int] | None = None
+    destination_parent_locked = False
     source_descriptor: int | None = None
     legacy_descriptors: list[int] = []
     captured_descriptor_identities: dict[int, tuple[int, ...]] = {}
@@ -2916,15 +3119,44 @@ def _prepare_store_migration_unchecked(
         backup_integrity = _integrity_check(backup)
         before_counts, schema_before = _migration_evidence(backup)
         backup_digest, backup_size = _hash_file(backup)
+        destination_parent_descriptor, destination_parent_identity = (
+            _lock_migration_destination_directory(
+                destination.parent,
+                destination_uid=destination_uid,
+                destination_gid=destination_gid,
+                executor_uid=root_uid,
+                executor_gid=root_gid,
+            )
+        )
+        destination_parent_locked = True
+        if destination_parent_identity == (expected_parent_device, expected_parent_inode):
+            raise ActivationPackageError(
+                "migration source and destination directories must be distinct"
+            )
+        if destination.exists() or destination.is_symlink():
+            raise ActivationPackageError(
+                "final migrated store destination appeared after namespace lock"
+            )
+        if any(path.exists() or path.is_symlink() for path in destination_sidecars):
+            raise ActivationPackageError(
+                "final migrated store sidecar appeared after namespace lock"
+            )
         _copy_store(
             backup,
             destination,
-            destination_uid=destination_uid,
-            destination_gid=destination_gid,
+            destination_uid=root_uid,
+            destination_gid=root_gid,
         )
         if store_kind == "overseer":
             migrated_store = SQLiteStore(destination)
             migrated_store.close()
+            # SQLiteStore enables WAL while applying schema migrations.  This
+            # helper is still running as the activation executor, so those
+            # sidecars belong to root rather than to the sealed destination
+            # principal.  Return the offline copy to a sidecar-free DELETE
+            # journal namespace before changing its owner; the successor will
+            # create fresh WAL/SHM artifacts under its own identity.
+            _normalize_copied_expression_indexes(destination)
         migrated_integrity = _integrity_check(destination)
         after_counts, schema_after = _migration_evidence(
             destination,
@@ -2943,6 +3175,13 @@ def _prepare_store_migration_unchecked(
             elif after_counts.get(table) != count:
                 raise ActivationPackageError(f"final migration changed retained row count: {table}")
         migrated_digest, migrated_size = _hash_file(destination)
+        if any(
+            path.exists() or path.is_symlink()
+            for path in destination_sidecars
+        ):
+            raise ActivationPackageError(
+                "final migrated store retained a sidecar before ownership handoff"
+            )
         os.chown(destination, destination_uid, destination_gid)
         os.chmod(destination, 0o600)
         final_metadata = destination.lstat()
@@ -2952,6 +3191,16 @@ def _prepare_store_migration_unchecked(
             or stat.S_IMODE(final_metadata.st_mode) != 0o600
         ):
             raise ActivationPackageError("final migrated store ownership is invalid")
+        _restore_migration_destination_directory(
+            destination_parent_descriptor,
+            destination.parent,
+            expected_identity=destination_parent_identity,
+            destination_uid=destination_uid,
+            destination_gid=destination_gid,
+            executor_uid=root_uid,
+            executor_gid=root_gid,
+        )
+        destination_parent_locked = False
         report: dict[str, object] = {
             "schemaVersion": "overseer.activation-final-migration.v1",
             "status": result_status,
@@ -3013,8 +3262,8 @@ def _prepare_store_migration_unchecked(
         os.fchown(parent_descriptor, root_uid, expected_source_gid)
         os.fchmod(parent_descriptor, 0o555)
         return report
-    except BaseException:
-        restore_error: BaseException | None = None
+    except BaseException as original_error:
+        recovery_failures: list[tuple[str, BaseException]] = []
         if lock_acquired:
             try:
                 _restore_legacy_store_access_unchecked(
@@ -3028,7 +3277,15 @@ def _prepare_store_migration_unchecked(
                     expected_parent_mode=expected_parent_mode,
                 )
             except BaseException as error:
-                restore_error = error
+                recovery_failures.append(("legacy store access restoration", error))
+        try:
+            _remove_executor_migration_sidecars(
+                destination_sidecars,
+                executor_uid=root_uid,
+                executor_gid=root_gid,
+            )
+        except BaseException as error:
+            recovery_failures.append(("destination sidecar cleanup", error))
         for target in (
             destination,
             backup,
@@ -3039,16 +3296,44 @@ def _prepare_store_migration_unchecked(
                 target.unlink()
             except FileNotFoundError:
                 pass
-        if restore_error is not None:
-            raise ActivationPackageError(
-                "final migration failed and legacy store access restoration also failed"
-            ) from restore_error
+            except BaseException as error:
+                recovery_failures.append(("migration artifact cleanup", error))
+        if (
+            destination_parent_locked
+            and destination_parent_descriptor is not None
+            and destination_parent_identity is not None
+        ):
+            try:
+                _restore_migration_destination_directory(
+                    destination_parent_descriptor,
+                    destination.parent,
+                    expected_identity=destination_parent_identity,
+                    destination_uid=destination_uid,
+                    destination_gid=destination_gid,
+                    executor_uid=root_uid,
+                    executor_gid=root_gid,
+                )
+                destination_parent_locked = False
+            except BaseException as error:
+                recovery_failures.append(
+                    ("destination ownership restoration", error)
+                )
+        if recovery_failures:
+            labels = ", ".join(label for label, _error in recovery_failures)
+            failure = ActivationPackageError(
+                f"final migration failed and recovery also failed: {labels}"
+            )
+            for label, error in recovery_failures:
+                failure.add_note(f"{label}: {type(error).__name__}: {error}")
+            raise failure from original_error
         raise
     finally:
         for descriptor in legacy_descriptors:
             os.close(descriptor)
         if parent_descriptor is not None:
             os.close(parent_descriptor)
+        if destination_parent_descriptor is not None:
+            os.close(destination_parent_descriptor)
 
 
 def prepare_maintenance_store_copy(
@@ -4980,9 +5265,16 @@ def render_activation_contract(
                 "--silent",
                 "--show-error",
                 "--connect-timeout",
-                "2",
+                "1",
                 "--max-time",
-                "5",
+                "3",
+                "--retry",
+                "15",
+                "--retry-delay",
+                "2",
+                "--retry-max-time",
+                "45",
+                "--retry-all-errors",
                 "http://127.0.0.1:8766/health",
             ],
         ]
@@ -5180,7 +5472,7 @@ def render_activation_contract(
         "earlyRollbackWindowTimeoutSeconds": 600,
         "earlyRollbackStartIndex": 1,
         "rollbackCommands": maintenance_rollback_commands,
-        "rollbackTimeoutSeconds": [120, 120, 60, 300, 300, 300, 60, 300, 30],
+        "rollbackTimeoutSeconds": [120, 120, 60, 300, 300, 300, 60, 300, 60],
         "rollbackWindowTimeoutSeconds": 1800,
         "rollbackStartIndex": 7,
         "secretInputs": [],

@@ -54,6 +54,12 @@ cutover state are not authority for this runner.
   observation challenge.
 - [x] Seal per-command timeouts, a 5,400-second runner deadline, a 600-second
   early-rollback deadline, and a separate 1,800-second full-rollback deadline.
+- [x] Return root-run migrated SQLite copies to sidecar-free DELETE journal
+  mode, hold each destination namespace under a root-owned directory descriptor
+  through ownership handoff, and preserve any non-executor sidecar on failure.
+- [x] Give rollback API readiness the same bounded retry profile as forward
+  acceptance, with an outer command timeout that includes a shutdown/startup
+  scheduling margin.
 - [x] Document outage behavior, no-reboot policy, exact approvals, stop
   conditions, acceptance, and rollback.
 - [ ] Build and verify a new owner-scoped package without importing or executing

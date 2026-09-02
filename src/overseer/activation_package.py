@@ -1643,6 +1643,7 @@ def _validate_store_artifact(
     *,
     label: str,
     expected_uid: int | None = None,
+    allowed_modes: frozenset[int] = frozenset({0o600}),
 ) -> os.stat_result:
     try:
         metadata = path.lstat()
@@ -1655,8 +1656,11 @@ def _validate_store_artifact(
     selected_uid = os.geteuid() if expected_uid is None else expected_uid
     if metadata.st_uid != selected_uid:
         raise ActivationPackageError(f"{label} has an unexpected owner")
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise ActivationPackageError(f"{label} must have mode 0600")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode not in allowed_modes:
+        if allowed_modes == frozenset({0o600}):
+            raise ActivationPackageError(f"{label} must have mode 0600")
+        raise ActivationPackageError(f"{label} has an unsupported mode")
     return metadata
 
 
@@ -4787,11 +4791,13 @@ def render_activation_contract(
             selected_source: Path,
             store_kind: str,
             destination: Path,
+            allowed_source_modes: frozenset[int] = frozenset({0o600}),
         ) -> dict[str, object]:
             selected_metadata = _validate_store_artifact(
                 selected_source,
                 label=f"maintenance {name} SQLite store",
                 expected_uid=god.pw_uid,
+                allowed_modes=allowed_source_modes,
             )
             if selected_metadata.st_gid != god.pw_gid:
                 raise ActivationPackageError(
@@ -4831,6 +4837,7 @@ def render_activation_contract(
                     "inode": selected_metadata.st_ino,
                     "uid": selected_metadata.st_uid,
                     "gid": selected_metadata.st_gid,
+                    "mode": stat.S_IMODE(selected_metadata.st_mode),
                     "parentDevice": selected_parent_metadata.st_dev,
                     "parentInode": selected_parent_metadata.st_ino,
                     "parentMode": selected_parent_mode,
@@ -4865,6 +4872,7 @@ def render_activation_contract(
                     selected_source=Path(codex_usage_store),
                     store_kind="copy-only",
                     destination=Path("/var/lib/overseer/codex-usage-deferred.sqlite3"),
+                    allowed_source_modes=frozenset({0o600, 0o644}),
                 ).items()
                 if key not in {"backupDb", "destinationDb", "storeKind"}
             }
@@ -10998,6 +11006,7 @@ def _maintenance_store_binding_identity_valid(binding: Mapping[str, object]) -> 
         and source_metadata.st_ino == identity.get("inode")
         and source_metadata.st_uid == identity.get("uid")
         and source_metadata.st_gid == identity.get("gid")
+        and stat.S_IMODE(source_metadata.st_mode) == identity.get("mode")
         and parent_metadata.st_dev == identity.get("parentDevice")
         and parent_metadata.st_ino == identity.get("parentInode")
         and stat.S_IMODE(parent_metadata.st_mode) == identity.get("parentMode")

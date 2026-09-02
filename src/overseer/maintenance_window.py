@@ -1140,6 +1140,7 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
                 "inode",
                 "uid",
                 "gid",
+                "mode",
                 "parentDevice",
                 "parentInode",
                 "parentMode",
@@ -1148,6 +1149,8 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
         )
         if any(type(value) is not int or value < 0 for value in identity.values()):
             _fail("contract store source identity is invalid")
+        if identity["mode"] != 0o600:
+            _fail("contract migrated store source mode is invalid")
         if identity["parentMode"] not in {0o700, 0o750, 0o770, 0o775}:
             _fail("contract store parent mode is invalid")
 
@@ -1188,6 +1191,7 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
             "inode",
             "uid",
             "gid",
+            "mode",
             "parentDevice",
             "parentInode",
             "parentMode",
@@ -1196,6 +1200,8 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
     )
     if any(type(value) is not int or value < 0 for value in deferred_identity.values()):
         _fail("contract deferred store source identity is invalid")
+    if deferred_identity["mode"] not in {0o600, 0o644}:
+        _fail("contract deferred store source mode is invalid")
     if deferred_identity["parentMode"] not in {0o700, 0o750, 0o770, 0o775}:
         _fail("contract deferred store parent mode is invalid")
 

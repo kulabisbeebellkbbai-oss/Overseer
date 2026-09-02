@@ -167,6 +167,7 @@ def _bind_source_identities(contract: dict[str, Any]) -> None:
             "inode": metadata.st_ino,
             "uid": metadata.st_uid,
             "gid": metadata.st_gid,
+            "mode": stat.S_IMODE(metadata.st_mode),
             "parentDevice": parent.st_dev,
             "parentInode": parent.st_ino,
             "parentMode": stat.S_IMODE(parent.st_mode),
@@ -222,6 +223,23 @@ def test_maintenance_preflight_rejects_store_identity_drift_before_stop(
     contract = _contract(tmp_path)
     _bind_source_identities(contract)
     contract["deferredStoreBindings"][0]["sourceIdentity"]["inode"] += 1
+    package_root = tmp_path / "package"
+    _install_contract_and_command_guard(
+        monkeypatch, contract, operation="preflight"
+    )
+
+    with pytest.raises(Exception, match="identity drifted"):
+        activation_package.verify_maintenance_preflight(package_root)
+
+
+def test_maintenance_preflight_rejects_store_mode_drift_before_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _contract(tmp_path)
+    _bind_source_identities(contract)
+    source = Path(contract["deferredStoreBindings"][0]["sourceDb"])
+    source.chmod(0o644)
     package_root = tmp_path / "package"
     _install_contract_and_command_guard(
         monkeypatch, contract, operation="preflight"

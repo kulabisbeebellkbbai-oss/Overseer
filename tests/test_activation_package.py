@@ -2336,6 +2336,7 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     codex_usage_store = tmp_path / "codex-usage-state" / "state.sqlite3"
     codex_usage_store.parent.mkdir()
     _wal_store(codex_usage_store)
+    codex_usage_store.chmod(0o644)
     rollback = tmp_path / "rollback-unit"
     rollback.write_text("[Service]\nExecStart=/old/python\n", encoding="utf-8")
     rollback_release = tmp_path / "rollback-release"
@@ -2416,6 +2417,14 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     assert result["readyForApproval"] is False
     assert result["packageRoot"] == str(package)
     assert not (package / "public" / "package-manifest.json").exists()
+    maintenance_contract = json.loads(
+        (package / "public" / "maintenance-window-contract.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert maintenance_contract["deferredStoreBindings"][0]["sourceIdentity"][
+        "mode"
+    ] == 0o644
     migration_report = json.loads(
         (package / "private" / "migration" / "migration-report.json").read_text(encoding="utf-8")
     )
@@ -9687,6 +9696,7 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
                     "inode": 11,
                     "uid": os.getuid(),
                     "gid": os.getgid(),
+                    "mode": 0o600,
                     "parentDevice": 1,
                     "parentInode": 10,
                     "parentMode": 0o700,
@@ -9703,6 +9713,7 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
                     "inode": 21,
                     "uid": os.getuid(),
                     "gid": os.getgid(),
+                    "mode": 0o600,
                     "parentDevice": 1,
                     "parentInode": 10,
                     "parentMode": 0o700,
@@ -9719,6 +9730,7 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
                     "inode": 31,
                     "uid": os.getuid(),
                     "gid": os.getgid(),
+                    "mode": 0o600,
                     "parentDevice": 1,
                     "parentInode": 10,
                     "parentMode": 0o700,
@@ -9735,6 +9747,7 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
                     "inode": 41,
                     "uid": os.getuid(),
                     "gid": os.getgid(),
+                    "mode": 0o644,
                     "parentDevice": 1,
                     "parentInode": 10,
                     "parentMode": 0o700,

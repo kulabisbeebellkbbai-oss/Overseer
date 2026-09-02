@@ -100,6 +100,7 @@ def _contract() -> dict[str, Any]:
                     "inode": 11,
                     "uid": 1000,
                     "gid": 1000,
+                    "mode": 384,
                     "parentDevice": 1,
                     "parentInode": 10,
                     "parentMode": 448,
@@ -116,6 +117,7 @@ def _contract() -> dict[str, Any]:
                     "inode": 21,
                     "uid": 1000,
                     "gid": 1000,
+                    "mode": 384,
                     "parentDevice": 1,
                     "parentInode": 20,
                     "parentMode": 448,
@@ -132,6 +134,7 @@ def _contract() -> dict[str, Any]:
                     "inode": 31,
                     "uid": 1000,
                     "gid": 1000,
+                    "mode": 384,
                     "parentDevice": 1,
                     "parentInode": 30,
                     "parentMode": 448,
@@ -148,6 +151,7 @@ def _contract() -> dict[str, Any]:
                     "inode": 41,
                     "uid": 1000,
                     "gid": 1000,
+                    "mode": 420,
                     "parentDevice": 1,
                     "parentInode": 40,
                     "parentMode": 448,
@@ -579,6 +583,18 @@ def test_contract_rejects_store_destination_drift() -> None:
 
     with pytest.raises(ValueError, match="store destination"):
         validate_maintenance_contract(contract)
+
+
+def test_contract_rejects_store_source_mode_drift() -> None:
+    migrated = _contract()
+    migrated["storeBindings"][0]["sourceIdentity"]["mode"] = 0o644
+    with pytest.raises(ValueError, match="migrated store source mode"):
+        validate_maintenance_contract(migrated)
+
+    deferred = _contract()
+    deferred["deferredStoreBindings"][0]["sourceIdentity"]["mode"] = 0o666
+    with pytest.raises(ValueError, match="deferred store source mode"):
+        validate_maintenance_contract(deferred)
 
 
 @pytest.mark.parametrize(

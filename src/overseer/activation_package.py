@@ -3191,16 +3191,6 @@ def _prepare_store_migration_unchecked(
             or stat.S_IMODE(final_metadata.st_mode) != 0o600
         ):
             raise ActivationPackageError("final migrated store ownership is invalid")
-        _restore_migration_destination_directory(
-            destination_parent_descriptor,
-            destination.parent,
-            expected_identity=destination_parent_identity,
-            destination_uid=destination_uid,
-            destination_gid=destination_gid,
-            executor_uid=root_uid,
-            executor_gid=root_gid,
-        )
-        destination_parent_locked = False
         report: dict[str, object] = {
             "schemaVersion": "overseer.activation-final-migration.v1",
             "status": result_status,
@@ -3261,6 +3251,16 @@ def _prepare_store_migration_unchecked(
         _write_new(report_path, _canonical(report) + b"\n", 0o600)
         os.fchown(parent_descriptor, root_uid, expected_source_gid)
         os.fchmod(parent_descriptor, 0o555)
+        _restore_migration_destination_directory(
+            destination_parent_descriptor,
+            destination.parent,
+            expected_identity=destination_parent_identity,
+            destination_uid=destination_uid,
+            destination_gid=destination_gid,
+            executor_uid=root_uid,
+            executor_gid=root_gid,
+        )
+        destination_parent_locked = False
         return report
     except BaseException as original_error:
         recovery_failures: list[tuple[str, BaseException]] = []

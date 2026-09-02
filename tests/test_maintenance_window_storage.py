@@ -657,6 +657,62 @@ def test_root_maintenance_copy_restores_destination_owner_when_cleanup_fails(
     real_unlink(destination)
 
 
+def test_root_maintenance_copy_keeps_destination_locked_through_report_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires root to exercise the real ownership boundary")
+    try:
+        account = pwd.getpwnam("overseer")
+    except KeyError:
+        pytest.skip("requires the dedicated overseer account")
+
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    destination = tmp_path / "destination" / "overseer.sqlite3"
+    destination.parent.mkdir(mode=0o700)
+    os.chown(destination.parent, account.pw_uid, account.pw_gid)
+    args = _source_args(
+        tmp_path,
+        source,
+        store_kind="overseer",
+        destination_uid=account.pw_uid,
+        destination_gid=account.pw_gid,
+    )
+    args["destination_store"] = destination
+    real_write_new = activation_package_module._write_new
+    observed_parent: list[tuple[int, int, int]] = []
+
+    def fail_report_persistence(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name.endswith(".sqlite3.report.json"):
+            metadata = destination.parent.stat()
+            observed_parent.append(
+                (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode))
+            )
+            raise OSError("injected report persistence failure")
+        real_write_new(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_new",
+        fail_report_persistence,
+    )
+
+    with pytest.raises(OSError, match="injected report persistence failure"):
+        _prepare(**args)
+
+    assert observed_parent == [(0, 0, 0o700)]
+    assert (destination.parent.stat().st_uid, destination.parent.stat().st_gid) == (
+        account.pw_uid,
+        account.pw_gid,
+    )
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    assert not destination.exists()
+
+
 def test_maintenance_copy_removes_destination_sidecars_when_handoff_sealing_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

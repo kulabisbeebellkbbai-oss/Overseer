@@ -1,0 +1,428 @@
+from __future__ import annotations
+
+import os
+import sqlite3
+import stat
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+import overseer.activation_package as activation_package_module
+
+from overseer.activation_package import ActivationPackageError
+
+
+def _create_sqlite_store(path: Path, *, table: str = "retained_items") -> dict[str, bytes]:
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.execute(
+            f"CREATE TABLE {table}(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.executemany(
+            f"INSERT INTO {table}(value) VALUES (?)",
+            [("one",), ("two",), ("three",)],
+        )
+        connection.commit()
+        wal = Path(f"{path}-wal").read_bytes()
+        shm = Path(f"{path}-shm").read_bytes()
+    finally:
+        connection.close()
+
+    # Closing the last WAL connection checkpoints and removes its sidecars.
+    # Restore the captured, valid sidecars so the test exercises preservation of
+    # all three legacy authority artifacts without leaving a writer open.
+    Path(f"{path}-wal").write_bytes(wal)
+    Path(f"{path}-shm").write_bytes(shm)
+    path.chmod(0o600)
+    Path(f"{path}-wal").chmod(0o600)
+    Path(f"{path}-shm").chmod(0o600)
+    return {
+        "store": path.read_bytes(),
+        "wal": wal,
+        "shm": shm,
+    }
+
+
+def _source_args(
+    tmp_path: Path,
+    source: Path,
+    *,
+    store_kind: str,
+    destination_uid: int | None = None,
+    destination_gid: int | None = None,
+) -> dict[str, object]:
+    source_metadata = source.stat()
+    parent_metadata = source.parent.stat()
+    return {
+        "package_root": tmp_path / "package",
+        "source_store": source,
+        "backup_store": tmp_path / "isolated-backup" / "backup.sqlite3",
+        "destination_store": tmp_path / "destination" / "store.sqlite3",
+        "expected_source_device": source_metadata.st_dev,
+        "expected_source_inode": source_metadata.st_ino,
+        "expected_source_uid": source_metadata.st_uid,
+        "expected_source_gid": source_metadata.st_gid,
+        "expected_parent_device": parent_metadata.st_dev,
+        "expected_parent_inode": parent_metadata.st_ino,
+        "expected_parent_mode": stat.S_IMODE(parent_metadata.st_mode),
+        "destination_uid": os.getuid() if destination_uid is None else destination_uid,
+        "destination_gid": os.getgid() if destination_gid is None else destination_gid,
+        "store_kind": store_kind,
+    }
+
+
+def _install_guard_seams(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_parent_lock_mode",
+        lambda: 0o700,
+    )
+    calls: list[dict[str, object]] = []
+
+    def maintenance_guard(*args: object, **kwargs: object) -> None:
+        calls.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_sealed_command",
+        maintenance_guard,
+        raising=False,
+    )
+
+    def cutover_guard(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("maintenance storage copy must not use the cutover phase guard")
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_active_phase_command",
+        cutover_guard,
+    )
+    return calls
+
+
+def _prepare(**kwargs: object) -> dict[str, object]:
+    return activation_package_module.prepare_maintenance_store_copy(**kwargs)
+
+
+def _schema_and_counts(path: Path) -> tuple[list[tuple[object, ...]], dict[str, int]]:
+    connection = sqlite3.connect(path)
+    try:
+        schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+        tables = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        counts = {
+            str((table_name := row[0])): int(
+                connection.execute(f"SELECT COUNT(*) FROM \"{table_name}\"").fetchone()[0]
+            )
+            for row in tables
+        }
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
+    return schema, counts
+
+
+def test_maintenance_copy_uses_maintenance_guard_and_preserves_authority_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    original = _create_sqlite_store(source)
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    calls = _install_guard_seams(monkeypatch)
+
+    report = _prepare(**_source_args(tmp_path, source, store_kind="overseer"))
+
+    assert report["status"] == "maintenance_store_copy_complete"
+    assert calls and calls[0]["kwargs"]["command_name"] == "prepare-maintenance-store-copy"
+    assert (source.stat().st_dev, source.stat().st_ino) == source_identity
+    assert source.read_bytes() == original["store"]
+    assert Path(f"{source}-wal").read_bytes() == original["wal"]
+    assert Path(f"{source}-shm").read_bytes() == original["shm"]
+
+
+def test_maintenance_copy_runs_sqlite_store_migration_only_for_overseer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    calls = _install_guard_seams(monkeypatch)
+    real_store = activation_package_module.SQLiteStore
+    migrated_paths: list[Path] = []
+
+    class RecordingStore:
+        def __init__(self, path: Path) -> None:
+            migrated_paths.append(Path(path))
+            self._store = real_store(path)
+
+        def close(self) -> None:
+            self._store.close()
+
+    monkeypatch.setattr(activation_package_module, "SQLiteStore", RecordingStore)
+    args = _source_args(tmp_path, source, store_kind="overseer")
+
+    _prepare(**args)
+
+    assert migrated_paths == [Path(args["destination_store"])]
+    assert calls
+    destination = Path(args["destination_store"])
+    assert destination.stat().st_uid == os.getuid()
+    assert destination.stat().st_gid == os.getgid()
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert _schema_and_counts(destination)[1]["retained_items"] == 3
+
+
+def test_maintenance_copy_preserves_copy_only_schema_and_rows_without_store_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "roadex-relay.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source, table="relay_events")
+    calls = _install_guard_seams(monkeypatch)
+    before_schema, before_counts = _schema_and_counts(source)
+    for suffix in ("-wal", "-shm"):
+        try:
+            Path(f"{source}{suffix}").unlink()
+        except FileNotFoundError:
+            pass
+
+    def forbidden_store(_path: Path) -> None:
+        raise AssertionError("copy-only sidecars must not run SQLiteStore migration")
+
+    monkeypatch.setattr(activation_package_module, "SQLiteStore", forbidden_store)
+    args = _source_args(tmp_path, source, store_kind="copy-only")
+
+    _prepare(**args)
+
+    destination = Path(args["destination_store"])
+    after_schema, after_counts = _schema_and_counts(destination)
+    assert after_schema == before_schema
+    assert after_counts == before_counts
+    assert calls
+
+
+def test_copy_only_store_uses_the_kernel_lease_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "roadex-relay.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source, table="relay_events")
+    _install_guard_seams(monkeypatch)
+    lease_calls: list[int] = []
+
+    @contextmanager
+    def lease_barrier(descriptors: tuple[int, ...]):
+        lease_calls.append(len(descriptors))
+        yield lambda: None
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_kernel_read_lease_barrier",
+        lease_barrier,
+    )
+
+    _prepare(**_source_args(tmp_path, source, store_kind="copy-only"))
+
+    assert lease_calls and lease_calls[0] >= 1
+
+
+def test_maintenance_copy_rejects_an_open_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    writer = sqlite3.connect(source)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("INSERT INTO retained_items(value) VALUES ('uncommitted')")
+        with pytest.raises(ActivationPackageError, match="open writer|open process|quiescen"):
+            _prepare(**_source_args(tmp_path, source, store_kind="overseer"))
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_maintenance_copy_fails_closed_when_a_target_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    _install_guard_seams(monkeypatch)
+    args = _source_args(tmp_path, source, store_kind="overseer")
+    destination = Path(args["destination_store"])
+    destination.parent.mkdir()
+    destination.write_bytes(b"pre-existing")
+
+    with pytest.raises(ActivationPackageError, match="already exists|destination"):
+        _prepare(**args)
+    assert destination.read_bytes() == b"pre-existing"
+
+
+def test_maintenance_copy_restores_source_access_and_removes_partial_outputs_on_migration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy" / "overseer.sqlite3"
+    source.parent.mkdir(mode=0o700)
+    _create_sqlite_store(source)
+    source_mode = stat.S_IMODE(source.stat().st_mode)
+    source_owner = (source.stat().st_uid, source.stat().st_gid)
+    parent_mode = stat.S_IMODE(source.parent.stat().st_mode)
+    parent_owner = (source.parent.stat().st_uid, source.parent.stat().st_gid)
+    _install_guard_seams(monkeypatch)
+
+    class FailingStore:
+        def __init__(self, _path: Path) -> None:
+            raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(activation_package_module, "SQLiteStore", FailingStore)
+    args = _source_args(tmp_path, source, store_kind="overseer")
+
+    with pytest.raises((ActivationPackageError, RuntimeError), match="injected migration failure"):
+        _prepare(**args)
+
+    assert (source.stat().st_uid, source.stat().st_gid) == source_owner
+    assert stat.S_IMODE(source.stat().st_mode) == source_mode
+    assert (source.parent.stat().st_uid, source.parent.stat().st_gid) == parent_owner
+    assert stat.S_IMODE(source.parent.stat().st_mode) == parent_mode
+    assert stat.S_IMODE(Path(f"{source}-wal").stat().st_mode) == 0o600
+    assert stat.S_IMODE(Path(f"{source}-shm").stat().st_mode) == 0o600
+    assert not Path(args["backup_store"]).exists()
+    assert not Path(args["destination_store"]).exists()
+    assert not Path(f"{args['backup_store']}.report.json").exists()
+
+
+def test_prepare_maintenance_stores_uses_exact_ordered_contract_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    names_and_kinds = (
+        ("overseer-main", "overseer"),
+        ("psychlo-bridge", "copy-only"),
+        ("roadex-relay", "copy-only"),
+    )
+    bindings = [
+        {
+            "name": name,
+            "sourceDb": str(tmp_path / "legacy" / f"{name}.sqlite3"),
+            "backupDb": str(tmp_path / "backup" / f"{name}.sqlite3"),
+            "destinationDb": str(tmp_path / "destination" / f"{name}.sqlite3"),
+            "storeKind": kind,
+            "sourceIdentity": {
+                "device": 1,
+                "inode": index + 10,
+                "uid": os.getuid(),
+                "gid": os.getgid(),
+                "parentDevice": 1,
+                "parentInode": 2,
+                "parentMode": 0o700,
+            },
+        }
+        for index, (name, kind) in enumerate(names_and_kinds)
+    ]
+    guard_calls: list[str] = []
+    migration_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_sealed_command",
+        lambda *_args, **kwargs: guard_calls.append(str(kwargs["command_name"])),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_read_maintenance_contract_file",
+        lambda _package: {"storeBindings": bindings},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_ensure_directory",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_prepare_store_migration_unchecked",
+        lambda **kwargs: migration_calls.append(kwargs) or {"status": "ok"},
+    )
+
+    result = activation_package_module.prepare_maintenance_stores(package)
+
+    assert result["status"] == "maintenance_stores_prepared"
+    assert guard_calls == ["prepare-maintenance-stores"]
+    assert [call["store_kind"] for call in migration_calls] == [
+        "overseer",
+        "copy-only",
+        "copy-only",
+    ]
+    assert [Path(str(call["source_store"])).name for call in migration_calls] == [
+        "overseer-main.sqlite3",
+        "psychlo-bridge.sqlite3",
+        "roadex-relay.sqlite3",
+    ]
+
+
+def test_restore_maintenance_store_access_restores_all_bound_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    bindings = [
+        {
+            "name": name,
+            "sourceDb": str(tmp_path / f"{name}.sqlite3"),
+            "sourceIdentity": {
+                "device": 1,
+                "inode": index + 20,
+                "uid": os.getuid(),
+                "gid": os.getgid(),
+                "parentDevice": 1,
+                "parentInode": 2,
+                "parentMode": 0o700,
+            },
+        }
+        for index, name in enumerate(
+            ("overseer-main", "psychlo-bridge", "roadex-relay")
+        )
+    ]
+    restored: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_rollback_command",
+        lambda *_args, **_kwargs: {"storeBindings": bindings},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_restore_legacy_store_access_unchecked",
+        lambda **kwargs: restored.append(kwargs) or {"restored": True},
+    )
+
+    result = activation_package_module.restore_maintenance_store_access(package)
+
+    assert result["status"] == "maintenance_store_access_restored"
+    assert [Path(str(call["source_store"])).name for call in restored] == [
+        "overseer-main.sqlite3",
+        "psychlo-bridge.sqlite3",
+        "roadex-relay.sqlite3",
+    ]

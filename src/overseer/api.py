@@ -34,6 +34,45 @@ from .roadex_approval_fixture import (
     stage_roadex_approval_fixture_api,
 )
 
+_MAINTENANCE_GATEWAY_CHALLENGE_PATH = Path(
+    "/run/overseer/maintenance-gateway-challenge"
+)
+
+
+def _maintenance_gateway_challenge() -> str | None:
+    """Expose a short-lived root-issued challenge through authenticated reads."""
+
+    path = _MAINTENANCE_GATEWAY_CHALLENGE_PATH
+    try:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o444
+            or metadata.st_nlink != 1
+            or not 1 <= metadata.st_size <= 128
+        ):
+            return None
+        value = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    if re.fullmatch(r"[0-9a-f]{32}", value) is None:
+        return None
+    return value
+
+
+def _maintenance_operator_dashboard_status(
+    store_path: str | Path, *, include_summaries: bool
+) -> dict[str, object]:
+    payload = operator_dashboard_status(
+        store_path, include_summaries=include_summaries
+    )
+    challenge = _maintenance_gateway_challenge()
+    if challenge is not None:
+        payload = {**payload, "maintenance_gateway_challenge": challenge}
+    return payload
+
 from .codex_usage import CodexUsageTracker
 from .audit import ApprovalStatus
 from .collection_models import CollectionJobKind
@@ -1467,7 +1506,11 @@ def make_api_handler(
                 return
             if path == "/operator-dashboard":
                 include_summaries = _query_first(query, "include_summaries") in {"1", "true", "yes"}
-                self._handle(lambda: operator_dashboard_status(store_path, include_summaries=include_summaries))
+                self._handle(
+                    lambda: _maintenance_operator_dashboard_status(
+                        store_path, include_summaries=include_summaries
+                    )
+                )
                 return
             if path == "/incidents/lifecycle":
                 self._handle(lambda: incident_lifecycle_status(store_path))

@@ -16,6 +16,7 @@ import sys
 import termios
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -43,7 +44,10 @@ from overseer.activation_package import (
     verify_canary_attestation,
     verify_rollback_inputs,
 )
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.x509.oid import NameOID
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -858,6 +862,27 @@ def _credential_sources(tmp_path: Path) -> tuple[Path, Path, Path]:
     return psychlo, roadex, bindings
 
 
+def _gateway_ca(tmp_path: Path) -> Path:
+    path = tmp_path / "roadex-private-ca.crt"
+    key = Ed25519PrivateKey.generate()
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Gateway CA")])
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, algorithm=None)
+    )
+    path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    path.chmod(0o644)
+    return path
+
+
 def test_stage_credentials_is_owner_only_and_public_metadata_is_secret_free(tmp_path: Path) -> None:
     psychlo, roadex, bindings = _credential_sources(tmp_path)
     package = tmp_path / "activation-package"
@@ -954,6 +979,7 @@ def test_human_verifier_gate_requires_distinct_non_api_secrets(tmp_path: Path) -
         psychlo_secret_file=psychlo,
         roadex_secret_file=roadex,
         psychlo_bindings_file=bindings,
+        protected_gateway_ca_file=_gateway_ca(tmp_path),
         random_bytes=lambda size: b"B" * size,
         ticket_private_key=Ed25519PrivateKey.from_private_bytes(bytes(range(32))),
     )
@@ -2135,6 +2161,7 @@ def _prepared_package(
         psychlo_secret_file=psychlo,
         roadex_secret_file=roadex,
         psychlo_bindings_file=bindings,
+        protected_gateway_ca_file=_gateway_ca(tmp_path),
         random_bytes=lambda size: b"C" * size,
         ticket_private_key=Ed25519PrivateKey.from_private_bytes(bytes(range(32))),
     )
@@ -2163,6 +2190,15 @@ def _prepared_package(
 
 def _finalized_package(tmp_path: Path) -> tuple[Path, str]:
     package, manifest, source = _prepared_package(tmp_path)
+    psychlo = tmp_path / "psychlo" / "bridge.sqlite3"
+    psychlo.parent.mkdir()
+    _wal_store(psychlo)
+    roadex = tmp_path / "roadex" / "relay.sqlite3"
+    roadex.parent.mkdir()
+    _wal_store(roadex)
+    codex_usage = tmp_path / "codex-usage" / "state.sqlite3"
+    codex_usage.parent.mkdir()
+    _wal_store(codex_usage)
     rollback = tmp_path / "rollback"
     rollback.mkdir()
     (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
@@ -2173,6 +2209,9 @@ def _finalized_package(tmp_path: Path) -> tuple[Path, str]:
         overseer_uid=984,
         overseer_gid=984,
         rollback_inputs={"v1.1.5-release": rollback},
+        psychlo_store=psychlo,
+        roadex_store=roadex,
+        codex_usage_store=codex_usage,
     )
     create_human_verifiers(
         package,
@@ -2288,6 +2327,15 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
     psychlo, roadex, bindings = _credential_sources(tmp_path)
     source = tmp_path / "overseer.sqlite3"
     _wal_store(source)
+    psychlo_store = tmp_path / "psychlo-state" / "bridge.sqlite3"
+    psychlo_store.parent.mkdir()
+    _wal_store(psychlo_store)
+    roadex_store = tmp_path / "roadex-state" / "relay.sqlite3"
+    roadex_store.parent.mkdir()
+    _wal_store(roadex_store)
+    codex_usage_store = tmp_path / "codex-usage-state" / "state.sqlite3"
+    codex_usage_store.parent.mkdir()
+    _wal_store(codex_usage_store)
     rollback = tmp_path / "rollback-unit"
     rollback.write_text("[Service]\nExecStart=/old/python\n", encoding="utf-8")
     rollback_release = tmp_path / "rollback-release"
@@ -2338,8 +2386,16 @@ def test_prepare_package_cli_stops_at_human_verifier_gate(
             str(roadex),
             "--psychlo-bindings-file",
             str(bindings),
+            "--protected-gateway-ca-file",
+            str(_gateway_ca(tmp_path)),
             "--source-store",
             str(source),
+            "--psychlo-store",
+            str(psychlo_store),
+            "--roadex-store",
+            str(roadex_store),
+            "--codex-usage-store",
+            str(codex_usage_store),
             "--god-uid",
             str(os.getuid()),
             "--god-gid",
@@ -2420,8 +2476,16 @@ def test_prepare_package_cli_rejects_god_gid_before_release_staging(
                 str(tmp_path / "roadex-secret"),
                 "--psychlo-bindings-file",
                 str(tmp_path / "bindings.json"),
+                "--protected-gateway-ca-file",
+                str(tmp_path / "gateway-ca.crt"),
                 "--source-store",
                 str(tmp_path / "overseer.sqlite3"),
+                "--psychlo-store",
+                str(tmp_path / "psychlo.sqlite3"),
+                "--roadex-store",
+                str(tmp_path / "roadex.sqlite3"),
+                "--codex-usage-store",
+                str(tmp_path / "codex-usage.sqlite3"),
                 "--god-uid",
                 str(os.getuid()),
                 "--god-gid",
@@ -5948,7 +6012,7 @@ def test_phase_bounded_activation_runner_stops_for_cutover_approval(
     monkeypatch.setattr(
         activation_package_module,
         "_execute_contract_command",
-        lambda command: calls.append(tuple(command)) or 0,
+        lambda command, **_kwargs: calls.append(tuple(command)) or 0,
     )
     monkeypatch.setattr(
         activation_package_module,
@@ -9230,3 +9294,608 @@ def test_activation_lock_revalidates_path_after_flock(
     with pytest.raises(ActivationPackageError, match="lock path changed"):
         with activation_package_module._activation_execution_lock():
             pytest.fail("replaced activation lock path was accepted")
+
+
+MAINTENANCE_STAGE_NAMES = (
+    "preflight",
+    "stopWriters",
+    "proveQuiescence",
+    "preserveState",
+    "installRelease",
+    "migrateOfflineStores",
+    "switchServices",
+    "acceptance",
+)
+
+
+def _maintenance_activation_contract_fixture(package: Path) -> dict[str, object]:
+    maintenance = _maintenance_contract_fixture(package)
+    return {
+        "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
+        "packageRoot": str(package.resolve()),
+        "releaseRoot": "/opt/overseer/releases/current",
+        "releaseManifestDigest": "a" * 64,
+        "account": {
+            "user": "overseer",
+            "uid": 984,
+            "group": "overseer",
+            "gid": 984,
+        },
+        "sourceStore": {"path": str(package / "legacy.sqlite3")},
+        "maintenanceWindow": {
+            "stages": [
+                {"name": name, "commands": [["/usr/bin/true", name]]}
+                for name in MAINTENANCE_STAGE_NAMES
+            ],
+            "rollbackCommands": [["/usr/bin/true", "rollback"]],
+            "rollbackTimeoutSeconds": [60],
+            "rollbackWindowTimeoutSeconds": 1800,
+            "rollbackStartIndex": 0,
+            "stageTimeoutSeconds": {
+                name: 60 for name in MAINTENANCE_STAGE_NAMES
+            },
+            "windowTimeoutSeconds": 5400,
+            "secretInputs": [],
+            "storeBindings": maintenance["storeBindings"],
+            "deferredStoreBindings": maintenance["deferredStoreBindings"],
+            "preservationInputs": maintenance["preservationInputs"],
+            "evidenceRoot": maintenance["evidenceRoot"],
+            "acceptanceChecks": maintenance["acceptanceChecks"],
+        },
+    }
+
+
+def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
+    return {
+        "schemaVersion": "overseer.maintenance-window-contract.v1",
+        "packageRoot": str(package.resolve()),
+        "releaseManifestDigest": "a" * 64,
+        "account": {
+            "user": "overseer",
+            "uid": 984,
+            "group": "overseer",
+            "gid": 984,
+        },
+        "scope": "maintenance-window-for-this-package-only",
+        "storeBindings": [
+            {
+                "name": "overseer-main",
+                "sourceDb": str(package / "legacy.sqlite3"),
+                "backupDb": str(package / "backup-main.sqlite3"),
+                "destinationDb": str(package / "destination-main.sqlite3"),
+                "storeKind": "overseer",
+                "sourceIdentity": {
+                    "device": 1,
+                    "inode": 11,
+                    "uid": os.getuid(),
+                    "gid": os.getgid(),
+                    "parentDevice": 1,
+                    "parentInode": 10,
+                    "parentMode": 0o700,
+                },
+            },
+            {
+                "name": "psychlo-bridge",
+                "sourceDb": str(package / "psychlo.sqlite3"),
+                "backupDb": str(package / "backup-psychlo.sqlite3"),
+                "destinationDb": str(package / "destination-psychlo.sqlite3"),
+                "storeKind": "copy-only",
+                "sourceIdentity": {
+                    "device": 1,
+                    "inode": 21,
+                    "uid": os.getuid(),
+                    "gid": os.getgid(),
+                    "parentDevice": 1,
+                    "parentInode": 10,
+                    "parentMode": 0o700,
+                },
+            },
+            {
+                "name": "roadex-relay",
+                "sourceDb": str(package / "roadex.sqlite3"),
+                "backupDb": str(package / "backup-roadex.sqlite3"),
+                "destinationDb": str(package / "destination-roadex.sqlite3"),
+                "storeKind": "copy-only",
+                "sourceIdentity": {
+                    "device": 1,
+                    "inode": 31,
+                    "uid": os.getuid(),
+                    "gid": os.getgid(),
+                    "parentDevice": 1,
+                    "parentInode": 10,
+                    "parentMode": 0o700,
+                },
+            },
+        ],
+        "deferredStoreBindings": [
+            {
+                "name": "codex-usage",
+                "sourceDb": str(package / "codex-usage.sqlite3"),
+                "policy": "preserve-and-resume-unchanged",
+                "sourceIdentity": {
+                    "device": 1,
+                    "inode": 41,
+                    "uid": os.getuid(),
+                    "gid": os.getgid(),
+                    "parentDevice": 1,
+                    "parentInode": 10,
+                    "parentMode": 0o700,
+                },
+            }
+        ],
+        "preservationInputs": {
+            "currentRelease": str(package / "current-release"),
+            "credentialsDirectory": str(package / "credentials"),
+            "userUnitsRuntimeEnv": str(package / "runtime.env"),
+            "rollbackBundle": str(package / "rollback"),
+            "userRuntimeUnit": str(package / "overseer.service"),
+            "userApiUnit": str(package / "overseer-api.service"),
+            "psychloCycleUnit": str(package / "overseer-psychlo-cycle.service"),
+            "psychloMeterUnit": str(package / "overseer-psychlo-meter.service"),
+            "psychloUsageUnit": str(package / "overseer-psychlo-usage.service"),
+            "psychloUsageTimer": str(package / "overseer-psychlo-usage.timer"),
+            "quarkSchedulerUnit": str(package / "overseer-quark-scheduler.service"),
+            "quarkSchedulerTimer": str(package / "overseer-quark-scheduler.timer"),
+            "codexUsageMcpUnit": str(package / "overseer-codex-usage-mcp.service"),
+            "codexUsageSnapshotUnit": str(package / "overseer-codex-usage-snapshot.service"),
+            "codexUsageSnapshotTimer": str(package / "overseer-codex-usage-snapshot.timer"),
+        },
+        "evidenceRoot": str(package / "evidence"),
+        "acceptanceChecks": list(
+            activation_package_module._MAINTENANCE_ACCEPTANCE_CHECKS
+        ),
+        "secretInputs": [],
+        "stages": [
+            {"name": name, "commands": [["/usr/bin/true", name]]}
+            for name in MAINTENANCE_STAGE_NAMES
+        ],
+        "stageTimeoutSeconds": {name: 60 for name in MAINTENANCE_STAGE_NAMES},
+        "windowTimeoutSeconds": 5400,
+        "rollbackCommands": [["/usr/bin/true", "rollback"]],
+        "rollbackTimeoutSeconds": [60],
+        "rollbackWindowTimeoutSeconds": 1800,
+        "rollbackStartIndex": 0,
+    }
+
+
+def _write_maintenance_contract_fixture(
+    package: Path,
+    contract: dict[str, object],
+) -> None:
+    public = package / "public"
+    public.mkdir(parents=True, exist_ok=True)
+    (public / "maintenance-window-contract.json").write_text(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    (public / "maintenance-window-contract.json").chmod(0o644)
+    (public / "package-manifest.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": activation_package_module.PACKAGE_MANIFEST_SCHEMA,
+                "packageDigest": "c" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (public / "package-manifest.json").chmod(0o644)
+
+
+def test_render_maintenance_window_contract_is_digest_bound_sibling_with_safe_order(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    (package / "public").mkdir(parents=True)
+
+    contract = activation_package_module.render_maintenance_window_contract(
+        package,
+        _maintenance_activation_contract_fixture(package),
+    )
+
+    contract_path = package / "public" / "maintenance-window-contract.json"
+    assert contract_path.is_file()
+    assert contract["packageRoot"] == str(package.resolve())
+    assert contract["releaseManifestDigest"] == "a" * 64
+    assert contract["account"] == {
+        "user": "overseer",
+        "uid": 984,
+        "group": "overseer",
+        "gid": 984,
+    }
+    assert "packageDigest" not in contract
+    assert [stage["name"] for stage in contract["stages"]] == list(
+        MAINTENANCE_STAGE_NAMES
+    )
+    assert contract["rollbackCommands"]
+
+    serialized = json.dumps(contract, sort_keys=True)
+    for forbidden in (
+        "phase-b",
+        "staging-canary",
+        "cutover",
+        "canary",
+        "vm",
+        "virsh",
+        "qemu",
+        "claim",
+        "firewall",
+        "reboot",
+    ):
+        assert forbidden not in serialized.lower()
+
+
+def test_render_activation_contract_emits_real_maintenance_window_plan(
+    tmp_path: Path,
+) -> None:
+    package, manifest, source = _prepared_package(tmp_path)
+    rollback = tmp_path / "rollback"
+    rollback.mkdir()
+    (rollback / "src.py").write_text("rollback input\n", encoding="utf-8")
+    psychlo = tmp_path / "psychlo" / "bridge.sqlite3"
+    psychlo.parent.mkdir()
+    _wal_store(psychlo)
+    roadex = tmp_path / "roadex" / "relay.sqlite3"
+    roadex.parent.mkdir()
+    _wal_store(roadex)
+    codex_usage = tmp_path / "codex-usage" / "state.sqlite3"
+    codex_usage.parent.mkdir()
+    _wal_store(codex_usage)
+
+    activation = render_activation_contract(
+        package,
+        manifest,
+        source_store=source,
+        overseer_uid=984,
+        overseer_gid=984,
+        rollback_inputs={"v1.1.5-release": rollback},
+        psychlo_store=psychlo,
+        roadex_store=roadex,
+        codex_usage_store=codex_usage,
+    )
+
+    maintenance_path = package / "public" / "maintenance-window-contract.json"
+    assert maintenance_path.is_file()
+    maintenance = json.loads(maintenance_path.read_text(encoding="utf-8"))
+    assert maintenance["releaseManifestDigest"] == manifest["manifestDigest"]
+    assert maintenance["rollbackCommands"] != activation["rollbackCommands"]
+    assert any(
+        "restore-maintenance-store-access" in command
+        for command in maintenance["rollbackCommands"]
+    )
+    assert [binding["name"] for binding in maintenance["storeBindings"]] == [
+        "overseer-main",
+        "psychlo-bridge",
+        "roadex-relay",
+    ]
+    assert maintenance["acceptanceChecks"] == list(
+        activation_package_module._MAINTENANCE_ACCEPTANCE_CHECKS
+    )
+    stages = {stage["name"]: stage["commands"] for stage in maintenance["stages"]}
+    assert any("stop-maintenance-writers" in command for command in stages["stopWriters"])
+    assert any("verify-maintenance-quiescence" in command for command in stages["proveQuiescence"])
+    assert any("preserve-maintenance-state" in command for command in stages["preserveState"])
+    assert any(command[0] == "/usr/bin/install" for command in stages["installRelease"])
+    assert any("prepare-maintenance-stores" in command for command in stages["migrateOfflineStores"])
+    assert any("overseer-runtime.service" in command for command in stages["switchServices"])
+    assert any("verify-maintenance-acceptance" in command for command in stages["acceptance"])
+    serialized = json.dumps(maintenance, sort_keys=True).lower()
+    for forbidden in ("staging-canary", "phase-b", "virsh", "qemu", "claim", "firewall", "reboot"):
+        assert forbidden not in serialized
+
+
+def test_final_package_manifest_seals_maintenance_window_contract_as_public_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    for relative in ("public", "private/migration"):
+        path = package / relative
+        path.mkdir(parents=True)
+        path.chmod(0o700)
+    (package / "private").chmod(0o700)
+    package.chmod(0o700)
+    contract = _maintenance_contract_fixture(package)
+    _write_maintenance_contract_fixture(package, contract)
+    (package / "public" / "activation-contract.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    (package / "public" / "rollback-manifest.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    (package / "private" / "migration" / "migration-report.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    for path in package.rglob("*"):
+        if path.is_file():
+            path.chmod(0o600 if "private" in path.parts else 0o644)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "activation_package_status",
+        lambda _package: {"status": "credentials_complete"},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_migration_rehearsal_semantics",
+        lambda _package: None,
+    )
+    (package / "public" / "package-manifest.json").unlink()
+
+    finalized = finalize_activation_package(package)
+    manifest = json.loads(
+        (package / "public" / "package-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert finalized["packageDigest"] == manifest["packageDigest"]
+    assert any(
+        item["path"] == "public/maintenance-window-contract.json"
+        for item in manifest["files"]
+    )
+    assert verify_activation_package(package, str(finalized["packageDigest"]))[
+        "verified"
+    ] is True
+
+
+def test_maintenance_window_approval_is_distinct_root_record_and_rejects_reuse_or_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    _write_maintenance_contract_fixture(package, contract)
+    approval_path = tmp_path / "approved-maintenance-window.json"
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_approval_record_path",
+        lambda: approval_path,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_activation_package",
+        lambda _package, expected: {
+            "verified": True,
+            "packageDigest": expected,
+        },
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: {"packageDigest": "c" * 64},
+    )
+
+    approval = activation_package_module.record_maintenance_window_approval(
+        package,
+        "c" * 64,
+        allow_reboot=False,
+    )
+
+    assert approval["packageDigest"] == "c" * 64
+    assert approval["scope"] == "maintenance-window-for-this-package-only"
+    assert approval["allowReboot"] is False
+    assert isinstance(approval["planDigest"], str)
+    assert len(approval["planDigest"]) == 64
+    assert stat_mode(approval_path) == 0o600
+    with pytest.raises(ActivationPackageError, match="already exists"):
+        activation_package_module.record_maintenance_window_approval(
+            package,
+            "c" * 64,
+            allow_reboot=False,
+        )
+
+    approval_path.unlink()
+    approval_path.write_text(
+        json.dumps(
+            {
+                **approval,
+                "packageDigest": "d" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    approval_path.chmod(0o600)
+    with pytest.raises(ActivationPackageError, match="digest|drift"):
+        activation_package_module.verify_approved_maintenance_window(package)
+
+
+def test_maintenance_window_verification_ignores_legacy_phase_approval_as_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    _write_maintenance_contract_fixture(package, contract)
+    phase_approval = tmp_path / "approved-activation-phase-staging-canary.json"
+    phase_approval.write_text(
+        json.dumps(
+            {
+                "schemaVersion": activation_package_module.ACTIVATION_PHASE_APPROVAL_SCHEMA,
+                "approved": True,
+                "packageDigest": "c" * 64,
+                "phase": "staging-canary",
+            }
+        ),
+        encoding="utf-8",
+    )
+    phase_approval.chmod(0o600)
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_approval_record_path",
+        lambda: tmp_path / "missing-maintenance-approval.json",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+
+    with pytest.raises(ActivationPackageError, match="maintenance approval"):
+        activation_package_module.verify_approved_maintenance_window(package)
+
+
+def test_maintenance_window_execution_uses_shared_lock_separate_state_and_checkpointed_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    _write_maintenance_contract_fixture(package, contract)
+    state_path = tmp_path / "maintenance-state.json"
+    legacy_state_path = tmp_path / "activation-state.json"
+    legacy_state_path.write_text('{"status":"legacy"}\n', encoding="utf-8")
+    approval = {
+        "schemaVersion": "overseer.maintenance-window-approval.v1",
+        "packageRoot": str(package.resolve()),
+        "packageDigest": "c" * 64,
+        "planDigest": activation_package_module.maintenance_plan_digest(contract),
+        "scope": "maintenance-window-for-this-package-only",
+        "allowReboot": False,
+    }
+    lock_events: list[str] = []
+    calls: list[tuple[str, ...]] = []
+
+    class Lock:
+        def __enter__(self) -> "Lock":
+            lock_events.append("acquired")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            lock_events.append("released")
+
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_execution_lock",
+        lambda: Lock(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_state_path",
+        lambda: state_path,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_state_path",
+        lambda: legacy_state_path,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: approval,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_activation_package",
+        lambda *_args, **_kwargs: {"verified": True, "packageDigest": "c" * 64},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_contract_command",
+        lambda command, **_kwargs: calls.append(tuple(command)) or 0,
+    )
+
+    result = activation_package_module.execute_approved_maintenance_window(package)
+
+    assert result["status"] == "complete"
+    assert lock_events == ["acquired", "released"]
+    assert calls == [
+        ("/usr/bin/true", stage_name)
+        for stage_name in MAINTENANCE_STAGE_NAMES
+    ]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "complete"
+    assert state["packageDigest"] == "c" * 64
+    assert json.loads(legacy_state_path.read_text(encoding="utf-8"))["status"] == "legacy"
+
+
+def test_maintenance_window_rollback_accepts_only_maintenance_state_and_cli_has_separate_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    legacy_state_path = tmp_path / "activation-state.json"
+    legacy_state_path.write_text('{"status":"command_running"}\n', encoding="utf-8")
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_state_path",
+        lambda: tmp_path / "missing-maintenance-state.json",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_state_path",
+        lambda: legacy_state_path,
+    )
+
+    with pytest.raises(ActivationPackageError, match="maintenance state"):
+        activation_package_module.execute_approved_maintenance_rollback(package)
+
+    observed: list[str] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "record_maintenance_window_approval",
+        lambda *_args, **_kwargs: observed.append("record") or {"status": "recorded"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_approved_maintenance_window",
+        lambda *_args, **_kwargs: observed.append("verify") or {"status": "verified"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "execute_approved_maintenance_window",
+        lambda *_args, **_kwargs: observed.append("execute") or {"status": "complete"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "execute_approved_maintenance_rollback",
+        lambda *_args, **_kwargs: observed.append("rollback") or {"status": "rolled_back"},
+        raising=False,
+    )
+
+    for command in (
+        "record-maintenance-window-approval",
+        "verify-approved-maintenance-window",
+        "execute-approved-maintenance-window",
+        "execute-approved-maintenance-rollback",
+    ):
+        argv = [command, "--package-root", str(package)]
+        if command == "record-maintenance-window-approval":
+            argv.extend(["--expected-package-digest", "c" * 64])
+        assert activation_package_module._main(argv) == 0
+
+    assert observed == ["record", "verify", "execute", "rollback"]

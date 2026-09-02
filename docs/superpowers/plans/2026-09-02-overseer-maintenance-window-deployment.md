@@ -28,21 +28,27 @@ cutover state are not authority for this runner.
   Psychlo bridge, and Roadex relay SQLite stores, including WAL/SHM capture,
   integrity checks, and dedicated-principal ownership on new copies only.
 - [x] Implement a checkpointed runner that rolls back immediately after any
-  post-stop failure, enforces dependency-aware restart barriers, and never
-  resumes from the old Phase B runner state.
+  post-stop failure, records shutdown as rollback-required before the stop
+  effect, uses an idempotent early recovery profile before store migration,
+  enforces dependency-aware restart barriers, and never resumes from the old
+  Phase B runner state.
 - [x] Implement bounded acceptance for API health, UI data, scheduler/runtime
   freshness, Protected Gateway reachability, Psychlo, Roadex, credential
   compatibility, and single-writer process state.
 - [x] Preserve the previous immutable release, raw database artifacts,
-  credentials, units, and root-owned rollback bundle until acceptance passes.
+  credentials, units, and root-owned rollback bundle until acceptance passes;
+  restore exact pre-handoff system credentials, system units, tmpfiles bytes,
+  absence, ownership, modes, and credential-directory metadata before any
+  legacy writer restart on full rollback.
 - [x] Stop the complete Overseer writer inventory, preserve and resume the
   Codex Usage store unchanged, and apply the kernel lease barrier to every
   migrated store.
 - [x] Add a pre-stop input/capacity/unit preflight, preservation re-verification,
-  core-job freshness limits, successor/legacy unit inventory, and an
-  authenticated Protected Gateway operator challenge.
-- [x] Seal per-command timeouts, a 5,400-second runner deadline, and a separate
-  1,800-second rollback deadline.
+  exact sealed writer-unit baseline, core-job freshness limits,
+  successor/legacy unit inventory, and an operator-attested Protected Gateway
+  observation challenge.
+- [x] Seal per-command timeouts, a 5,400-second runner deadline, a 600-second
+  early-rollback deadline, and a separate 1,800-second full-rollback deadline.
 - [x] Document outage behavior, no-reboot policy, exact approvals, stop
   conditions, acceptance, and rollback.
 - [ ] Build and verify a new owner-scoped package without importing or executing

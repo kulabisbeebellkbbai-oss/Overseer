@@ -187,7 +187,13 @@ def test_maintenance_preflight_is_read_only_and_checks_every_store_before_stop(
     monkeypatch.setattr(
         activation_package,
         "_maintenance_writer_unit_preflight",
-        lambda: {"overseer.service": {"ActiveState": "active"}},
+        lambda _baseline: {"overseer.service": {"ActiveState": "active"}},
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_maintenance_successor_unit_preflight",
+        lambda _baseline: {"overseer-runtime.service": {"ActiveState": "inactive"}},
+        raising=False,
     )
     monkeypatch.setattr(
         activation_package,
@@ -391,6 +397,12 @@ def test_preserve_maintenance_state_copies_triplets_and_artifacts_with_hashes(
     assert calls == [COMMAND_NAMES["preservation"]]
     assert evidence_root.is_dir()
     assert stat.S_IMODE(evidence_root.stat().st_mode) == 0o700
+    assert result["directories"]
+    for artifact in result["artifacts"]:
+        assert Path(artifact["sourcePath"]).is_absolute()
+        assert artifact["sourceUid"] == os.geteuid()
+        assert artifact["sourceGid"] == os.getegid()
+        assert 0 <= artifact["sourceMode"] <= 0o777
 
     for binding in contract["storeBindings"]:
         source = Path(binding["sourceDb"])
@@ -428,6 +440,121 @@ def test_preserve_maintenance_state_copies_triplets_and_artifacts_with_hashes(
     artifact.write_bytes(b"drifted")
     with pytest.raises(Exception, match="drifted"):
         activation_package.verify_maintenance_preservation(package_root)
+
+
+def test_restore_maintenance_handoff_artifacts_restores_exact_files_and_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _contract(tmp_path)
+    package_root = tmp_path / "package"
+    system_credentials = tmp_path / "system-credentials"
+    system_credentials.mkdir(mode=0o700)
+    api_token = _write(system_credentials / "api-token", b"original-token")
+    new_only = system_credentials / "new-only"
+    system_unit = _write(
+        tmp_path / "systemd" / "overseer-api.service",
+        b"[Service]\nExecStart=/old\n",
+        mode=0o644,
+    )
+    contract["preservationInputs"].update(
+        {
+            "systemCredentialsDirectory": str(system_credentials),
+            "systemApiUnit": str(system_unit),
+        }
+    )
+    _install_contract_and_command_guard(
+        monkeypatch,
+        contract,
+        operation="preservation",
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_maintenance_writer_inventory",
+        lambda _contract: (),
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_MAINTENANCE_HANDOFF_CREDENTIAL_DIRECTORY",
+        system_credentials,
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_MAINTENANCE_HANDOFF_CREDENTIAL_NAMES",
+        ("api-token", "new-only"),
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_MAINTENANCE_HANDOFF_SYSTEM_INPUTS",
+        {"systemApiUnit": system_unit},
+    )
+
+    activation_package.preserve_maintenance_state(package_root)
+    api_token.write_bytes(b"replacement-token")
+    system_unit.write_bytes(b"[Service]\nExecStart=/new\n")
+    _write(new_only, b"new-only")
+    system_credentials.chmod(0o710)
+    monkeypatch.setattr(
+        activation_package,
+        "_require_maintenance_active_rollback_command",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_load_maintenance_state",
+        lambda: {"stage": "rollback"},
+    )
+
+    result = activation_package.restore_maintenance_handoff_artifacts(package_root)
+
+    assert result == {
+        "status": "maintenance_handoff_restored",
+        "restoredFileCount": 2,
+        "removedFileCount": 1,
+        "credentialDirectoryMetadataRestored": True,
+    }
+    assert api_token.read_bytes() == b"original-token"
+    assert system_unit.read_bytes() == b"[Service]\nExecStart=/old\n"
+    assert not new_only.exists()
+    assert stat.S_IMODE(system_credentials.stat().st_mode) == 0o700
+
+
+def test_restore_maintenance_handoff_artifacts_rejects_early_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "package"
+    monkeypatch.setattr(
+        activation_package,
+        "_require_maintenance_active_rollback_command",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_load_maintenance_state",
+        lambda: {"stage": "earlyRollback"},
+    )
+
+    with pytest.raises(Exception, match="full rollback"):
+        activation_package.restore_maintenance_handoff_artifacts(package_root)
+
+
+def test_remove_unpreserved_handoff_rejects_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "systemd"
+    parent.mkdir(mode=0o700)
+    target = parent / "overseer-api.service"
+    target.symlink_to(tmp_path / "outside")
+    monkeypatch.setattr(
+        activation_package,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    with pytest.raises(Exception, match="unsafe"):
+        activation_package._maintenance_remove_unpreserved_handoff(target)
 
 
 def test_preserve_maintenance_state_rejects_oversized_evidence_before_copy(
@@ -612,6 +739,41 @@ def test_real_bounded_acceptance_dispatch_reads_only_allowlisted_projections(
         ("/psychlo/status", True),
         ("/roadex/human-decisions", True),
     ]
+
+
+def test_successor_user_unit_inventory_checks_the_complete_writer_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "overseer-psychlo-coordination-tick.timer": ("not-found", "inactive", ""),
+        "overseer-psychlo-usage.timer": ("loaded", "inactive", "disabled"),
+        "overseer-quark-scheduler.timer": ("loaded", "active", "enabled"),
+        "overseer-codex-usage-snapshot.timer": ("loaded", "active", "enabled"),
+        "overseer-psychlo-coordination-tick.service": ("not-found", "inactive", ""),
+        "overseer-psychlo-cycle.service": ("loaded", "inactive", "static"),
+        "overseer-psychlo-meter.service": ("loaded", "inactive", "static"),
+        "overseer-psychlo-usage.service": ("loaded", "inactive", "static"),
+        "overseer-quark-scheduler.service": ("loaded", "inactive", "static"),
+        "overseer-codex-usage-snapshot.service": ("loaded", "inactive", "static"),
+        "overseer-codex-usage-mcp.service": ("loaded", "active", "enabled"),
+        "overseer-api.service": ("loaded", "inactive", "disabled"),
+        "overseer.service": ("loaded", "inactive", "disabled"),
+    }
+
+    def state(unit: str) -> dict[str, str]:
+        load, active, unit_file = expected[unit]
+        return {
+            "LoadState": load,
+            "ActiveState": active,
+            "UnitFileState": unit_file,
+        }
+
+    monkeypatch.setattr(activation_package, "_maintenance_user_unit_state", state)
+
+    assert activation_package._maintenance_success_user_unit_inventory_valid() is True
+
+    expected["overseer-api.service"] = ("loaded", "active", "disabled")
+    assert activation_package._maintenance_success_user_unit_inventory_valid() is False
 
 
 @pytest.mark.parametrize("failed_check", ACCEPTANCE_CHECK_NAMES)

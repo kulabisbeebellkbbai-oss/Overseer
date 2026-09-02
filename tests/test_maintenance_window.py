@@ -33,6 +33,44 @@ PACKAGE_ROOT = "/opt/overseer/releases/replacement"
 ADMIN_SECRET = "admin-secret-must-not-be-persisted"
 ROADEX_SECRET = "roadex-secret-must-not-be-persisted"
 
+WRITER_UNIT_BASELINE = [
+    {
+        "unit": unit,
+        "loadState": load_state,
+        "activeState": active_state,
+        "unitFileState": unit_file_state,
+    }
+    for unit, load_state, active_state, unit_file_state in (
+        ("overseer-psychlo-coordination-tick.timer", "not-found", "inactive", ""),
+        ("overseer-psychlo-usage.timer", "loaded", "active", "enabled"),
+        ("overseer-quark-scheduler.timer", "loaded", "active", "enabled"),
+        ("overseer-codex-usage-snapshot.timer", "loaded", "active", "enabled"),
+        ("overseer-psychlo-coordination-tick.service", "not-found", "inactive", ""),
+        ("overseer-psychlo-cycle.service", "loaded", "inactive", "static"),
+        ("overseer-psychlo-meter.service", "loaded", "inactive", "static"),
+        ("overseer-psychlo-usage.service", "loaded", "inactive", "static"),
+        ("overseer-quark-scheduler.service", "loaded", "inactive", "static"),
+        ("overseer-codex-usage-snapshot.service", "loaded", "inactive", "static"),
+        ("overseer-codex-usage-mcp.service", "loaded", "active", "enabled"),
+        ("overseer-api.service", "loaded", "active", "enabled"),
+        ("overseer.service", "loaded", "active", "enabled"),
+    )
+]
+SUCCESSOR_UNIT_BASELINE = [
+    {
+        "unit": unit,
+        "loadState": "loaded",
+        "activeState": "inactive",
+        "unitFileState": "disabled",
+    }
+    for unit in (
+        "overseer-api.service",
+        "overseer-runtime.service",
+        "overseer-admin-executor.socket",
+        "overseer-codex-user-bridge.socket",
+    )
+]
+
 
 def _contract() -> dict[str, Any]:
     return {
@@ -46,6 +84,8 @@ def _contract() -> dict[str, Any]:
             "gid": 984,
         },
         "scope": "maintenance-window-for-this-package-only",
+        "writerUnitBaseline": [dict(entry) for entry in WRITER_UNIT_BASELINE],
+        "successorUnitBaseline": [dict(entry) for entry in SUCCESSOR_UNIT_BASELINE],
         "storeBindings": [
             {
                 "name": "overseer-main",
@@ -128,6 +168,14 @@ def _contract() -> dict[str, Any]:
             "codexUsageMcpUnit": "/home/god/.config/systemd/user/overseer-codex-usage-mcp.service",
             "codexUsageSnapshotUnit": "/home/god/.config/systemd/user/overseer-codex-usage-snapshot.service",
             "codexUsageSnapshotTimer": "/home/god/.config/systemd/user/overseer-codex-usage-snapshot.timer",
+            "systemCredentialsDirectory": "/etc/overseer",
+            "systemAdminSocketUnit": "/etc/systemd/system/overseer-admin-executor.socket",
+            "systemAdminServiceUnit": "/etc/systemd/system/overseer-admin-executor@.service",
+            "systemApiUnit": "/etc/systemd/system/overseer-api.service",
+            "systemUserBridgeServiceUnit": "/etc/systemd/system/overseer-codex-user-bridge.service",
+            "systemUserBridgeSocketUnit": "/etc/systemd/system/overseer-codex-user-bridge.socket",
+            "systemRuntimeUnit": "/etc/systemd/system/overseer-runtime.service",
+            "systemTmpfilesRule": "/etc/tmpfiles.d/overseer.conf",
         },
         "evidenceRoot": "/var/lib/overseer-executor/maintenance/preserved",
         "acceptanceChecks": [
@@ -149,6 +197,13 @@ def _contract() -> dict[str, Any]:
         ],
         "stageTimeoutSeconds": {name: 60 for name in STAGE_NAMES},
         "windowTimeoutSeconds": 5400,
+        "earlyRollbackCommands": [
+            ["/usr/bin/true", "early-restop"],
+            ["/usr/bin/true", "early-restart"],
+        ],
+        "earlyRollbackTimeoutSeconds": [60, 60],
+        "earlyRollbackWindowTimeoutSeconds": 300,
+        "earlyRollbackStartIndex": 1,
         "rollbackCommands": [
             ["/usr/bin/true", "rollback-cleanup"],
             ["/usr/bin/true", "rollback-restart"],
@@ -229,6 +284,19 @@ def test_contract_requires_exact_ordered_nonempty_stages_and_rollback_commands()
         ["/usr/bin/overseer", "execute-approved-cutover"],
         ["/usr/bin/systemctl", "reboot"],
         ["/usr/bin/systemctl", "poweroff"],
+        ["/usr/bin/systemctl", "stop", "unlisted.service"],
+        [
+            "/usr/sbin/runuser",
+            "--user",
+            "god",
+            "--",
+            "/usr/bin/env",
+            "XDG_RUNTIME_DIR=/run/user/1000",
+            "/usr/bin/systemctl",
+            "--user",
+            "stop",
+            "unlisted.service",
+        ],
     ],
 )
 def test_contract_rejects_forbidden_argv(forbidden_argv: list[str]) -> None:
@@ -248,6 +316,42 @@ def test_contract_rejects_embedded_secret_values() -> None:
 
     with pytest.raises(ValueError, match="secret"):
         validate_maintenance_contract(contract)
+
+
+def test_contract_rejects_writer_unit_baseline_drift() -> None:
+    unknown = _contract()
+    unknown["writerUnitBaseline"][0]["unit"] = "unlisted.service"
+    with pytest.raises(ValueError, match="writer unit baseline"):
+        validate_maintenance_contract(unknown)
+
+    duplicate = _contract()
+    duplicate["writerUnitBaseline"][1]["unit"] = duplicate[
+        "writerUnitBaseline"
+    ][0]["unit"]
+    with pytest.raises(ValueError, match="writer unit baseline"):
+        validate_maintenance_contract(duplicate)
+
+    transient = _contract()
+    transient["writerUnitBaseline"][1]["activeState"] = "activating"
+    with pytest.raises(ValueError, match="writer unit baseline"):
+        validate_maintenance_contract(transient)
+
+    missing = _contract()
+    del missing["writerUnitBaseline"]
+    with pytest.raises(ValueError, match="writerUnitBaseline"):
+        validate_maintenance_contract(missing)
+
+
+def test_contract_rejects_successor_unit_baseline_drift() -> None:
+    wrong_state = _contract()
+    wrong_state["successorUnitBaseline"][0]["activeState"] = "active"
+    with pytest.raises(ValueError, match="successor unit baseline"):
+        validate_maintenance_contract(wrong_state)
+
+    unknown = _contract()
+    unknown["successorUnitBaseline"][0]["unit"] = "unlisted.service"
+    with pytest.raises(ValueError, match="successor unit baseline"):
+        validate_maintenance_contract(unknown)
 
 
 @pytest.mark.parametrize(
@@ -314,7 +418,7 @@ def test_plan_digest_is_stable_and_changes_when_contract_changes() -> None:
     assert maintenance_plan_digest(changed) != digest
 
 
-def test_failure_before_writers_stop_does_not_run_rollback() -> None:
+def test_writer_stop_failure_runs_only_the_early_recovery_profile() -> None:
     calls: list[tuple[str, ...]] = []
     states: list[dict[str, Any]] = []
 
@@ -334,6 +438,8 @@ def test_failure_before_writers_stop_does_not_run_rollback() -> None:
     assert calls == [
         ("/usr/bin/true", "preflight"),
         ("/usr/bin/true", "stopWriters"),
+        ("/usr/bin/true", "early-restop"),
+        ("/usr/bin/true", "early-restart"),
     ]
     assert all("rollback" not in call[1] for call in calls)
 
@@ -359,7 +465,10 @@ def test_failure_after_writers_stop_runs_rollback_and_records_rolled_back(
             states.append,
         )
 
-    assert calls[-1] == ("/usr/bin/true", "rollback-restart")
+    assert calls[-1] == (
+        "/usr/bin/true",
+        "early-restart" if failing_stage == "proveQuiescence" else "rollback-restart",
+    )
     assert states[-1]["schemaVersion"] == MAINTENANCE_RUNNER_STATE_SCHEMA
     assert states[-1]["status"] == "rolled_back"
 
@@ -402,6 +511,13 @@ def test_runner_checkpoints_bind_each_command_digest_and_writer_state() -> None:
         and state.get("status") == "after_command"
     )
     assert stop_after["writersStopped"] is True
+    stop_before = next(
+        state
+        for state in states
+        if state.get("stage") == "stopWriters"
+        and state.get("status") == "writer_stop_in_progress"
+    )
+    assert stop_before["writersStopped"] is True
     assert states[-1]["writersStopped"] is True
 
 
@@ -444,7 +560,7 @@ def test_rollback_never_restarts_legacy_units_after_prerequisite_failure() -> No
     assert states[-1]["status"] == "rollback_failed"
 
 
-def test_global_window_deadline_stops_before_writer_shutdown() -> None:
+def test_global_window_deadline_exits_without_touching_writers() -> None:
     calls: list[tuple[str, ...]] = []
     states: list[dict[str, Any]] = []
     moments = iter((0.0, 1.0, 5400.0))
@@ -460,3 +576,4 @@ def test_global_window_deadline_stops_before_writer_shutdown() -> None:
 
     assert calls == [("/usr/bin/true", "preflight")]
     assert states[-1]["status"] == "failed_before_stopWriters"
+    assert states[-1]["writersStopped"] is False

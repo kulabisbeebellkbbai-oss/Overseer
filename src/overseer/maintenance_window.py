@@ -21,6 +21,40 @@ MAINTENANCE_CONTRACT_SCHEMA = "overseer.maintenance-window-contract.v1"
 MAINTENANCE_RUNNER_STATE_SCHEMA = "overseer.maintenance-window-runner-state.v1"
 
 _EXPECTED_SCOPE = "maintenance-window-for-this-package-only"
+MAINTENANCE_WRITER_UNITS = (
+    "overseer-psychlo-coordination-tick.timer",
+    "overseer-psychlo-usage.timer",
+    "overseer-quark-scheduler.timer",
+    "overseer-codex-usage-snapshot.timer",
+    "overseer-psychlo-coordination-tick.service",
+    "overseer-psychlo-cycle.service",
+    "overseer-psychlo-meter.service",
+    "overseer-psychlo-usage.service",
+    "overseer-quark-scheduler.service",
+    "overseer-codex-usage-snapshot.service",
+    "overseer-codex-usage-mcp.service",
+    "overseer-api.service",
+    "overseer.service",
+)
+MAINTENANCE_EXPECTED_ACTIVE_UNITS = (
+    "overseer.service",
+    "overseer-api.service",
+    "overseer-psychlo-usage.timer",
+    "overseer-quark-scheduler.timer",
+    "overseer-codex-usage-mcp.service",
+    "overseer-codex-usage-snapshot.timer",
+)
+MAINTENANCE_SUCCESSOR_SYSTEM_UNITS = (
+    "overseer-api.service",
+    "overseer-runtime.service",
+    "overseer-admin-executor.socket",
+    "overseer-codex-user-bridge.socket",
+)
+_OPTIONAL_ABSENT_WRITER_UNITS = {
+    "overseer-psychlo-coordination-tick.timer",
+    "overseer-psychlo-coordination-tick.service",
+}
+_SYSTEM_SERVICE_UNITS = set(MAINTENANCE_SUCCESSOR_SYSTEM_UNITS)
 _STAGE_NAMES = (
     "preflight",
     "stopWriters",
@@ -37,6 +71,8 @@ _CONTRACT_FIELDS = {
     "releaseManifestDigest",
     "account",
     "scope",
+    "writerUnitBaseline",
+    "successorUnitBaseline",
     "storeBindings",
     "deferredStoreBindings",
     "preservationInputs",
@@ -45,6 +81,10 @@ _CONTRACT_FIELDS = {
     "stages",
     "stageTimeoutSeconds",
     "windowTimeoutSeconds",
+    "earlyRollbackCommands",
+    "earlyRollbackTimeoutSeconds",
+    "earlyRollbackWindowTimeoutSeconds",
+    "earlyRollbackStartIndex",
     "rollbackCommands",
     "rollbackTimeoutSeconds",
     "rollbackWindowTimeoutSeconds",
@@ -77,6 +117,14 @@ _PRESERVATION_INPUT_NAMES = {
     "codexUsageMcpUnit",
     "codexUsageSnapshotUnit",
     "codexUsageSnapshotTimer",
+    "systemCredentialsDirectory",
+    "systemAdminSocketUnit",
+    "systemAdminServiceUnit",
+    "systemApiUnit",
+    "systemUserBridgeServiceUnit",
+    "systemUserBridgeSocketUnit",
+    "systemRuntimeUnit",
+    "systemTmpfilesRule",
 }
 
 _SHELL_NAMES = {
@@ -267,16 +315,39 @@ def _validate_argv(argv: Any, label: str) -> list[str]:
         _fail(f"{label} contains a forbidden runuser payload")
     if "systemctl" in names:
         systemctl_index = names.index("systemctl")
-        action = next(
+        systemctl_tail = argv[systemctl_index + 1 :]
+        action_offset = next(
             (
-                argument
-                for argument in argv[systemctl_index + 1 :]
+                index
+                for index, argument in enumerate(systemctl_tail)
                 if not argument.startswith("-")
             ),
             None,
         )
+        action = (
+            None if action_offset is None else systemctl_tail[action_offset]
+        )
         if action not in _ALLOWED_SYSTEMCTL_ACTIONS:
             _fail(f"{label} contains a forbidden systemctl action")
+        prefix_options = systemctl_tail[:action_offset]
+        trailing = systemctl_tail[action_offset + 1 :]
+        if first_name == "runuser":
+            if prefix_options != ["--user"]:
+                _fail(f"{label} contains forbidden systemctl options")
+            allowed_units = set(MAINTENANCE_WRITER_UNITS)
+        else:
+            if prefix_options:
+                _fail(f"{label} contains forbidden systemctl options")
+            allowed_units = _SYSTEM_SERVICE_UNITS
+        trailing_options = [argument for argument in trailing if argument.startswith("-")]
+        units = [argument for argument in trailing if not argument.startswith("-")]
+        if any(option != "--now" for option in trailing_options):
+            _fail(f"{label} contains forbidden systemctl options")
+        if action == "daemon-reload":
+            if trailing:
+                _fail(f"{label} contains forbidden systemctl arguments")
+        elif not units or any(unit not in allowed_units for unit in units):
+            _fail(f"{label} contains a forbidden systemctl unit")
     if first_name == "systemd-tmpfiles" and argv != [
         "/usr/bin/systemd-tmpfiles",
         "--create",
@@ -347,6 +418,69 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
         _fail("contract.account must be the exact overseer 984:984 account")
     if document["scope"] != _EXPECTED_SCOPE:
         _fail("contract.scope does not match maintenance-window scope")
+
+    writer_baseline = document["writerUnitBaseline"]
+    if (
+        not isinstance(writer_baseline, Sequence)
+        or isinstance(writer_baseline, (str, bytes, bytearray))
+        or [
+            entry.get("unit") if isinstance(entry, Mapping) else None
+            for entry in writer_baseline
+        ]
+        != list(MAINTENANCE_WRITER_UNITS)
+    ):
+        _fail("contract writer unit baseline must contain the exact ordered unit set")
+    expected_active = set(MAINTENANCE_EXPECTED_ACTIVE_UNITS)
+    for index, entry in enumerate(writer_baseline):
+        baseline = _require_mapping(
+            entry, f"contract.writerUnitBaseline[{index}]"
+        )
+        _require_exact_fields(
+            baseline,
+            {"unit", "loadState", "activeState", "unitFileState"},
+            f"contract.writerUnitBaseline[{index}]",
+        )
+        unit = str(baseline["unit"])
+        observed = (
+            baseline["loadState"],
+            baseline["activeState"],
+            baseline["unitFileState"],
+        )
+        if unit in _OPTIONAL_ABSENT_WRITER_UNITS:
+            expected = ("not-found", "inactive", "")
+        elif unit in expected_active:
+            expected = ("loaded", "active", "enabled")
+        else:
+            expected = ("loaded", "inactive", "static")
+        if observed != expected:
+            _fail("contract writer unit baseline does not match the stable deployment profile")
+
+    successor_baseline = document["successorUnitBaseline"]
+    if (
+        not isinstance(successor_baseline, Sequence)
+        or isinstance(successor_baseline, (str, bytes, bytearray))
+        or [
+            entry.get("unit") if isinstance(entry, Mapping) else None
+            for entry in successor_baseline
+        ]
+        != list(MAINTENANCE_SUCCESSOR_SYSTEM_UNITS)
+    ):
+        _fail("contract successor unit baseline must contain the exact ordered unit set")
+    for index, entry in enumerate(successor_baseline):
+        baseline = _require_mapping(
+            entry, f"contract.successorUnitBaseline[{index}]"
+        )
+        _require_exact_fields(
+            baseline,
+            {"unit", "loadState", "activeState", "unitFileState"},
+            f"contract.successorUnitBaseline[{index}]",
+        )
+        if (
+            baseline["loadState"],
+            baseline["activeState"],
+            baseline["unitFileState"],
+        ) != ("loaded", "inactive", "disabled"):
+            _fail("contract successor unit baseline does not match the inactive profile")
 
     bindings = document["storeBindings"]
     expected_store_names = (
@@ -515,6 +649,31 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
         _fail("contract window timeout is invalid")
 
     _validate_command_list(document["rollbackCommands"], "contract.rollbackCommands")
+    _validate_command_list(
+        document["earlyRollbackCommands"], "contract.earlyRollbackCommands"
+    )
+    early_rollback_timeouts = document["earlyRollbackTimeoutSeconds"]
+    if (
+        not isinstance(early_rollback_timeouts, Sequence)
+        or isinstance(early_rollback_timeouts, (str, bytes, bytearray))
+        or len(early_rollback_timeouts) != len(document["earlyRollbackCommands"])
+        or any(
+            type(value) is not int or not 1 <= value <= 3600
+            for value in early_rollback_timeouts
+        )
+    ):
+        _fail("contract early rollback timeouts are invalid")
+    if (
+        type(document["earlyRollbackWindowTimeoutSeconds"]) is not int
+        or not 1 <= document["earlyRollbackWindowTimeoutSeconds"] <= 3600
+    ):
+        _fail("contract early rollback window timeout is invalid")
+    early_start_index = document["earlyRollbackStartIndex"]
+    if (
+        type(early_start_index) is not int
+        or not 0 <= early_start_index < len(document["earlyRollbackCommands"])
+    ):
+        _fail("contract early rollback start index is invalid")
     rollback_timeouts = document["rollbackTimeoutSeconds"]
     if (
         not isinstance(rollback_timeouts, Sequence)
@@ -629,9 +788,10 @@ def execute_maintenance_contract(
 ) -> None:
     """Execute a validated contract through injected effects only.
 
-    Rollback starts only after the ``stopWriters`` command has returned
-    successfully.  Every rollback command is attempted; the first rollback
-    failure wins over the original failure, while a successful rollback
+    Writer shutdown becomes rollback-required before its first effect starts.
+    Failures before offline migration use the idempotent early recovery profile;
+    later failures use the full store-and-service rollback.  A prerequisite
+    rollback failure blocks restart commands, and a successful rollback
     re-raises the original exception.
     """
 
@@ -658,24 +818,30 @@ def execute_maintenance_contract(
             timeout_seconds = int(contract["stageTimeoutSeconds"][current_stage])
             for current_index, argv in enumerate(stage["commands"]):
                 command_digest = _command_digest(argv)
+                command_timeout = bounded_timeout(timeout_seconds, window_deadline)
+                if current_stage == "stopWriters":
+                    # Writer shutdown is uncertain as soon as the effect starts.
+                    # Persist rollback-required state before invoking it so a
+                    # crash cannot strand stopped services behind a false flag.
+                    writers_stopped = True
                 _checkpoint(
                     checkpoint,
                     package_digest=digest,
-                    status="before_command",
+                    status=(
+                        "writer_stop_in_progress"
+                        if current_stage == "stopWriters"
+                        else "before_command"
+                    ),
                     stage=current_stage,
                     command_index=current_index,
                     command_digest=command_digest,
                     writers_stopped=writers_stopped,
                 )
-                result = execute(
-                    list(argv), bounded_timeout(timeout_seconds, window_deadline)
-                )
+                result = execute(list(argv), command_timeout)
                 if type(result) is int and result != 0:
                     raise RuntimeError(
                         f"maintenance command returned nonzero status: {result}"
                     )
-                if current_stage == "stopWriters":
-                    writers_stopped = True
                 _checkpoint(
                     checkpoint,
                     package_digest=digest,
@@ -710,12 +876,32 @@ def execute_maintenance_contract(
             )
             raise
 
-        rollback_error: BaseException | None = None
-        rollback_start_index = int(contract["rollbackStartIndex"])
-        rollback_deadline = monotonic() + int(
-            contract["rollbackWindowTimeoutSeconds"]
+        use_early_rollback = (
+            current_stage is not None
+            and _STAGE_NAMES.index(current_stage)
+            < _STAGE_NAMES.index("migrateOfflineStores")
         )
-        for rollback_index, argv in enumerate(contract["rollbackCommands"]):
+        command_field = (
+            "earlyRollbackCommands" if use_early_rollback else "rollbackCommands"
+        )
+        timeout_field = (
+            "earlyRollbackTimeoutSeconds"
+            if use_early_rollback
+            else "rollbackTimeoutSeconds"
+        )
+        start_field = (
+            "earlyRollbackStartIndex" if use_early_rollback else "rollbackStartIndex"
+        )
+        window_field = (
+            "earlyRollbackWindowTimeoutSeconds"
+            if use_early_rollback
+            else "rollbackWindowTimeoutSeconds"
+        )
+        rollback_stage = "earlyRollback" if use_early_rollback else "rollback"
+        rollback_error: BaseException | None = None
+        rollback_start_index = int(contract[start_field])
+        rollback_deadline = monotonic() + int(contract[window_field])
+        for rollback_index, argv in enumerate(contract[command_field]):
             if rollback_error is not None and rollback_index >= rollback_start_index:
                 break
             rollback_digest = _command_digest(argv)
@@ -724,7 +910,7 @@ def execute_maintenance_contract(
                     checkpoint,
                     package_digest=digest,
                     status="before_rollback_command",
-                    stage="rollback",
+                    stage=rollback_stage,
                     command_index=rollback_index,
                     command_digest=rollback_digest,
                     writers_stopped=True,
@@ -732,7 +918,7 @@ def execute_maintenance_contract(
                 result = execute(
                     list(argv),
                     bounded_timeout(
-                        int(contract["rollbackTimeoutSeconds"][rollback_index]),
+                        int(contract[timeout_field][rollback_index]),
                         rollback_deadline,
                     ),
                 )
@@ -744,7 +930,7 @@ def execute_maintenance_contract(
                     checkpoint,
                     package_digest=digest,
                     status="after_rollback_command",
-                    stage="rollback",
+                    stage=rollback_stage,
                     command_index=rollback_index,
                     command_digest=rollback_digest,
                     writers_stopped=True,
@@ -758,7 +944,7 @@ def execute_maintenance_contract(
                 checkpoint,
                 package_digest=digest,
                 status="rollback_failed",
-                stage="rollback",
+                stage=rollback_stage,
                 command_index=None,
                 command_digest=None,
                 writers_stopped=True,
@@ -768,7 +954,7 @@ def execute_maintenance_contract(
             checkpoint,
             package_digest=digest,
             status="rolled_back",
-            stage="rollback",
+            stage=rollback_stage,
             command_index=None,
             command_digest=None,
             writers_stopped=True,

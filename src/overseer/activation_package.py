@@ -48,7 +48,10 @@ from .approval_auth import (
 from .maintenance_window import (
     MAINTENANCE_APPROVAL_SCHEMA,
     MAINTENANCE_CONTRACT_SCHEMA,
+    MAINTENANCE_EXPECTED_ACTIVE_UNITS,
     MAINTENANCE_RUNNER_STATE_SCHEMA,
+    MAINTENANCE_SUCCESSOR_SYSTEM_UNITS,
+    MAINTENANCE_WRITER_UNITS,
     execute_maintenance_contract,
     maintenance_plan_digest,
     validate_maintenance_approval,
@@ -505,7 +508,7 @@ def ensure_dedicated_principal(
     maintenance_state = _load_maintenance_state() if os.geteuid() == 0 else None
     if (
         maintenance_state is not None
-        and maintenance_state.get("stage") == "installRelease"
+        and maintenance_state.get("stage") == "switchServices"
         and maintenance_state.get("status") in {"before_command", "command_running"}
     ):
         contract, lock_descriptor = _require_maintenance_active_sealed_command(
@@ -3118,7 +3121,7 @@ def _require_maintenance_active_rollback_command(
         or state.get("schemaVersion") != MAINTENANCE_RUNNER_STATE_SCHEMA
         or state.get("packageDigest") != package_digest
         or state.get("planDigest") != plan_digest
-        or state.get("stage") != "rollback"
+        or state.get("stage") not in {"rollback", "earlyRollback"}
         or state.get("status")
         not in {"before_rollback_command", "rollback_command_running"}
         or state.get("writersStopped") is not True
@@ -3126,7 +3129,12 @@ def _require_maintenance_active_rollback_command(
         raise ActivationPackageError(
             f"{command_name} requires the active sealed maintenance rollback"
         )
-    commands = _contract_commands(contract, "rollbackCommands")
+    command_field = (
+        "earlyRollbackCommands"
+        if state.get("stage") == "earlyRollback"
+        else "rollbackCommands"
+    )
+    commands = _contract_commands(contract, command_field)
     index = state.get("commandIndex")
     if type(index) is not int or not 0 <= index < len(commands):
         raise ActivationPackageError(
@@ -4784,6 +4792,39 @@ def render_activation_contract(
             }
         ]
         deferred_store_bindings[0]["policy"] = "preserve-and-resume-unchanged"
+        writer_unit_baseline = _capture_maintenance_writer_unit_baseline()
+        successor_unit_baseline = _capture_maintenance_successor_unit_baseline()
+        mutable_handoff_prefixes = (
+            "/etc/overseer",
+            "/etc/systemd/system",
+            "/etc/tmpfiles.d",
+            "/var/lib/overseer",
+        )
+        maintenance_excluded_unit_targets = {
+            "/etc/systemd/system/overseer-api-canary.service",
+            "/etc/systemd/system/overseer-approval-smoke.service",
+        }
+        maintenance_immutable_install_commands: list[list[str]] = []
+        maintenance_handoff_install_commands: list[list[str]] = []
+        for command in install_commands:
+            if (
+                command
+                and command[0] == "/usr/bin/install"
+                and command[-1] in maintenance_excluded_unit_targets
+            ):
+                continue
+            mutates_handoff_state = "ensure-dedicated-principal" in command
+            if command and command[0] == "/usr/bin/install":
+                target = command[-1]
+                mutates_handoff_state = mutates_handoff_state or any(
+                    target == prefix or target.startswith(prefix + "/")
+                    for prefix in mutable_handoff_prefixes
+                )
+            (
+                maintenance_handoff_install_commands
+                if mutates_handoff_state
+                else maintenance_immutable_install_commands
+            ).append(command)
         maintenance_rollback_commands = [
             [
                 "/usr/bin/systemctl",
@@ -4818,6 +4859,13 @@ def render_activation_contract(
             ],
             [
                 *package_activation_python,
+                "restore-maintenance-handoff-artifacts",
+                "--package-root",
+                str(execution_package),
+            ],
+            ["/usr/bin/systemctl", "daemon-reload"],
+            [
+                *package_activation_python,
                 "restore-maintenance-writers",
                 "--package-root",
                 str(execution_package),
@@ -4834,9 +4882,25 @@ def render_activation_contract(
                 "http://127.0.0.1:8766/health",
             ],
         ]
+        maintenance_early_rollback_commands = [
+            [
+                *package_activation_python,
+                "restop-maintenance-writers",
+                "--package-root",
+                str(execution_package),
+            ],
+            [
+                *package_activation_python,
+                "restore-maintenance-writers",
+                "--package-root",
+                str(execution_package),
+            ],
+        ]
         maintenance_window = {
         "storeBindings": store_bindings,
         "deferredStoreBindings": deferred_store_bindings,
+        "writerUnitBaseline": writer_unit_baseline,
+        "successorUnitBaseline": successor_unit_baseline,
         "preservationInputs": {
             "currentRelease": str(rollback_release["path"]),
             "credentialsDirectory": "/home/god/.config/overseer",
@@ -4858,6 +4922,14 @@ def render_activation_contract(
             "codexUsageMcpUnit": "/home/god/.config/systemd/user/overseer-codex-usage-mcp.service",
             "codexUsageSnapshotUnit": "/home/god/.config/systemd/user/overseer-codex-usage-snapshot.service",
             "codexUsageSnapshotTimer": "/home/god/.config/systemd/user/overseer-codex-usage-snapshot.timer",
+            "systemCredentialsDirectory": "/etc/overseer",
+            "systemAdminSocketUnit": "/etc/systemd/system/overseer-admin-executor.socket",
+            "systemAdminServiceUnit": "/etc/systemd/system/overseer-admin-executor@.service",
+            "systemApiUnit": "/etc/systemd/system/overseer-api.service",
+            "systemUserBridgeServiceUnit": "/etc/systemd/system/overseer-codex-user-bridge.service",
+            "systemUserBridgeSocketUnit": "/etc/systemd/system/overseer-codex-user-bridge.socket",
+            "systemRuntimeUnit": "/etc/systemd/system/overseer-runtime.service",
+            "systemTmpfilesRule": "/etc/tmpfiles.d/overseer.conf",
         },
         "evidenceRoot": str(maintenance_evidence_root / "preserved"),
         "acceptanceChecks": list(_MAINTENANCE_ACCEPTANCE_CHECKS),
@@ -4906,7 +4978,10 @@ def render_activation_contract(
                     ]
                 ],
             },
-            {"name": "installRelease", "commands": install_commands},
+            {
+                "name": "installRelease",
+                "commands": maintenance_immutable_install_commands,
+            },
             {
                 "name": "migrateOfflineStores",
                 "commands": [
@@ -4927,6 +5002,7 @@ def render_activation_contract(
                         "--package-root",
                         str(execution_package),
                     ],
+                    *maintenance_handoff_install_commands,
                     [
                         *user_systemctl,
                         "disable",
@@ -4994,10 +5070,14 @@ def render_activation_contract(
             "acceptance": 900,
         },
         "windowTimeoutSeconds": 5400,
+        "earlyRollbackCommands": maintenance_early_rollback_commands,
+        "earlyRollbackTimeoutSeconds": [120, 300],
+        "earlyRollbackWindowTimeoutSeconds": 600,
+        "earlyRollbackStartIndex": 1,
         "rollbackCommands": maintenance_rollback_commands,
-        "rollbackTimeoutSeconds": [120, 120, 60, 300, 300, 300, 30],
+        "rollbackTimeoutSeconds": [120, 120, 60, 300, 300, 300, 60, 300, 30],
         "rollbackWindowTimeoutSeconds": 1800,
-        "rollbackStartIndex": 5,
+        "rollbackStartIndex": 7,
         "secretInputs": [],
         }
     contract: dict[str, object] = {
@@ -5267,6 +5347,8 @@ def render_maintenance_window_contract(
         "releaseManifestDigest": release_digest,
         "account": dict(account),
         "scope": "maintenance-window-for-this-package-only",
+        "writerUnitBaseline": maintenance.get("writerUnitBaseline"),
+        "successorUnitBaseline": maintenance.get("successorUnitBaseline"),
         "storeBindings": maintenance.get("storeBindings"),
         "deferredStoreBindings": maintenance.get("deferredStoreBindings"),
         "preservationInputs": maintenance.get("preservationInputs"),
@@ -5275,6 +5357,14 @@ def render_maintenance_window_contract(
         "stages": maintenance.get("stages"),
         "stageTimeoutSeconds": maintenance.get("stageTimeoutSeconds"),
         "windowTimeoutSeconds": maintenance.get("windowTimeoutSeconds"),
+        "earlyRollbackCommands": maintenance.get("earlyRollbackCommands"),
+        "earlyRollbackTimeoutSeconds": maintenance.get(
+            "earlyRollbackTimeoutSeconds"
+        ),
+        "earlyRollbackWindowTimeoutSeconds": maintenance.get(
+            "earlyRollbackWindowTimeoutSeconds"
+        ),
+        "earlyRollbackStartIndex": maintenance.get("earlyRollbackStartIndex"),
         "rollbackCommands": maintenance.get("rollbackCommands"),
         "rollbackTimeoutSeconds": maintenance.get("rollbackTimeoutSeconds"),
         "rollbackWindowTimeoutSeconds": maintenance.get(
@@ -8489,7 +8579,7 @@ def _require_maintenance_active_sealed_command(
         "verify-maintenance-quiescence": ("proveQuiescence", "switchServices"),
         "preserve-maintenance-state": ("preserveState",),
         "verify-maintenance-preservation": ("switchServices",),
-        "ensure-dedicated-principal": ("installRelease",),
+        "ensure-dedicated-principal": ("switchServices",),
         "prepare-maintenance-store-copy": ("migrateOfflineStores",),
         "prepare-maintenance-stores": ("migrateOfflineStores",),
         "verify-maintenance-acceptance": ("acceptance",),
@@ -8504,9 +8594,10 @@ def _require_maintenance_active_sealed_command(
         or state.get("packageDigest") != package_digest
         or state.get("planDigest") != plan_digest
         or current_stage not in expected_stages
-        or state.get("status") not in {"before_command", "command_running"}
+        or state.get("status")
+        not in {"before_command", "command_running", "writer_stop_in_progress"}
         or state.get("writersStopped")
-        is not (current_stage not in {"preflight", "stopWriters"})
+        is not (current_stage != "preflight")
     ):
         raise ActivationPackageError(
             f"{command_name} requires the active sealed maintenance command"
@@ -10483,29 +10574,8 @@ def execute_approved_activation(
     )
 
 
-_MAINTENANCE_WRITER_UNITS = (
-    "overseer-psychlo-coordination-tick.timer",
-    "overseer-psychlo-usage.timer",
-    "overseer-quark-scheduler.timer",
-    "overseer-codex-usage-snapshot.timer",
-    "overseer-psychlo-coordination-tick.service",
-    "overseer-psychlo-cycle.service",
-    "overseer-psychlo-meter.service",
-    "overseer-psychlo-usage.service",
-    "overseer-quark-scheduler.service",
-    "overseer-codex-usage-snapshot.service",
-    "overseer-codex-usage-mcp.service",
-    "overseer-api.service",
-    "overseer.service",
-)
-_MAINTENANCE_PRIOR_ACTIVE_UNITS = (
-    "overseer.service",
-    "overseer-api.service",
-    "overseer-psychlo-usage.timer",
-    "overseer-quark-scheduler.timer",
-    "overseer-codex-usage-mcp.service",
-    "overseer-codex-usage-snapshot.timer",
-)
+_MAINTENANCE_WRITER_UNITS = MAINTENANCE_WRITER_UNITS
+_MAINTENANCE_PRIOR_ACTIVE_UNITS = MAINTENANCE_EXPECTED_ACTIVE_UNITS
 _MAINTENANCE_OPTIONAL_WRITER_UNITS = {
     "overseer-psychlo-coordination-tick.timer",
     "overseer-psychlo-coordination-tick.service",
@@ -10527,12 +10597,31 @@ def _maintenance_user_systemctl_command(*arguments: str) -> list[str]:
     ]
 
 
+def _maintenance_user_systemctl_inspection_command(*arguments: str) -> list[str]:
+    """Inspect the god user manager as root or as god during package staging."""
+
+    god = pwd.getpwnam("god")
+    if os.geteuid() == 0:
+        return _maintenance_user_systemctl_command(*arguments)
+    if os.geteuid() == god.pw_uid:
+        return [
+            "/usr/bin/env",
+            f"XDG_RUNTIME_DIR=/run/user/{god.pw_uid}",
+            "/usr/bin/systemctl",
+            "--user",
+            *arguments,
+        ]
+    raise ActivationPackageError(
+        "maintenance writer unit inspection requires root or the god account"
+    )
+
+
 def _maintenance_user_unit_state(unit: str) -> dict[str, str]:
     if unit not in _MAINTENANCE_WRITER_UNITS:
         raise ActivationPackageError("maintenance writer unit is not allowlisted")
     try:
         result = subprocess.run(
-            _maintenance_user_systemctl_command(
+            _maintenance_user_systemctl_inspection_command(
                 "show",
                 "--no-pager",
                 "--property=LoadState",
@@ -10562,7 +10651,9 @@ def _maintenance_user_unit_state(unit: str) -> dict[str, str]:
     return observed
 
 
-def _maintenance_writer_unit_preflight() -> dict[str, dict[str, str]]:
+def _capture_maintenance_writer_unit_baseline() -> list[dict[str, str]]:
+    """Capture only the exact stable writer profile supported by this package."""
+
     observed = {
         unit: _maintenance_user_unit_state(unit)
         for unit in _MAINTENANCE_WRITER_UNITS
@@ -10580,6 +10671,157 @@ def _maintenance_writer_unit_preflight() -> dict[str, dict[str, str]]:
             raise ActivationPackageError(
                 "maintenance writer unit no longer matches the sealed active baseline"
             )
+    for unit in set(_MAINTENANCE_WRITER_UNITS) - set(
+        _MAINTENANCE_PRIOR_ACTIVE_UNITS
+    ) - _MAINTENANCE_OPTIONAL_WRITER_UNITS:
+        state = observed[unit]
+        if state["ActiveState"] != "inactive" or state["UnitFileState"] != "static":
+            raise ActivationPackageError(
+                "maintenance writer unit does not match the stable inactive baseline"
+            )
+    for unit in _MAINTENANCE_OPTIONAL_WRITER_UNITS:
+        state = observed[unit]
+        if state != {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+            "UnitFileState": "",
+        }:
+            raise ActivationPackageError(
+                "legacy Psychlo coordination units must be absent before packaging"
+            )
+    return [
+        {
+            "unit": unit,
+            "loadState": observed[unit]["LoadState"],
+            "activeState": observed[unit]["ActiveState"],
+            "unitFileState": observed[unit]["UnitFileState"],
+        }
+        for unit in _MAINTENANCE_WRITER_UNITS
+    ]
+
+
+def _maintenance_writer_unit_preflight(
+    baseline: object,
+) -> dict[str, dict[str, str]]:
+    """Require the current writer inventory to equal the sealed package baseline."""
+
+    if not isinstance(baseline, list):
+        raise ActivationPackageError("maintenance writer unit baseline is invalid")
+    expected = {
+        str(entry.get("unit")): {
+            "LoadState": entry.get("loadState"),
+            "ActiveState": entry.get("activeState"),
+            "UnitFileState": entry.get("unitFileState"),
+        }
+        for entry in baseline
+        if isinstance(entry, Mapping)
+    }
+    if tuple(expected) != _MAINTENANCE_WRITER_UNITS:
+        raise ActivationPackageError("maintenance writer unit baseline is invalid")
+    observed = {
+        unit: _maintenance_user_unit_state(unit)
+        for unit in _MAINTENANCE_WRITER_UNITS
+    }
+    if observed != expected:
+        raise ActivationPackageError(
+            "maintenance writer units drifted from the sealed writer unit baseline"
+        )
+    return observed
+
+
+def _maintenance_system_unit_state(unit: str) -> dict[str, str]:
+    if unit not in MAINTENANCE_SUCCESSOR_SYSTEM_UNITS:
+        raise ActivationPackageError("maintenance successor unit is not allowlisted")
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=UnitFileState",
+                unit,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ActivationPackageError(
+            "maintenance successor unit state could not be inspected"
+        ) from error
+    if result.returncode != 0:
+        raise ActivationPackageError(
+            "maintenance successor unit state inspection failed"
+        )
+    observed: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            observed[key] = value
+    if set(observed) != {"LoadState", "ActiveState", "UnitFileState"}:
+        raise ActivationPackageError(
+            "maintenance successor unit state is incomplete"
+        )
+    return observed
+
+
+def _capture_maintenance_successor_unit_baseline() -> list[dict[str, str]]:
+    """Capture the exact inactive successor system-unit profile."""
+
+    observed = {
+        unit: _maintenance_system_unit_state(unit)
+        for unit in MAINTENANCE_SUCCESSOR_SYSTEM_UNITS
+    }
+    expected = {
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "UnitFileState": "disabled",
+    }
+    if any(state != expected for state in observed.values()):
+        raise ActivationPackageError(
+            "maintenance successor units must be loaded, inactive, and disabled"
+        )
+    return [
+        {
+            "unit": unit,
+            "loadState": observed[unit]["LoadState"],
+            "activeState": observed[unit]["ActiveState"],
+            "unitFileState": observed[unit]["UnitFileState"],
+        }
+        for unit in MAINTENANCE_SUCCESSOR_SYSTEM_UNITS
+    ]
+
+
+def _maintenance_successor_unit_preflight(
+    baseline: object,
+) -> dict[str, dict[str, str]]:
+    """Require successor system units to equal the sealed inactive baseline."""
+
+    if not isinstance(baseline, list):
+        raise ActivationPackageError("maintenance successor unit baseline is invalid")
+    expected = {
+        str(entry.get("unit")): {
+            "LoadState": entry.get("loadState"),
+            "ActiveState": entry.get("activeState"),
+            "UnitFileState": entry.get("unitFileState"),
+        }
+        for entry in baseline
+        if isinstance(entry, Mapping)
+    }
+    if tuple(expected) != MAINTENANCE_SUCCESSOR_SYSTEM_UNITS:
+        raise ActivationPackageError("maintenance successor unit baseline is invalid")
+    observed = {
+        unit: _maintenance_system_unit_state(unit)
+        for unit in MAINTENANCE_SUCCESSOR_SYSTEM_UNITS
+    }
+    if observed != expected:
+        raise ActivationPackageError(
+            "maintenance successor units drifted from the sealed unit baseline"
+        )
     return observed
 
 
@@ -10625,6 +10867,8 @@ def verify_maintenance_preflight(
     bindings = contract.get("storeBindings")
     deferred = contract.get("deferredStoreBindings")
     inputs = contract.get("preservationInputs")
+    writer_baseline = contract.get("writerUnitBaseline")
+    successor_baseline = contract.get("successorUnitBaseline")
     evidence_value = contract.get("evidenceRoot")
     if (
         not isinstance(bindings, list)
@@ -10661,12 +10905,44 @@ def verify_maintenance_preflight(
         raise ActivationPackageError("maintenance evidence parent is unsafe")
     if available < required_bytes + MIN_APPROVED_PACKAGE_IMPORT_HEADROOM_BYTES:
         raise ActivationPackageError("maintenance evidence storage headroom is insufficient")
-    unit_states = _maintenance_writer_unit_preflight()
+    unit_states = _maintenance_writer_unit_preflight(writer_baseline)
+    successor_states = _maintenance_successor_unit_preflight(successor_baseline)
     return {
         "status": "preflight_passed",
         "requiredBytes": required_bytes,
         "writerUnitCount": len(unit_states),
+        "successorUnitCount": len(successor_states),
     }
+
+
+def _stop_maintenance_writers_unchecked() -> dict[str, object]:
+    """Idempotently stop every loaded allowlisted Overseer user writer."""
+
+    states = {
+        unit: _maintenance_user_unit_state(unit)
+        for unit in _MAINTENANCE_WRITER_UNITS
+    }
+    loaded = [unit for unit, state in states.items() if state["LoadState"] == "loaded"]
+    if loaded:
+        try:
+            result = subprocess.run(
+                _maintenance_user_systemctl_command("stop", *loaded),
+                check=False,
+                timeout=90,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ActivationPackageError("maintenance writer stop failed") from error
+        if result.returncode != 0:
+            raise ActivationPackageError("maintenance writer stop failed")
+    remaining = [
+        unit
+        for unit in loaded
+        if _maintenance_user_unit_state(unit)["ActiveState"] != "inactive"
+    ]
+    if remaining:
+        raise ActivationPackageError("maintenance writer stop did not quiesce all units")
+    return {"status": "writers_stopped", "unitCount": len(loaded)}
 
 
 def stop_maintenance_writers(
@@ -10680,30 +10956,21 @@ def stop_maintenance_writers(
         command_name="stop-maintenance-writers",
         expected_options={"--package-root": str(package)},
     )
-    states = {
-        unit: _maintenance_user_unit_state(unit)
-        for unit in _MAINTENANCE_WRITER_UNITS
-    }
-    loaded = [unit for unit, state in states.items() if state["LoadState"] == "loaded"]
-    try:
-        result = subprocess.run(
-            _maintenance_user_systemctl_command("stop", *loaded),
-            check=False,
-            timeout=90,
-            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ActivationPackageError("maintenance writer stop failed") from error
-    if result.returncode != 0:
-        raise ActivationPackageError("maintenance writer stop failed")
-    remaining = [
-        unit
-        for unit in loaded
-        if _maintenance_user_unit_state(unit)["ActiveState"] != "inactive"
-    ]
-    if remaining:
-        raise ActivationPackageError("maintenance writer stop did not quiesce all units")
-    return {"status": "writers_stopped", "unitCount": len(loaded)}
+    return _stop_maintenance_writers_unchecked()
+
+
+def restop_maintenance_writers(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Reassert writer quiescence during sealed early rollback."""
+
+    package = Path(package_root).resolve()
+    _require_maintenance_active_rollback_command(
+        package_root,
+        command_name="restop-maintenance-writers",
+        expected_options={"--package-root": str(package)},
+    )
+    return _stop_maintenance_writers_unchecked()
 
 
 def restore_maintenance_writers(
@@ -10712,16 +10979,32 @@ def restore_maintenance_writers(
     """Restore the exact preflight-active user units after safe rollback."""
 
     package = Path(package_root).resolve()
-    _require_maintenance_active_rollback_command(
+    contract = _require_maintenance_active_rollback_command(
         package_root,
         command_name="restore-maintenance-writers",
         expected_options={"--package-root": str(package)},
     )
+    baseline = contract.get("writerUnitBaseline")
+    if not isinstance(baseline, list):
+        raise ActivationPackageError("maintenance writer restoration baseline is invalid")
+    active_units = [
+        str(entry.get("unit"))
+        for entry in baseline
+        if isinstance(entry, Mapping) and entry.get("activeState") == "active"
+    ]
+    if not active_units or any(
+        not isinstance(entry, Mapping)
+        or entry.get("unit") not in _MAINTENANCE_WRITER_UNITS
+        or (
+            entry.get("activeState") == "active"
+            and entry.get("unitFileState") != "enabled"
+        )
+        for entry in baseline
+    ):
+        raise ActivationPackageError("maintenance writer restoration baseline is invalid")
     try:
         result = subprocess.run(
-            _maintenance_user_systemctl_command(
-                "enable", "--now", *_MAINTENANCE_PRIOR_ACTIVE_UNITS
-            ),
+            _maintenance_user_systemctl_command("enable", "--now", *active_units),
             check=False,
             timeout=120,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
@@ -10730,12 +11013,12 @@ def restore_maintenance_writers(
         raise ActivationPackageError("maintenance writer restoration failed") from error
     if result.returncode != 0 or any(
         _maintenance_user_unit_state(unit)["ActiveState"] != "active"
-        for unit in _MAINTENANCE_PRIOR_ACTIVE_UNITS
+        for unit in active_units
     ):
         raise ActivationPackageError("maintenance writer restoration failed")
     return {
         "status": "writers_restored",
-        "unitCount": len(_MAINTENANCE_PRIOR_ACTIVE_UNITS),
+        "unitCount": len(active_units),
     }
 
 
@@ -10828,6 +11111,36 @@ _MAINTENANCE_FRESHNESS_JOB_IDS = (
 _MAINTENANCE_GATEWAY_CHALLENGE_PATH = Path(
     "/run/overseer/maintenance-gateway-challenge"
 )
+_MAINTENANCE_HANDOFF_CREDENTIAL_DIRECTORY = Path("/etc/overseer")
+_MAINTENANCE_HANDOFF_CREDENTIAL_NAMES = (
+    "admin-approval-verifier.json",
+    "roadex-fixture-approval-verifier.json",
+    "api-token",
+    "psychlo-peer-secret",
+    "roadex-project-human-thread-secret",
+    "psychlo-project-bindings.json",
+    "admin-executor-public-key",
+    "admin-executor-allowlist.json",
+    "admin-ticket-private-key",
+    "protected-gateway-ca.crt",
+)
+_MAINTENANCE_HANDOFF_SYSTEM_INPUTS = {
+    "systemAdminSocketUnit": Path(
+        "/etc/systemd/system/overseer-admin-executor.socket"
+    ),
+    "systemAdminServiceUnit": Path(
+        "/etc/systemd/system/overseer-admin-executor@.service"
+    ),
+    "systemApiUnit": Path("/etc/systemd/system/overseer-api.service"),
+    "systemUserBridgeServiceUnit": Path(
+        "/etc/systemd/system/overseer-codex-user-bridge.service"
+    ),
+    "systemUserBridgeSocketUnit": Path(
+        "/etc/systemd/system/overseer-codex-user-bridge.socket"
+    ),
+    "systemRuntimeUnit": Path("/etc/systemd/system/overseer-runtime.service"),
+    "systemTmpfilesRule": Path("/etc/tmpfiles.d/overseer.conf"),
+}
 
 
 def _maintenance_copy_regular(source: Path, target: Path) -> dict[str, object]:
@@ -10897,10 +11210,19 @@ def _maintenance_copy_regular(source: Path, target: Path) -> dict[str, object]:
         "sha256": digest.hexdigest(),
         "size": copied,
         "mode": "0600",
+        "sourcePath": str(source),
+        "sourceDevice": before.st_dev,
+        "sourceInode": before.st_ino,
+        "sourceUid": before.st_uid,
+        "sourceGid": before.st_gid,
+        "sourceMode": stat.S_IMODE(before.st_mode),
     }
 
 
-def _maintenance_copy_tree(source: Path, target: Path) -> list[dict[str, object]]:
+def _maintenance_copy_tree(
+    source: Path,
+    target: Path,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     try:
         metadata = source.lstat()
     except OSError as error:
@@ -10927,11 +11249,29 @@ def _maintenance_copy_tree(source: Path, target: Path) -> list[dict[str, object]
         source,
         label="maintenance preservation directory",
     )
-    if inventory_after != inventory_before:
+    try:
+        metadata_after = source.lstat()
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance preservation directory changed during copy"
+        ) from error
+    if (
+        inventory_after != inventory_before
+        or _metadata_identity(metadata_after) != _metadata_identity(metadata)
+    ):
         raise ActivationPackageError(
             "maintenance preservation directory changed during copy"
         )
-    return artifacts
+    return artifacts, {
+        "path": str(target),
+        "mode": "0700",
+        "sourcePath": str(source),
+        "sourceDevice": metadata.st_dev,
+        "sourceInode": metadata.st_ino,
+        "sourceUid": metadata.st_uid,
+        "sourceGid": metadata.st_gid,
+        "sourceMode": stat.S_IMODE(metadata.st_mode),
+    }
 
 
 def _maintenance_preservation_required_bytes(
@@ -11046,6 +11386,7 @@ def preserve_maintenance_state(
         _ensure_directory(evidence_root)
         os.chmod(evidence_root, 0o700)
     artifacts: list[dict[str, object]] = []
+    directories: list[dict[str, object]] = []
     for binding in [*bindings, *deferred]:
         if not isinstance(binding, Mapping):
             raise ActivationPackageError("maintenance store binding is invalid")
@@ -11078,7 +11419,9 @@ def preserve_maintenance_state(
         source = Path(source_value)
         destination = evidence_root / "inputs" / name
         if source.is_dir() and not source.is_symlink():
-            artifacts.extend(_maintenance_copy_tree(source, destination))
+            copied, directory = _maintenance_copy_tree(source, destination)
+            artifacts.extend(copied)
+            directories.append(directory)
         else:
             artifacts.append(_maintenance_copy_regular(source, destination))
     manifest = {
@@ -11086,6 +11429,7 @@ def preserve_maintenance_state(
         "status": "preserved",
         "evidenceRoot": str(evidence_root),
         "artifacts": artifacts,
+        "directories": directories,
     }
     manifest_path = evidence_root / "preservation-manifest.json"
     _write_new(manifest_path, _canonical(manifest) + b"\n", 0o600)
@@ -11099,18 +11443,11 @@ def preserve_maintenance_state(
     return manifest
 
 
-def verify_maintenance_preservation(
-    package_root: str | os.PathLike[str],
+def _verify_maintenance_preservation_unchecked(
+    contract: Mapping[str, object],
 ) -> dict[str, object]:
-    """Re-hash the complete root-owned preservation namespace before handoff."""
+    """Verify the sealed preservation namespace after command authorization."""
 
-    package = Path(package_root).resolve()
-    _require_maintenance_active_sealed_command(
-        package_root,
-        command_name="verify-maintenance-preservation",
-        expected_options={"--package-root": str(package)},
-    )
-    contract = _read_maintenance_contract_file(package)
     root_value = contract.get("evidenceRoot")
     if not isinstance(root_value, str) or not root_value.startswith("/"):
         raise ActivationPackageError("maintenance evidence root is invalid")
@@ -11129,6 +11466,7 @@ def verify_maintenance_preservation(
         or manifest.get("status") != "preserved"
         or manifest.get("evidenceRoot") != str(evidence_root)
         or not isinstance(manifest.get("artifacts"), list)
+        or not isinstance(manifest.get("directories"), list)
         or evidence_root.is_symlink()
         or not stat.S_ISDIR(root_metadata.st_mode)
         or (root_metadata.st_uid, root_metadata.st_gid) != (root_uid, root_gid)
@@ -11142,7 +11480,23 @@ def verify_maintenance_preservation(
         if not isinstance(item, Mapping):
             raise ActivationPackageError("maintenance preservation artifact is invalid")
         path_value = item.get("path")
-        if not isinstance(path_value, str):
+        source_value = item.get("sourcePath")
+        if (
+            not isinstance(path_value, str)
+            or not isinstance(source_value, str)
+            or not source_value.startswith("/")
+            or any(
+                type(item.get(field)) is not int or int(item[field]) < 0
+                for field in (
+                    "sourceDevice",
+                    "sourceInode",
+                    "sourceUid",
+                    "sourceGid",
+                    "sourceMode",
+                )
+            )
+            or int(item["sourceMode"]) > 0o777
+        ):
             raise ActivationPackageError("maintenance preservation artifact is invalid")
         path = Path(path_value)
         try:
@@ -11158,13 +11512,380 @@ def verify_maintenance_preservation(
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
             raise ActivationPackageError("maintenance preservation artifact drifted")
+        if path in expected_paths:
+            raise ActivationPackageError("maintenance preservation artifact is duplicated")
         expected_paths.add(path)
+    observed_directories: set[str] = set()
+    for item in manifest["directories"]:
+        if not isinstance(item, Mapping):
+            raise ActivationPackageError("maintenance preservation directory is invalid")
+        path_value = item.get("path")
+        source_value = item.get("sourcePath")
+        if (
+            not isinstance(path_value, str)
+            or not isinstance(source_value, str)
+            or not source_value.startswith("/")
+            or source_value in observed_directories
+            or item.get("mode") != "0700"
+            or any(
+                type(item.get(field)) is not int or int(item[field]) < 0
+                for field in (
+                    "sourceDevice",
+                    "sourceInode",
+                    "sourceUid",
+                    "sourceGid",
+                    "sourceMode",
+                )
+            )
+            or int(item["sourceMode"]) > 0o777
+        ):
+            raise ActivationPackageError("maintenance preservation directory is invalid")
+        path = Path(path_value)
+        try:
+            path.relative_to(evidence_root)
+            metadata = path.lstat()
+        except (OSError, ValueError) as error:
+            raise ActivationPackageError(
+                "maintenance preservation directory is invalid"
+            ) from error
+        if (
+            path.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid) != (root_uid, root_gid)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ActivationPackageError("maintenance preservation directory drifted")
+        if source_value in observed_directories:
+            raise ActivationPackageError("maintenance preservation directory is duplicated")
+        observed_directories.add(source_value)
     observed_paths = {path for path in evidence_root.rglob("*") if path.is_file()}
     if observed_paths != expected_paths:
         raise ActivationPackageError(
             "maintenance preservation namespace contains unexpected artifacts"
         )
-    return {"status": "preservation_verified", "artifactCount": len(expected_paths) - 1}
+    return manifest
+
+
+def verify_maintenance_preservation(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Re-hash the complete root-owned preservation namespace before handoff."""
+
+    package = Path(package_root).resolve()
+    _require_maintenance_active_sealed_command(
+        package_root,
+        command_name="verify-maintenance-preservation",
+        expected_options={"--package-root": str(package)},
+    )
+    contract = _read_maintenance_contract_file(package)
+    manifest = _verify_maintenance_preservation_unchecked(contract)
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ActivationPackageError("maintenance preservation manifest is invalid")
+    return {"status": "preservation_verified", "artifactCount": len(artifacts)}
+
+
+def _maintenance_validate_restore_parent(
+    parent: Path,
+    *,
+    preserved_directory: Mapping[str, object] | None = None,
+) -> os.stat_result:
+    """Validate an exact rollback target parent without following links."""
+
+    try:
+        metadata = parent.lstat()
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance handoff restore parent is unavailable"
+        ) from error
+    root_uid, root_gid = _activation_root_identity()
+    if parent.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise ActivationPackageError("maintenance handoff restore parent is unsafe")
+    if preserved_directory is not None:
+        if (
+            preserved_directory.get("sourcePath") != str(parent)
+            or metadata.st_dev != preserved_directory.get("sourceDevice")
+            or metadata.st_ino != preserved_directory.get("sourceInode")
+            or metadata.st_uid != root_uid
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise ActivationPackageError(
+                "maintenance credential directory identity drifted"
+            )
+    elif (
+        (metadata.st_uid, metadata.st_gid) != (root_uid, root_gid)
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ActivationPackageError("maintenance handoff restore parent is unsafe")
+    return metadata
+
+
+def _maintenance_restore_regular(
+    evidence: Path,
+    target: Path,
+    artifact: Mapping[str, object],
+    *,
+    preserved_directory: Mapping[str, object] | None = None,
+) -> None:
+    """Atomically restore one exact preserved handoff file."""
+
+    _maintenance_validate_restore_parent(
+        target.parent,
+        preserved_directory=preserved_directory,
+    )
+    try:
+        target_metadata = target.lstat()
+    except FileNotFoundError:
+        target_metadata = None
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance handoff target could not be inspected"
+        ) from error
+    if target_metadata is not None and (
+        target.is_symlink()
+        or not stat.S_ISREG(target_metadata.st_mode)
+        or target_metadata.st_nlink != 1
+    ):
+        raise ActivationPackageError("maintenance handoff target is unsafe")
+    content, evidence_metadata = _stable_read(evidence)
+    root_uid, root_gid = _activation_root_identity()
+    source_uid = artifact.get("sourceUid")
+    source_gid = artifact.get("sourceGid")
+    source_mode = artifact.get("sourceMode")
+    if (
+        artifact.get("path") != str(evidence)
+        or artifact.get("sourcePath") != str(target)
+        or artifact.get("sha256") != _sha256(content)
+        or artifact.get("size") != len(content)
+        or (evidence_metadata.st_uid, evidence_metadata.st_gid)
+        != (root_uid, root_gid)
+        or type(source_uid) is not int
+        or type(source_gid) is not int
+        or type(source_mode) is not int
+        or source_uid < 0
+        or source_gid < 0
+        or not 0 <= source_mode <= 0o777
+    ):
+        raise ActivationPackageError("maintenance preserved handoff artifact is invalid")
+    temporary = target.with_name(
+        f".{target.name}.maintenance-rollback-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("maintenance handoff restore made no progress")
+            view = view[written:]
+        os.fchown(descriptor, source_uid, source_gid)
+        os.fchmod(descriptor, source_mode)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, target)
+        _fsync_package_directory(target.parent)
+    except OSError as error:
+        raise ActivationPackageError("maintenance handoff restore failed") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _maintenance_remove_unpreserved_handoff(
+    target: Path,
+    *,
+    preserved_directory: Mapping[str, object] | None = None,
+) -> bool:
+    """Remove only an exact newly installed file that was absent before handoff."""
+
+    _maintenance_validate_restore_parent(
+        target.parent,
+        preserved_directory=preserved_directory,
+    )
+    try:
+        metadata = target.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance handoff target could not be inspected"
+        ) from error
+    if target.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ActivationPackageError("maintenance handoff target is unsafe")
+    try:
+        target.unlink()
+        _fsync_package_directory(target.parent)
+    except OSError as error:
+        raise ActivationPackageError("maintenance handoff removal failed") from error
+    return True
+
+
+def _maintenance_restore_directory_metadata(
+    directory: Path,
+    preserved: Mapping[str, object],
+) -> None:
+    """Restore preserved ownership and mode on an unchanged directory inode."""
+
+    _maintenance_validate_restore_parent(
+        directory,
+        preserved_directory=preserved,
+    )
+    source_uid = preserved.get("sourceUid")
+    source_gid = preserved.get("sourceGid")
+    source_mode = preserved.get("sourceMode")
+    if (
+        type(source_uid) is not int
+        or type(source_gid) is not int
+        or type(source_mode) is not int
+        or source_uid < 0
+        or source_gid < 0
+        or not 0 <= source_mode <= 0o777
+    ):
+        raise ActivationPackageError(
+            "maintenance preserved directory metadata is invalid"
+        )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            metadata.st_dev != preserved.get("sourceDevice")
+            or metadata.st_ino != preserved.get("sourceInode")
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise ActivationPackageError(
+                "maintenance credential directory identity drifted"
+            )
+        os.fchown(descriptor, source_uid, source_gid)
+        os.fchmod(descriptor, source_mode)
+        os.fsync(descriptor)
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance credential directory metadata restore failed"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def restore_maintenance_handoff_artifacts(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Restore exact pre-switch credentials and units during full rollback."""
+
+    package = Path(package_root).resolve()
+    contract = _require_maintenance_active_rollback_command(
+        package,
+        command_name="restore-maintenance-handoff-artifacts",
+        expected_options={"--package-root": str(package)},
+    )
+    state = _load_maintenance_state()
+    if state is None or state.get("stage") != "rollback":
+        raise ActivationPackageError(
+            "maintenance handoff artifacts require the full rollback profile"
+        )
+    manifest = _verify_maintenance_preservation_unchecked(contract)
+    inputs = contract.get("preservationInputs")
+    root_value = contract.get("evidenceRoot")
+    artifacts = manifest.get("artifacts")
+    directories = manifest.get("directories")
+    if (
+        not isinstance(inputs, Mapping)
+        or not isinstance(root_value, str)
+        or not isinstance(artifacts, list)
+        or not isinstance(directories, list)
+        or inputs.get("systemCredentialsDirectory")
+        != str(_MAINTENANCE_HANDOFF_CREDENTIAL_DIRECTORY)
+        or any(
+            inputs.get(name) != str(target)
+            for name, target in _MAINTENANCE_HANDOFF_SYSTEM_INPUTS.items()
+        )
+    ):
+        raise ActivationPackageError(
+            "maintenance handoff restoration binding is invalid"
+        )
+    evidence_root = Path(root_value)
+    credential_evidence = (
+        evidence_root / "inputs" / "systemCredentialsDirectory"
+    )
+    credential_directories = [
+        item
+        for item in directories
+        if isinstance(item, Mapping)
+        and item.get("sourcePath") == str(_MAINTENANCE_HANDOFF_CREDENTIAL_DIRECTORY)
+    ]
+    if (
+        len(credential_directories) != 1
+        or credential_directories[0].get("path") != str(credential_evidence)
+    ):
+        raise ActivationPackageError(
+            "maintenance credential directory preservation is invalid"
+        )
+    credential_directory = credential_directories[0]
+    expected: dict[Path, tuple[Path, Mapping[str, object] | None]] = {
+        _MAINTENANCE_HANDOFF_CREDENTIAL_DIRECTORY / name: (
+            credential_evidence / name,
+            credential_directory,
+        )
+        for name in _MAINTENANCE_HANDOFF_CREDENTIAL_NAMES
+    }
+    expected.update(
+        {
+            target: (evidence_root / "inputs" / name, None)
+            for name, target in _MAINTENANCE_HANDOFF_SYSTEM_INPUTS.items()
+        }
+    )
+    restored = 0
+    removed = 0
+    for target, (evidence, preserved_directory) in expected.items():
+        matches = [
+            item
+            for item in artifacts
+            if isinstance(item, Mapping) and item.get("sourcePath") == str(target)
+        ]
+        if len(matches) > 1 or (
+            matches and matches[0].get("path") != str(evidence)
+        ):
+            raise ActivationPackageError(
+                "maintenance handoff artifact preservation is ambiguous"
+            )
+        if matches:
+            _maintenance_restore_regular(
+                evidence,
+                target,
+                matches[0],
+                preserved_directory=preserved_directory,
+            )
+            restored += 1
+        elif _maintenance_remove_unpreserved_handoff(
+            target,
+            preserved_directory=preserved_directory,
+        ):
+            removed += 1
+    _maintenance_restore_directory_metadata(
+        _MAINTENANCE_HANDOFF_CREDENTIAL_DIRECTORY,
+        credential_directory,
+    )
+    return {
+        "status": "maintenance_handoff_restored",
+        "restoredFileCount": restored,
+        "removedFileCount": removed,
+        "credentialDirectoryMetadataRestored": True,
+    }
 
 
 def _run_bounded_maintenance_acceptance_check(
@@ -11404,6 +12125,47 @@ def _maintenance_credentials_valid() -> bool:
     return True
 
 
+def _maintenance_success_user_unit_inventory_valid() -> bool:
+    """Verify every legacy/continuing user unit against the successor profile."""
+
+    exact = {
+        "overseer-psychlo-coordination-tick.timer": ("not-found", "inactive", ""),
+        "overseer-psychlo-usage.timer": ("loaded", "inactive", "disabled"),
+        "overseer-quark-scheduler.timer": ("loaded", "active", "enabled"),
+        "overseer-codex-usage-snapshot.timer": ("loaded", "active", "enabled"),
+        "overseer-psychlo-coordination-tick.service": ("not-found", "inactive", ""),
+        "overseer-psychlo-cycle.service": ("loaded", "inactive", "static"),
+        "overseer-psychlo-meter.service": ("loaded", "inactive", "static"),
+        "overseer-psychlo-usage.service": ("loaded", "inactive", "static"),
+        "overseer-codex-usage-mcp.service": ("loaded", "active", "enabled"),
+        "overseer-api.service": ("loaded", "inactive", "disabled"),
+        "overseer.service": ("loaded", "inactive", "disabled"),
+    }
+    timer_oneshots = {
+        "overseer-quark-scheduler.service",
+        "overseer-codex-usage-snapshot.service",
+    }
+    try:
+        for unit in _MAINTENANCE_WRITER_UNITS:
+            state = _maintenance_user_unit_state(unit)
+            observed = (
+                state["LoadState"],
+                state["ActiveState"],
+                state["UnitFileState"],
+            )
+            if unit in timer_oneshots:
+                if observed not in {
+                    ("loaded", "inactive", "static"),
+                    ("loaded", "active", "static"),
+                }:
+                    return False
+            elif observed != exact.get(unit):
+                return False
+    except (KeyError, ActivationPackageError):
+        return False
+    return True
+
+
 def _maintenance_single_writer_inventory_valid(
     contract: Mapping[str, object],
 ) -> bool:
@@ -11464,23 +12226,7 @@ def _maintenance_single_writer_inventory_valid(
     ):
         return False
     try:
-        if any(
-            _maintenance_user_unit_state(unit)["ActiveState"] != "inactive"
-            for unit in (
-                "overseer.service",
-                "overseer-api.service",
-                "overseer-psychlo-usage.timer",
-            )
-        ):
-            return False
-        if any(
-            _maintenance_user_unit_state(unit)["ActiveState"] != "active"
-            for unit in (
-                "overseer-quark-scheduler.timer",
-                "overseer-codex-usage-mcp.service",
-                "overseer-codex-usage-snapshot.timer",
-            )
-        ):
+        if not _maintenance_success_user_unit_inventory_valid():
             return False
         expected_system = (
             "overseer-runtime.service",
@@ -11518,7 +12264,7 @@ def _maintenance_single_writer_inventory_valid(
 def verify_maintenance_acceptance(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
-    """Run only the exact sealed read-only maintenance acceptance checks."""
+    """Run the exact sealed bounded maintenance acceptance checks."""
 
     package = Path(package_root).resolve()
     _require_maintenance_active_sealed_command(
@@ -11645,7 +12391,12 @@ def execute_approved_maintenance_rollback(
         state = _load_maintenance_state()
         if state is None:
             raise ActivationPackageError("maintenance state is required for rollback")
-        if state.get("status") in {"complete", "rolled_back", "failed_before_stopWriters"}:
+        if state.get("status") in {
+            "complete",
+            "rolled_back",
+            "failed_before_stopWriters",
+            "rollback_failed",
+        }:
             if state.get("status") == "rolled_back":
                 return {
                     "status": "rolled_back",
@@ -11677,13 +12428,36 @@ def execute_approved_maintenance_rollback(
         except ValueError as error:
             raise ActivationPackageError("maintenance approval binding is invalid") from error
 
-        rollback_commands = contract["rollbackCommands"]
-        rollback_timeouts = contract["rollbackTimeoutSeconds"]
-        rollback_start_index = int(contract["rollbackStartIndex"])
-        rollback_error: BaseException | None = None
-        rollback_deadline = time.monotonic() + int(
-            contract["rollbackWindowTimeoutSeconds"]
+        original_stage = state.get("stage")
+        use_early_rollback = original_stage in {
+            "stopWriters",
+            "proveQuiescence",
+            "preserveState",
+            "installRelease",
+            "earlyRollback",
+        }
+        command_field = (
+            "earlyRollbackCommands" if use_early_rollback else "rollbackCommands"
         )
+        timeout_field = (
+            "earlyRollbackTimeoutSeconds"
+            if use_early_rollback
+            else "rollbackTimeoutSeconds"
+        )
+        start_field = (
+            "earlyRollbackStartIndex" if use_early_rollback else "rollbackStartIndex"
+        )
+        window_field = (
+            "earlyRollbackWindowTimeoutSeconds"
+            if use_early_rollback
+            else "rollbackWindowTimeoutSeconds"
+        )
+        rollback_stage = "earlyRollback" if use_early_rollback else "rollback"
+        rollback_commands = contract[command_field]
+        rollback_timeouts = contract[timeout_field]
+        rollback_start_index = int(contract[start_field])
+        rollback_error: BaseException | None = None
+        rollback_deadline = time.monotonic() + int(contract[window_field])
         for index, command in enumerate(rollback_commands):
             if rollback_error is not None and index >= rollback_start_index:
                 break
@@ -11692,7 +12466,7 @@ def execute_approved_maintenance_rollback(
                 "packageDigest": digest,
                 "planDigest": plan_digest,
                 "status": "before_rollback_command",
-                "stage": "rollback",
+                "stage": rollback_stage,
                 "commandIndex": index,
                 "commandDigest": _sha256(_canonical(command)),
                 "writersStopped": True,
@@ -11726,7 +12500,7 @@ def execute_approved_maintenance_rollback(
                     "packageDigest": digest,
                     "planDigest": plan_digest,
                     "status": "rollback_failed",
-                    "stage": "rollback",
+                    "stage": rollback_stage,
                     "writersStopped": True,
                     "failure": type(rollback_error).__name__,
                 }
@@ -11740,7 +12514,7 @@ def execute_approved_maintenance_rollback(
                 "packageDigest": digest,
                 "planDigest": plan_digest,
                 "status": "rolled_back",
-                "stage": "rollback",
+                "stage": rollback_stage,
                 "writersStopped": True,
             }
         )
@@ -11895,6 +12669,16 @@ def _main(argv: list[str] | None = None) -> int:
         help="restore all sealed legacy store authorities during maintenance rollback",
     )
     maintenance_restore.add_argument("--package-root", required=True)
+    maintenance_restore_handoff = commands.add_parser(
+        "restore-maintenance-handoff-artifacts",
+        help="restore exact preserved credentials and units during full rollback",
+    )
+    maintenance_restore_handoff.add_argument("--package-root", required=True)
+    maintenance_restop_writers = commands.add_parser(
+        "restop-maintenance-writers",
+        help="reassert writer quiescence during sealed early rollback",
+    )
+    maintenance_restop_writers.add_argument("--package-root", required=True)
     maintenance_restore_writers = commands.add_parser(
         "restore-maintenance-writers",
         help="restore the exact preflight-active writer units during rollback",
@@ -11902,7 +12686,7 @@ def _main(argv: list[str] | None = None) -> int:
     maintenance_restore_writers.add_argument("--package-root", required=True)
     maintenance_acceptance = commands.add_parser(
         "verify-maintenance-acceptance",
-        help="run the exact bounded read-only maintenance acceptance set",
+        help="run the exact bounded maintenance acceptance set",
     )
     maintenance_acceptance.add_argument("--package-root", required=True)
     canary_store = commands.add_parser(
@@ -12219,6 +13003,18 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "restore-maintenance-handoff-artifacts":
+        result = restore_maintenance_handoff_artifacts(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "restop-maintenance-writers":
+        result = restop_maintenance_writers(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "restore-maintenance-writers":
         result = restore_maintenance_writers(
             _validate_existing_package_destination(args.package_root),
@@ -12409,6 +13205,8 @@ __all__ = [
     "render_activation_contract",
     "render_maintenance_window_contract",
     "render_systemd_units",
+    "restop_maintenance_writers",
+    "restore_maintenance_handoff_artifacts",
     "restore_legacy_store_access",
     "run_canary_acceptance",
     "stage_canary_identity",

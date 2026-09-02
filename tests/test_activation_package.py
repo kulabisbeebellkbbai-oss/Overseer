@@ -2988,6 +2988,64 @@ def test_ensure_dedicated_principal_derives_identity_from_active_sealed_contract
     }
 
 
+def test_ensure_dedicated_principal_uses_sealed_maintenance_switch_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = (tmp_path / "approved-package").resolve()
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(activation_package_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_state",
+        lambda: {"stage": "switchServices", "status": "before_command"},
+    )
+
+    def maintenance_guard(*args: object, **kwargs: object) -> object:
+        observed["guardArgs"] = args
+        observed["guardKwargs"] = kwargs
+        return {}, 37
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_sealed_command",
+        maintenance_guard,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "validate_maintenance_contract",
+        lambda _contract: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_active_phase_command",
+        lambda *_args, **_kwargs: pytest.fail(
+            "maintenance principal conversion must not use the legacy phase guard"
+        ),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_ensure_dedicated_principal_identity",
+        lambda **kwargs: observed.setdefault("identity", kwargs) or {},
+    )
+
+    result = activation_package_module.ensure_dedicated_principal(package_root=package)
+
+    assert result == observed["identity"]
+    assert observed["guardKwargs"] == {
+        "command_name": "ensure-dedicated-principal",
+        "expected_options": {"--package-root": str(package)},
+    }
+    assert observed["identity"] == {
+        "uid": 984,
+        "gid": 984,
+        "home_dir": "/var/lib/overseer",
+        "shell": "/usr/sbin/nologin",
+        "lock_descriptor": 37,
+    }
+
+
 def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_path: Path) -> None:
     package, manifest, source = _prepared_package(tmp_path)
     rollback_release = tmp_path / "v1.1.5-release"
@@ -9308,6 +9366,38 @@ MAINTENANCE_STAGE_NAMES = (
 )
 
 
+def _maintenance_writer_unit_baseline_fixture() -> list[dict[str, str]]:
+    active_units = set(activation_package_module._MAINTENANCE_PRIOR_ACTIVE_UNITS)
+    optional_units = activation_package_module._MAINTENANCE_OPTIONAL_WRITER_UNITS
+    return [
+        {
+            "unit": unit,
+            "loadState": "not-found" if unit in optional_units else "loaded",
+            "activeState": "active" if unit in active_units else "inactive",
+            "unitFileState": (
+                ""
+                if unit in optional_units
+                else "enabled"
+                if unit in active_units
+                else "static"
+            ),
+        }
+        for unit in activation_package_module._MAINTENANCE_WRITER_UNITS
+    ]
+
+
+def _maintenance_successor_unit_baseline_fixture() -> list[dict[str, str]]:
+    return [
+        {
+            "unit": unit,
+            "loadState": "loaded",
+            "activeState": "inactive",
+            "unitFileState": "disabled",
+        }
+        for unit in activation_package_module.MAINTENANCE_SUCCESSOR_SYSTEM_UNITS
+    ]
+
+
 def _maintenance_activation_contract_fixture(package: Path) -> dict[str, object]:
     maintenance = _maintenance_contract_fixture(package)
     return {
@@ -9323,11 +9413,17 @@ def _maintenance_activation_contract_fixture(package: Path) -> dict[str, object]
         },
         "sourceStore": {"path": str(package / "legacy.sqlite3")},
         "maintenanceWindow": {
+            "writerUnitBaseline": maintenance["writerUnitBaseline"],
+            "successorUnitBaseline": maintenance["successorUnitBaseline"],
             "stages": [
                 {"name": name, "commands": [["/usr/bin/true", name]]}
                 for name in MAINTENANCE_STAGE_NAMES
             ],
             "rollbackCommands": [["/usr/bin/true", "rollback"]],
+            "earlyRollbackCommands": [["/usr/bin/true", "early-rollback"]],
+            "earlyRollbackTimeoutSeconds": [60],
+            "earlyRollbackWindowTimeoutSeconds": 300,
+            "earlyRollbackStartIndex": 0,
             "rollbackTimeoutSeconds": [60],
             "rollbackWindowTimeoutSeconds": 1800,
             "rollbackStartIndex": 0,
@@ -9357,6 +9453,8 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
             "gid": 984,
         },
         "scope": "maintenance-window-for-this-package-only",
+        "writerUnitBaseline": _maintenance_writer_unit_baseline_fixture(),
+        "successorUnitBaseline": _maintenance_successor_unit_baseline_fixture(),
         "storeBindings": [
             {
                 "name": "overseer-main",
@@ -9439,6 +9537,14 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
             "codexUsageMcpUnit": str(package / "overseer-codex-usage-mcp.service"),
             "codexUsageSnapshotUnit": str(package / "overseer-codex-usage-snapshot.service"),
             "codexUsageSnapshotTimer": str(package / "overseer-codex-usage-snapshot.timer"),
+            "systemCredentialsDirectory": str(package / "system-credentials"),
+            "systemAdminSocketUnit": str(package / "overseer-admin-executor.socket"),
+            "systemAdminServiceUnit": str(package / "overseer-admin-executor@.service"),
+            "systemApiUnit": str(package / "system-overseer-api.service"),
+            "systemUserBridgeServiceUnit": str(package / "overseer-codex-user-bridge.service"),
+            "systemUserBridgeSocketUnit": str(package / "overseer-codex-user-bridge.socket"),
+            "systemRuntimeUnit": str(package / "overseer-runtime.service"),
+            "systemTmpfilesRule": str(package / "overseer.conf"),
         },
         "evidenceRoot": str(package / "evidence"),
         "acceptanceChecks": list(
@@ -9451,6 +9557,10 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
         ],
         "stageTimeoutSeconds": {name: 60 for name in MAINTENANCE_STAGE_NAMES},
         "windowTimeoutSeconds": 5400,
+        "earlyRollbackCommands": [["/usr/bin/true", "early-rollback"]],
+        "earlyRollbackTimeoutSeconds": [60],
+        "earlyRollbackWindowTimeoutSeconds": 300,
+        "earlyRollbackStartIndex": 0,
         "rollbackCommands": [["/usr/bin/true", "rollback"]],
         "rollbackTimeoutSeconds": [60],
         "rollbackWindowTimeoutSeconds": 1800,
@@ -9510,6 +9620,8 @@ def test_render_maintenance_window_contract_is_digest_bound_sibling_with_safe_or
         MAINTENANCE_STAGE_NAMES
     )
     assert contract["rollbackCommands"]
+    assert contract["writerUnitBaseline"] == _maintenance_writer_unit_baseline_fixture()
+    assert contract["successorUnitBaseline"] == _maintenance_successor_unit_baseline_fixture()
 
     serialized = json.dumps(contract, sort_keys=True)
     for forbidden in (
@@ -9529,6 +9641,7 @@ def test_render_maintenance_window_contract_is_digest_bound_sibling_with_safe_or
 
 def test_render_activation_contract_emits_real_maintenance_window_plan(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     package, manifest, source = _prepared_package(tmp_path)
     rollback = tmp_path / "rollback"
@@ -9543,6 +9656,19 @@ def test_render_activation_contract_emits_real_maintenance_window_plan(
     codex_usage = tmp_path / "codex-usage" / "state.sqlite3"
     codex_usage.parent.mkdir()
     _wal_store(codex_usage)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_capture_maintenance_writer_unit_baseline",
+        _maintenance_writer_unit_baseline_fixture,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_capture_maintenance_successor_unit_baseline",
+        _maintenance_successor_unit_baseline_fixture,
+        raising=False,
+    )
 
     activation = render_activation_contract(
         package,
@@ -9565,6 +9691,23 @@ def test_render_activation_contract_emits_real_maintenance_window_plan(
         "restore-maintenance-store-access" in command
         for command in maintenance["rollbackCommands"]
     )
+    rollback = maintenance["rollbackCommands"]
+    handoff_restore_index = next(
+        index
+        for index, command in enumerate(rollback)
+        if "restore-maintenance-handoff-artifacts" in command
+    )
+    writer_restore_index = next(
+        index
+        for index, command in enumerate(rollback)
+        if "restore-maintenance-writers" in command
+    )
+    assert handoff_restore_index < writer_restore_index
+    assert rollback[handoff_restore_index + 1] == [
+        "/usr/bin/systemctl",
+        "daemon-reload",
+    ]
+    assert maintenance["rollbackStartIndex"] == writer_restore_index
     assert [binding["name"] for binding in maintenance["storeBindings"]] == [
         "overseer-main",
         "psychlo-bridge",
@@ -9573,6 +9716,8 @@ def test_render_activation_contract_emits_real_maintenance_window_plan(
     assert maintenance["acceptanceChecks"] == list(
         activation_package_module._MAINTENANCE_ACCEPTANCE_CHECKS
     )
+    assert maintenance["writerUnitBaseline"] == _maintenance_writer_unit_baseline_fixture()
+    assert maintenance["successorUnitBaseline"] == _maintenance_successor_unit_baseline_fixture()
     stages = {stage["name"]: stage["commands"] for stage in maintenance["stages"]}
     assert any("stop-maintenance-writers" in command for command in stages["stopWriters"])
     assert any("verify-maintenance-quiescence" in command for command in stages["proveQuiescence"])
@@ -9581,6 +9726,32 @@ def test_render_activation_contract_emits_real_maintenance_window_plan(
     assert any("prepare-maintenance-stores" in command for command in stages["migrateOfflineStores"])
     assert any("overseer-runtime.service" in command for command in stages["switchServices"])
     assert any("verify-maintenance-acceptance" in command for command in stages["acceptance"])
+    mutable_install_targets = (
+        "/etc/overseer",
+        "/etc/systemd/system",
+        "/etc/tmpfiles.d",
+        "/var/lib/overseer",
+    )
+    assert not any(
+        "ensure-dedicated-principal" in command
+        or (
+            command[0] == "/usr/bin/install"
+            and any(
+                command[-1] == prefix or command[-1].startswith(prefix + "/")
+                for prefix in mutable_install_targets
+            )
+        )
+        for command in stages["installRelease"]
+    )
+    assert any(
+        "ensure-dedicated-principal" in command
+        for command in stages["switchServices"]
+    )
+    assert any(
+        command[0] == "/usr/bin/install"
+        and command[-1].startswith("/etc/systemd/system/")
+        for command in stages["switchServices"]
+    )
     serialized = json.dumps(maintenance, sort_keys=True).lower()
     for forbidden in ("staging-canary", "phase-b", "virsh", "qemu", "claim", "firewall", "reboot"):
         assert forbidden not in serialized
@@ -9899,3 +10070,286 @@ def test_maintenance_window_rollback_accepts_only_maintenance_state_and_cli_has_
         assert activation_package_module._main(argv) == 0
 
     assert observed == ["record", "verify", "execute", "rollback"]
+
+
+def test_writer_stop_command_accepts_the_pre_effect_uncertain_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    stop_command = [
+        "/usr/bin/env",
+        "PYTHONPATH=/opt/overseer/app/src",
+        "/usr/bin/python3",
+        "-m",
+        "overseer.activation_package",
+        "stop-maintenance-writers",
+        "--package-root",
+        str(package.resolve()),
+    ]
+    contract["stages"][1]["commands"] = [stop_command]
+    plan_digest = activation_package_module.maintenance_plan_digest(contract)
+    approval = {
+        "packageDigest": "c" * 64,
+        "planDigest": plan_digest,
+        "allowReboot": False,
+    }
+    state = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": "c" * 64,
+        "planDigest": plan_digest,
+        "status": "writer_stop_in_progress",
+        "stage": "stopWriters",
+        "commandIndex": 0,
+        "commandDigest": activation_package_module._sha256(
+            activation_package_module._canonical(stop_command)
+        ),
+        "writersStopped": True,
+    }
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_inherited_activation_lock",
+        lambda: 9,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: approval,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_maintenance_contract",
+        lambda _package, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_state",
+        lambda: state,
+    )
+
+    sealed, descriptor = (
+        activation_package_module._require_maintenance_active_sealed_command(
+            package,
+            command_name="stop-maintenance-writers",
+            expected_options={"--package-root": str(package.resolve())},
+        )
+    )
+
+    assert sealed is contract
+    assert descriptor == 9
+
+
+def test_writer_unit_preflight_rejects_drift_from_the_sealed_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = _maintenance_writer_unit_baseline_fixture()
+    current = {
+        entry["unit"]: {
+            "LoadState": entry["loadState"],
+            "ActiveState": entry["activeState"],
+            "UnitFileState": entry["unitFileState"],
+        }
+        for entry in baseline
+    }
+    current["overseer-api.service"]["ActiveState"] = "inactive"
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_user_unit_state",
+        lambda unit: current[unit],
+    )
+
+    with pytest.raises(ActivationPackageError, match="sealed writer unit baseline"):
+        activation_package_module._maintenance_writer_unit_preflight(baseline)
+
+
+def test_early_rollback_restop_is_idempotent_and_sealed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    stopped = False
+    calls: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_rollback_command",
+        lambda *_args, **_kwargs: contract,
+    )
+
+    def state(unit: str) -> dict[str, str]:
+        return {
+            "LoadState": "loaded",
+            "ActiveState": "inactive" if stopped else "active",
+            "UnitFileState": "enabled",
+        }
+
+    monkeypatch.setattr(activation_package_module, "_maintenance_user_unit_state", state)
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        nonlocal stopped
+        calls.append(tuple(command))
+        stopped = True
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(activation_package_module.subprocess, "run", run)
+
+    first = activation_package_module.restop_maintenance_writers(package)
+    second = activation_package_module.restop_maintenance_writers(package)
+
+    assert first["status"] == "writers_stopped"
+    assert second["status"] == "writers_stopped"
+    assert len(calls) == 2
+
+
+def test_restore_maintenance_writers_uses_the_sealed_active_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    baseline = contract["writerUnitBaseline"]
+    for entry in baseline:
+        entry["activeState"] = "inactive"
+        if entry["loadState"] == "loaded":
+            entry["unitFileState"] = "static"
+    selected = next(entry for entry in baseline if entry["unit"] == "overseer.service")
+    selected["activeState"] = "active"
+    selected["unitFileState"] = "enabled"
+    restored = False
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_rollback_command",
+        lambda *_args, **_kwargs: contract,
+    )
+
+    def state(unit: str) -> dict[str, str]:
+        entry = next(item for item in baseline if item["unit"] == unit)
+        return {
+            "LoadState": entry["loadState"],
+            "ActiveState": (
+                "active" if restored and unit == "overseer.service" else "inactive"
+            ),
+            "UnitFileState": entry["unitFileState"],
+        }
+
+    monkeypatch.setattr(activation_package_module, "_maintenance_user_unit_state", state)
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        nonlocal restored
+        calls.append(tuple(command))
+        restored = True
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(activation_package_module.subprocess, "run", run)
+
+    result = activation_package_module.restore_maintenance_writers(package)
+
+    assert result == {"status": "writers_restored", "unitCount": 1}
+    assert calls == [
+        tuple(
+            activation_package_module._maintenance_user_systemctl_command(
+                "enable", "--now", "overseer.service"
+            )
+        )
+    ]
+
+
+def test_manual_maintenance_rollback_uses_early_profile_before_store_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    plan_digest = activation_package_module.maintenance_plan_digest(contract)
+    current: dict[str, object] = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": "c" * 64,
+        "planDigest": plan_digest,
+        "status": "writer_stop_in_progress",
+        "stage": "stopWriters",
+        "commandIndex": 0,
+        "writersStopped": True,
+    }
+    written: list[dict[str, object]] = []
+    calls: list[tuple[str, ...]] = []
+
+    class Lock:
+        def __enter__(self) -> "Lock":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_activation_execution_lock", Lock)
+    monkeypatch.setattr(activation_package_module, "_load_maintenance_state", lambda: current)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_maintenance_state",
+        lambda document: (written.append(dict(document)), current.update(document)),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: {
+            "schemaVersion": "overseer.maintenance-window-approval.v1",
+            "packageRoot": str(package.resolve()),
+            "packageDigest": "c" * 64,
+            "planDigest": plan_digest,
+            "scope": "maintenance-window-for-this-package-only",
+            "allowReboot": False,
+        },
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_maintenance_contract",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_maintenance_contract_command",
+        lambda command, _timeout: calls.append(tuple(command)) or 0,
+    )
+
+    result = activation_package_module.execute_approved_maintenance_rollback(package)
+
+    assert result["status"] == "rolled_back"
+    assert calls == [("/usr/bin/true", "early-rollback")]
+    assert written[-1]["stage"] == "earlyRollback"
+
+
+def test_manual_maintenance_rollback_rejects_terminal_rollback_failure_without_new_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    state = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": "c" * 64,
+        "planDigest": "d" * 64,
+        "status": "rollback_failed",
+        "stage": "earlyRollback",
+        "writersStopped": True,
+    }
+
+    class Lock:
+        def __enter__(self) -> "Lock":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(activation_package_module, "_load_maintenance_state", lambda: state)
+    monkeypatch.setattr(activation_package_module, "_activation_execution_lock", Lock)
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+
+    with pytest.raises(ActivationPackageError, match="not eligible"):
+        activation_package_module.execute_approved_maintenance_rollback(package)

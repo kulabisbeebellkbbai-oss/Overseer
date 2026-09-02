@@ -4804,13 +4804,23 @@ def render_activation_contract(
             "/etc/systemd/system/overseer-api-canary.service",
             "/etc/systemd/system/overseer-approval-smoke.service",
         }
+        maintenance_excluded_target_prefixes = (
+            "/var/lib/overseer-executor/activation-package",
+        )
         maintenance_immutable_install_commands: list[list[str]] = []
         maintenance_handoff_install_commands: list[list[str]] = []
         for command in install_commands:
             if (
                 command
                 and command[0] == "/usr/bin/install"
-                and command[-1] in maintenance_excluded_unit_targets
+                and (
+                    command[-1] in maintenance_excluded_unit_targets
+                    or any(
+                        command[-1] == prefix
+                        or command[-1].startswith(prefix + "/")
+                        for prefix in maintenance_excluded_target_prefixes
+                    )
+                )
             ):
                 continue
             mutates_handoff_state = "ensure-dedicated-principal" in command
@@ -4825,6 +4835,14 @@ def render_activation_contract(
                 if mutates_handoff_state
                 else maintenance_immutable_install_commands
             ).append(command)
+        maintenance_immutable_install_commands.append(
+            [
+                *package_activation_python,
+                "verify-maintenance-installed-release",
+                "--package-root",
+                str(execution_package),
+            ]
+        )
         maintenance_rollback_commands = [
             [
                 "/usr/bin/systemctl",
@@ -4849,7 +4867,7 @@ def render_activation_contract(
                 "--bundle-root",
                 str(rollback_bundle_root),
                 "--rollback-manifest",
-                "/var/lib/overseer-executor/activation-package/public/rollback-manifest.json",
+                str(execution_package / "public" / "rollback-manifest.json"),
             ],
             [
                 *package_activation_python,
@@ -4930,6 +4948,7 @@ def render_activation_contract(
             "systemUserBridgeSocketUnit": "/etc/systemd/system/overseer-codex-user-bridge.socket",
             "systemRuntimeUnit": "/etc/systemd/system/overseer-runtime.service",
             "systemTmpfilesRule": "/etc/tmpfiles.d/overseer.conf",
+            "compatibilityApiToken": "/home/god/.local/share/overseer/project/state/api-token",
         },
         "evidenceRoot": str(maintenance_evidence_root / "preserved"),
         "acceptanceChecks": list(_MAINTENANCE_ACCEPTANCE_CHECKS),
@@ -4960,7 +4979,7 @@ def render_activation_contract(
                 "name": "proveQuiescence",
                 "commands": [
                     [
-                        *activation_python,
+                        *package_activation_python,
                         "verify-maintenance-quiescence",
                         "--package-root",
                         str(execution_package),
@@ -4971,7 +4990,7 @@ def render_activation_contract(
                 "name": "preserveState",
                 "commands": [
                     [
-                        *activation_python,
+                        *package_activation_python,
                         "preserve-maintenance-state",
                         "--package-root",
                         str(execution_package),
@@ -5554,7 +5573,7 @@ def finalize_activation_package(package_root: str | os.PathLike[str]) -> dict[st
             raise ActivationPackageError(
                 "maintenance-capable package is missing its maintenance contract"
             )
-        _read_maintenance_contract_file(package)
+        _read_maintenance_contract_file(package, require_bound_package=False)
     files = _package_file_inventory(package)
     directories = _package_directory_inventory(package)
     unsigned = {
@@ -6077,7 +6096,11 @@ def _load_activation_approval(
     return document
 
 
-def _read_maintenance_contract_file(package: Path) -> dict[str, object]:
+def _read_maintenance_contract_file(
+    package: Path,
+    *,
+    require_bound_package: bool = True,
+) -> dict[str, object]:
     target = package / "public" / "maintenance-window-contract.json"
     try:
         raw, metadata = _stable_read(target)
@@ -6098,6 +6121,10 @@ def _read_maintenance_contract_file(package: Path) -> dict[str, object]:
         validate_maintenance_contract(document)
     except ValueError as error:
         raise ActivationPackageError("maintenance contract is invalid") from error
+    if require_bound_package and document.get("packageRoot") != str(package):
+        raise ActivationPackageError(
+            "maintenance contract package root is not the approved package"
+        )
     return document
 
 
@@ -6117,6 +6144,10 @@ def _sealed_maintenance_contract(
         raise
     except ValueError as error:
         raise ActivationPackageError("maintenance contract is invalid") from error
+    if contract.get("packageRoot") != str(package):
+        raise ActivationPackageError(
+            "maintenance contract package root is not the approved package"
+        )
     return contract
 
 
@@ -7508,6 +7539,48 @@ def verify_installed_staging(
     )
 
 
+def verify_maintenance_installed_release(
+    package_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Re-hash every sealed immutable install before offline migration."""
+
+    package = Path(package_root).resolve()
+    contract, _lock_descriptor = _require_maintenance_active_sealed_command(
+        package,
+        command_name="verify-maintenance-installed-release",
+        expected_options={"--package-root": str(package)},
+    )
+    approval = _load_maintenance_approval(package)
+    package_digest = approval.get("packageDigest")
+    stages = contract.get("stages")
+    if not isinstance(package_digest, str) or not isinstance(stages, list):
+        raise ActivationPackageError(
+            "maintenance immutable install verification binding is invalid"
+        )
+    stage = next(
+        (
+            item
+            for item in stages
+            if isinstance(item, Mapping) and item.get("name") == "installRelease"
+        ),
+        None,
+    )
+    if not isinstance(stage, Mapping):
+        raise ActivationPackageError(
+            "maintenance immutable install stage is unavailable"
+        )
+    commands = stage.get("commands")
+    if not isinstance(commands, list):
+        raise ActivationPackageError(
+            "maintenance immutable install commands are invalid"
+        )
+    return _verify_install_results(
+        package,
+        expected_package_digest=package_digest,
+        commands=commands,
+    )
+
+
 def verify_compatibility_token(
     *,
     source_token: str | os.PathLike[str],
@@ -8578,6 +8651,7 @@ def _require_maintenance_active_sealed_command(
         "stop-maintenance-writers": ("stopWriters",),
         "verify-maintenance-quiescence": ("proveQuiescence", "switchServices"),
         "preserve-maintenance-state": ("preserveState",),
+        "verify-maintenance-installed-release": ("installRelease",),
         "verify-maintenance-preservation": ("switchServices",),
         "ensure-dedicated-principal": ("switchServices",),
         "prepare-maintenance-store-copy": ("migrateOfflineStores",),
@@ -11141,6 +11215,11 @@ _MAINTENANCE_HANDOFF_SYSTEM_INPUTS = {
     "systemRuntimeUnit": Path("/etc/systemd/system/overseer-runtime.service"),
     "systemTmpfilesRule": Path("/etc/tmpfiles.d/overseer.conf"),
 }
+_MAINTENANCE_HANDOFF_COMPATIBILITY_INPUTS = {
+    "compatibilityApiToken": Path(
+        "/home/god/.local/share/overseer/project/state/api-token"
+    ),
+}
 
 
 def _maintenance_copy_regular(source: Path, target: Path) -> dict[str, object]:
@@ -11501,20 +11580,53 @@ def _verify_maintenance_preservation_unchecked(
         path = Path(path_value)
         try:
             path.relative_to(evidence_root)
-            content, metadata = _stable_read(path)
-        except (OSError, ValueError) as error:
-            raise ActivationPackageError("maintenance preservation artifact is invalid") from error
+        except ValueError as error:
+            raise ActivationPackageError(
+                "maintenance preservation artifact is invalid"
+            ) from error
+        try:
+            details = _stream_hash_regular(
+                path,
+                label="maintenance preservation artifact",
+                expected_size=(
+                    int(item["size"])
+                    if type(item.get("size")) is int
+                    else None
+                ),
+            )
+        except ActivationPackageError as error:
+            raise ActivationPackageError(
+                "maintenance preservation artifact drifted"
+            ) from error
         if (
-            item.get("sha256") != _sha256(content)
-            or item.get("size") != len(content)
+            item.get("sha256") != details["sha256"]
+            or item.get("size") != details["size"]
             or item.get("mode") != "0600"
-            or (metadata.st_uid, metadata.st_gid) != (root_uid, root_gid)
-            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (details["uid"], details["gid"]) != (root_uid, root_gid)
+            or details["mode"] != "0600"
+            or details["links"] != 1
         ):
             raise ActivationPackageError("maintenance preservation artifact drifted")
         if path in expected_paths:
             raise ActivationPackageError("maintenance preservation artifact is duplicated")
         expected_paths.add(path)
+    expected_directories: set[Path] = set()
+
+    def record_expected_parents(path: Path) -> None:
+        parent = path.parent
+        while parent != evidence_root:
+            try:
+                parent.relative_to(evidence_root)
+            except ValueError as error:
+                raise ActivationPackageError(
+                    "maintenance preservation parent is invalid"
+                ) from error
+            expected_directories.add(parent)
+            parent = parent.parent
+
+    for path in expected_paths:
+        record_expected_parents(path)
+
     observed_directories: set[str] = set()
     for item in manifest["directories"]:
         if not isinstance(item, Mapping):
@@ -11555,11 +11667,36 @@ def _verify_maintenance_preservation_unchecked(
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
             raise ActivationPackageError("maintenance preservation directory drifted")
+        expected_directories.add(path)
+        record_expected_parents(path)
         if source_value in observed_directories:
             raise ActivationPackageError("maintenance preservation directory is duplicated")
         observed_directories.add(source_value)
-    observed_paths = {path for path in evidence_root.rglob("*") if path.is_file()}
-    if observed_paths != expected_paths:
+    observed_paths: set[Path] = set()
+    observed_directory_paths: set[Path] = set()
+    for path in evidence_root.rglob("*"):
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise ActivationPackageError(
+                "maintenance preservation namespace could not be inspected"
+            ) from error
+        if path.is_symlink():
+            raise ActivationPackageError(
+                "maintenance preservation namespace contains an invalid artifact"
+            )
+        if stat.S_ISREG(metadata.st_mode):
+            observed_paths.add(path)
+        elif stat.S_ISDIR(metadata.st_mode):
+            observed_directory_paths.add(path)
+        else:
+            raise ActivationPackageError(
+                "maintenance preservation namespace contains an invalid artifact"
+            )
+    if (
+        observed_paths != expected_paths
+        or observed_directory_paths != expected_directories
+    ):
         raise ActivationPackageError(
             "maintenance preservation namespace contains unexpected artifacts"
         )
@@ -11589,6 +11726,7 @@ def _maintenance_validate_restore_parent(
     parent: Path,
     *,
     preserved_directory: Mapping[str, object] | None = None,
+    expected_identity: Mapping[str, object] | None = None,
 ) -> os.stat_result:
     """Validate an exact rollback target parent without following links."""
 
@@ -11601,6 +11739,8 @@ def _maintenance_validate_restore_parent(
     root_uid, root_gid = _activation_root_identity()
     if parent.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
         raise ActivationPackageError("maintenance handoff restore parent is unsafe")
+    if preserved_directory is not None and expected_identity is not None:
+        raise ActivationPackageError("maintenance restore parent binding is ambiguous")
     if preserved_directory is not None:
         if (
             preserved_directory.get("sourcePath") != str(parent)
@@ -11611,6 +11751,18 @@ def _maintenance_validate_restore_parent(
         ):
             raise ActivationPackageError(
                 "maintenance credential directory identity drifted"
+            )
+    elif expected_identity is not None:
+        if (
+            metadata.st_dev != expected_identity.get("parentDevice")
+            or metadata.st_ino != expected_identity.get("parentInode")
+            or metadata.st_uid != expected_identity.get("uid")
+            or metadata.st_gid != expected_identity.get("gid")
+            or stat.S_IMODE(metadata.st_mode)
+            != expected_identity.get("parentMode")
+        ):
+            raise ActivationPackageError(
+                "maintenance compatibility-token parent identity drifted"
             )
     elif (
         (metadata.st_uid, metadata.st_gid) != (root_uid, root_gid)
@@ -11626,12 +11778,14 @@ def _maintenance_restore_regular(
     artifact: Mapping[str, object],
     *,
     preserved_directory: Mapping[str, object] | None = None,
+    expected_parent_identity: Mapping[str, object] | None = None,
 ) -> None:
     """Atomically restore one exact preserved handoff file."""
 
     _maintenance_validate_restore_parent(
         target.parent,
         preserved_directory=preserved_directory,
+        expected_identity=expected_parent_identity,
     )
     try:
         target_metadata = target.lstat()
@@ -11703,12 +11857,14 @@ def _maintenance_remove_unpreserved_handoff(
     target: Path,
     *,
     preserved_directory: Mapping[str, object] | None = None,
+    expected_parent_identity: Mapping[str, object] | None = None,
 ) -> bool:
     """Remove only an exact newly installed file that was absent before handoff."""
 
     _maintenance_validate_restore_parent(
         target.parent,
         preserved_directory=preserved_directory,
+        expected_identity=expected_parent_identity,
     )
     try:
         metadata = target.lstat()
@@ -11814,6 +11970,10 @@ def restore_maintenance_handoff_artifacts(
             inputs.get(name) != str(target)
             for name, target in _MAINTENANCE_HANDOFF_SYSTEM_INPUTS.items()
         )
+        or any(
+            inputs.get(name) != str(target)
+            for name, target in _MAINTENANCE_HANDOFF_COMPATIBILITY_INPUTS.items()
+        )
     ):
         raise ActivationPackageError(
             "maintenance handoff restoration binding is invalid"
@@ -11836,22 +11996,62 @@ def restore_maintenance_handoff_artifacts(
             "maintenance credential directory preservation is invalid"
         )
     credential_directory = credential_directories[0]
-    expected: dict[Path, tuple[Path, Mapping[str, object] | None]] = {
+    expected: dict[
+        Path,
+        tuple[
+            Path,
+            Mapping[str, object] | None,
+            Mapping[str, object] | None,
+        ],
+    ] = {
         _MAINTENANCE_HANDOFF_CREDENTIAL_DIRECTORY / name: (
             credential_evidence / name,
             credential_directory,
+            None,
         )
         for name in _MAINTENANCE_HANDOFF_CREDENTIAL_NAMES
     }
     expected.update(
         {
-            target: (evidence_root / "inputs" / name, None)
+            target: (evidence_root / "inputs" / name, None, None)
             for name, target in _MAINTENANCE_HANDOFF_SYSTEM_INPUTS.items()
+        }
+    )
+    bindings = contract.get("storeBindings")
+    main_binding = (
+        next(
+            (
+                item
+                for item in bindings
+                if isinstance(item, Mapping) and item.get("name") == "overseer-main"
+            ),
+            None,
+        )
+        if isinstance(bindings, list)
+        else None
+    )
+    main_identity = (
+        main_binding.get("sourceIdentity")
+        if isinstance(main_binding, Mapping)
+        else None
+    )
+    if not isinstance(main_identity, Mapping):
+        raise ActivationPackageError(
+            "maintenance compatibility-token parent binding is invalid"
+        )
+    expected.update(
+        {
+            target: (evidence_root / "inputs" / name, None, main_identity)
+            for name, target in _MAINTENANCE_HANDOFF_COMPATIBILITY_INPUTS.items()
         }
     )
     restored = 0
     removed = 0
-    for target, (evidence, preserved_directory) in expected.items():
+    for target, (
+        evidence,
+        preserved_directory,
+        expected_parent_identity,
+    ) in expected.items():
         matches = [
             item
             for item in artifacts
@@ -11869,11 +12069,13 @@ def restore_maintenance_handoff_artifacts(
                 target,
                 matches[0],
                 preserved_directory=preserved_directory,
+                expected_parent_identity=expected_parent_identity,
             )
             restored += 1
         elif _maintenance_remove_unpreserved_handoff(
             target,
             preserved_directory=preserved_directory,
+            expected_parent_identity=expected_parent_identity,
         ):
             removed += 1
     _maintenance_restore_directory_metadata(
@@ -12035,17 +12237,30 @@ def _maintenance_gateway_operator_challenge() -> bool:
     path = _MAINTENANCE_GATEWAY_CHALLENGE_PATH
     created = False
     try:
+        root_uid, _root_gid = _activation_root_identity()
         parent_metadata = path.parent.lstat()
         if (
             path.parent.is_symlink()
             or not stat.S_ISDIR(parent_metadata.st_mode)
-            or parent_metadata.st_uid != 0
+            or parent_metadata.st_uid != root_uid
             or parent_metadata.st_gid != APPROVED_OVERSEER_GID
             or stat.S_IMODE(parent_metadata.st_mode) != 0o750
-            or path.exists()
-            or path.is_symlink()
         ):
             return False
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            stale, stale_metadata = _stable_read(path)
+            if (
+                stale_metadata.st_uid != root_uid
+                or stat.S_IMODE(stale_metadata.st_mode) != 0o444
+                or not re.fullmatch(rb"[0-9a-f]{32}\n", stale)
+            ):
+                return False
+            path.unlink()
+            _fsync_package_directory(path.parent)
         _write_new(path, (challenge + "\n").encode("ascii"), 0o444)
         created = True
         entered = input(
@@ -12290,17 +12505,36 @@ def verify_maintenance_acceptance(
     evidence_root = contract.get("evidenceRoot")
     if not isinstance(evidence_root, str) or not evidence_root.startswith("/"):
         raise ActivationPackageError("maintenance acceptance evidence root is invalid")
+    preservation_root = Path(evidence_root)
+    if preservation_root.parent == preservation_root:
+        raise ActivationPackageError("maintenance acceptance evidence root is invalid")
     report = {
         "schemaVersion": "overseer.maintenance-acceptance.v1",
         "status": "accepted",
         "planDigest": _sha256(_canonical(contract)),
         "checks": results,
     }
-    _write_new(
-        Path(evidence_root) / "acceptance-report.json",
-        _canonical(report) + b"\n",
-        0o600,
-    )
+    report_path = preservation_root.with_name("acceptance-report.json")
+    payload = _canonical(report) + b"\n"
+    try:
+        report_path.lstat()
+    except FileNotFoundError:
+        _write_new(report_path, payload, 0o600)
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance acceptance report could not be inspected"
+        ) from error
+    else:
+        existing, metadata = _stable_read(report_path)
+        root_uid, root_gid = _activation_root_identity()
+        if (
+            existing != payload
+            or (metadata.st_uid, metadata.st_gid) != (root_uid, root_gid)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ActivationPackageError(
+                "maintenance acceptance report conflicts with this plan"
+            )
     return report
 
 
@@ -12349,7 +12583,11 @@ def execute_approved_maintenance_window(
                     "planDigest": plan_digest,
                     "replayed": True,
                 }
-            raise ActivationPackageError("maintenance runner state already exists")
+            if not (
+                prior.get("status") == "failed_before_stopWriters"
+                and prior.get("writersStopped") is False
+            ):
+                raise ActivationPackageError("maintenance runner state already exists")
 
         def checkpoint(state: dict[str, object]) -> None:
             _write_maintenance_state(
@@ -12654,6 +12892,11 @@ def _main(argv: list[str] | None = None) -> int:
         help="copy the sealed maintenance rollback evidence before installation",
     )
     maintenance_preservation.add_argument("--package-root", required=True)
+    maintenance_verify_installed = commands.add_parser(
+        "verify-maintenance-installed-release",
+        help="re-hash every immutable installed release artifact before migration",
+    )
+    maintenance_verify_installed.add_argument("--package-root", required=True)
     maintenance_verify_preservation = commands.add_parser(
         "verify-maintenance-preservation",
         help="re-hash the root-owned maintenance evidence before service handoff",
@@ -12985,6 +13228,12 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "verify-maintenance-installed-release":
+        result = verify_maintenance_installed_release(
+            _validate_existing_package_destination(args.package_root),
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "verify-maintenance-preservation":
         result = verify_maintenance_preservation(
             _validate_existing_package_destination(args.package_root),
@@ -13219,6 +13468,7 @@ __all__ = [
     "verify_canary_attestation",
     "verify_compatibility_token",
     "verify_installed_staging",
+    "verify_maintenance_installed_release",
     "verify_rollback_inputs",
     "verify_rollback_bundle",
 ]

@@ -3046,6 +3046,58 @@ def test_ensure_dedicated_principal_uses_sealed_maintenance_switch_stage(
     }
 
 
+def test_verify_maintenance_installed_release_rehashes_the_sealed_install_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = (tmp_path / "approved-package").resolve()
+    install_commands = [
+        ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/opt/overseer"],
+        ["/usr/bin/env", "sealed-verifier"],
+    ]
+    contract = _maintenance_contract_fixture(package)
+    next(
+        stage for stage in contract["stages"] if stage["name"] == "installRelease"
+    )["commands"] = install_commands
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_maintenance_active_sealed_command",
+        lambda *_args, **_kwargs: (contract, 41),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: {"packageDigest": "c" * 64},
+    )
+
+    def verify(
+        selected_package: Path,
+        *,
+        expected_package_digest: str,
+        commands: list[object],
+    ) -> dict[str, object]:
+        observed.update(
+            {
+                "package": selected_package,
+                "digest": expected_package_digest,
+                "commands": commands,
+            }
+        )
+        return {"verified": True, "installedFileCount": 1}
+
+    monkeypatch.setattr(activation_package_module, "_verify_install_results", verify)
+
+    result = activation_package_module.verify_maintenance_installed_release(package)
+
+    assert result == {"verified": True, "installedFileCount": 1}
+    assert observed == {
+        "package": package,
+        "digest": "c" * 64,
+        "commands": install_commands,
+    }
+
+
 def test_activation_contract_is_exact_nonexecuting_and_has_closed_rollback(tmp_path: Path) -> None:
     package, manifest, source = _prepared_package(tmp_path)
     rollback_release = tmp_path / "v1.1.5-release"
@@ -9366,6 +9418,175 @@ MAINTENANCE_STAGE_NAMES = (
 )
 
 
+def _maintenance_python_command(
+    package: Path,
+    subcommand: str,
+    *extra: str,
+    installed: bool = False,
+) -> list[str]:
+    package_root = str(package.resolve())
+    release_root = (
+        "/opt/overseer/releases/current"
+        if installed
+        else f"{package_root}/public/release/current"
+    )
+    return [
+        "/usr/bin/env",
+        f"LD_LIBRARY_PATH={release_root}/lib",
+        f"PYTHONHOME={release_root}/runtime",
+        f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
+        f"{release_root}/runtime/bin/python3.13",
+        "-B",
+        "-s",
+        "-P",
+        "-m",
+        "overseer.activation_package",
+        subcommand,
+        *extra,
+    ]
+
+
+def _maintenance_command_profiles(package: Path) -> dict[str, object]:
+    package_root = str(package.resolve())
+    helper = lambda name: _maintenance_python_command(
+        package, name, "--package-root", package_root
+    )
+    installed_helper = lambda name: _maintenance_python_command(
+        package, name, "--package-root", package_root, installed=True
+    )
+    install_dir = lambda owner, group, mode, target: [
+        "/usr/bin/install", "-d", "-o", owner, "-g", group, "-m", mode, target
+    ]
+    install_file = lambda owner, group, mode, source, target: [
+        "/usr/bin/install", "-o", owner, "-g", group, "-m", mode, source, target
+    ]
+    user_systemctl = [
+        "/usr/sbin/runuser", "--user", "god", "--", "/usr/bin/env",
+        f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", "/usr/bin/systemctl", "--user",
+    ]
+    credentials = (
+        ("private/credentials/admin-approval-verifier.json", "/etc/overseer/admin-approval-verifier.json", "984", "984", "0600"),
+        ("private/credentials/roadex-fixture-approval-verifier.json", "/etc/overseer/roadex-fixture-approval-verifier.json", "984", "984", "0600"),
+        ("private/credentials/api-token", "/etc/overseer/api-token", "root", "root", "0600"),
+        ("private/credentials/psychlo-peer-secret", "/etc/overseer/psychlo-peer-secret", "root", "root", "0600"),
+        ("private/credentials/roadex-project-human-thread-secret", "/etc/overseer/roadex-project-human-thread-secret", "root", "root", "0600"),
+        ("public/config/psychlo-project-bindings.json", "/etc/overseer/psychlo-project-bindings.json", "root", "root", "0644"),
+        ("public/config/admin-executor-public-key", "/etc/overseer/admin-executor-public-key", "root", "root", "0644"),
+        ("public/config/admin-executor-allowlist.json", "/etc/overseer/admin-executor-allowlist.json", "root", "root", "0644"),
+        ("private/credentials/admin-ticket-private-key", "/etc/overseer/admin-ticket-private-key", "984", "984", "0600"),
+        ("public/config/protected-gateway-ca.crt", "/etc/overseer/protected-gateway-ca.crt", "root", "root", "0644"),
+    )
+    systems = (
+        ("overseer-admin-executor.socket", "/etc/systemd/system/overseer-admin-executor.socket"),
+        ("overseer-admin-executor@.service", "/etc/systemd/system/overseer-admin-executor@.service"),
+        ("overseer-api.service", "/etc/systemd/system/overseer-api.service"),
+        ("overseer-codex-user-bridge.service", "/etc/systemd/system/overseer-codex-user-bridge.service"),
+        ("overseer-codex-user-bridge.socket", "/etc/systemd/system/overseer-codex-user-bridge.socket"),
+        ("overseer-runtime.service", "/etc/systemd/system/overseer-runtime.service"),
+        ("overseer-tmpfiles.conf", "/etc/tmpfiles.d/overseer.conf"),
+    )
+    switch_commands = [
+        helper("verify-maintenance-preservation"),
+        helper("ensure-dedicated-principal"),
+        install_dir("984", "984", "0700", "/var/lib/overseer"),
+        install_dir("0", "984", "0710", "/etc/overseer"),
+        *[
+            install_file(owner, group, mode, f"{package_root}/{source}", target)
+            for source, target, owner, group, mode in credentials
+        ],
+        *[
+            install_file(
+                "root", "root", "0644", f"{package_root}/public/systemd/{source}", target
+            )
+            for source, target in systems
+        ],
+        [
+            *user_systemctl, "disable", "overseer-psychlo-usage.timer",
+            "overseer-psychlo-cycle.service", "overseer-psychlo-meter.service",
+            "overseer-psychlo-usage.service", "overseer-api.service", "overseer.service",
+        ],
+        helper("verify-maintenance-quiescence"),
+        ["/usr/bin/systemctl", "daemon-reload"],
+        ["/usr/bin/systemd-tmpfiles", "--create", "/etc/tmpfiles.d/overseer.conf"],
+        ["/usr/bin/systemctl", "enable", "--now", "overseer-codex-user-bridge.socket", "overseer-admin-executor.socket"],
+        ["/usr/bin/systemctl", "enable", "--now", "overseer-runtime.service", "overseer-api.service"],
+        install_file("root", "god", "0640", "/etc/overseer/api-token", "/home/god/.local/share/overseer/project/state/api-token"),
+        _maintenance_python_command(
+            package,
+            "verify-compatibility-token",
+            "--source-token", "/etc/overseer/api-token",
+            "--target-token", "/home/god/.local/share/overseer/project/state/api-token",
+            "--expected-target-uid", "0",
+            "--expected-target-gid", str(os.getgid()),
+            "--expected-parent-device", "1",
+            "--expected-parent-inode", "10",
+            installed=True,
+        ),
+        [
+            *user_systemctl, "start", "overseer-quark-scheduler.timer",
+            "overseer-codex-usage-mcp.service", "overseer-codex-usage-snapshot.timer",
+        ],
+    ]
+    rollback = [
+        ["/usr/bin/systemctl", "stop", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
+        ["/usr/bin/systemctl", "disable", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
+        ["/usr/bin/systemctl", "daemon-reload"],
+        _maintenance_python_command(
+            package, "verify-rollback-bundle",
+            "--bundle-root", f"/opt/overseer/rollback/{'a' * 64}",
+            "--rollback-manifest", f"{package_root}/public/rollback-manifest.json",
+        ),
+        helper("restore-maintenance-store-access"),
+        helper("restore-maintenance-handoff-artifacts"),
+        ["/usr/bin/systemctl", "daemon-reload"],
+        helper("restore-maintenance-writers"),
+        [
+            "/usr/bin/curl", "--fail", "--silent", "--show-error",
+            "--connect-timeout", "2", "--max-time", "5",
+            "http://127.0.0.1:8766/health",
+        ],
+    ]
+    return {
+        "stages": [
+            {"name": "preflight", "commands": [helper("verify-maintenance-preflight")]},
+            {"name": "stopWriters", "commands": [helper("stop-maintenance-writers")]},
+            {"name": "proveQuiescence", "commands": [helper("verify-maintenance-quiescence")]},
+            {"name": "preserveState", "commands": [helper("preserve-maintenance-state")]},
+            {
+                "name": "installRelease",
+                "commands": [
+                    install_dir("root", "root", "0755", "/opt/overseer"),
+                    install_dir("root", "root", "0755", "/opt/overseer/releases"),
+                    install_dir("root", "root", "0755", "/opt/overseer/rollback"),
+                    install_dir("root", "root", "0700", "/var/lib/overseer-executor"),
+                    install_dir("root", "root", "0755", "/opt/overseer/releases/current"),
+                    install_dir("root", "god", "0750", f"/opt/overseer/rollback/{'a' * 64}"),
+                    helper("verify-maintenance-installed-release"),
+                ],
+            },
+            {"name": "migrateOfflineStores", "commands": [installed_helper("prepare-maintenance-stores")]},
+            {"name": "switchServices", "commands": switch_commands},
+            {
+                "name": "acceptance",
+                "commands": [[
+                    "/usr/bin/curl", "--fail", "--silent", "--show-error",
+                    "--connect-timeout", "1", "--max-time", "3", "--retry", "15",
+                    "--retry-delay", "2", "--retry-max-time", "45", "--retry-all-errors",
+                    "http://127.0.0.1:8766/health",
+                ], installed_helper("verify-maintenance-acceptance")],
+            },
+        ],
+        "earlyRollbackCommands": [
+            helper("restop-maintenance-writers"),
+            helper("restore-maintenance-writers"),
+        ],
+        "rollbackCommands": rollback,
+    }
+
+
 def _maintenance_writer_unit_baseline_fixture() -> list[dict[str, str]]:
     active_units = set(activation_package_module._MAINTENANCE_PRIOR_ACTIVE_UNITS)
     optional_units = activation_package_module._MAINTENANCE_OPTIONAL_WRITER_UNITS
@@ -9400,6 +9621,7 @@ def _maintenance_successor_unit_baseline_fixture() -> list[dict[str, str]]:
 
 def _maintenance_activation_contract_fixture(package: Path) -> dict[str, object]:
     maintenance = _maintenance_contract_fixture(package)
+    profiles = _maintenance_command_profiles(package)
     return {
         "schemaVersion": activation_package_module.ACTIVATION_CONTRACT_SCHEMA,
         "packageRoot": str(package.resolve()),
@@ -9415,18 +9637,15 @@ def _maintenance_activation_contract_fixture(package: Path) -> dict[str, object]
         "maintenanceWindow": {
             "writerUnitBaseline": maintenance["writerUnitBaseline"],
             "successorUnitBaseline": maintenance["successorUnitBaseline"],
-            "stages": [
-                {"name": name, "commands": [["/usr/bin/true", name]]}
-                for name in MAINTENANCE_STAGE_NAMES
-            ],
-            "rollbackCommands": [["/usr/bin/true", "rollback"]],
-            "earlyRollbackCommands": [["/usr/bin/true", "early-rollback"]],
-            "earlyRollbackTimeoutSeconds": [60],
+            "stages": profiles["stages"],
+            "rollbackCommands": profiles["rollbackCommands"],
+            "earlyRollbackCommands": profiles["earlyRollbackCommands"],
+            "earlyRollbackTimeoutSeconds": [60, 60],
             "earlyRollbackWindowTimeoutSeconds": 300,
-            "earlyRollbackStartIndex": 0,
-            "rollbackTimeoutSeconds": [60],
+            "earlyRollbackStartIndex": 1,
+            "rollbackTimeoutSeconds": [60] * 9,
             "rollbackWindowTimeoutSeconds": 1800,
-            "rollbackStartIndex": 0,
+            "rollbackStartIndex": 7,
             "stageTimeoutSeconds": {
                 name: 60 for name in MAINTENANCE_STAGE_NAMES
             },
@@ -9442,6 +9661,7 @@ def _maintenance_activation_contract_fixture(package: Path) -> dict[str, object]
 
 
 def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
+    profiles = _maintenance_command_profiles(package)
     return {
         "schemaVersion": "overseer.maintenance-window-contract.v1",
         "packageRoot": str(package.resolve()),
@@ -9545,26 +9765,24 @@ def _maintenance_contract_fixture(package: Path) -> dict[str, object]:
             "systemUserBridgeSocketUnit": str(package / "overseer-codex-user-bridge.socket"),
             "systemRuntimeUnit": str(package / "overseer-runtime.service"),
             "systemTmpfilesRule": str(package / "overseer.conf"),
+            "compatibilityApiToken": str(package / "compatibility-api-token"),
         },
         "evidenceRoot": str(package / "evidence"),
         "acceptanceChecks": list(
             activation_package_module._MAINTENANCE_ACCEPTANCE_CHECKS
         ),
         "secretInputs": [],
-        "stages": [
-            {"name": name, "commands": [["/usr/bin/true", name]]}
-            for name in MAINTENANCE_STAGE_NAMES
-        ],
+        "stages": profiles["stages"],
         "stageTimeoutSeconds": {name: 60 for name in MAINTENANCE_STAGE_NAMES},
         "windowTimeoutSeconds": 5400,
-        "earlyRollbackCommands": [["/usr/bin/true", "early-rollback"]],
-        "earlyRollbackTimeoutSeconds": [60],
+        "earlyRollbackCommands": profiles["earlyRollbackCommands"],
+        "earlyRollbackTimeoutSeconds": [60, 60],
         "earlyRollbackWindowTimeoutSeconds": 300,
-        "earlyRollbackStartIndex": 0,
-        "rollbackCommands": [["/usr/bin/true", "rollback"]],
-        "rollbackTimeoutSeconds": [60],
+        "earlyRollbackStartIndex": 1,
+        "rollbackCommands": profiles["rollbackCommands"],
+        "rollbackTimeoutSeconds": [60] * 9,
         "rollbackWindowTimeoutSeconds": 1800,
-        "rollbackStartIndex": 0,
+        "rollbackStartIndex": 7,
     }
 
 
@@ -9592,6 +9810,54 @@ def _write_maintenance_contract_fixture(
         encoding="utf-8",
     )
     (public / "package-manifest.json").chmod(0o644)
+
+
+def test_maintenance_contract_loaders_reject_a_different_bound_package_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    different_root = tmp_path / "different-approved-package"
+    drifted = json.loads(
+        json.dumps(contract).replace(str(package.resolve()), str(different_root))
+    )
+    _write_maintenance_contract_fixture(package, drifted)
+
+    with pytest.raises(ActivationPackageError, match="not the approved package"):
+        activation_package_module._read_maintenance_contract_file(package)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_package_json",
+        lambda *_args, **_kwargs: drifted,
+    )
+    with pytest.raises(ActivationPackageError, match="not the approved package"):
+        activation_package_module._sealed_maintenance_contract(
+            package,
+            package_digest="c" * 64,
+        )
+
+
+def test_maintenance_contract_rejects_installed_runtime_before_install_stage(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    contract["stages"][2]["commands"] = [
+        _maintenance_python_command(
+            package,
+            "verify-maintenance-quiescence",
+            "--package-root",
+            str(package.resolve()),
+            installed=True,
+        )
+    ]
+
+    with pytest.raises(ValueError, match="pre-install helpers"):
+        activation_package_module.validate_maintenance_contract(contract)
 
 
 def test_render_maintenance_window_contract_is_digest_bound_sibling_with_safe_order(
@@ -9722,8 +9988,21 @@ def test_render_activation_contract_emits_real_maintenance_window_plan(
     assert any("stop-maintenance-writers" in command for command in stages["stopWriters"])
     assert any("verify-maintenance-quiescence" in command for command in stages["proveQuiescence"])
     assert any("preserve-maintenance-state" in command for command in stages["preserveState"])
+    package_runtime = stages["preflight"][0][1]
+    assert stages["stopWriters"][0][1] == package_runtime
+    assert stages["proveQuiescence"][0][1] == package_runtime
+    assert stages["preserveState"][0][1] == package_runtime
+    assert package_runtime.startswith(
+        "LD_LIBRARY_PATH="
+        + str(activation_package_module.APPROVED_EXECUTION_PACKAGE.absolute())
+        + "/public/release/"
+    )
     assert any(command[0] == "/usr/bin/install" for command in stages["installRelease"])
+    assert "verify-maintenance-installed-release" in stages["installRelease"][-1]
     assert any("prepare-maintenance-stores" in command for command in stages["migrateOfflineStores"])
+    assert stages["migrateOfflineStores"][0][1].startswith(
+        "LD_LIBRARY_PATH=/opt/overseer/releases/"
+    )
     assert any("overseer-runtime.service" in command for command in stages["switchServices"])
     assert any("verify-maintenance-acceptance" in command for command in stages["acceptance"])
     mutable_install_targets = (
@@ -9747,6 +10026,25 @@ def test_render_activation_contract_emits_real_maintenance_window_plan(
         "ensure-dedicated-principal" in command
         for command in stages["switchServices"]
     )
+    assert not any(
+        command
+        and command[0] == "/usr/bin/install"
+        and command[-1].startswith(
+            "/var/lib/overseer-executor/activation-package"
+        )
+        for commands in stages.values()
+        for command in commands
+    )
+    rollback_manifest_command = next(
+        command
+        for command in maintenance["rollbackCommands"]
+        if "verify-rollback-bundle" in command
+    )
+    assert str(
+        activation_package_module.APPROVED_EXECUTION_PACKAGE.absolute()
+        / "public"
+        / "rollback-manifest.json"
+    ) in rollback_manifest_command
     assert any(
         command[0] == "/usr/bin/install"
         and command[-1].startswith("/etc/systemd/system/")
@@ -9999,8 +10297,9 @@ def test_maintenance_window_execution_uses_shared_lock_separate_state_and_checkp
     assert result["status"] == "complete"
     assert lock_events == ["acquired", "released"]
     assert calls == [
-        ("/usr/bin/true", stage_name)
-        for stage_name in MAINTENANCE_STAGE_NAMES
+        tuple(command)
+        for stage in contract["stages"]
+        for command in stage["commands"]
     ]
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["status"] == "complete"
@@ -10031,6 +10330,7 @@ def test_maintenance_window_rollback_accepts_only_maintenance_state_and_cli_has_
 
     with pytest.raises(ActivationPackageError, match="maintenance state"):
         activation_package_module.execute_approved_maintenance_rollback(package)
+
 
     observed: list[str] = []
     monkeypatch.setattr(
@@ -10072,6 +10372,72 @@ def test_maintenance_window_rollback_accepts_only_maintenance_state_and_cli_has_
     assert observed == ["record", "verify", "execute", "rollback"]
 
 
+def test_maintenance_window_retries_an_exact_pre_stop_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    plan_digest = activation_package_module.maintenance_plan_digest(contract)
+    approval = {
+        "schemaVersion": "overseer.maintenance-window-approval.v1",
+        "packageRoot": str(package.resolve()),
+        "packageDigest": "c" * 64,
+        "planDigest": plan_digest,
+        "scope": "maintenance-window-for-this-package-only",
+        "allowReboot": False,
+    }
+    prior = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": "c" * 64,
+        "planDigest": plan_digest,
+        "status": "failed_before_stopWriters",
+        "stage": "preflight",
+        "writersStopped": False,
+    }
+    calls: list[tuple[str, ...]] = []
+    written: list[dict[str, object]] = []
+
+    class Lock:
+        def __enter__(self) -> "Lock":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_activation_execution_lock", Lock)
+    monkeypatch.setattr(activation_package_module, "_load_maintenance_state", lambda: prior)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_maintenance_state",
+        lambda document: written.append(dict(document)),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: approval,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_maintenance_contract",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_maintenance_contract_command",
+        lambda command, _timeout: calls.append(tuple(command)) or 0,
+    )
+
+    result = activation_package_module.execute_approved_maintenance_window(package)
+
+    assert result["status"] == "complete"
+    assert calls
+    assert calls[0] == tuple(contract["stages"][0]["commands"][0])
+    assert written[-1]["status"] == "complete"
+
+
 def test_writer_stop_command_accepts_the_pre_effect_uncertain_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10079,17 +10445,7 @@ def test_writer_stop_command_accepts_the_pre_effect_uncertain_checkpoint(
     package = tmp_path / "package"
     package.mkdir()
     contract = _maintenance_contract_fixture(package)
-    stop_command = [
-        "/usr/bin/env",
-        "PYTHONPATH=/opt/overseer/app/src",
-        "/usr/bin/python3",
-        "-m",
-        "overseer.activation_package",
-        "stop-maintenance-writers",
-        "--package-root",
-        str(package.resolve()),
-    ]
-    contract["stages"][1]["commands"] = [stop_command]
+    stop_command = list(contract["stages"][1]["commands"][0])
     plan_digest = activation_package_module.maintenance_plan_digest(contract)
     approval = {
         "packageDigest": "c" * 64,
@@ -10321,7 +10677,9 @@ def test_manual_maintenance_rollback_uses_early_profile_before_store_migration(
     result = activation_package_module.execute_approved_maintenance_rollback(package)
 
     assert result["status"] == "rolled_back"
-    assert calls == [("/usr/bin/true", "early-rollback")]
+    assert calls == [
+        tuple(command) for command in contract["earlyRollbackCommands"]
+    ]
     assert written[-1]["stage"] == "earlyRollback"
 
 

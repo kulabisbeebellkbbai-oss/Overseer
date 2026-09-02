@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -12,6 +13,7 @@ from overseer.maintenance_window import (
     MAINTENANCE_RUNNER_STATE_SCHEMA,
     execute_maintenance_contract,
     maintenance_plan_digest,
+    _validate_argv,
     validate_maintenance_approval,
     validate_maintenance_contract,
 )
@@ -29,7 +31,7 @@ STAGE_NAMES = (
 )
 PACKAGE_DIGEST = "a" * 64
 PLAN_DIGEST = "b" * 64
-PACKAGE_ROOT = "/opt/overseer/releases/replacement"
+PACKAGE_ROOT = "/var/lib/overseer-executor/approved-package"
 ADMIN_SECRET = "admin-secret-must-not-be-persisted"
 ROADEX_SECRET = "roadex-secret-must-not-be-persisted"
 
@@ -176,6 +178,7 @@ def _contract() -> dict[str, Any]:
             "systemUserBridgeSocketUnit": "/etc/systemd/system/overseer-codex-user-bridge.socket",
             "systemRuntimeUnit": "/etc/systemd/system/overseer-runtime.service",
             "systemTmpfilesRule": "/etc/tmpfiles.d/overseer.conf",
+            "compatibilityApiToken": "/home/god/.local/share/overseer/project/state/api-token",
         },
         "evidenceRoot": "/var/lib/overseer-executor/maintenance/preserved",
         "acceptanceChecks": [
@@ -229,10 +232,18 @@ def _approval(*, allow_reboot: bool = False) -> dict[str, Any]:
     }
 
 
+def _execute_placeholder_contract(*args: Any, **kwargs: Any) -> None:
+    """Exercise runner mechanics without weakening production validation."""
+
+    with patch(
+        "overseer.maintenance_window.validate_maintenance_contract",
+        return_value=None,
+    ):
+        execute_maintenance_contract(*args, **kwargs)
+
+
 def test_contract_requires_exact_ordered_nonempty_stages_and_rollback_commands() -> None:
     contract = _contract()
-
-    assert validate_maintenance_contract(contract) is None
 
     assert [stage["name"] for stage in contract["stages"]] == list(STAGE_NAMES)
     assert all(stage["commands"] for stage in contract["stages"])
@@ -242,6 +253,8 @@ def test_contract_requires_exact_ordered_nonempty_stages_and_rollback_commands()
         "psychlo-bridge",
         "roadex-relay",
     ]
+    with pytest.raises(ValueError, match="forbidden executable"):
+        validate_maintenance_contract(contract)
 
     for index, name in enumerate(STAGE_NAMES):
         missing = _contract()
@@ -257,7 +270,7 @@ def test_contract_requires_exact_ordered_nonempty_stages_and_rollback_commands()
         validate_maintenance_contract(reordered)
 
     empty_stage = _contract()
-    empty_stage["stages"][2]["commands"] = []
+    empty_stage["stages"][0]["commands"] = []
     with pytest.raises(ValueError, match="non-empty"):
         validate_maintenance_contract(empty_stage)
 
@@ -305,6 +318,210 @@ def test_contract_rejects_forbidden_argv(forbidden_argv: list[str]) -> None:
 
     with pytest.raises(ValueError, match="forbidden"):
         validate_maintenance_contract(contract)
+
+
+@pytest.mark.parametrize(
+    "unsafe_argv",
+    [
+        ["/tmp/systemctl", "daemon-reload"],
+        ["/usr/bin/../bin/systemctl", "daemon-reload"],
+        [
+            "/usr/bin/install",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0644",
+            "/var/lib/overseer-executor/approved-package/public/config/x",
+            "/etc/overseer/../sudoers.d/x",
+        ],
+        [
+            "/usr/bin/env",
+            "LD_LIBRARY_PATH=/opt/overseer/releases/replacement/lib",
+            "PYTHONHOME=/opt/overseer/releases/replacement/runtime",
+            "PYTHONPATH=/opt/overseer/releases/replacement/app/src:/opt/overseer/releases/replacement/site-packages",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "PYTHONNOUSERSITE=1",
+            "PYTHONSAFEPATH=1",
+            "/opt/overseer/releases/replacement/runtime/bin/python3.13",
+            "-X",
+            "dev",
+            "-B",
+            "-s",
+            "-P",
+            "-m",
+            "overseer.activation_package",
+            "verify-maintenance-preflight",
+            "--package-root",
+            PACKAGE_ROOT,
+        ],
+        [
+            "/usr/bin/env",
+            "LD_LIBRARY_PATH=/opt/overseer/releases/replacement/lib",
+            "PYTHONHOME=/opt/overseer/releases/replacement/runtime",
+            "PYTHONPATH=/opt/overseer/releases/replacement/app/src:/opt/overseer/releases/replacement/site-packages",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "PYTHONNOUSERSITE=1",
+            "PYTHONSAFEPATH=1",
+            "/opt/overseer/releases/replacement/runtime/bin/python3.13",
+            "-B",
+            "-s",
+            "-P",
+            "-m",
+            "unexpected.module",
+            "verify-maintenance-preflight",
+            "--package-root",
+            PACKAGE_ROOT,
+        ],
+        [
+            "/usr/bin/env",
+            "LD_LIBRARY_PATH=/opt/overseer/releases/replacement/lib",
+            "PYTHONHOME=/opt/overseer/releases/replacement/runtime",
+            "PYTHONPATH=/opt/overseer/releases/replacement/app/src:/opt/overseer/releases/replacement/site-packages",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "PYTHONNOUSERSITE=1",
+            "PYTHONSAFEPATH=1",
+            "/opt/overseer/releases/replacement/runtime/bin/python3.13",
+            "-B",
+            "-s",
+            "-P",
+            "-m",
+            "overseer.activation_package",
+            "-c",
+            "print('unexpected')",
+        ],
+    ],
+)
+def test_contract_rejects_noncanonical_or_unexpected_command_shapes(
+    unsafe_argv: list[str],
+) -> None:
+    contract = _contract()
+    contract["stages"][0]["commands"] = [unsafe_argv]
+
+    with pytest.raises(ValueError):
+        validate_maintenance_contract(contract)
+
+
+def test_contract_rejects_arbitrary_options_after_allowlisted_helper() -> None:
+    contract = _contract()
+    contract["stages"][0]["commands"] = [[
+        "/usr/bin/env",
+        "LD_LIBRARY_PATH=/opt/overseer/releases/replacement/lib",
+        "PYTHONHOME=/opt/overseer/releases/replacement/runtime",
+        "PYTHONPATH=/opt/overseer/releases/replacement/app/src:/opt/overseer/releases/replacement/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
+        "/opt/overseer/releases/replacement/runtime/bin/python3.13",
+        "-B",
+        "-s",
+        "-P",
+        "-m",
+        "overseer.activation_package",
+        "verify-maintenance-preflight",
+        "--package-root",
+        PACKAGE_ROOT,
+        "--unexpected",
+        "value",
+    ]]
+
+    with pytest.raises(ValueError):
+        validate_maintenance_contract(contract)
+
+
+def test_contract_rejects_removed_prepare_final_store_helper() -> None:
+    contract = _contract()
+    contract["stages"][0]["commands"] = [[
+        "/usr/bin/env",
+        "LD_LIBRARY_PATH=/opt/overseer/releases/replacement/lib",
+        "PYTHONHOME=/opt/overseer/releases/replacement/runtime",
+        "PYTHONPATH=/opt/overseer/releases/replacement/app/src:/opt/overseer/releases/replacement/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
+        "/opt/overseer/releases/replacement/runtime/bin/python3.13",
+        "-B", "-s", "-P", "-m", "overseer.activation_package",
+        "prepare-final-store", "--package-root", PACKAGE_ROOT,
+    ]]
+
+    with pytest.raises(ValueError):
+        validate_maintenance_contract(contract)
+
+
+def test_contract_rejects_allowed_handoff_install_moved_to_preflight() -> None:
+    contract = _contract()
+    contract["stages"][0]["commands"] = [[
+        "/usr/bin/install", "-o", "root", "-g", "root", "-m", "0644",
+        f"{PACKAGE_ROOT}/public/systemd/overseer-api.service",
+        "/etc/systemd/system/overseer-api.service",
+    ]]
+
+    with pytest.raises(ValueError, match="preflight|stage|profile"):
+        validate_maintenance_contract(contract)
+
+
+def test_contract_accepts_rendered_python_install_and_systemctl_shapes() -> None:
+    commands = [
+        [
+            "/usr/bin/env",
+            "LD_LIBRARY_PATH=/opt/overseer/releases/replacement/lib",
+            "PYTHONHOME=/opt/overseer/releases/replacement/runtime",
+            "PYTHONPATH=/opt/overseer/releases/replacement/app/src:/opt/overseer/releases/replacement/site-packages",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "PYTHONNOUSERSITE=1",
+            "PYTHONSAFEPATH=1",
+            "/opt/overseer/releases/replacement/runtime/bin/python3.13",
+            "-B",
+            "-s",
+            "-P",
+            "-m",
+            "overseer.activation_package",
+            "verify-maintenance-preflight",
+            "--package-root",
+            PACKAGE_ROOT,
+        ],
+        [
+            "/usr/bin/install",
+            "-d",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0755",
+            "/opt/overseer/releases",
+        ],
+        [
+            "/usr/bin/install",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0644",
+            f"{PACKAGE_ROOT}/public/systemd/overseer-api.service",
+            "/etc/systemd/system/overseer-api.service",
+        ],
+        ["/usr/bin/systemctl", "daemon-reload"],
+        [
+            "/usr/sbin/runuser",
+            "--user",
+            "god",
+            "--",
+            "/usr/bin/env",
+            "XDG_RUNTIME_DIR=/run/user/1000",
+            "/usr/bin/systemctl",
+            "--user",
+            "start",
+            "overseer-quark-scheduler.timer",
+            "overseer-codex-usage-mcp.service",
+            "overseer-codex-usage-snapshot.timer",
+        ],
+    ]
+
+    for index, command in enumerate(commands):
+        assert _validate_argv(command, f"command[{index}]") == command
 
 
 def test_contract_rejects_embedded_secret_values() -> None:
@@ -407,15 +624,19 @@ def test_approval_accepts_exact_binding_and_rejects_schema_mismatch() -> None:
 
 def test_plan_digest_is_stable_and_changes_when_contract_changes() -> None:
     contract = _contract()
-    digest = maintenance_plan_digest(contract)
+    with patch(
+        "overseer.maintenance_window.validate_maintenance_contract",
+        return_value=None,
+    ):
+        digest = maintenance_plan_digest(contract)
 
-    assert isinstance(digest, str)
-    assert len(digest) == 64
-    assert digest == maintenance_plan_digest(json.loads(json.dumps(contract)))
+        assert isinstance(digest, str)
+        assert len(digest) == 64
+        assert digest == maintenance_plan_digest(json.loads(json.dumps(contract)))
 
-    changed = json.loads(json.dumps(contract))
-    changed["stages"][3]["commands"][0].append("replacement")
-    assert maintenance_plan_digest(changed) != digest
+        changed = json.loads(json.dumps(contract))
+        changed["stages"][3]["commands"][0].append("replacement")
+        assert maintenance_plan_digest(changed) != digest
 
 
 def test_writer_stop_failure_runs_only_the_early_recovery_profile() -> None:
@@ -428,7 +649,7 @@ def test_writer_stop_failure_runs_only_the_early_recovery_profile() -> None:
             raise RuntimeError("stop writers failed")
 
     with pytest.raises(RuntimeError, match="stop writers failed"):
-        execute_maintenance_contract(
+        _execute_placeholder_contract(
             _contract(),
             PACKAGE_DIGEST,
             execute,
@@ -458,7 +679,7 @@ def test_failure_after_writers_stop_runs_rollback_and_records_rolled_back(
             raise RuntimeError(f"{failing_stage} failed")
 
     with pytest.raises(RuntimeError, match=failing_stage):
-        execute_maintenance_contract(
+        _execute_placeholder_contract(
             contract,
             PACKAGE_DIGEST,
             execute,
@@ -476,7 +697,7 @@ def test_failure_after_writers_stop_runs_rollback_and_records_rolled_back(
 def test_success_records_complete() -> None:
     states: list[dict[str, Any]] = []
 
-    execute_maintenance_contract(
+    _execute_placeholder_contract(
         _contract(),
         PACKAGE_DIGEST,
         lambda _argv, _timeout_seconds: None,
@@ -490,7 +711,7 @@ def test_success_records_complete() -> None:
 def test_runner_checkpoints_bind_each_command_digest_and_writer_state() -> None:
     states: list[dict[str, Any]] = []
 
-    execute_maintenance_contract(
+    _execute_placeholder_contract(
         _contract(),
         PACKAGE_DIGEST,
         lambda _argv, _timeout_seconds: None,
@@ -524,7 +745,7 @@ def test_runner_checkpoints_bind_each_command_digest_and_writer_state() -> None:
 def test_runner_state_never_contains_secret_values() -> None:
     states: list[dict[str, Any]] = []
 
-    execute_maintenance_contract(
+    _execute_placeholder_contract(
         _contract(),
         PACKAGE_DIGEST,
         lambda _argv, _timeout_seconds: None,
@@ -549,7 +770,7 @@ def test_rollback_never_restarts_legacy_units_after_prerequisite_failure() -> No
             raise RuntimeError("rollback prerequisite failed")
 
     with pytest.raises(RuntimeError, match="rollback prerequisite failed"):
-        execute_maintenance_contract(
+        _execute_placeholder_contract(
             contract,
             PACKAGE_DIGEST,
             execute,
@@ -566,7 +787,7 @@ def test_global_window_deadline_exits_without_touching_writers() -> None:
     moments = iter((0.0, 1.0, 5400.0))
 
     with pytest.raises(TimeoutError, match="sealed deadline"):
-        execute_maintenance_contract(
+        _execute_placeholder_contract(
             _contract(),
             PACKAGE_DIGEST,
             lambda argv, _timeout: calls.append(tuple(argv)),

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import posixpath
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -54,7 +55,6 @@ _OPTIONAL_ABSENT_WRITER_UNITS = {
     "overseer-psychlo-coordination-tick.timer",
     "overseer-psychlo-coordination-tick.service",
 }
-_SYSTEM_SERVICE_UNITS = set(MAINTENANCE_SUCCESSOR_SYSTEM_UNITS)
 _STAGE_NAMES = (
     "preflight",
     "stopWriters",
@@ -125,20 +125,9 @@ _PRESERVATION_INPUT_NAMES = {
     "systemUserBridgeSocketUnit",
     "systemRuntimeUnit",
     "systemTmpfilesRule",
+    "compatibilityApiToken",
 }
 
-_SHELL_NAMES = {
-    "ash",
-    "bash",
-    "csh",
-    "dash",
-    "fish",
-    "ksh",
-    "rbash",
-    "sh",
-    "tcsh",
-    "zsh",
-}
 _VIRTUALIZATION_NAMES = {
     "virsh",
     "qemu-img",
@@ -167,22 +156,14 @@ _NETWORK_NAMES = {
     "wg",
 }
 _REBOOT_NAMES = {"halt", "kexec", "poweroff", "reboot", "shutdown"}
-_ALLOWED_EXECUTABLE_NAMES = {
-    "curl",
-    "chmod",
-    "env",
-    "install",
-    "runuser",
-    "systemctl",
-    "systemd-tmpfiles",
-    "true",
-}
-_ALLOWED_SYSTEMCTL_ACTIONS = {
-    "daemon-reload",
-    "disable",
-    "enable",
-    "start",
-    "stop",
+_ALLOWED_EXECUTABLE_PATHS = {
+    "/usr/bin/chmod",
+    "/usr/bin/curl",
+    "/usr/bin/env",
+    "/usr/bin/install",
+    "/usr/bin/systemctl",
+    "/usr/bin/systemd-tmpfiles",
+    "/usr/sbin/runuser",
 }
 _SECRET_KEY_MARKERS = (
     "credential",
@@ -192,6 +173,133 @@ _SECRET_KEY_MARKERS = (
     "privatekey",
     "private_key",
 )
+
+_MAINTENANCE_PYTHON_MODULE = "overseer.activation_package"
+_MAINTENANCE_SIMPLE_HELPER_SUBCOMMANDS = {
+    "ensure-dedicated-principal",
+    "prepare-maintenance-stores",
+    "preserve-maintenance-state",
+    "restop-maintenance-writers",
+    "restore-maintenance-handoff-artifacts",
+    "restore-maintenance-store-access",
+    "restore-maintenance-writers",
+    "stop-maintenance-writers",
+    "verify-maintenance-acceptance",
+    "verify-maintenance-installed-release",
+    "verify-maintenance-preservation",
+    "verify-maintenance-preflight",
+    "verify-maintenance-quiescence",
+}
+_MAINTENANCE_PYTHON_SUBCOMMANDS = _MAINTENANCE_SIMPLE_HELPER_SUBCOMMANDS | {
+    "verify-compatibility-token",
+    "verify-rollback-bundle",
+}
+_MAINTENANCE_SYSTEMCTL_TUPLES = {
+    ("systemctl", "daemon-reload"),
+    (
+        "systemctl",
+        "stop",
+        "overseer-api.service",
+        "overseer-runtime.service",
+        "overseer-admin-executor.socket",
+        "overseer-codex-user-bridge.socket",
+    ),
+    (
+        "systemctl",
+        "disable",
+        "overseer-api.service",
+        "overseer-runtime.service",
+        "overseer-admin-executor.socket",
+        "overseer-codex-user-bridge.socket",
+    ),
+    (
+        "systemctl",
+        "enable",
+        "--now",
+        "overseer-codex-user-bridge.socket",
+        "overseer-admin-executor.socket",
+    ),
+    (
+        "systemctl",
+        "enable",
+        "--now",
+        "overseer-runtime.service",
+        "overseer-api.service",
+    ),
+}
+_MAINTENANCE_USER_SYSTEMCTL_TUPLES = {
+    (
+        "disable",
+        "overseer-psychlo-usage.timer",
+        "overseer-psychlo-cycle.service",
+        "overseer-psychlo-meter.service",
+        "overseer-psychlo-usage.service",
+        "overseer-api.service",
+        "overseer.service",
+    ),
+    (
+        "start",
+        "overseer-quark-scheduler.timer",
+        "overseer-codex-usage-mcp.service",
+        "overseer-codex-usage-snapshot.timer",
+    ),
+}
+_MAINTENANCE_HANDOFF_CREDENTIAL_TARGETS = {
+    "/etc/overseer/admin-approval-verifier.json": ("984", "984", "0600"),
+    "/etc/overseer/roadex-fixture-approval-verifier.json": ("984", "984", "0600"),
+    "/etc/overseer/api-token": ("root", "root", "0600"),
+    "/etc/overseer/psychlo-peer-secret": ("root", "root", "0600"),
+    "/etc/overseer/roadex-project-human-thread-secret": ("root", "root", "0600"),
+    "/etc/overseer/psychlo-project-bindings.json": ("root", "root", "0644"),
+    "/etc/overseer/admin-executor-public-key": ("root", "root", "0644"),
+    "/etc/overseer/admin-executor-allowlist.json": ("root", "root", "0644"),
+    "/etc/overseer/admin-ticket-private-key": ("984", "984", "0600"),
+    "/etc/overseer/protected-gateway-ca.crt": ("root", "root", "0644"),
+}
+_MAINTENANCE_HANDOFF_SYSTEM_TARGETS = {
+    "/etc/systemd/system/overseer-admin-executor.socket",
+    "/etc/systemd/system/overseer-admin-executor@.service",
+    "/etc/systemd/system/overseer-api.service",
+    "/etc/systemd/system/overseer-codex-user-bridge.service",
+    "/etc/systemd/system/overseer-codex-user-bridge.socket",
+    "/etc/systemd/system/overseer-runtime.service",
+    "/etc/tmpfiles.d/overseer.conf",
+}
+_MAINTENANCE_FIXED_DIRECTORY_TARGETS = {
+    "/opt/overseer": ("root", "root", {"0755"}),
+    "/opt/overseer/releases": ("root", "root", {"0755"}),
+    "/opt/overseer/rollback": ("root", "root", {"0755"}),
+    "/var/lib/overseer": ("984", "984", {"0700"}),
+    "/var/lib/overseer-executor": ("root", "root", {"0700"}),
+    "/etc/overseer": ("0", "984", {"0710"}),
+}
+_MAINTENANCE_PACKAGE_ROOT = "/var/lib/overseer-executor/approved-package"
+_MAINTENANCE_COMPATIBILITY_TOKEN_TARGET = (
+    "/home/god/.local/share/overseer/project/state/api-token"
+)
+_MAINTENANCE_RELEASE_PREFIX = "/opt/overseer/releases/"
+_MAINTENANCE_ROLLBACK_PREFIX = "/opt/overseer/rollback/"
+_MAINTENANCE_CREDENTIAL_SOURCES = {
+    "/etc/overseer/admin-approval-verifier.json": "private/credentials/admin-approval-verifier.json",
+    "/etc/overseer/roadex-fixture-approval-verifier.json": "private/credentials/roadex-fixture-approval-verifier.json",
+    "/etc/overseer/api-token": "private/credentials/api-token",
+    "/etc/overseer/psychlo-peer-secret": "private/credentials/psychlo-peer-secret",
+    "/etc/overseer/roadex-project-human-thread-secret": "private/credentials/roadex-project-human-thread-secret",
+    "/etc/overseer/psychlo-project-bindings.json": "public/config/psychlo-project-bindings.json",
+    "/etc/overseer/admin-executor-public-key": "public/config/admin-executor-public-key",
+    "/etc/overseer/admin-executor-allowlist.json": "public/config/admin-executor-allowlist.json",
+    "/etc/overseer/admin-ticket-private-key": "private/credentials/admin-ticket-private-key",
+    "/etc/overseer/protected-gateway-ca.crt": "public/config/protected-gateway-ca.crt",
+}
+_MAINTENANCE_SYSTEM_SOURCES = {
+    "/etc/systemd/system/overseer-admin-executor.socket": "public/systemd/overseer-admin-executor.socket",
+    "/etc/systemd/system/overseer-admin-executor@.service": "public/systemd/overseer-admin-executor@.service",
+    "/etc/systemd/system/overseer-api.service": "public/systemd/overseer-api.service",
+    "/etc/systemd/system/overseer-codex-user-bridge.service": "public/systemd/overseer-codex-user-bridge.service",
+    "/etc/systemd/system/overseer-codex-user-bridge.socket": "public/systemd/overseer-codex-user-bridge.socket",
+    "/etc/systemd/system/overseer-runtime.service": "public/systemd/overseer-runtime.service",
+    "/etc/tmpfiles.d/overseer.conf": "public/systemd/overseer-tmpfiles.conf",
+}
 
 
 def _fail(message: str) -> None:
@@ -253,36 +361,251 @@ def _reject_secret_bearing_fields(value: Any, *, path: str = "contract") -> None
             _reject_secret_bearing_fields(child, path=f"{path}[{index}]")
 
 
-def _executable_name(argv0: str) -> str:
-    return posixpath.basename(argv0).lower()
+def _require_canonical_absolute_path(value: str, label: str) -> str:
+    path = _require_absolute_path(value, label)
+    if path != posixpath.normpath(path) or path.startswith("//"):
+        _fail(f"{label} must be canonical")
+    return path
 
 
-def _validate_argv(argv: Any, label: str) -> list[str]:
+def _safe_named_path_suffix(path: str, prefix: str, label: str) -> bool:
+    if not path.startswith(prefix):
+        return False
+    suffix = path[len(prefix) :]
+    parts = suffix.split("/")
+    if not suffix or any(
+        not part or part in {".", ".."} or re.fullmatch(r"[A-Za-z0-9_.@-]+", part) is None
+        for part in parts
+    ):
+        return False
+    _require_canonical_absolute_path(path, label)
+    return True
+
+
+def _validate_python_env_argv(
+    argv: list[str], label: str, package_root: str = _MAINTENANCE_PACKAGE_ROOT
+) -> None:
+    if len(argv) < 14:
+        _fail(f"{label} contains a forbidden Python environment")
+    if not argv[1].startswith("LD_LIBRARY_PATH="):
+        _fail(f"{label} contains an invalid Python environment")
+    library_path = argv[1][len("LD_LIBRARY_PATH=") :]
+    if not library_path.endswith("/lib"):
+        _fail(f"{label} contains a forbidden Python environment")
+    release_root = library_path[: -len("/lib")]
+    _require_canonical_absolute_path(release_root, f"{label} Python release root")
+    valid_roots = (
+        _MAINTENANCE_RELEASE_PREFIX,
+        f"{package_root}/public/release/",
+    )
+    if not any(
+        _safe_named_path_suffix(release_root, prefix, f"{label} Python release root")
+        and release_root.count("/") == prefix.count("/")
+        for prefix in valid_roots
+    ):
+        _fail(f"{label} contains a forbidden Python release root")
+    expected_environment = [
+        f"LD_LIBRARY_PATH={release_root}/lib",
+        f"PYTHONHOME={release_root}/runtime",
+        f"PYTHONPATH={release_root}/app/src:{release_root}/site-packages",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONNOUSERSITE=1",
+        "PYTHONSAFEPATH=1",
+    ]
+    if argv[1:7] != expected_environment:
+        _fail(f"{label} contains forbidden Python environment arguments")
+    interpreter = _require_canonical_absolute_path(
+        argv[7], f"{label} Python interpreter"
+    )
+    if interpreter != f"{release_root}/runtime/bin/python3.13":
+        _fail(f"{label} contains a forbidden Python interpreter path")
+    if argv[8:13] != ["-B", "-s", "-P", "-m", _MAINTENANCE_PYTHON_MODULE]:
+        _fail(f"{label} contains forbidden Python or module arguments")
+    subcommand = argv[13] if len(argv) > 13 else None
+    if subcommand not in _MAINTENANCE_PYTHON_SUBCOMMANDS:
+        _fail(f"{label} contains a forbidden maintenance Python command")
+    if subcommand in _MAINTENANCE_SIMPLE_HELPER_SUBCOMMANDS:
+        expected_tail = [subcommand, "--package-root", package_root]
+        if argv[13:] != expected_tail:
+            _fail(f"{label} contains an unexpected maintenance helper argument")
+    elif subcommand == "verify-compatibility-token":
+        if len(argv) != 26 or argv[13:17] != [
+            "verify-compatibility-token",
+            "--source-token",
+            "/etc/overseer/api-token",
+            "--target-token",
+        ] or argv[17] != _MAINTENANCE_COMPATIBILITY_TOKEN_TARGET:
+            _fail(f"{label} contains an invalid compatibility-token verification shape")
+        expected_options = [
+            "--expected-target-uid",
+            "--expected-target-gid",
+            "--expected-parent-device",
+            "--expected-parent-inode",
+        ]
+        for index, option in enumerate(expected_options):
+            option_index = 18 + index * 2
+            if argv[option_index] != option or re.fullmatch(r"[0-9]+", argv[option_index + 1]) is None:
+                _fail(f"{label} contains an invalid sealed compatibility-token identity")
+    elif subcommand == "verify-rollback-bundle":
+        if len(argv) != 18 or argv[13] != "verify-rollback-bundle":
+            _fail(f"{label} contains an invalid rollback-bundle verification shape")
+        bundle_root = argv[15]
+        if (
+            argv[14] != "--bundle-root"
+            or re.fullmatch(r"/opt/overseer/rollback/[0-9a-f]{64}", bundle_root) is None
+            or _require_canonical_absolute_path(bundle_root, f"{label} rollback bundle root") != bundle_root
+            or argv[16:] != [
+                "--rollback-manifest",
+                f"{package_root}/public/rollback-manifest.json",
+            ]
+        ):
+            _fail(f"{label} contains an invalid rollback-bundle verification shape")
+
+
+def _validate_systemctl_argv(argv: list[str], label: str) -> None:
+    if tuple(["systemctl", *argv[1:]]) in _MAINTENANCE_SYSTEMCTL_TUPLES:
+        return
+    _fail(f"{label} contains a forbidden systemctl tuple")
+
+
+def _validate_user_systemctl_argv(argv: list[str], label: str) -> None:
+    if len(argv) < 9 or argv[:5] != [
+        "/usr/sbin/runuser",
+        "--user",
+        "god",
+        "--",
+        "/usr/bin/env",
+    ]:
+        _fail(f"{label} contains a forbidden runuser payload")
+    if (
+        re.fullmatch(r"XDG_RUNTIME_DIR=/run/user/[0-9]+", argv[5]) is None
+        or argv[6:8] != ["/usr/bin/systemctl", "--user"]
+        or tuple(argv[8:]) not in _MAINTENANCE_USER_SYSTEMCTL_TUPLES
+    ):
+        _fail(f"{label} contains a forbidden user systemctl tuple")
+
+
+def _install_target_kind(path: str) -> str | None:
+    if path in _MAINTENANCE_FIXED_DIRECTORY_TARGETS:
+        return "directory-fixed"
+    if _maintenance_release_parts(path) is not None:
+        return "release"
+    if _maintenance_rollback_parts(path) is not None:
+        return "rollback"
+    if path in _MAINTENANCE_HANDOFF_CREDENTIAL_TARGETS:
+        return "credential"
+    if path in _MAINTENANCE_HANDOFF_SYSTEM_TARGETS:
+        return "system"
+    if path == _MAINTENANCE_COMPATIBILITY_TOKEN_TARGET:
+        return "compatibility-token"
+    return None
+
+
+def _maintenance_release_parts(path: str) -> tuple[str, list[str]] | None:
+    if not _safe_named_path_suffix(path, _MAINTENANCE_RELEASE_PREFIX, "release path"):
+        return None
+    parts = path[len(_MAINTENANCE_RELEASE_PREFIX) :].split("/")
+    return parts[0], parts[1:]
+
+
+def _maintenance_rollback_parts(path: str) -> tuple[str, list[str]] | None:
+    if not _safe_named_path_suffix(path, _MAINTENANCE_ROLLBACK_PREFIX, "rollback path"):
+        return None
+    parts = path[len(_MAINTENANCE_ROLLBACK_PREFIX) :].split("/")
+    if re.fullmatch(r"[0-9a-f]{64}", parts[0]) is None:
+        return None
+    return parts[0], parts[1:]
+
+
+def _validate_install_argv(
+    argv: list[str], label: str, package_root: str = _MAINTENANCE_PACKAGE_ROOT
+) -> None:
+    if len(argv) not in {9}:
+        _fail(f"{label} contains an invalid install shape")
+    if argv[1] == "-d":
+        if argv[2:8:2] != ["-o", "-g", "-m"]:
+            _fail(f"{label} contains an invalid install directory shape")
+        target = _require_canonical_absolute_path(argv[8], f"{label} install target")
+        kind = _install_target_kind(target)
+        if kind == "directory-fixed":
+            owner, group, modes = _MAINTENANCE_FIXED_DIRECTORY_TARGETS[target]
+        elif kind == "release":
+            owner, group, modes = "root", "root", {"0755"}
+        elif kind == "rollback":
+            owner, group, modes = "root", "god", {"0750"}
+        else:
+            _fail(f"{label} contains an unapproved install directory target")
+        if (argv[3], argv[5], argv[7]) != (owner, group, next(iter(modes))):
+            _fail(f"{label} contains an unsafe install directory owner or mode")
+        return
+    if argv[1:2] != ["-o"] or argv[3:4] != ["-g"] or argv[5:6] != ["-m"]:
+        _fail(f"{label} contains an invalid install file shape")
+    source = _require_canonical_absolute_path(argv[7], f"{label} install source")
+    target = _require_canonical_absolute_path(argv[8], f"{label} install target")
+    kind = _install_target_kind(target)
+    if kind is None:
+        _fail(f"{label} contains an unapproved install target")
+    if target == _MAINTENANCE_COMPATIBILITY_TOKEN_TARGET:
+        expected = ("root", "god", "0640")
+        if source != "/etc/overseer/api-token":
+            _fail(f"{label} contains an unapproved compatibility-token source")
+    elif kind == "release":
+        target_parts = _maintenance_release_parts(target)
+        source_prefix = f"{package_root}/public/release/"
+        if target_parts is None or not _safe_named_path_suffix(source, source_prefix, f"{label} install source"):
+            _fail(f"{label} contains an unapproved release source")
+        source_parts = source[len(source_prefix) :].split("/")
+        if source_parts != [target_parts[0], *target_parts[1]]:
+            _fail(f"{label} release source and target do not correspond")
+        if argv[6] not in {"0444", "0555"}:
+            _fail(f"{label} contains an unsafe release mode")
+        expected = ("root", "root", argv[6])
+    elif kind == "rollback":
+        target_parts = _maintenance_rollback_parts(target)
+        source_prefix = f"{package_root}/private/rollback-inputs/"
+        if target_parts is None or not _safe_named_path_suffix(source, source_prefix, f"{label} install source"):
+            _fail(f"{label} contains an unapproved rollback source")
+        source_parts = source[len(source_prefix) :].split("/")
+        if source_parts != target_parts[1]:
+            _fail(f"{label} rollback source and target do not correspond")
+        if argv[6] not in {"0440", "0550"}:
+            _fail(f"{label} contains an unsafe rollback mode")
+        expected = ("root", "god", argv[6])
+    elif kind == "credential":
+        expected = _MAINTENANCE_HANDOFF_CREDENTIAL_TARGETS[target]
+        expected_source = f"{package_root}/{_MAINTENANCE_CREDENTIAL_SOURCES[target]}"
+        if source != expected_source:
+            _fail(f"{label} credential source and target do not correspond")
+    elif kind == "system":
+        expected = ("root", "root", "0644")
+        expected_source = f"{package_root}/{_MAINTENANCE_SYSTEM_SOURCES[target]}"
+        if source != expected_source:
+            _fail(f"{label} system source and target do not correspond")
+    else:
+        _fail(f"{label} contains an unsupported install target")
+    if (argv[2], argv[4], argv[6]) != expected:
+        _fail(f"{label} contains an unsafe install owner or mode")
+
+
+def _validate_argv(
+    argv: Any, label: str, package_root: str = _MAINTENANCE_PACKAGE_ROOT
+) -> list[str]:
     if not isinstance(argv, Sequence) or isinstance(argv, (str, bytes, bytearray)):
         _fail(f"{label} must be a nonempty argv")
     if not argv:
         _fail(f"{label} must be a nonempty argv")
     if any(not isinstance(argument, str) or not argument or "\x00" in argument for argument in argv):
         _fail(f"{label} contains an empty or invalid argv element")
-    if not argv[0].startswith("/"):
-        _fail(f"{label} executable must be an absolute path")
-
-    names = [_executable_name(argument) for argument in argv]
-    first_name = names[0]
-    if first_name not in _ALLOWED_EXECUTABLE_NAMES:
+    if argv[0] not in _ALLOWED_EXECUTABLE_PATHS:
         _fail(f"{label} contains a forbidden executable")
-    if first_name in _SHELL_NAMES or first_name == "env":
-        if first_name in _SHELL_NAMES:
-            _fail(f"{label} contains a forbidden shell interpreter")
-        # env may carry assignments and options, so inspect every subsequent
-        # token for a shell executable rather than trusting argv position.
-        if any(name in _SHELL_NAMES for name in names[1:]):
-            _fail(f"{label} contains a forbidden env-wrapped shell interpreter")
+    for index, argument in enumerate(argv):
+        if argument.startswith("/"):
+            _require_canonical_absolute_path(argument, f"{label}[{index}]")
 
+    names = [posixpath.basename(argument).lower() for argument in argv]
     forbidden_names = _VIRTUALIZATION_NAMES | _NETWORK_NAMES | _REBOOT_NAMES
     if any(name in forbidden_names for name in names):
         _fail(f"{label} contains a forbidden command")
-
     lowered = [argument.lower() for argument in argv]
     if any("claim" in argument or "claims" in argument for argument in lowered):
         _fail(f"{label} contains a forbidden claims command")
@@ -298,98 +621,373 @@ def _validate_argv(argv: Any, label: str) -> list[str]:
         for marker in ("--reboot", "--poweroff", "systemctl-reboot")
     ):
         _fail(f"{label} contains a forbidden reboot command")
-    if "systemctl" in names and any(
-        argument in _REBOOT_NAMES for argument in lowered
-    ):
-        _fail(f"{label} contains a forbidden systemctl power command")
-    if first_name == "env" and not (
-        "-m" in argv and "overseer.activation_package" in argv
-    ):
-        _fail(f"{label} contains a forbidden env payload")
-    if first_name == "runuser" and not (
-        len(argv) >= 8
-        and argv[1:4] == ["--user", "god", "--"]
-        and "/usr/bin/systemctl" in argv
-        and "--user" in argv
-    ):
-        _fail(f"{label} contains a forbidden runuser payload")
-    if "systemctl" in names:
-        systemctl_index = names.index("systemctl")
-        systemctl_tail = argv[systemctl_index + 1 :]
-        action_offset = next(
-            (
-                index
-                for index, argument in enumerate(systemctl_tail)
-                if not argument.startswith("-")
-            ),
-            None,
-        )
-        action = (
-            None if action_offset is None else systemctl_tail[action_offset]
-        )
-        if action not in _ALLOWED_SYSTEMCTL_ACTIONS:
-            _fail(f"{label} contains a forbidden systemctl action")
-        prefix_options = systemctl_tail[:action_offset]
-        trailing = systemctl_tail[action_offset + 1 :]
-        if first_name == "runuser":
-            if prefix_options != ["--user"]:
-                _fail(f"{label} contains forbidden systemctl options")
-            allowed_units = set(MAINTENANCE_WRITER_UNITS)
-        else:
-            if prefix_options:
-                _fail(f"{label} contains forbidden systemctl options")
-            allowed_units = _SYSTEM_SERVICE_UNITS
-        trailing_options = [argument for argument in trailing if argument.startswith("-")]
-        units = [argument for argument in trailing if not argument.startswith("-")]
-        if any(option != "--now" for option in trailing_options):
-            _fail(f"{label} contains forbidden systemctl options")
-        if action == "daemon-reload":
-            if trailing:
-                _fail(f"{label} contains forbidden systemctl arguments")
-        elif not units or any(unit not in allowed_units for unit in units):
-            _fail(f"{label} contains a forbidden systemctl unit")
-    if first_name == "systemd-tmpfiles" and argv != [
-        "/usr/bin/systemd-tmpfiles",
-        "--create",
-        "/etc/tmpfiles.d/overseer.conf",
-    ]:
-        _fail(f"{label} contains a forbidden tmpfiles payload")
-    if first_name == "curl" and not any(
-        argument == "http://127.0.0.1:8766/health" for argument in argv
-    ):
-        _fail(f"{label} contains a forbidden curl target")
-    if first_name == "install":
-        target = argv[-1]
-        if not any(
-            target == prefix or target.startswith(prefix + "/")
-            for prefix in (
-                "/etc/overseer",
-                "/etc/systemd/system",
-                "/etc/tmpfiles.d",
-                "/opt/overseer",
-                "/var/lib/overseer",
-                "/var/lib/overseer-executor",
-                "/home/god/.local/share/overseer/project/state",
-            )
-        ):
-            _fail(f"{label} contains a forbidden install target")
-    if first_name == "chmod" and not (
-        len(argv) == 3
-        and argv[1] in {"0550", "0555"}
-        and argv[2].startswith("/opt/overseer/")
-    ):
-        _fail(f"{label} contains a forbidden chmod target")
 
+    executable = argv[0]
+    if executable == "/usr/bin/env":
+        _validate_python_env_argv(list(argv), label, package_root)
+    elif executable == "/usr/sbin/runuser":
+        _validate_user_systemctl_argv(list(argv), label)
+    elif executable == "/usr/bin/systemctl":
+        _validate_systemctl_argv(list(argv), label)
+    elif executable == "/usr/bin/systemd-tmpfiles":
+        if list(argv) != [
+            "/usr/bin/systemd-tmpfiles",
+            "--create",
+            "/etc/tmpfiles.d/overseer.conf",
+        ]:
+            _fail(f"{label} contains a forbidden tmpfiles payload")
+    elif executable == "/usr/bin/curl":
+        valid_curls = {
+            (
+                "/usr/bin/curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "http://127.0.0.1:8766/health",
+            ),
+            (
+                "/usr/bin/curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "2",
+                "--max-time",
+                "5",
+                "http://127.0.0.1:8766/health",
+            ),
+            (
+                "/usr/bin/curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "1",
+                "--max-time",
+                "3",
+                "--retry",
+                "15",
+                "--retry-delay",
+                "2",
+                "--retry-max-time",
+                "45",
+                "--retry-all-errors",
+                "http://127.0.0.1:8766/health",
+            ),
+        }
+        if tuple(argv) not in valid_curls:
+            _fail(f"{label} contains a forbidden curl shape")
+    elif executable == "/usr/bin/install":
+        _validate_install_argv(list(argv), label, package_root)
+    elif executable == "/usr/bin/chmod":
+        if len(argv) != 3:
+            _fail(f"{label} contains an invalid chmod shape")
+        target = _require_canonical_absolute_path(argv[2], f"{label} chmod target")
+        if not (
+            (argv[1] == "0555" and _safe_named_path_suffix(target, _MAINTENANCE_RELEASE_PREFIX, label))
+            or (argv[1] == "0550" and _safe_named_path_suffix(target, _MAINTENANCE_ROLLBACK_PREFIX, label))
+        ):
+            _fail(f"{label} contains a forbidden chmod target")
     return list(argv)
 
 
-def _validate_command_list(commands: Any, label: str) -> None:
+def _validate_command_list(commands: Any, label: str, package_root: str) -> None:
     if not isinstance(commands, Sequence) or isinstance(commands, (str, bytes, bytearray)):
         _fail(f"{label} must be non-empty")
     if not commands:
         _fail(f"{label} must be non-empty")
     for index, argv in enumerate(commands):
-        _validate_argv(argv, f"{label}[{index}]")
+        _validate_argv(argv, f"{label}[{index}]", package_root)
+
+
+def _is_simple_helper(argv: list[str], subcommand: str) -> bool:
+    return argv[0] == "/usr/bin/env" and argv[13] == subcommand
+
+
+def _python_release_root(argv: list[str]) -> str:
+    return argv[1].removeprefix("LD_LIBRARY_PATH=").removesuffix("/lib")
+
+
+def _exact_install_file(
+    argv: list[str], source: str, target: str, owner: str, group: str, mode: str
+) -> bool:
+    return argv == [
+        "/usr/bin/install",
+        "-o",
+        owner,
+        "-g",
+        group,
+        "-m",
+        mode,
+        source,
+        target,
+    ]
+
+
+def _exact_install_directory(
+    argv: list[str], target: str, owner: str, group: str, mode: str
+) -> bool:
+    return argv == [
+        "/usr/bin/install",
+        "-d",
+        "-o",
+        owner,
+        "-g",
+        group,
+        "-m",
+        mode,
+        target,
+    ]
+
+
+def _expected_maintenance_python_subcommand(argv: list[str], subcommand: str) -> bool:
+    return _is_simple_helper(argv, subcommand)
+
+
+def _validate_maintenance_stage_profiles(
+    document: Mapping[str, Any], package_root: str
+) -> None:
+    stages = document["stages"]
+    stage_commands = {stage["name"]: stage["commands"] for stage in stages}
+    package_stage_commands = {
+        "preflight": "verify-maintenance-preflight",
+        "stopWriters": "stop-maintenance-writers",
+        "proveQuiescence": "verify-maintenance-quiescence",
+        "preserveState": "preserve-maintenance-state",
+    }
+    installed_stage_commands = {
+        "migrateOfflineStores": "prepare-maintenance-stores",
+    }
+    package_release_root: str | None = None
+    for stage_name, subcommand in package_stage_commands.items():
+        commands = stage_commands[stage_name]
+        if len(commands) != 1 or not _expected_maintenance_python_subcommand(commands[0], subcommand):
+            _fail(f"contract stage profile places {stage_name} commands incorrectly")
+        observed_root = _python_release_root(commands[0])
+        if package_release_root is None:
+            package_release_root = observed_root
+        if observed_root != package_release_root:
+            _fail("contract pre-install helpers do not share one package release root")
+    package_release_prefix = f"{package_root}/public/release/"
+    if package_release_root is None or not package_release_root.startswith(
+        package_release_prefix
+    ):
+        _fail("contract pre-install helpers must run from the sealed package")
+
+    installed_release_root: str | None = None
+    for stage_name, subcommand in installed_stage_commands.items():
+        commands = stage_commands[stage_name]
+        if len(commands) != 1 or not _expected_maintenance_python_subcommand(commands[0], subcommand):
+            _fail(f"contract stage profile places {stage_name} commands incorrectly")
+        observed_root = _python_release_root(commands[0])
+        if installed_release_root is None:
+            installed_release_root = observed_root
+        if observed_root != installed_release_root:
+            _fail("contract installed helpers do not share one release root")
+    if installed_release_root is None or not installed_release_root.startswith(
+        _MAINTENANCE_RELEASE_PREFIX
+    ):
+        _fail("contract post-install helpers must run from the installed release")
+    release_name = package_release_root[len(package_release_prefix) :]
+    if installed_release_root != f"{_MAINTENANCE_RELEASE_PREFIX}{release_name}":
+        _fail("contract package and installed release roots do not correspond")
+
+    install_commands = stage_commands["installRelease"]
+    fixed_directories = [
+        ("/opt/overseer", "root", "root", "0755"),
+        ("/opt/overseer/releases", "root", "root", "0755"),
+        ("/opt/overseer/rollback", "root", "root", "0755"),
+        ("/var/lib/overseer-executor", "root", "root", "0700"),
+    ]
+    if len(install_commands) < len(fixed_directories) + 3:
+        _fail("contract installRelease stage profile is incomplete")
+    for index, (target, owner, group, mode) in enumerate(fixed_directories):
+        if not _exact_install_directory(install_commands[index], target, owner, group, mode):
+            _fail("contract installRelease stage profile has an invalid fixed directory")
+    if not _is_simple_helper(install_commands[-1], "verify-maintenance-installed-release"):
+        _fail("contract installRelease stage profile must end with its verifier")
+    if _python_release_root(install_commands[-1]) != package_release_root:
+        _fail("contract install verifier must run from the sealed package")
+
+    release_seen = False
+    rollback_seen = False
+    rollback_phase = False
+    for command in install_commands[len(fixed_directories) : -1]:
+        if command[0] == "/usr/bin/install":
+            target = command[-1]
+            release = _maintenance_release_parts(target)
+            rollback = _maintenance_rollback_parts(target)
+        elif command[0] == "/usr/bin/chmod":
+            target = command[2]
+            release = _maintenance_release_parts(target)
+            rollback = _maintenance_rollback_parts(target)
+        else:
+            _fail("contract installRelease stage profile contains a non-immutable command")
+        if release is not None:
+            if rollback_phase:
+                _fail("contract installRelease stage profile interleaves release and rollback")
+            if release[0] != release_name:
+                _fail("contract immutable release target does not match its runtime")
+            release_seen = True
+        elif rollback is not None:
+            if rollback[0] != document["releaseManifestDigest"]:
+                _fail("contract rollback root does not match the release manifest")
+            rollback_phase = True
+            rollback_seen = True
+        else:
+            _fail("contract installRelease stage profile contains an invalid target")
+    if not release_seen or not rollback_seen:
+        _fail("contract installRelease stage profile must contain release and rollback artifacts")
+
+    switch_commands = stage_commands["switchServices"]
+    if len(switch_commands) != 30:
+        _fail("contract switchServices stage profile has an invalid command count")
+    position = 0
+    if not _is_simple_helper(switch_commands[position], "verify-maintenance-preservation"):
+        _fail("contract switchServices stage profile has an invalid preservation verifier")
+    if _python_release_root(switch_commands[position]) != package_release_root:
+        _fail("contract preservation verifier must run from the sealed package")
+    position += 1
+    if not _is_simple_helper(switch_commands[position], "ensure-dedicated-principal"):
+        _fail("contract switchServices stage profile has an invalid principal helper")
+    if _python_release_root(switch_commands[position]) != package_release_root:
+        _fail("contract principal helper must run from the sealed package")
+    position += 1
+    if not _exact_install_directory(switch_commands[position], "/var/lib/overseer", "984", "984", "0700"):
+        _fail("contract switchServices stage profile has an invalid Overseer store directory")
+    position += 1
+    if not _exact_install_directory(switch_commands[position], "/etc/overseer", "0", "984", "0710"):
+        _fail("contract switchServices stage profile has an invalid credentials directory")
+    position += 1
+
+    for target in _MAINTENANCE_CREDENTIAL_SOURCES:
+        source = f"{package_root}/{_MAINTENANCE_CREDENTIAL_SOURCES[target]}"
+        owner, group, mode = _MAINTENANCE_HANDOFF_CREDENTIAL_TARGETS[target]
+        if not _exact_install_file(switch_commands[position], source, target, owner, group, mode):
+            _fail("contract switchServices stage profile has reordered or invalid credentials")
+        position += 1
+
+    for target, source_suffix in _MAINTENANCE_SYSTEM_SOURCES.items():
+        if not _exact_install_file(
+            switch_commands[position],
+            f"{package_root}/{source_suffix}",
+            target,
+            "root",
+            "root",
+            "0644",
+        ):
+            _fail("contract switchServices stage profile has reordered or invalid system files")
+        position += 1
+
+    if tuple(switch_commands[position][8:]) not in _MAINTENANCE_USER_SYSTEMCTL_TUPLES or switch_commands[position][8] != "disable":
+        _fail("contract switchServices stage profile has an invalid writer disable command")
+    position += 1
+    if not _is_simple_helper(switch_commands[position], "verify-maintenance-quiescence"):
+        _fail("contract switchServices stage profile has an invalid quiescence verifier")
+    if _python_release_root(switch_commands[position]) != package_release_root:
+        _fail("contract switch quiescence verifier must run from the sealed package")
+    position += 1
+    if switch_commands[position] != ["/usr/bin/systemctl", "daemon-reload"]:
+        _fail("contract switchServices stage profile has an invalid daemon reload")
+    position += 1
+    if switch_commands[position] != [
+        "/usr/bin/systemd-tmpfiles", "--create", "/etc/tmpfiles.d/overseer.conf"
+    ]:
+        _fail("contract switchServices stage profile has an invalid tmpfiles command")
+    position += 1
+    for expected in (
+        ("enable", "--now", "overseer-codex-user-bridge.socket", "overseer-admin-executor.socket"),
+        ("enable", "--now", "overseer-runtime.service", "overseer-api.service"),
+    ):
+        if tuple(switch_commands[position][1:]) != expected:
+            _fail("contract switchServices stage profile has reordered service handoff commands")
+        position += 1
+    if not _exact_install_file(
+        switch_commands[position],
+        "/etc/overseer/api-token",
+        _MAINTENANCE_COMPATIBILITY_TOKEN_TARGET,
+        "root",
+        "god",
+        "0640",
+    ):
+        _fail("contract switchServices stage profile has an invalid compatibility-token install")
+    position += 1
+    if switch_commands[position][13] != "verify-compatibility-token":
+        _fail("contract switchServices stage profile has an invalid compatibility-token verifier")
+    if _python_release_root(switch_commands[position]) != installed_release_root:
+        _fail("contract compatibility verifier must run from the installed release")
+    position += 1
+    if tuple(switch_commands[position][8:]) != next(
+        value for value in _MAINTENANCE_USER_SYSTEMCTL_TUPLES if value[0] == "start"
+    ):
+        _fail("contract switchServices stage profile has an invalid writer start command")
+    if position + 1 != len(switch_commands):
+        _fail("contract switchServices stage profile contains extra commands")
+
+    acceptance = stage_commands["acceptance"]
+    expected_acceptance_curl = [
+        "/usr/bin/curl", "--fail", "--silent", "--show-error",
+        "--connect-timeout", "1", "--max-time", "3", "--retry", "15",
+        "--retry-delay", "2", "--retry-max-time", "45", "--retry-all-errors",
+        "http://127.0.0.1:8766/health",
+    ]
+    if len(acceptance) != 2 or acceptance[0] != expected_acceptance_curl:
+        _fail("contract acceptance stage profile must begin with the exact health check")
+    if not _is_simple_helper(acceptance[1], "verify-maintenance-acceptance"):
+        _fail("contract acceptance stage profile must end with its verifier")
+    if _python_release_root(acceptance[1]) != installed_release_root:
+        _fail("contract acceptance verifier must run from the installed release")
+
+    early_rollback = document["earlyRollbackCommands"]
+    if len(early_rollback) != 2:
+        _fail("contract early rollback profile has invalid command count")
+    if early_rollback[0][13:] != [
+        "restop-maintenance-writers", "--package-root", package_root
+    ] or early_rollback[1][13:] != [
+        "restore-maintenance-writers", "--package-root", package_root
+    ]:
+        _fail("contract early rollback profile has invalid command order")
+    if any(
+        _python_release_root(command) != package_release_root
+        for command in early_rollback
+    ):
+        _fail("contract early rollback must run from the sealed package")
+
+    rollback = document["rollbackCommands"]
+    if len(rollback) != 9:
+        _fail("contract rollback profile has invalid command count")
+    expected_direct = [
+        ["/usr/bin/systemctl", "stop", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
+        ["/usr/bin/systemctl", "disable", "overseer-api.service", "overseer-runtime.service", "overseer-admin-executor.socket", "overseer-codex-user-bridge.socket"],
+        ["/usr/bin/systemctl", "daemon-reload"],
+    ]
+    if rollback[:3] != expected_direct:
+        _fail("contract rollback profile has invalid prerequisite order")
+    if rollback[3][13] != "verify-rollback-bundle":
+        _fail("contract rollback profile must verify the bundle before restoration")
+    if rollback[3][15] != f"{_MAINTENANCE_ROLLBACK_PREFIX}{document['releaseManifestDigest']}":
+        _fail("contract rollback verifier has a mismatched bundle root")
+    if _python_release_root(rollback[3]) != package_release_root:
+        _fail("contract rollback verifier must run from the sealed package")
+    if rollback[4][13:] != ["restore-maintenance-store-access", "--package-root", package_root]:
+        _fail("contract rollback profile has invalid store restoration order")
+    if rollback[5][13:] != ["restore-maintenance-handoff-artifacts", "--package-root", package_root]:
+        _fail("contract rollback profile has invalid handoff restoration order")
+    if rollback[6] != ["/usr/bin/systemctl", "daemon-reload"]:
+        _fail("contract rollback profile has invalid second daemon reload")
+    if rollback[7][13:] != ["restore-maintenance-writers", "--package-root", package_root]:
+        _fail("contract rollback profile has invalid writer restoration order")
+    if rollback[8] != [
+        "/usr/bin/curl", "--fail", "--silent", "--show-error",
+        "--connect-timeout", "2", "--max-time", "5",
+        "http://127.0.0.1:8766/health",
+    ]:
+        _fail("contract rollback profile must end with the exact health check")
+    if any(
+        _python_release_root(rollback[index]) != package_release_root
+        for index in (4, 5, 7)
+    ):
+        _fail("contract rollback helpers must run from the sealed package")
 
 
 def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
@@ -401,7 +999,9 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
 
     if document["schemaVersion"] != MAINTENANCE_CONTRACT_SCHEMA:
         _fail("contract schema does not match maintenance contract schema")
-    _require_absolute_path(document["packageRoot"], "contract.packageRoot")
+    package_root = _require_canonical_absolute_path(
+        document["packageRoot"], "contract.packageRoot"
+    )
     _require_digest(document["releaseManifestDigest"], "contract.releaseManifestDigest")
     account = _require_mapping(document["account"], "contract.account")
     _require_exact_fields(
@@ -629,7 +1229,11 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
         _require_exact_fields(stage_document, _STAGE_FIELDS, f"contract.stages[{index}]")
         if stage_document["name"] != _STAGE_NAMES[index]:
             _fail(f"contract stage {index} has an invalid name")
-        _validate_command_list(stage_document["commands"], f"contract.stages[{index}].commands")
+        _validate_command_list(
+            stage_document["commands"],
+            f"contract.stages[{index}].commands",
+            package_root,
+        )
 
     stage_timeouts = _require_mapping(
         document["stageTimeoutSeconds"], "contract.stageTimeoutSeconds"
@@ -648,10 +1252,15 @@ def validate_maintenance_contract(contract: Mapping[str, Any]) -> None:
     ):
         _fail("contract window timeout is invalid")
 
-    _validate_command_list(document["rollbackCommands"], "contract.rollbackCommands")
     _validate_command_list(
-        document["earlyRollbackCommands"], "contract.earlyRollbackCommands"
+        document["rollbackCommands"], "contract.rollbackCommands", package_root
     )
+    _validate_command_list(
+        document["earlyRollbackCommands"],
+        "contract.earlyRollbackCommands",
+        package_root,
+    )
+    _validate_maintenance_stage_profiles(document, package_root)
     early_rollback_timeouts = document["earlyRollbackTimeoutSeconds"]
     if (
         not isinstance(early_rollback_timeouts, Sequence)

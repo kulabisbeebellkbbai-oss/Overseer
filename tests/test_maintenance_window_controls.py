@@ -302,6 +302,40 @@ def test_operator_dashboard_exposes_only_the_short_lived_gateway_challenge(
     }
 
 
+def test_gateway_challenge_replaces_only_a_valid_stale_challenge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "run-overseer"
+    runtime.mkdir(mode=0o750)
+    stale = _write(runtime / "maintenance-gateway-challenge", b"a" * 32 + b"\n")
+    stale.chmod(0o444)
+    monkeypatch.setattr(
+        activation_package,
+        "_MAINTENANCE_GATEWAY_CHALLENGE_PATH",
+        stale,
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "APPROVED_OVERSEER_GID",
+        os.getegid(),
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package.secrets,
+        "token_hex",
+        lambda _size: "b" * 32,
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt: "b" * 32)
+
+    assert activation_package._maintenance_gateway_operator_challenge() is True
+    assert not stale.exists()
+
+
 def test_verify_maintenance_quiescence_is_sealed_and_read_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -428,9 +462,38 @@ def test_preserve_maintenance_state_copies_triplets_and_artifacts_with_hashes(
             assert destination.read_bytes() == source.read_bytes()
         assert stat.S_IMODE(destination.stat().st_mode) in {0o600, 0o700}
 
+    original_stable_read = activation_package._stable_read
+
+    def manifest_only_stable_read(path: Path) -> tuple[bytes, os.stat_result]:
+        if path.name != "preservation-manifest.json":
+            pytest.fail("preserved artifacts must be verified by streaming hash")
+        return original_stable_read(path)
+
+    monkeypatch.setattr(
+        activation_package,
+        "_stable_read",
+        manifest_only_stable_read,
+    )
     verified = activation_package.verify_maintenance_preservation(package_root)
     assert verified["status"] == "preservation_verified"
     assert calls[-1] == "verify-maintenance-preservation"
+    acceptance_report = evidence_root.with_name("acceptance-report.json")
+    _write(acceptance_report, b"{}\n")
+    assert activation_package.verify_maintenance_preservation(package_root)[
+        "status"
+    ] == "preservation_verified"
+
+    unexpected_directory = evidence_root / "unexpected-directory"
+    unexpected_directory.mkdir()
+    with pytest.raises(Exception, match="unexpected artifacts"):
+        activation_package.verify_maintenance_preservation(package_root)
+    unexpected_directory.rmdir()
+
+    unexpected_fifo = evidence_root / "unexpected-fifo"
+    os.mkfifo(unexpected_fifo)
+    with pytest.raises(Exception, match="invalid artifact"):
+        activation_package.verify_maintenance_preservation(package_root)
+    unexpected_fifo.unlink()
 
     artifact = next(
         path
@@ -457,12 +520,18 @@ def test_restore_maintenance_handoff_artifacts_restores_exact_files_and_absence(
         b"[Service]\nExecStart=/old\n",
         mode=0o644,
     )
+    compatibility_token = _write(
+        tmp_path / "legacy" / "api-token",
+        b"original-compatibility-token",
+    )
     contract["preservationInputs"].update(
         {
             "systemCredentialsDirectory": str(system_credentials),
             "systemApiUnit": str(system_unit),
+            "compatibilityApiToken": str(compatibility_token),
         }
     )
+    _bind_source_identities(contract)
     _install_contract_and_command_guard(
         monkeypatch,
         contract,
@@ -488,10 +557,16 @@ def test_restore_maintenance_handoff_artifacts_restores_exact_files_and_absence(
         "_MAINTENANCE_HANDOFF_SYSTEM_INPUTS",
         {"systemApiUnit": system_unit},
     )
+    monkeypatch.setattr(
+        activation_package,
+        "_MAINTENANCE_HANDOFF_COMPATIBILITY_INPUTS",
+        {"compatibilityApiToken": compatibility_token},
+    )
 
     activation_package.preserve_maintenance_state(package_root)
     api_token.write_bytes(b"replacement-token")
     system_unit.write_bytes(b"[Service]\nExecStart=/new\n")
+    compatibility_token.write_bytes(b"replacement-compatibility-token")
     _write(new_only, b"new-only")
     system_credentials.chmod(0o710)
     monkeypatch.setattr(
@@ -509,12 +584,13 @@ def test_restore_maintenance_handoff_artifacts_restores_exact_files_and_absence(
 
     assert result == {
         "status": "maintenance_handoff_restored",
-        "restoredFileCount": 2,
+        "restoredFileCount": 3,
         "removedFileCount": 1,
         "credentialDirectoryMetadataRestored": True,
     }
     assert api_token.read_bytes() == b"original-token"
     assert system_unit.read_bytes() == b"[Service]\nExecStart=/old\n"
+    assert compatibility_token.read_bytes() == b"original-compatibility-token"
     assert not new_only.exists()
     assert stat.S_IMODE(system_credentials.stat().st_mode) == 0o700
 
@@ -658,6 +734,10 @@ def test_verify_maintenance_acceptance_uses_only_bounded_injected_checks(
     assert checked == list(ACCEPTANCE_CHECK_NAMES)
     assert calls == [COMMAND_NAMES["acceptance"]]
     assert other_project.read_bytes() == before
+    report = Path(contract["evidenceRoot"]).with_name("acceptance-report.json")
+    assert report.is_file()
+    assert not (Path(contract["evidenceRoot"]) / "acceptance-report.json").exists()
+    assert activation_package.verify_maintenance_acceptance(package_root) == result
 
 
 def test_real_bounded_acceptance_dispatch_reads_only_allowlisted_projections(

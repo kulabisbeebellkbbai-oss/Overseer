@@ -38,8 +38,13 @@ cutover state are not authority for this runner.
 - [x] Preserve the previous immutable release, raw database artifacts,
   credentials, units, and root-owned rollback bundle until acceptance passes;
   restore exact pre-handoff system credentials, system units, tmpfiles bytes,
-  absence, ownership, modes, and credential-directory metadata before any
-  legacy writer restart on full rollback.
+  legacy compatibility token, absence, ownership, modes, and
+  credential-directory metadata before any legacy writer restart on full
+  rollback.
+- [x] Stream-rehash the complete installed immutable release before migration,
+  keep the durable acceptance report outside immutable preservation evidence,
+  make report replay idempotent, and recover only structurally valid stale
+  gateway challenges.
 - [x] Stop the complete Overseer writer inventory, preserve and resume the
   Codex Usage store unchanged, and apply the kernel lease barrier to every
   migrated store.

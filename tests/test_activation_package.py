@@ -10800,6 +10800,12 @@ def test_failed_maintenance_rollback_retries_from_zero_with_exact_approval(
         "_load_maintenance_rollback_retry_approval",
         lambda _package, _state: {"failedStateDigest": "d" * 64},
     )
+    consumed = tmp_path / "consumed-retry-approval.json"
+    monkeypatch.setattr(
+        activation_package_module,
+        "_consume_maintenance_rollback_retry_approval",
+        lambda _package, _state, _approval: consumed,
+    )
     monkeypatch.setattr(
         activation_package_module,
         "_write_maintenance_state",
@@ -10832,9 +10838,168 @@ def test_failed_maintenance_rollback_retries_from_zero_with_exact_approval(
 
     assert result["status"] == "rolled_back"
     assert result["retryApproved"] is True
+    assert result["retryApprovalRecord"] == str(consumed)
     assert calls == [tuple(command) for command in contract["rollbackCommands"]]
-    assert written[0]["commandIndex"] == 0
+    assert written[0]["status"] == "rollback_retry_authorized"
+    assert written[1]["commandIndex"] == 0
     assert written[-1]["status"] == "rolled_back"
+
+
+def test_failed_maintenance_rollback_cannot_replay_consumed_retry_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _maintenance_contract_fixture(package)
+    plan_digest = activation_package_module.maintenance_plan_digest(contract)
+    current: dict[str, object] = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": "c" * 64,
+        "planDigest": plan_digest,
+        "status": "rollback_failed",
+        "stage": "rollback",
+        "writersStopped": True,
+        "failure": "ActivationPackageError",
+    }
+    approval_available = True
+    calls: list[tuple[str, ...]] = []
+
+    class Lock:
+        def __enter__(self) -> "Lock":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def load_retry_approval(
+        _package: Path,
+        _state: dict[str, object],
+    ) -> dict[str, object]:
+        if not approval_available:
+            raise ActivationPackageError(
+                "maintenance rollback retry approval is required"
+            )
+        return {"failedStateDigest": "d" * 64}
+
+    def consume_retry_approval(
+        _package: Path,
+        _state: dict[str, object],
+        _approval: dict[str, object],
+    ) -> Path:
+        nonlocal approval_available
+        assert approval_available is True
+        approval_available = False
+        return tmp_path / "consumed-retry-approval.json"
+
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(activation_package_module, "_activation_execution_lock", Lock)
+    monkeypatch.setattr(activation_package_module, "_load_maintenance_state", lambda: current)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_rollback_retry_approval",
+        load_retry_approval,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_consume_maintenance_rollback_retry_approval",
+        consume_retry_approval,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_write_maintenance_state",
+        lambda document: current.update(document),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: {
+            "schemaVersion": "overseer.maintenance-window-approval.v1",
+            "packageRoot": str(package.resolve()),
+            "packageDigest": "c" * 64,
+            "planDigest": plan_digest,
+            "scope": "maintenance-window-for-this-package-only",
+            "allowReboot": False,
+        },
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_maintenance_contract",
+        lambda *_args, **_kwargs: contract,
+    )
+
+    def fail_command(command: list[str], _timeout: int) -> int:
+        calls.append(tuple(command))
+        raise ActivationPackageError("simulated retry failure")
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_execute_maintenance_contract_command",
+        fail_command,
+    )
+
+    with pytest.raises(ActivationPackageError, match="simulated retry failure"):
+        activation_package_module.execute_approved_maintenance_rollback(package)
+    first_attempt_calls = list(calls)
+    assert current["status"] == "rollback_failed"
+
+    with pytest.raises(ActivationPackageError, match="retry approval"):
+        activation_package_module.execute_approved_maintenance_rollback(package)
+
+    assert calls == first_attempt_calls
+
+
+def test_consume_maintenance_rollback_retry_approval_is_durable_and_one_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    state = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": "c" * 64,
+        "planDigest": "d" * 64,
+        "status": "rollback_failed",
+        "stage": "rollback",
+        "writersStopped": True,
+        "failure": "ActivationPackageError",
+    }
+    approval, state_digest = (
+        activation_package_module._maintenance_rollback_retry_approval_document(
+            package.resolve(),
+            state,
+        )
+    )
+    target = tmp_path / "retry-approval.json"
+    target.write_bytes(activation_package_module._canonical(approval) + b"\n")
+    target.chmod(0o600)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_rollback_retry_approval_path",
+        lambda digest: target if digest == state_digest else pytest.fail("wrong digest"),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (target.stat().st_uid, target.stat().st_gid),
+    )
+
+    consumed = activation_package_module._consume_maintenance_rollback_retry_approval(
+        package.resolve(),
+        state,
+        approval,
+    )
+
+    assert not target.exists()
+    assert consumed.exists()
+    assert consumed.read_bytes() == activation_package_module._canonical(approval) + b"\n"
+    assert stat.S_IMODE(consumed.stat().st_mode) == 0o600
+    with pytest.raises(ActivationPackageError, match="changed before consumption"):
+        activation_package_module._consume_maintenance_rollback_retry_approval(
+            package.resolve(),
+            state,
+            approval,
+        )
 
 
 def test_record_maintenance_rollback_retry_approval_binds_exact_failed_state(

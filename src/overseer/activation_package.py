@@ -7019,6 +7019,64 @@ def _load_maintenance_rollback_retry_approval(
     return expected
 
 
+def _consume_maintenance_rollback_retry_approval(
+    package: Path,
+    state: Mapping[str, object],
+    approval: Mapping[str, object],
+) -> Path:
+    """Atomically consume one exact retry approval before command zero."""
+
+    expected, state_digest = _maintenance_rollback_retry_approval_document(
+        package,
+        state,
+    )
+    if dict(approval) != expected:
+        raise ActivationPackageError(
+            "maintenance rollback retry approval changed before consumption"
+        )
+    target = _maintenance_rollback_retry_approval_path(state_digest)
+    try:
+        raw, before = _stable_read(target)
+    except (ActivationPackageError, OSError) as error:
+        raise ActivationPackageError(
+            "maintenance rollback retry approval changed before consumption"
+        ) from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        raw != _canonical(expected) + b"\n"
+        or (before.st_uid, before.st_gid) != (root_uid, root_gid)
+        or stat.S_IMODE(before.st_mode) != 0o600
+    ):
+        raise ActivationPackageError(
+            "maintenance rollback retry approval changed before consumption"
+        )
+    consumed = target.with_name(
+        f"consumed-{target.stem}-{time.time_ns()}-{secrets.token_hex(8)}.json"
+    )
+    if consumed.exists() or consumed.is_symlink():
+        raise ActivationPackageError(
+            "maintenance rollback retry consumption destination exists"
+        )
+    try:
+        _rename_package_no_replace(target, consumed)
+        _fsync_package_directory(target.parent)
+        consumed_raw, after = _stable_read(consumed)
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance rollback retry approval could not be consumed"
+        ) from error
+    if (
+        consumed_raw != raw
+        or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or (after.st_uid, after.st_gid) != (before.st_uid, before.st_gid)
+        or stat.S_IMODE(after.st_mode) != 0o600
+    ):
+        raise ActivationPackageError(
+            "consumed maintenance rollback retry approval is invalid"
+        )
+    return consumed
+
+
 def record_maintenance_rollback_retry_approval(
     package_root: str | os.PathLike[str],
     expected_package_digest: str,
@@ -13531,6 +13589,26 @@ def execute_approved_maintenance_rollback(
         except ValueError as error:
             raise ActivationPackageError("maintenance approval binding is invalid") from error
 
+        retry_approval_record: Path | None = None
+        if retry_approval is not None:
+            retry_approval_record = _consume_maintenance_rollback_retry_approval(
+                package,
+                state,
+                retry_approval,
+            )
+            _write_maintenance_state(
+                {
+                    "schemaVersion": MAINTENANCE_RUNNER_STATE_SCHEMA,
+                    "packageDigest": digest,
+                    "planDigest": plan_digest,
+                    "status": "rollback_retry_authorized",
+                    "stage": state.get("stage"),
+                    "writersStopped": True,
+                    "failedStateDigest": retry_approval["failedStateDigest"],
+                    "retryApprovalRecord": str(retry_approval_record),
+                }
+            )
+
         original_stage = state.get("stage")
         use_early_rollback = original_stage in {
             "stopWriters",
@@ -13626,6 +13704,11 @@ def execute_approved_maintenance_rollback(
             "packageDigest": digest,
             "replayed": False,
             "retryApproved": retry_approval is not None,
+            "retryApprovalRecord": (
+                None
+                if retry_approval_record is None
+                else str(retry_approval_record)
+            ),
         }
 
 

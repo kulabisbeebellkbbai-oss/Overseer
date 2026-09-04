@@ -17,6 +17,8 @@ from overseer.collection_models import (
     CollectionJob,
     CollectionJobKind,
     CollectionJobState,
+    CollectionOutcome,
+    CollectionRun,
 )
 from overseer.collection_scheduler import CollectionScheduler
 from overseer.core import OwnerDomain
@@ -357,6 +359,48 @@ def test_collection_projections_are_bounded_and_do_not_echo_reason(tmp_path: Pat
             assert "do not expose this reason" not in serialized
             assert "response_body" not in serialized
             assert "password" not in serialized
+
+
+def test_collection_runs_filter_has_exact_total_and_limit(tmp_path: Path) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    seed_job(store_path)
+    with SQLiteStore(store_path) as store:
+        for run in (
+            CollectionRun(
+                id="run.failed.old",
+                job_id="collection.health.api",
+                trigger="scheduled",
+                started_at="2026-08-24T11:58:00+00:00",
+                completed_at="2026-08-24T11:58:01+00:00",
+                outcome=CollectionOutcome.FAILED,
+            ),
+            CollectionRun(
+                id="run.succeeded",
+                job_id="collection.health.api",
+                trigger="scheduled",
+                started_at="2026-08-24T11:59:00+00:00",
+                completed_at="2026-08-24T11:59:01+00:00",
+                outcome=CollectionOutcome.SUCCEEDED,
+            ),
+            CollectionRun(
+                id="run.failed.new",
+                job_id="collection.health.api",
+                trigger="scheduled",
+                started_at="2026-08-24T12:00:00+00:00",
+                completed_at="2026-08-24T12:00:01+00:00",
+                outcome=CollectionOutcome.FAILED,
+            ),
+        ):
+            store.save_collection_run(run)
+
+    with ApiHarness(store_path) as api:
+        status, body, _ = api.get("/collections/runs?status=failed&limit=1")
+
+    assert status == 200
+    assert body["total_count"] == 2
+    assert body["returned_count"] == 1
+    assert body["truncated"] is True
+    assert body["runs"][0]["id"] == "run.failed.new"
 
 
 def test_deprecated_health_probe_route_only_enqueues_and_sets_successor_headers(

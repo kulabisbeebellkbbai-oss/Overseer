@@ -16,6 +16,7 @@ from overseer import (
     CollectionJob,
     CollectionJobKind,
     CollectionOutcome,
+    CollectionRun,
     CollectionScheduler,
     OwnerDomain,
     SQLiteStore,
@@ -28,6 +29,7 @@ from overseer.collection_adapters import (
     StorePathCallbackAdapter,
 )
 from overseer.collection_deadline import CollectionDeadlineExceeded, collection_deadline_scope
+from overseer.cli import collection_runs_status, collection_scheduler_status
 from overseer.health import HealthEvidence, HealthStatus, HealthTarget, ProbeType
 from overseer.host import HostCommandObservation, HostInspectionAdapter, HostInspectionSnapshot
 from overseer.packages import FirmwarePreflightAdapter, PackageInspectionSnapshot, PackageUpdate
@@ -323,6 +325,157 @@ def test_scheduler_status_reports_bounds(tmp_path: Path) -> None:
     assert status["max_workers"] == 2
     assert status["max_per_concurrency_key"] == 1
     assert status["job_count"] == 1
+
+
+def test_scheduler_status_counts_runs_without_loading_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    _seed(path, (_job("one"),))
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "list_collection_runs",
+        lambda _store: pytest.fail("scheduler status loaded collection-run history"),
+    )
+
+    status = scheduler_status(path)
+
+    assert status["run_count"] == 0
+
+
+def test_collection_runs_status_pages_history_in_sql(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    _seed(path, (_job("one"),))
+    with SQLiteStore(path) as store:
+        store.save_collection_run(
+            CollectionRun(
+                id="run.one",
+                job_id="one",
+                trigger="scheduled",
+                started_at=NOW,
+                completed_at=NOW,
+                outcome=CollectionOutcome.SUCCEEDED,
+            )
+        )
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "list_collection_runs",
+        lambda _store: pytest.fail("run projection loaded collection-run history"),
+    )
+
+    status = collection_runs_status(path, limit=1)
+
+    assert status["total_count"] == 1
+    assert status["returned_count"] == 1
+    assert status["runs"][0]["id"] == "run.one"
+
+
+def test_collection_runs_status_filters_before_counting_and_limiting(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    _seed(path, (_job("one"),))
+    with SQLiteStore(path) as store:
+        for run in (
+            CollectionRun(
+                id="run.failed.old",
+                job_id="one",
+                trigger="scheduled",
+                started_at="2026-08-24T11:58:00+00:00",
+                completed_at="2026-08-24T11:58:01+00:00",
+                outcome=CollectionOutcome.FAILED,
+            ),
+            CollectionRun(
+                id="run.succeeded",
+                job_id="one",
+                trigger="scheduled",
+                started_at="2026-08-24T11:59:00+00:00",
+                completed_at="2026-08-24T11:59:01+00:00",
+                outcome=CollectionOutcome.SUCCEEDED,
+            ),
+            CollectionRun(
+                id="run.failed.new",
+                job_id="one",
+                trigger="scheduled",
+                started_at=NOW,
+                completed_at="2026-08-24T12:00:01+00:00",
+                outcome=CollectionOutcome.FAILED,
+            ),
+        ):
+            store.save_collection_run(run)
+
+    status = collection_runs_status(path, outcome="failed", limit=1)
+
+    assert status["total_count"] == 2
+    assert status["returned_count"] == 1
+    assert status["truncated"] is True
+    assert status["runs"][0]["id"] == "run.failed.new"
+
+
+def test_collection_scheduler_status_uses_aggregate_and_bounded_store_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    _seed(path, (_job("one"),))
+    with SQLiteStore(path) as store:
+        store.request_collection_run("one", "operator", "refresh bounded status")
+
+    for method_name in (
+        "list_collection_jobs",
+        "list_collection_job_states",
+        "list_collection_requests",
+        "list_triage_incidents",
+    ):
+        monkeypatch.setattr(
+            SQLiteStore,
+            method_name,
+            lambda _store, name=method_name: pytest.fail(
+                f"scheduler projection called unbounded {name}"
+            ),
+        )
+
+    status = collection_scheduler_status(path, limit=1)
+
+    assert status["job_count"] == 1
+    assert status["enabled_job_count"] == 1
+    assert status["pending_request_count"] == 1
+    assert status["request_count"] == 1
+    assert status["request_total_count"] == 1
+    assert status["request_returned_count"] == 1
+    assert status["pending_requests"][0]["job_id"] == "one"
+
+
+def test_collection_scheduler_status_uses_one_read_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    _seed(path, (_job("one"),))
+    original_page = SQLiteStore.page_active_collection_job_ids
+    inserted = False
+
+    def insert_after_metrics(store: SQLiteStore, limit: int):
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            with SQLiteStore(path) as writer:
+                writer.request_collection_run(
+                    "one", "operator", "concurrent snapshot fixture"
+                )
+        return original_page(store, limit)
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "page_active_collection_job_ids",
+        insert_after_metrics,
+    )
+
+    status = collection_scheduler_status(path, limit=1)
+
+    assert inserted is True
+    assert status["request_count"] == status["request_total_count"] == 0
+    assert status["pending_requests"] == []
 
 
 def test_store_path_callback_receives_job_timeout_boundary() -> None:

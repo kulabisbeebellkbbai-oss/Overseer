@@ -1038,23 +1038,12 @@ def _collection_run_projection(
     status: str | None,
     limit: int,
 ) -> dict[str, object]:
-    projection = collection_runs_status(store_path, job_id=job_id, limit=COLLECTION_MAX_API_LIMIT)
-    rows = list(projection.get("runs", []))
-    if status is not None:
-        rows = [row for row in rows if row.get("outcome") == status]
-    total = len(rows)
-    rows = rows[:limit]
-    projection.update(
-        {
-            "runs": rows,
-            "run_count": len(rows),
-            "total_count": total,
-            "returned_count": len(rows),
-            "truncated": total > len(rows),
-            "limit": limit,
-        }
+    return collection_runs_status(
+        store_path,
+        job_id=job_id,
+        outcome=status,
+        limit=limit,
     )
-    return projection
 
 
 def _collection_incidents_for_api(

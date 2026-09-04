@@ -81,7 +81,7 @@ from .codex_dispatch_system_activation import (
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .collection_adapters import bounded_text
 from .collection_models import CollectionJobKind, TriageIncidentStatus
-from .collection_scheduler import scheduler_status
+from .collection_scheduler import scheduler_status, scheduler_status_from_metrics
 from .claim_continuation import (
     activate_claim_group_status,
     claim_group_status,
@@ -2919,28 +2919,23 @@ def collection_scheduler_status(
 ) -> dict[str, object]:
     limit = _collection_status_limit(limit)
     with SQLiteStore(store_path) as store:
-        requests = store.list_collection_requests()
-        incidents = store.list_triage_incidents()
-        jobs = store.list_collection_jobs()
-        states = store.list_collection_job_states()
-    status = scheduler_status(store_path)
-    leased_job_ids = sorted(item.job_id for item in states if item.active_lease_id)
-    pending_requests = sorted(
-        (item for item in requests if item.status == "pending"),
-        key=lambda item: (item.requested_at, item.id),
-    )
+        with store.read_snapshot():
+            metrics = store.collection_scheduler_metrics()
+            leased_total, leased_job_ids = store.page_active_collection_job_ids(limit)
+            pending_total, pending_requests = store.page_pending_collection_requests(limit)
+    status = scheduler_status_from_metrics(metrics)
     status.update(
         {
             "status": "ok",
-            "pending_request_count": sum(1 for item in requests if item.status == "pending"),
-            "request_count": len(requests),
-            "open_incident_count": sum(1 for item in incidents if item.status is TriageIncidentStatus.OPEN),
-            "resolved_incident_count": sum(1 for item in incidents if item.status is TriageIncidentStatus.RESOLVED),
-            "enabled_job_count": sum(1 for item in jobs if item.enabled),
-            "leased_job_ids": leased_job_ids[:limit],
-            "leased_total_count": len(leased_job_ids),
-            "leased_returned_count": min(len(leased_job_ids), limit),
-            "leased_truncated": len(leased_job_ids) > limit,
+            "pending_request_count": metrics["pending_request_count"],
+            "request_count": metrics["request_count"],
+            "open_incident_count": metrics["open_incident_count"],
+            "resolved_incident_count": metrics["resolved_incident_count"],
+            "enabled_job_count": metrics["enabled_job_count"],
+            "leased_job_ids": list(leased_job_ids),
+            "leased_total_count": leased_total,
+            "leased_returned_count": len(leased_job_ids),
+            "leased_truncated": leased_total > len(leased_job_ids),
             "pending_requests": [
                 {
                     "id": item.id,
@@ -2949,11 +2944,11 @@ def collection_scheduler_status(
                     "requested_at": item.requested_at,
                     "status": item.status,
                 }
-                for item in pending_requests[:limit]
+                for item in pending_requests
             ],
-            "request_total_count": len(pending_requests),
-            "request_returned_count": min(len(pending_requests), limit),
-            "request_truncated": len(pending_requests) > limit,
+            "request_total_count": pending_total,
+            "request_returned_count": len(pending_requests),
+            "request_truncated": pending_total > len(pending_requests),
             "durable_status": True,
             "limit": limit,
         }
@@ -2965,12 +2960,16 @@ def collection_runs_status(
     store_path: str | Path,
     job_id: str | None = None,
     limit: int = 50,
+    outcome: str | None = None,
 ) -> dict[str, object]:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("collection run limit must be between 1 and 1000")
     with SQLiteStore(store_path) as store:
-        runs = [run for run in store.list_collection_runs() if job_id is None or run.job_id == job_id]
-    runs.sort(key=lambda run: (run.started_at, run.id), reverse=True)
+        total, runs = store.page_collection_runs(
+            job_id=job_id,
+            outcome=outcome,
+            limit=limit,
+        )
     rows = [
         {
             "id": run.id,
@@ -2992,7 +2991,7 @@ def collection_runs_status(
         "runs": rows,
         "run_count": len(rows),
         "job_id": job_id,
-        **_collection_page(len(runs), len(rows), limit),
+        **_collection_page(total, len(rows), limit),
     }
 
 

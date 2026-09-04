@@ -92,7 +92,8 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
+AUDIT_EVENT_NORMALIZATION_GENERATION = 12
 _SCHEMA_CURRENT_REQUIRED_TABLES = frozenset(
     {
         "schema_migrations",
@@ -140,8 +141,29 @@ _COLLECTION_INDEX_SPECS = {
         "table": "collection_runs",
         "unique": 0,
         "partial": 0,
-        "columns": (("job_id", 0), ("started_at", 1)),
-        "sql": "CREATE INDEX idx_collection_runs_job_started ON collection_runs (job_id, started_at DESC)",
+        "columns": (("job_id", 0), ("started_at", 1), ("id", 1)),
+        "sql": "CREATE INDEX idx_collection_runs_job_started ON collection_runs (job_id, started_at DESC, id DESC)",
+    },
+    "idx_collection_runs_started": {
+        "table": "collection_runs",
+        "unique": 0,
+        "partial": 0,
+        "columns": (("started_at", 1), ("id", 1)),
+        "sql": "CREATE INDEX idx_collection_runs_started ON collection_runs (started_at DESC, id DESC)",
+    },
+    "idx_collection_runs_outcome_started": {
+        "table": "collection_runs",
+        "unique": 0,
+        "partial": 0,
+        "columns": (("outcome", 0), ("started_at", 1), ("id", 1)),
+        "sql": "CREATE INDEX idx_collection_runs_outcome_started ON collection_runs (outcome, started_at DESC, id DESC)",
+    },
+    "idx_collection_runs_job_outcome_started": {
+        "table": "collection_runs",
+        "unique": 0,
+        "partial": 0,
+        "columns": (("job_id", 0), ("outcome", 0), ("started_at", 1), ("id", 1)),
+        "sql": "CREATE INDEX idx_collection_runs_job_outcome_started ON collection_runs (job_id, outcome, started_at DESC, id DESC)",
     },
     "idx_collection_request_pending_job": {
         "table": "collection_requests",
@@ -1277,33 +1299,7 @@ class SQLiteStore:
             )
         return True
 
-    def _schema_is_current(self) -> bool:
-        if self._observation_schema_status() != "exact":
-            return False
-        required_tables = tuple(sorted(_SCHEMA_CURRENT_REQUIRED_TABLES))
-        placeholders = ", ".join("?" for _ in required_tables)
-        tables = {
-            str(row[0])
-            for row in self._connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                f"AND name IN ({placeholders})",
-                required_tables,
-            ).fetchall()
-        }
-        if tables != _SCHEMA_CURRENT_REQUIRED_TABLES:
-            return False
-        if not all(
-            self._collection_index_is_canonical(index_name)
-            for index_name in _COLLECTION_INDEX_SPECS
-        ):
-            return False
-        schema_current = self._connection.execute(
-            "SELECT MAX(version) AS version FROM schema_migrations"
-        ).fetchone()
-        agent_current = self._connection.execute(
-            "SELECT 1 FROM agent_schema_migrations WHERE version = ?",
-            (AGENT_DRIVER_SCHEMA_V9,),
-        ).fetchone()
+    def _audit_event_schema_is_current(self) -> bool:
         audit_index = self._connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
             ("idx_audit_events_event_type_v4",),
@@ -1333,13 +1329,10 @@ class SQLiteStore:
             "WHERE id=1"
         ).fetchone()
         return (
-            schema_current is not None
-            and schema_current["version"] is not None
-            and int(schema_current["version"]) >= CURRENT_SCHEMA_VERSION
-            and agent_current is not None
-            and audit_columns.get("event_type") == ("TEXT", 0, None, 0)
+            audit_columns.get("event_type") == ("TEXT", 0, None, 0)
             and audit_normalization is not None
-            and int(audit_normalization["generation"]) == CURRENT_SCHEMA_VERSION
+            and int(audit_normalization["generation"])
+            == AUDIT_EVENT_NORMALIZATION_GENERATION
             and str(audit_normalization["state"]) == "complete"
             and audit_index is not None
             and obsolete_audit_index is None
@@ -1353,6 +1346,41 @@ class SQLiteStore:
                 audit_triggers.get(_AUDIT_EVENT_UPDATE_TRIGGER)
             )
             == self._normalize_schema_sql(_AUDIT_EVENT_UPDATE_TRIGGER_SQL)
+        )
+
+    def _schema_is_current(self) -> bool:
+        if self._observation_schema_status() != "exact":
+            return False
+        required_tables = tuple(sorted(_SCHEMA_CURRENT_REQUIRED_TABLES))
+        placeholders = ", ".join("?" for _ in required_tables)
+        tables = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                f"AND name IN ({placeholders})",
+                required_tables,
+            ).fetchall()
+        }
+        if tables != _SCHEMA_CURRENT_REQUIRED_TABLES:
+            return False
+        if not all(
+            self._collection_index_is_canonical(index_name)
+            for index_name in _COLLECTION_INDEX_SPECS
+        ):
+            return False
+        schema_current = self._connection.execute(
+            "SELECT MAX(version) AS version FROM schema_migrations"
+        ).fetchone()
+        agent_current = self._connection.execute(
+            "SELECT 1 FROM agent_schema_migrations WHERE version = ?",
+            (AGENT_DRIVER_SCHEMA_V9,),
+        ).fetchone()
+        return (
+            schema_current is not None
+            and schema_current["version"] is not None
+            and int(schema_current["version"]) >= CURRENT_SCHEMA_VERSION
+            and agent_current is not None
+            and self._audit_event_schema_is_current()
         )
 
     def close(self) -> None:
@@ -1407,6 +1435,8 @@ class SQLiteStore:
         self.close()
 
     def _migrate_audit_event_schema(self) -> None:
+        if self._audit_event_schema_is_current():
+            return
         # Install/repair the normalized schema under a short exclusive writer
         # transaction. Historical payload parsing happens in bounded batches
         # below so concurrent store users are not locked out for the full
@@ -1431,7 +1461,7 @@ class SQLiteStore:
                 "(id, generation, state) VALUES (1, ?, 'backfilling') "
                 "ON CONFLICT(id) DO UPDATE SET generation=excluded.generation, "
                 "state=excluded.state",
-                (CURRENT_SCHEMA_VERSION,),
+                (AUDIT_EVENT_NORMALIZATION_GENERATION,),
             )
 
             # Schema v8 briefly used an application-defined expression index.
@@ -1502,59 +1532,63 @@ class SQLiteStore:
             self._connection.execute(
                 "UPDATE audit_event_normalization_state SET state='complete' "
                 "WHERE id=1 AND generation=?",
-                (CURRENT_SCHEMA_VERSION,),
+                (AUDIT_EVENT_NORMALIZATION_GENERATION,),
             )
             self._connection.commit()
         except Exception:
             self._connection.rollback()
             raise
 
-    def _repair_collection_index_rows_in_transaction(self) -> None:
-        for index_name in _COLLECTION_INDEX_SPECS:
-            self._connection.execute(f"DROP INDEX IF EXISTS {index_name}")
-
-        pending_jobs: set[str] = set()
-        pending_rows = self._connection.execute(
-            "SELECT payload FROM collection_requests WHERE status='pending' "
-            "ORDER BY job_id ASC, id ASC"
-        ).fetchall()
-        for row in pending_rows:
-            request = _load_dataclass(CollectionRequest, str(row["payload"]))
-            if request.job_id not in pending_jobs:
-                pending_jobs.add(request.job_id)
-                continue
-            self._update_collection_request_in_transaction(
-                replace(
-                    request,
-                    status="coalesced",
-                    terminal_disposition="coalesced",
+    def _repair_collection_index_rows_in_transaction(
+        self,
+        *,
+        repair_pending_requests: bool,
+        repair_open_incidents: bool,
+    ) -> None:
+        if repair_pending_requests:
+            pending_jobs: set[str] = set()
+            pending_rows = self._connection.execute(
+                "SELECT payload FROM collection_requests WHERE status='pending' "
+                "ORDER BY job_id ASC, id ASC"
+            ).fetchall()
+            for row in pending_rows:
+                request = _load_dataclass(CollectionRequest, str(row["payload"]))
+                if request.job_id not in pending_jobs:
+                    pending_jobs.add(request.job_id)
+                    continue
+                self._update_collection_request_in_transaction(
+                    replace(
+                        request,
+                        status="coalesced",
+                        terminal_disposition="coalesced",
+                    )
                 )
-            )
 
-        open_generations: set[tuple[str, int]] = set()
-        incident_rows = self._connection.execute(
-            "SELECT payload FROM triage_incidents WHERE status='open' "
-            "ORDER BY job_id ASC, generation ASC, id ASC"
-        ).fetchall()
-        for row in incident_rows:
-            incident = _load_dataclass(TriageIncident, str(row["payload"]))
-            key = (incident.job_id, incident.generation)
-            if key not in open_generations:
-                open_generations.add(key)
-                continue
-            self._upsert_collection_incident_in_transaction(
-                replace(
-                    incident,
-                    status=TriageIncidentStatus.RESOLVED,
-                    repair_state="coalesced",
-                    resolution="legacy duplicate incident generation coalesced",
+        if repair_open_incidents:
+            open_generations: set[tuple[str, int]] = set()
+            incident_rows = self._connection.execute(
+                "SELECT payload FROM triage_incidents WHERE status='open' "
+                "ORDER BY job_id ASC, generation ASC, id ASC"
+            ).fetchall()
+            for row in incident_rows:
+                incident = _load_dataclass(TriageIncident, str(row["payload"]))
+                key = (incident.job_id, incident.generation)
+                if key not in open_generations:
+                    open_generations.add(key)
+                    continue
+                self._upsert_collection_incident_in_transaction(
+                    replace(
+                        incident,
+                        status=TriageIncidentStatus.RESOLVED,
+                        repair_state="coalesced",
+                        resolution="legacy duplicate incident generation coalesced",
+                    )
                 )
-            )
 
     def _migrate_collection_schema(self) -> None:
-        """Install the v12 normalized scheduler schema as one rollback unit."""
+        """Install the normalized scheduler schema and v13 query indexes."""
 
-        savepoint = "collection_schema_v12"
+        savepoint = "collection_schema_v13"
         self._connection.execute(f"SAVEPOINT {savepoint}")
         try:
             schema_sql = f"""
@@ -1658,8 +1692,28 @@ class SQLiteStore:
             for statement in schema_sql.split(";"):
                 if statement.strip():
                     self._connection.execute(statement)
-            self._repair_collection_index_rows_in_transaction()
+
+            pending_index = "idx_collection_request_pending_job"
+            incident_index = "idx_triage_open_generation"
+            repair_pending_requests = not self._collection_index_is_canonical(
+                pending_index
+            )
+            repair_open_incidents = not self._collection_index_is_canonical(
+                incident_index
+            )
+            if repair_pending_requests:
+                self._connection.execute(f"DROP INDEX IF EXISTS {pending_index}")
+            if repair_open_incidents:
+                self._connection.execute(f"DROP INDEX IF EXISTS {incident_index}")
+            if repair_pending_requests or repair_open_incidents:
+                self._repair_collection_index_rows_in_transaction(
+                    repair_pending_requests=repair_pending_requests,
+                    repair_open_incidents=repair_open_incidents,
+                )
             for index_name, spec in _COLLECTION_INDEX_SPECS.items():
+                if self._collection_index_is_canonical(index_name):
+                    continue
+                self._connection.execute(f"DROP INDEX IF EXISTS {index_name}")
                 self._connection.execute(str(spec["sql"]))
         except Exception:
             self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -1917,7 +1971,7 @@ class SQLiteStore:
                 if current_version is None or int(current_version) < CURRENT_SCHEMA_VERSION:
                     self._record_schema_migration(
                         CURRENT_SCHEMA_VERSION,
-                        "persist normalized collection schedules, leases, and triage",
+                        "add bounded collection projection indexes",
                     )
             self._connection.execute(
                 """
@@ -2250,6 +2304,24 @@ class SQLiteStore:
                 ),
             )
         self._connection.execute("DROP TABLE agent_dispatches_legacy_v1")
+
+    @contextmanager
+    def read_snapshot(self) -> Iterable[None]:
+        """Keep related projection reads on one SQLite snapshot."""
+
+        outermost = not self._connection.in_transaction
+        require_collection_time(self._collection_deadline)
+        if outermost:
+            self._connection.execute("BEGIN")
+        try:
+            yield
+        except Exception:
+            if outermost:
+                self._connection.rollback()
+            raise
+        else:
+            if outermost:
+                self._connection.rollback()
 
     @contextmanager
     def agent_transaction(self) -> Iterable[None]:
@@ -4381,6 +4453,80 @@ class SQLiteStore:
             for payload in self._list_collection_payloads("collection_job_states")
         )
 
+    def collection_scheduler_metrics(self) -> dict[str, int | str | None]:
+        row = self._connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM collection_jobs) AS job_count,
+                (SELECT COUNT(*) FROM collection_jobs WHERE enabled=1) AS enabled_job_count,
+                (SELECT COUNT(*) FROM collection_job_states WHERE active_lease_id IS NOT NULL) AS active_count,
+                (SELECT COUNT(*) FROM collection_job_states WHERE active_lease_id IS NULL) AS queue_depth,
+                (SELECT MIN(next_due_at) FROM collection_job_states WHERE active_lease_id IS NULL) AS next_due_at,
+                (SELECT COUNT(*) FROM collection_job_states WHERE circuit_state='open') AS circuit_count,
+                (SELECT COUNT(*) FROM collection_runs) AS run_count,
+                (SELECT COUNT(*) FROM collection_requests) AS request_count,
+                (SELECT COUNT(*) FROM collection_requests WHERE status='pending') AS pending_request_count,
+                (SELECT COUNT(*) FROM triage_incidents WHERE status='open') AS open_incident_count,
+                (SELECT COUNT(*) FROM triage_incidents WHERE status='resolved') AS resolved_incident_count
+            """
+        ).fetchone()
+        integer_fields = (
+            "job_count",
+            "enabled_job_count",
+            "active_count",
+            "queue_depth",
+            "circuit_count",
+            "run_count",
+            "request_count",
+            "pending_request_count",
+            "open_incident_count",
+            "resolved_incident_count",
+        )
+        metrics: dict[str, int | str | None] = {
+            field: int(row[field]) for field in integer_fields
+        }
+        metrics["next_due_at"] = (
+            str(row["next_due_at"]) if row["next_due_at"] is not None else None
+        )
+        return metrics
+
+    def page_active_collection_job_ids(self, limit: int) -> tuple[int, tuple[str, ...]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("collection status limit must be between 1 and 1000")
+        with self.read_snapshot():
+            total = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) AS count FROM collection_job_states "
+                    "WHERE active_lease_id IS NOT NULL"
+                ).fetchone()["count"]
+            )
+            rows = self._connection.execute(
+                "SELECT job_id FROM collection_job_states "
+                "WHERE active_lease_id IS NOT NULL ORDER BY job_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return total, tuple(str(row["job_id"]) for row in rows)
+
+    def page_pending_collection_requests(
+        self, limit: int
+    ) -> tuple[int, tuple[CollectionRequest, ...]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("collection status limit must be between 1 and 1000")
+        with self.read_snapshot():
+            total = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) AS count FROM collection_requests WHERE status='pending'"
+                ).fetchone()["count"]
+            )
+            rows = self._connection.execute(
+                "SELECT payload FROM collection_requests WHERE status='pending' "
+                "ORDER BY requested_at, id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return total, tuple(
+            _load_dataclass(CollectionRequest, str(row["payload"])) for row in rows
+        )
+
     def claim_due_collection_jobs(
         self,
         now: str,
@@ -4781,6 +4927,40 @@ class SQLiteStore:
         return tuple(
             _load_dataclass(CollectionRun, payload)
             for payload in self._list_collection_payloads("collection_runs")
+        )
+
+    def page_collection_runs(
+        self,
+        *,
+        job_id: str | None = None,
+        outcome: str | None = None,
+        limit: int = 50,
+    ) -> tuple[int, tuple[CollectionRun, ...]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("collection run limit must be between 1 and 1000")
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if job_id is not None:
+            clauses.append("job_id = ?")
+            parameters.append(job_id)
+        if outcome is not None:
+            clauses.append("outcome = ?")
+            parameters.append(CollectionOutcome(outcome).value)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.read_snapshot():
+            total = int(
+                self._connection.execute(
+                    f"SELECT COUNT(*) AS count FROM collection_runs{where}",
+                    tuple(parameters),
+                ).fetchone()["count"]
+            )
+            rows = self._connection.execute(
+                f"SELECT payload FROM collection_runs{where} "
+                "ORDER BY started_at DESC, id DESC LIMIT ?",
+                (*parameters, limit),
+            ).fetchall()
+        return total, tuple(
+            _load_dataclass(CollectionRun, str(row["payload"])) for row in rows
         )
 
     def list_collection_requests(self) -> tuple[CollectionRequest, ...]:
@@ -5701,7 +5881,7 @@ class SQLiteStore:
         ).fetchone()
         if (
             row is None
-            or int(row["generation"]) != CURRENT_SCHEMA_VERSION
+            or int(row["generation"]) != AUDIT_EVENT_NORMALIZATION_GENERATION
             or str(row["state"]) != "complete"
         ):
             raise sqlite3.OperationalError(

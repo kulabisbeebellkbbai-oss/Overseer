@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import threading
 import time
@@ -5,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import overseer.store as store_module
 from overseer.collection_adapters import CollectionAdapterRegistry, CollectionExecution
 from overseer.collection_models import (
     CollectionJob,
@@ -18,7 +20,7 @@ from overseer.collection_models import (
 )
 from overseer.collection_scheduler import CollectionScheduler
 from overseer.core import OwnerDomain, RiskLevel
-from overseer.store import SQLiteStore
+from overseer.store import CURRENT_SCHEMA_VERSION, SQLiteStore
 from tests.test_ui_full_regression import SAFE_POST_PAYLOADS
 from tests.test_ui_regression import LocalApiHarness
 
@@ -88,6 +90,9 @@ SAFE_POST_BUDGETS = {
     "/Overseer/admin/approve": 1.0,
     "/Overseer/admin/policy-customization-helper/profile": 1.0,
 }
+
+PRODUCTION_COLLECTION_RUN_COUNT = 150_000
+PRODUCTION_COLLECTION_INDEX_UPGRADE_BUDGET_SECONDS = 10.0
 
 
 def _timed(call):
@@ -159,6 +164,45 @@ def _seed_collection_projections(path: Path, count: int = 24) -> None:
             )
 
 
+def _seed_production_collection_history(
+    path: Path, count: int = PRODUCTION_COLLECTION_RUN_COUNT
+) -> None:
+    _seed_collection_projections(path, count=1)
+    base_id = "run.performance.000"
+    with SQLiteStore(path) as store:
+        base = store._connection.execute(
+            "SELECT * FROM collection_runs WHERE id=?", (base_id,)
+        ).fetchone()
+        assert base is not None
+
+        def rows():
+            for index in range(1, count):
+                run_id = f"run.performance.scale.{index:06d}"
+                yield (
+                    run_id,
+                    base["job_id"],
+                    base["trigger"],
+                    base["started_at"],
+                    base["completed_at"],
+                    base["outcome"],
+                    base["summary"],
+                    base["evidence_ids"],
+                    base["error_category"],
+                    base["retry_disposition"],
+                    base["request_id"],
+                    str(base["payload"]).replace(base_id, run_id, 1),
+                )
+
+        store._connection.executemany(
+            "INSERT INTO collection_runs ("
+            "id, job_id, trigger, started_at, completed_at, outcome, summary, "
+            "evidence_ids, error_category, retry_disposition, request_id, payload"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows(),
+        )
+        store._connection.commit()
+
+
 class PerformanceRegressionTests(unittest.TestCase):
     def test_scheduler_dashboard_contract_stays_projection_only(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
@@ -192,6 +236,88 @@ class PerformanceRegressionTests(unittest.TestCase):
                         status, elapsed = _timed(lambda endpoint=endpoint: server.get_status(endpoint))
                         self.assertIn(status, GET_ENDPOINT_ALLOWED_STATUSES.get(endpoint, {200}))
                         self.assertLess(elapsed, budget)
+
+    def test_collection_history_projection_is_bounded_at_production_scale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            _seed_production_collection_history(store_path)
+            original_load = store_module._load_dataclass
+            loaded_runs: list[str] = []
+
+            def tracked_load(record_type, payload):
+                if record_type is CollectionRun:
+                    loaded_runs.append(record_type.__name__)
+                return original_load(record_type, payload)
+
+            with patch("overseer.store._load_dataclass", side_effect=tracked_load):
+                with LocalApiHarness(store_path) as server:
+                    status, status_elapsed = _timed(
+                        lambda: server.get_json("/Overseer/collections/status")
+                    )
+                    runs, runs_elapsed = _timed(
+                        lambda: server.get_json("/Overseer/collections/runs?limit=12")
+                    )
+
+        self.assertEqual(status["run_count"], PRODUCTION_COLLECTION_RUN_COUNT)
+        self.assertEqual(runs["total_count"], PRODUCTION_COLLECTION_RUN_COUNT)
+        self.assertEqual(runs["returned_count"], 12)
+        self.assertTrue(runs["truncated"])
+        self.assertEqual(len(loaded_runs), 12)
+        self.assertLess(status_elapsed, GET_ENDPOINT_BUDGETS["/Overseer/collections/status"])
+        self.assertLess(runs_elapsed, GET_ENDPOINT_BUDGETS["/Overseer/collections/runs?limit=12"])
+
+    def test_v12_run_index_upgrade_is_bounded_at_production_scale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            _seed_production_collection_history(store_path)
+            with sqlite3.connect(store_path) as connection:
+                for index_name in (
+                    "idx_collection_runs_job_started",
+                    "idx_collection_runs_started",
+                    "idx_collection_runs_outcome_started",
+                    "idx_collection_runs_job_outcome_started",
+                ):
+                    connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+                connection.execute(
+                    "CREATE INDEX idx_collection_runs_job_started "
+                    "ON collection_runs (job_id, started_at DESC)"
+                )
+                connection.execute(
+                    "DELETE FROM schema_migrations WHERE version > 12"
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_migrations"
+                    "(version, description, applied_at) VALUES "
+                    "(12, 'legacy collection index contract', '2026-08-24T12:00:00+00:00')"
+                )
+                connection.commit()
+
+            upgrade_started = time.perf_counter()
+            with SQLiteStore(store_path) as store:
+                metrics = store.collection_scheduler_metrics()
+                versions = [
+                    item.version
+                    for item in store.list_schema_migrations()
+                    if isinstance(item.version, int)
+                ]
+                indexes_are_current = all(
+                    store._collection_index_is_canonical(index_name)
+                    for index_name in (
+                        "idx_collection_runs_job_started",
+                        "idx_collection_runs_started",
+                        "idx_collection_runs_outcome_started",
+                        "idx_collection_runs_job_outcome_started",
+                    )
+                )
+            upgrade_elapsed = time.perf_counter() - upgrade_started
+
+        self.assertEqual(metrics["run_count"], PRODUCTION_COLLECTION_RUN_COUNT)
+        self.assertEqual(versions[-1], CURRENT_SCHEMA_VERSION)
+        self.assertTrue(indexes_are_current)
+        self.assertLess(
+            upgrade_elapsed,
+            PRODUCTION_COLLECTION_INDEX_UPGRADE_BUDGET_SECONDS,
+        )
 
     def test_authenticated_panel_gets_never_launch_host_collectors(self):
         with tempfile.TemporaryDirectory() as directory:

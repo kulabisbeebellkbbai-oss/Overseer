@@ -106,7 +106,7 @@ def seeded_collection_store(tmp_path: Path) -> SQLiteStore:
     return store
 
 
-def test_schema_v12_is_normalized_and_repairs_claimed_current_missing_tables(tmp_path: Path) -> None:
+def test_schema_v13_is_normalized_and_repairs_claimed_current_missing_tables(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     with SQLiteStore(path) as store:
         store._connection.execute(
@@ -154,7 +154,7 @@ def test_schema_v12_is_normalized_and_repairs_claimed_current_missing_tables(tmp
         ).fetchone()[0] == '{"preserved":true}'
         assert max(
             row.version for row in store.list_schema_migrations() if isinstance(row.version, int)
-        ) == CURRENT_SCHEMA_VERSION == 12
+        ) == CURRENT_SCHEMA_VERSION == 13
 
 
 def test_current_marked_store_recreates_missing_admin_execution_claim_table(
@@ -400,6 +400,21 @@ def test_complete_collection_run_nested_failure_rolls_back_when_outer_catches(
             "CREATE INDEX idx_collection_runs_job_started ON collection_runs (job_id, started_at)",
         ),
         (
+            "idx_collection_runs_started",
+            "collection_runs",
+            "CREATE INDEX idx_collection_runs_started ON collection_runs (started_at)",
+        ),
+        (
+            "idx_collection_runs_outcome_started",
+            "collection_runs",
+            "CREATE INDEX idx_collection_runs_outcome_started ON collection_runs (outcome, started_at)",
+        ),
+        (
+            "idx_collection_runs_job_outcome_started",
+            "collection_runs",
+            "CREATE INDEX idx_collection_runs_job_outcome_started ON collection_runs (job_id, outcome)",
+        ),
+        (
             "idx_collection_request_pending_job",
             "collection_requests",
             "CREATE INDEX idx_collection_request_pending_job ON collection_requests (job_id)",
@@ -426,6 +441,51 @@ def test_reopen_repairs_same_named_scheduler_index_to_canonical_semantics(
         assert store._connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchone() is not None
+
+
+def test_v12_run_index_upgrade_does_not_repair_unrelated_unique_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with seeded_collection_store(tmp_path):
+        pass
+    with sqlite3.connect(path) as connection:
+        for index_name in (
+            "idx_collection_runs_job_started",
+            "idx_collection_runs_started",
+            "idx_collection_runs_outcome_started",
+            "idx_collection_runs_job_outcome_started",
+        ):
+            connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+        connection.execute(
+            "CREATE INDEX idx_collection_runs_job_started "
+            "ON collection_runs (job_id, started_at DESC)"
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version > 12"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, description, applied_at) "
+            "VALUES (12, 'legacy collection index contract', ?)",
+            (NOW,),
+        )
+        connection.commit()
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "_repair_collection_index_rows_in_transaction",
+        lambda *_args, **_kwargs: pytest.fail(
+            "v12 run-index upgrade invoked unrelated uniqueness repair"
+        ),
+    )
+
+    with SQLiteStore(path) as store:
+        assert store._schema_is_current()
+        assert max(
+            row.version
+            for row in store.list_schema_migrations()
+            if isinstance(row.version, int)
+        ) == CURRENT_SCHEMA_VERSION
 
 
 def test_repaired_pending_index_remains_race_safe_for_request_coalescing(
@@ -465,7 +525,7 @@ def test_repaired_incident_index_rejects_generation_collision_without_raw_sqlite
             store.save_collection_incident(sample_incident(id="incident.second"))
 
 
-def test_v11_fixture_migrates_to_v12_preserving_package_data_and_history(tmp_path: Path) -> None:
+def test_v11_fixture_migrates_to_v13_preserving_package_data_and_history(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     package_payload = '{"package":"preserved-v11"}'
     with SQLiteStore(path) as store:
@@ -494,7 +554,7 @@ def test_v11_fixture_migrates_to_v12_preserving_package_data_and_history(tmp_pat
         integer_versions = [
             row.version for row in store.list_schema_migrations() if isinstance(row.version, int)
         ]
-        assert integer_versions == [3, 11, 12]
+        assert integer_versions == [3, 11, 13]
         assert store._connection.execute(
             "SELECT payload FROM package_inspection_records WHERE id=?", ("package.v11",)
         ).fetchone()[0] == package_payload
@@ -806,6 +866,28 @@ def test_complete_collection_run_preserves_outer_transaction_rollback(tmp_path: 
         assert store.load_collection_job_state(claimed.id).active_lease_id == state.active_lease_id
 
 
+def test_collection_run_page_count_and_rows_share_one_read_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with seeded_collection_store(tmp_path) as store:
+        store.save_collection_run(sample_run("run.first"))
+
+    with SQLiteStore(path) as reader, SQLiteStore(path) as writer:
+        inserted = False
+
+        def insert_between_count_and_page(statement: str) -> None:
+            nonlocal inserted
+            if inserted or not statement.startswith("SELECT payload FROM collection_runs"):
+                return
+            inserted = True
+            writer.save_collection_run(sample_run("run.second"))
+
+        reader._connection.set_trace_callback(insert_between_count_and_page)
+        total, runs = reader.page_collection_runs(limit=10)
+
+    assert inserted is True
+    assert total == len(runs) == 1
+
+
 def test_retention_rejects_zero_and_preserves_protected_runs(tmp_path: Path) -> None:
     with seeded_collection_store(tmp_path) as store:
         with pytest.raises(ValueError, match="retention"):
@@ -871,11 +953,11 @@ def test_collection_migration_rolls_back_tables_when_history_record_fails(tmp_pa
 
     class FailingMigrationStore(SQLiteStore):
         def _record_schema_migration(self, version: int, description: str) -> None:
-            if version == 12:
-                raise RuntimeError("injected v12 migration failure")
+            if version == 13:
+                raise RuntimeError("injected v13 migration failure")
             super()._record_schema_migration(version, description)
 
-    with pytest.raises(RuntimeError, match="v12 migration"):
+    with pytest.raises(RuntimeError, match="v13 migration"):
         FailingMigrationStore(path)
     with sqlite3.connect(path) as connection:
         assert connection.execute(

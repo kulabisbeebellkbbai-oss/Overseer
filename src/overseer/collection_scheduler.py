@@ -9,7 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from .collection_adapters import (
     CollectionAdapterRegistry,
@@ -437,14 +437,10 @@ class CollectionScheduler:
         self.shutdown()
 
 
-def scheduler_status(store_path: str | Path) -> dict[str, object]:
-    with SQLiteStore(store_path) as store:
-        jobs = store.list_collection_jobs()
-        states = store.list_collection_job_states()
-        runs = store.list_collection_runs()
-        incidents = store.list_triage_incidents()
-    open_incidents = sum(1 for incident in incidents if incident.status.value == "open")
-    circuit_count = sum(1 for state in states if state.circuit_state is CircuitState.OPEN)
+def scheduler_status_from_metrics(
+    metrics: Mapping[str, int | str | None],
+) -> dict[str, object]:
+    open_incidents = int(metrics["open_incident_count"])
     return {
         "max_workers": DEFAULT_MAX_WORKERS,
         "max_per_concurrency_key": MAX_PER_CONCURRENCY_KEY,
@@ -452,12 +448,18 @@ def scheduler_status(store_path: str | Path) -> dict[str, object]:
             "global_max": DEFAULT_MAX_WORKERS,
             "per_concurrency_key_max": MAX_PER_CONCURRENCY_KEY,
         },
-        "job_count": len(jobs),
-        "active_count": sum(1 for state in states if state.active_lease_id is not None),
-        "queue_depth": sum(1 for state in states if state.active_lease_id is None),
-        "run_count": len(runs),
+        "job_count": metrics["job_count"],
+        "active_count": metrics["active_count"],
+        "queue_depth": metrics["queue_depth"],
+        "run_count": metrics["run_count"],
         "open_incident_count": open_incidents,
         "incident_count": open_incidents,
-        "circuit_count": circuit_count,
-        "next_due_at": min((state.next_due_at for state in states if state.active_lease_id is None), default=None),
+        "circuit_count": metrics["circuit_count"],
+        "next_due_at": metrics["next_due_at"],
     }
+
+
+def scheduler_status(store_path: str | Path) -> dict[str, object]:
+    with SQLiteStore(store_path) as store:
+        metrics = store.collection_scheduler_metrics()
+    return scheduler_status_from_metrics(metrics)

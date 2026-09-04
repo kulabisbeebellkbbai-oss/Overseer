@@ -299,4 +299,4 @@ def test_package_evidence_migration_advances_from_schema_v10(tmp_path: Path) -> 
             if isinstance(row.version, int)
         ]
         assert integer_versions[-2:] == [10, CURRENT_SCHEMA_VERSION]
-        assert CURRENT_SCHEMA_VERSION == 12
+        assert CURRENT_SCHEMA_VERSION == 13

@@ -6236,15 +6236,41 @@ def test_retirement_replays_only_after_re_fsyncing_a_published_archive(
     assert interrupted is True
     assert final_archive.is_dir()
 
+    recovery_fsync_attempts = 0
+
+    def fail_recovery_fsync(path: Path) -> None:
+        nonlocal recovery_fsync_attempts
+        if path == archive_parent:
+            recovery_fsync_attempts += 1
+            raise OSError("injected recovery archive fsync failure")
+        fsync_directory(path)
+
     monkeypatch.setattr(
         activation_package_module,
         "_fsync_package_directory",
-        fsync_directory,
+        fail_recovery_fsync,
+    )
+    with pytest.raises(OSError, match="recovery archive fsync failure"):
+        _retire_test_package(environment)
+    assert recovery_fsync_attempts == 1
+
+    replay_fsyncs: list[Path] = []
+
+    def record_recovery_fsync(path: Path) -> None:
+        if path == archive_parent:
+            replay_fsyncs.append(path)
+        fsync_directory(path)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_fsync_package_directory",
+        record_recovery_fsync,
     )
     replayed = _retire_test_package(environment)
 
     assert replayed["status"] == "retired"
     assert replayed["replayed"] is True
+    assert replay_fsyncs == [archive_parent]
 
 
 def test_retirement_recovers_an_intent_record_staged_before_publication(

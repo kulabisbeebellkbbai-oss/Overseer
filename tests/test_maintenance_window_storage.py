@@ -1068,6 +1068,154 @@ def test_restore_maintenance_store_access_holds_destination_lock_through_sources
         os.fstat(descriptor)
 
 
+def test_rollback_destination_lock_validates_the_exact_safe_owner_pairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination_parent = tmp_path / "destination"
+    destination_parent.mkdir(mode=0o700)
+    destination = destination_parent / "overseer.sqlite3"
+    destination.write_bytes(b"failed successor store")
+    destination.chmod(0o600)
+    service_owner = (os.geteuid(), os.getegid())
+    root_owner = (service_owner[0] + 10000, service_owner[1] + 10000)
+    bindings: list[object] = [
+        {
+            "destinationDb": str(destination),
+            "backupDb": str(tmp_path / "backup" / "overseer.sqlite3"),
+        }
+    ]
+    observed_owner_sets: list[frozenset[tuple[int, int]] | None] = []
+
+    def validate(
+        path: Path,
+        *,
+        label: str,
+        expected_uid: int | None = None,
+        allowed_owners: frozenset[tuple[int, int]] | None = None,
+        allowed_modes: frozenset[int] = frozenset({0o600}),
+    ) -> os.stat_result:
+        del label, expected_uid, allowed_modes
+        observed_owner_sets.append(allowed_owners)
+        assert allowed_owners == frozenset({root_owner, service_owner})
+        return path.lstat()
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_UID",
+        service_owner[0],
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_GID",
+        service_owner[1],
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: root_owner,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_relock_migration_destination_directory",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_store_artifact",
+        validate,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_processes_for_uid",
+        lambda _uid: (),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_legacy_inode_activity",
+        lambda *_args, **_kwargs: (),
+    )
+
+    descriptor, markers = (
+        activation_package_module._lock_maintenance_destination_namespace_for_rollback(
+            bindings
+        )
+    )
+    os.close(descriptor)
+
+    assert markers == []
+    assert observed_owner_sets == [frozenset({root_owner, service_owner})]
+
+
+def test_store_artifact_allowed_owners_rejects_an_unlisted_owner(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "store.sqlite3"
+    artifact.write_bytes(b"store")
+    artifact.chmod(0o600)
+
+    with pytest.raises(ActivationPackageError, match="unexpected owner"):
+        activation_package_module._validate_store_artifact(
+            artifact,
+            label="rollback destination",
+            allowed_owners=frozenset({(os.geteuid() + 10000, os.getegid())}),
+        )
+
+
+def test_store_artifact_allowed_owners_accepts_only_an_exact_pair(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "store.sqlite3"
+    artifact.write_bytes(b"store")
+    artifact.chmod(0o600)
+    actual_owner = (os.geteuid(), os.getegid())
+
+    metadata = activation_package_module._validate_store_artifact(
+        artifact,
+        label="rollback destination",
+        allowed_owners=frozenset({actual_owner, (actual_owner[0] + 10000, 10000)}),
+    )
+    assert (metadata.st_uid, metadata.st_gid) == actual_owner
+
+    with pytest.raises(ActivationPackageError, match="unexpected owner"):
+        activation_package_module._validate_store_artifact(
+            artifact,
+            label="rollback destination",
+            allowed_owners=frozenset(
+                {
+                    (actual_owner[0], actual_owner[1] + 10000),
+                    (actual_owner[0] + 10000, actual_owner[1]),
+                }
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_uid", "allowed_owners", "message"),
+    [
+        (None, frozenset(), "owner policy is empty"),
+        (0, frozenset({(0, 0)}), "owner policy is ambiguous"),
+    ],
+)
+def test_store_artifact_rejects_an_invalid_owner_policy(
+    tmp_path: Path,
+    expected_uid: int | None,
+    allowed_owners: frozenset[tuple[int, int]],
+    message: str,
+) -> None:
+    artifact = tmp_path / "store.sqlite3"
+    artifact.write_bytes(b"store")
+    artifact.chmod(0o600)
+
+    with pytest.raises(ActivationPackageError, match=message):
+        activation_package_module._validate_store_artifact(
+            artifact,
+            label="rollback destination",
+            expected_uid=expected_uid,
+            allowed_owners=allowed_owners,
+        )
+
+
 def test_root_rollback_destination_lock_blocks_service_principal_processes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

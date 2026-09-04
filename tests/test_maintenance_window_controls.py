@@ -901,6 +901,51 @@ def test_real_bounded_acceptance_dispatch_reads_only_allowlisted_projections(
     ]
 
 
+def test_maintenance_api_read_uses_a_bounded_dashboard_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import overseer.client as client_module
+
+    clients: list[tuple[str | None, float]] = []
+    reads: list[tuple[str, bool]] = []
+
+    class FakeClient:
+        def __init__(
+            self,
+            *,
+            auth_token_file: str | None,
+            timeout_seconds: float,
+        ) -> None:
+            clients.append((auth_token_file, timeout_seconds))
+
+        def _get(
+            self,
+            path: str,
+            *,
+            authenticated: bool = True,
+        ) -> dict[str, object]:
+            reads.append((path, authenticated))
+            return {"ok": True}
+
+    monkeypatch.setattr(client_module, "OverseerApiClient", FakeClient)
+
+    assert activation_package._maintenance_api_read(
+        "/health", authenticated=False
+    ) == {"ok": True}
+    assert activation_package._maintenance_api_read("/operator-dashboard") == {
+        "ok": True
+    }
+
+    assert clients == [
+        (None, 5.0),
+        ("/etc/overseer/api-token", 60.0),
+    ]
+    assert reads == [
+        ("/health", False),
+        ("/operator-dashboard", True),
+    ]
+
+
 def test_successor_user_unit_inventory_checks_the_complete_writer_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

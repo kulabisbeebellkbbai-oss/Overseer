@@ -1646,8 +1646,13 @@ def _validate_store_artifact(
     *,
     label: str,
     expected_uid: int | None = None,
+    allowed_owners: frozenset[tuple[int, int]] | None = None,
     allowed_modes: frozenset[int] = frozenset({0o600}),
 ) -> os.stat_result:
+    if expected_uid is not None and allowed_owners is not None:
+        raise ActivationPackageError(f"{label} owner policy is ambiguous")
+    if allowed_owners is not None and not allowed_owners:
+        raise ActivationPackageError(f"{label} owner policy is empty")
     try:
         metadata = path.lstat()
     except OSError as error:
@@ -1657,7 +1662,11 @@ def _validate_store_artifact(
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise ActivationPackageError(f"{label} must be a single-link regular file")
     selected_uid = os.geteuid() if expected_uid is None else expected_uid
-    if metadata.st_uid != selected_uid:
+    if allowed_owners is not None:
+        owner_is_allowed = (metadata.st_uid, metadata.st_gid) in allowed_owners
+    else:
+        owner_is_allowed = metadata.st_uid == selected_uid
+    if not owner_is_allowed:
         raise ActivationPackageError(f"{label} has an unexpected owner")
     mode = stat.S_IMODE(metadata.st_mode)
     if mode not in allowed_modes:
@@ -3773,14 +3782,13 @@ def _lock_maintenance_destination_namespace_for_rollback(
                 metadata = _validate_store_artifact(
                     path,
                     label="maintenance rollback destination SQLite artifact",
+                    allowed_owners=frozenset(
+                        {
+                            (root_uid, root_gid),
+                            (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID),
+                        }
+                    ),
                 )
-                if (metadata.st_uid, metadata.st_gid) not in {
-                    (root_uid, root_gid),
-                    (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID),
-                }:
-                    raise ActivationPackageError(
-                        "maintenance rollback destination SQLite owner is unsafe"
-                    )
                 artifact_identities.append((metadata.st_dev, metadata.st_ino))
         if artifact_identities and _legacy_inode_activity(
             tuple(artifact_identities),
@@ -13094,9 +13102,10 @@ def _maintenance_api_read(
     ):
         raise ActivationPackageError("maintenance acceptance API path is invalid")
     try:
+        timeout_seconds = 60.0 if path == "/operator-dashboard" else 5.0
         client = OverseerApiClient(
             auth_token_file=("/etc/overseer/api-token" if authenticated else None),
-            timeout_seconds=5.0,
+            timeout_seconds=timeout_seconds,
         )
         payload = client._get(path, authenticated=authenticated)
     except Exception as error:

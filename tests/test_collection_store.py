@@ -488,6 +488,31 @@ def test_v12_run_index_upgrade_does_not_repair_unrelated_unique_rows(
         ) == CURRENT_SCHEMA_VERSION
 
 
+def test_reopen_repairs_same_named_collection_index_with_wrong_collation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with seeded_collection_store(tmp_path) as store:
+        store._connection.execute("DROP INDEX idx_collection_runs_started")
+        store._connection.execute(
+            "CREATE INDEX idx_collection_runs_started ON collection_runs "
+            "(started_at COLLATE NOCASE DESC, id DESC)"
+        )
+        store._connection.commit()
+
+    with SQLiteStore(path) as store:
+        keyed_columns = store._connection.execute(
+            "SELECT name, coll FROM pragma_index_xinfo(?) "
+            "WHERE key=1 ORDER BY seqno",
+            ("idx_collection_runs_started",),
+        ).fetchall()
+
+    assert [(str(row["name"]), str(row["coll"])) for row in keyed_columns] == [
+        ("started_at", "BINARY"),
+        ("id", "BINARY"),
+    ]
+
+
 def test_repaired_pending_index_remains_race_safe_for_request_coalescing(
     tmp_path: Path,
 ) -> None:

@@ -1285,12 +1285,16 @@ class SQLiteStore:
         ):
             return False
         sort_columns = self._connection.execute(
-            "SELECT name, desc, key FROM pragma_index_xinfo(?) "
+            "SELECT name, desc, coll, key FROM pragma_index_xinfo(?) "
             "WHERE key=1 ORDER BY seqno",
             (index_name,),
         ).fetchall()
-        if tuple((str(item[0]), int(item[1])) for item in sort_columns) != tuple(
-            (name, descending) for name, descending in spec["columns"]
+        if tuple(
+            (str(item[0]), int(item[1]), str(item[2]).upper())
+            for item in sort_columns
+        ) != tuple(
+            (name, descending, "BINARY")
+            for name, descending in spec["columns"]
         ):
             return False
         if int(spec["partial"]):

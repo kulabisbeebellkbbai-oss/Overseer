@@ -9630,6 +9630,23 @@ def _maintenance_successor_unit_baseline_fixture() -> list[dict[str, str]]:
     ]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_package_contracts_from_live_unit_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep package tests independent from timer-driven host unit activity."""
+    monkeypatch.setattr(
+        activation_package_module,
+        "_capture_maintenance_writer_unit_baseline",
+        _maintenance_writer_unit_baseline_fixture,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_capture_maintenance_successor_unit_baseline",
+        _maintenance_successor_unit_baseline_fixture,
+    )
+
+
 def _maintenance_activation_contract_fixture(package: Path) -> dict[str, object]:
     maintenance = _maintenance_contract_fixture(package)
     profiles = _maintenance_command_profiles(package)

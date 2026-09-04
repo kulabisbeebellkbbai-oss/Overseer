@@ -6214,21 +6214,21 @@ def test_retirement_replays_only_after_re_fsyncing_a_published_archive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     environment = _retirement_test_environment(tmp_path, monkeypatch)
-    fsync_directory = activation_package_module._fsync_package_directory
+    fsync_directory = activation_package_module._retirement_fsync_private_directory
     archive_parent = Path(str(environment["archiveRoot"]))
     final_archive = archive_parent / str(environment["predecessorDigest"])
     interrupted = False
 
-    def fail_after_final_publish(path: Path) -> None:
+    def fail_after_final_publish(path: Path, *, label: str) -> None:
         nonlocal interrupted
         if path == archive_parent and final_archive.exists() and not interrupted:
             interrupted = True
             raise OSError("injected final archive fsync interruption")
-        fsync_directory(path)
+        fsync_directory(path, label=label)
 
     monkeypatch.setattr(
         activation_package_module,
-        "_fsync_package_directory",
+        "_retirement_fsync_private_directory",
         fail_after_final_publish,
     )
     with pytest.raises(OSError, match="final archive fsync interruption"):
@@ -6238,16 +6238,16 @@ def test_retirement_replays_only_after_re_fsyncing_a_published_archive(
 
     recovery_fsync_attempts = 0
 
-    def fail_recovery_fsync(path: Path) -> None:
+    def fail_recovery_fsync(path: Path, *, label: str) -> None:
         nonlocal recovery_fsync_attempts
         if path == archive_parent:
             recovery_fsync_attempts += 1
             raise OSError("injected recovery archive fsync failure")
-        fsync_directory(path)
+        fsync_directory(path, label=label)
 
     monkeypatch.setattr(
         activation_package_module,
-        "_fsync_package_directory",
+        "_retirement_fsync_private_directory",
         fail_recovery_fsync,
     )
     with pytest.raises(OSError, match="recovery archive fsync failure"):
@@ -6256,14 +6256,14 @@ def test_retirement_replays_only_after_re_fsyncing_a_published_archive(
 
     replay_fsyncs: list[Path] = []
 
-    def record_recovery_fsync(path: Path) -> None:
+    def record_recovery_fsync(path: Path, *, label: str) -> None:
         if path == archive_parent:
             replay_fsyncs.append(path)
-        fsync_directory(path)
+        fsync_directory(path, label=label)
 
     monkeypatch.setattr(
         activation_package_module,
-        "_fsync_package_directory",
+        "_retirement_fsync_private_directory",
         record_recovery_fsync,
     )
     replayed = _retire_test_package(environment)
@@ -6278,7 +6278,7 @@ def test_retirement_recovers_an_intent_record_staged_before_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     environment = _retirement_test_environment(tmp_path, monkeypatch)
-    rename = activation_package_module._rename_package_no_replace
+    rename = activation_package_module._retirement_rename_entry_no_replace
     interrupted = False
 
     def interrupt_once(source: Path, destination: Path) -> None:
@@ -6290,7 +6290,7 @@ def test_retirement_recovers_an_intent_record_staged_before_publication(
 
     monkeypatch.setattr(
         activation_package_module,
-        "_rename_package_no_replace",
+        "_retirement_rename_entry_no_replace",
         interrupt_once,
     )
     with pytest.raises(OSError, match="intent publication interruption"):
@@ -6303,13 +6303,130 @@ def test_retirement_recovers_an_intent_record_staged_before_publication(
 
     monkeypatch.setattr(
         activation_package_module,
-        "_rename_package_no_replace",
+        "_retirement_rename_entry_no_replace",
         rename,
     )
     retired = _retire_test_package(environment)
 
     assert retired["status"] == "retired"
     assert retired["replayed"] is False
+
+
+def test_retirement_re_fsyncs_an_existing_receipt_before_archive_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    rename = activation_package_module._retirement_rename_entry_no_replace
+    interrupted = False
+
+    def interrupt_after_receipt(source: Path, destination: Path) -> None:
+        nonlocal interrupted
+        rename(source, destination)
+        if destination.name == "retirement-receipt.json" and not interrupted:
+            interrupted = True
+            raise OSError("injected post-receipt-rename interruption")
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retirement_rename_entry_no_replace",
+        interrupt_after_receipt,
+    )
+    with pytest.raises(OSError, match="post-receipt-rename interruption"):
+        _retire_test_package(environment)
+    assert interrupted is True
+    pending = Path(str(environment["archiveRoot"])) / (
+        ".pending-" + str(environment["predecessorDigest"])
+    )
+    assert (pending / "retirement-receipt.json").is_file()
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retirement_rename_entry_no_replace",
+        rename,
+    )
+    publish_record = activation_package_module._retirement_publish_record
+    fsync_directory = activation_package_module._retirement_fsync_private_directory
+    active_record: str | None = None
+    receipt_fsyncs: list[Path] = []
+
+    def observe_publish(
+        directory: Path,
+        *,
+        name: str,
+        document: object,
+    ) -> None:
+        nonlocal active_record
+        active_record = name
+        try:
+            publish_record(directory, name=name, document=document)
+        finally:
+            active_record = None
+
+    def observe_fsync(path: Path, *, label: str) -> None:
+        if active_record == "retirement-receipt.json":
+            receipt_fsyncs.append(path)
+        fsync_directory(path, label=label)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retirement_publish_record",
+        observe_publish,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retirement_fsync_private_directory",
+        observe_fsync,
+    )
+    retired = _retire_test_package(environment)
+
+    assert retired["status"] == "retired"
+    assert receipt_fsyncs == [pending]
+
+
+def test_retirement_rejects_successor_replacement_before_final_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    publish_record = activation_package_module._retirement_publish_record
+    successor = Path(str(environment["successorPackage"]))
+    original_successor = successor.with_name("original-successor")
+    replaced = False
+
+    def replace_after_receipt(
+        directory: Path,
+        *,
+        name: str,
+        document: object,
+    ) -> None:
+        nonlocal replaced
+        publish_record(directory, name=name, document=document)
+        if name == "retirement-receipt.json" and not replaced:
+            successor.rename(original_successor)
+            successor.mkdir(mode=0o700)
+            payload = successor / "payload"
+            payload.write_text("successor\n", encoding="utf-8")
+            payload.chmod(0o644)
+            replaced = True
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retirement_publish_record",
+        replace_after_receipt,
+    )
+
+    with pytest.raises(
+        ActivationPackageError,
+        match="successor package identity or content drifted",
+    ):
+        _retire_test_package(environment)
+
+    assert replaced is True
+    final_archive = Path(str(environment["archiveRoot"])) / str(
+        environment["predecessorDigest"]
+    )
+    assert not final_archive.exists()
 
 
 def test_retirement_rejects_symlinked_archive_namespace(

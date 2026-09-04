@@ -13848,6 +13848,7 @@ def _retirement_observe_artifact(
     name: str,
     kind: str,
     package_digest: str | None = None,
+    owner_identity: tuple[int, int] | None = None,
 ) -> dict[str, object]:
     """Return a stable, root-owned identity and content inventory."""
 
@@ -13859,7 +13860,11 @@ def _retirement_observe_artifact(
         raise ActivationPackageError(
             f"retirement artifact is unavailable: {name}"
         ) from error
-    root_uid, root_gid = _activation_root_identity()
+    expected_uid, expected_gid = (
+        _activation_root_identity()
+        if owner_identity is None
+        else owner_identity
+    )
     base = {
         "name": name,
         "kind": kind,
@@ -13870,7 +13875,11 @@ def _retirement_observe_artifact(
         "gid": metadata.st_gid,
         "links": metadata.st_nlink,
     }
-    if path.is_symlink() or metadata.st_uid != root_uid or metadata.st_gid != root_gid:
+    if (
+        path.is_symlink()
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+    ):
         raise ActivationPackageError(f"retirement artifact is unsafe: {name}")
     if kind == "file":
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
@@ -13901,8 +13910,8 @@ def _retirement_observe_artifact(
         if (
             current.is_symlink()
             or not stat.S_ISDIR(current_metadata.st_mode)
-            or current_metadata.st_uid != root_uid
-            or current_metadata.st_gid != root_gid
+            or current_metadata.st_uid != expected_uid
+            or current_metadata.st_gid != expected_gid
             or stat.S_IMODE(current_metadata.st_mode) & 0o022
         ):
             raise ActivationPackageError(
@@ -13942,8 +13951,8 @@ def _retirement_observe_artifact(
             if (
                 _retirement_inode_identity(child_before)
                 != _retirement_inode_identity(child_after)
-                or child_details["uid"] != root_uid
-                or child_details["gid"] != root_gid
+                or child_details["uid"] != expected_uid
+                or child_details["gid"] != expected_gid
                 or child_details["links"] != 1
                 or int(str(child_details["mode"]), 8) & 0o022
             ):
@@ -14031,6 +14040,43 @@ def _retirement_record_artifact(
     return result
 
 
+def _retirement_successor_package_evidence(
+    package: Path,
+    *,
+    package_digest: str,
+) -> dict[str, object]:
+    validated = _validate_existing_package_destination(package)
+    if validated != package:
+        raise ActivationPackageError("successor package path changed")
+    try:
+        metadata = package.lstat()
+    except OSError as error:
+        raise ActivationPackageError("successor package is unavailable") from error
+    return _retirement_observe_artifact(
+        package,
+        name=package.name,
+        kind="package",
+        package_digest=package_digest,
+        owner_identity=(metadata.st_uid, metadata.st_gid),
+    )
+
+
+def _retirement_verify_successor_package(
+    package: Path,
+    *,
+    package_digest: str,
+    expected: object,
+) -> None:
+    if not isinstance(expected, Mapping):
+        raise ActivationPackageError("successor package evidence is invalid")
+    observed = _retirement_successor_package_evidence(
+        package,
+        package_digest=package_digest,
+    )
+    if observed != dict(expected):
+        raise ActivationPackageError("successor package identity or content drifted")
+
+
 def _retirement_verify_artifact(
     path: Path,
     expected: Mapping[str, object],
@@ -14051,6 +14097,132 @@ def _retirement_verify_artifact(
     recorded = {key: value for key, value in expected.items() if key != "sourcePath"}
     if observed != recorded:
         raise ActivationPackageError(f"retirement artifact drifted: {name}")
+
+
+def _retirement_fsync_private_directory(path: Path, *, label: str) -> None:
+    before = _retirement_validate_private_directory(path, label=label)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        if _retirement_directory_identity(os.fstat(descriptor)) != (
+            _retirement_directory_identity(before)
+        ):
+            raise ActivationPackageError(f"{label} changed before fsync")
+        os.fsync(descriptor)
+        lexical = path.lstat()
+        if _retirement_directory_identity(os.fstat(descriptor)) != (
+            _retirement_directory_identity(lexical)
+        ):
+            raise ActivationPackageError(f"{label} changed during fsync")
+    finally:
+        os.close(descriptor)
+
+
+def _retirement_rename_entry_no_replace(source: Path, destination: Path) -> None:
+    """Rename one entry inside a validated private directory and fsync it."""
+
+    if (
+        source.parent != destination.parent
+        or _safe_relative(source.name) != source.name
+        or _safe_relative(destination.name) != destination.name
+        or "/" in source.name
+        or "/" in destination.name
+    ):
+        raise ActivationPackageError("retirement publication path is unsafe")
+    parent = source.parent
+    before = _retirement_validate_private_directory(
+        parent,
+        label="retirement publication directory",
+    )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(parent, flags)
+    try:
+        if _retirement_directory_identity(os.fstat(descriptor)) != (
+            _retirement_directory_identity(before)
+        ):
+            raise ActivationPackageError(
+                "retirement publication directory changed before rename"
+            )
+        try:
+            source_metadata = os.stat(
+                source.name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise ActivationPackageError(
+                "retirement publication source is unavailable"
+            ) from error
+        if stat.S_ISLNK(source_metadata.st_mode):
+            raise ActivationPackageError(
+                "retirement publication source is an unsafe symlink"
+            )
+        try:
+            os.stat(
+                destination.name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise ActivationPackageError(
+                "retirement publication destination could not be inspected"
+            ) from error
+        else:
+            raise ActivationPackageError(
+                "retirement publication destination already exists"
+            )
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError as error:
+            raise ActivationPackageError(
+                "atomic no-replace retirement publication is unavailable"
+            ) from error
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            descriptor,
+            os.fsencode(source.name),
+            descriptor,
+            os.fsencode(destination.name),
+            1,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                raise FileExistsError(
+                    error_number,
+                    "retirement publication destination already exists",
+                    destination,
+                )
+            raise OSError(error_number, os.strerror(error_number), destination)
+        if _retirement_directory_identity(os.fstat(descriptor)) != (
+            _retirement_directory_identity(before)
+        ):
+            raise ActivationPackageError(
+                "retirement publication directory changed during rename"
+            )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _retirement_rename_artifact_no_replace(
@@ -14289,6 +14461,10 @@ def _retirement_fresh_intent(
     _maintenance_writer_unit_preflight(writer_unit_baseline)
     _maintenance_successor_unit_preflight(successor_unit_baseline)
     health = _retirement_health_preflight()
+    successor_package_evidence = _retirement_successor_package_evidence(
+        successor_package,
+        package_digest=successor_digest,
+    )
     artifacts = [
         _retirement_record_artifact(
             package,
@@ -14349,6 +14525,7 @@ def _retirement_fresh_intent(
         "maintenancePlanDigest": plan_digest,
         "releaseManifestDigest": release_digest,
         "successorPackageRoot": str(successor_package),
+        "successorPackageEvidence": successor_package_evidence,
         "archiveRoot": str(final_archive),
         "writerUnitBaseline": writer_unit_baseline,
         "successorUnitBaseline": successor_unit_baseline,
@@ -14380,6 +14557,7 @@ def _retirement_validate_intent(
         or set(release_digest) - _HEX
         or intent.get("successorPackageRoot") != str(successor_package)
         or intent.get("archiveRoot") != str(final_archive)
+        or not isinstance(intent.get("successorPackageEvidence"), Mapping)
         or not isinstance(artifacts, list)
         or not artifacts
         or not isinstance(intent.get("writerUnitBaseline"), list)
@@ -14453,11 +14631,15 @@ def _retirement_validate_intent(
     }
     if not required.issubset(names):
         raise ActivationPackageError("retirement intent is missing a required artifact")
+    _retirement_verify_successor_package(
+        successor_package,
+        package_digest=successor_digest,
+        expected=intent.get("successorPackageEvidence"),
+    )
     if require_live_preflight:
         _maintenance_writer_unit_preflight(intent.get("writerUnitBaseline"))
         _maintenance_successor_unit_preflight(intent.get("successorUnitBaseline"))
         _retirement_health_preflight()
-        verify_activation_package(successor_package, successor_digest)
         _retirement_active_retry_approvals_absent(APPROVED_EXECUTION_PACKAGE.parent)
         _retirement_require_absent(
             _activation_state_path(),
@@ -14482,6 +14664,7 @@ def _retirement_receipt(
         "maintenancePlanDigest": intent["maintenancePlanDigest"],
         "releaseManifestDigest": intent["releaseManifestDigest"],
         "successorPackageRoot": intent["successorPackageRoot"],
+        "successorPackageEvidence": intent["successorPackageEvidence"],
         "archiveRoot": intent["archiveRoot"],
         "liveServiceMutationPerformed": False,
         "artifacts": intent["artifacts"],
@@ -14518,12 +14701,19 @@ def _retirement_publish_record(
             raise ActivationPackageError(
                 f"retirement record binding is invalid: {name}"
             )
+        _retirement_fsync_private_directory(
+            directory,
+            label="retirement record directory",
+        )
         return
     try:
         temporary.lstat()
     except FileNotFoundError:
         _write_new(temporary, expected, 0o600)
-        _fsync_package_directory(directory)
+        _retirement_fsync_private_directory(
+            directory,
+            label="retirement record directory",
+        )
     except OSError as error:
         raise ActivationPackageError(
             f"retirement record staging path could not be inspected: {name}"
@@ -14541,8 +14731,11 @@ def _retirement_publish_record(
             raise ActivationPackageError(
                 f"retirement staged record binding is invalid: {name}"
             )
-    _rename_package_no_replace(temporary, target)
-    _fsync_package_directory(directory)
+    _retirement_rename_entry_no_replace(temporary, target)
+    _retirement_fsync_private_directory(
+        directory,
+        label="retirement record directory",
+    )
 
 
 def _retirement_verify_complete_archive(
@@ -14632,7 +14825,10 @@ def _retire_approved_package_locked(
             raise ActivationPackageError(
                 "retirement archive has conflicting final and pending state"
             )
-        _fsync_package_directory(archive_parent)
+        _retirement_fsync_private_directory(
+            archive_parent,
+            label="retirement archive namespace",
+        )
         return _retirement_verify_complete_archive(
             final_archive,
             successor_package=successor_package,
@@ -14683,13 +14879,19 @@ def _retire_approved_package_locked(
                 archive_parent,
                 label="retirement archive namespace",
             )
-            _fsync_package_directory(archive_parent.parent)
+            _retirement_fsync_private_directory(
+                archive_parent.parent,
+                label="retirement executor directory",
+            )
         pending_archive.mkdir(mode=0o700)
         _retirement_validate_private_directory(
             pending_archive,
             label="pending retirement archive",
         )
-        _fsync_package_directory(archive_parent)
+        _retirement_fsync_private_directory(
+            archive_parent,
+            label="retirement archive namespace",
+        )
         _retirement_publish_record(
             pending_archive,
             name="retirement-intent.json",
@@ -14717,8 +14919,14 @@ def _retire_approved_package_locked(
             _retirement_verify_artifact(source, item)
             _retirement_rename_artifact_no_replace(source, destination, item)
         _retirement_verify_artifact(destination, item)
-        _fsync_package_directory(source.parent)
-        _fsync_package_directory(pending_archive)
+        _retirement_fsync_private_directory(
+            source.parent,
+            label="retirement executor directory",
+        )
+        _retirement_fsync_private_directory(
+            pending_archive,
+            label="pending retirement archive",
+        )
     receipt = _retirement_receipt(intent)
     _retirement_publish_record(
         pending_archive,
@@ -14734,8 +14942,16 @@ def _retire_approved_package_locked(
         raise ActivationPackageError(
             "pending retirement archive contains an unexpected artifact"
         )
-    _rename_package_no_replace(pending_archive, final_archive)
-    _fsync_package_directory(archive_parent)
+    _retirement_verify_successor_package(
+        successor_package,
+        package_digest=successor_digest,
+        expected=intent.get("successorPackageEvidence"),
+    )
+    _retirement_rename_entry_no_replace(pending_archive, final_archive)
+    _retirement_fsync_private_directory(
+        archive_parent,
+        label="retirement archive namespace",
+    )
     result = _retirement_verify_complete_archive(
         final_archive,
         successor_package=successor_package,

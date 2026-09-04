@@ -5640,6 +5640,714 @@ def test_root_approval_import_uses_atomic_no_replace_publication(tmp_path: Path)
     assert destination.is_dir()
 
 
+def _retirement_test_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    executor = tmp_path / "executor"
+    executor.mkdir(mode=0o700)
+    approved_package = executor / "approved-package"
+    approved_package.mkdir(mode=0o700)
+    predecessor_payload = approved_package / "payload"
+    predecessor_payload.write_text("predecessor\n", encoding="utf-8")
+    predecessor_payload.chmod(0o644)
+    successor_package = tmp_path / "successor-package"
+    successor_package.mkdir(mode=0o700)
+    successor_payload = successor_package / "payload"
+    successor_payload.write_text("successor\n", encoding="utf-8")
+    successor_payload.chmod(0o644)
+    predecessor_digest = "a" * 64
+    successor_digest = "b" * 64
+    plan_digest = "c" * 64
+    release_digest = "d" * 64
+    activation_approval = {
+        "schemaVersion": activation_package_module.ACTIVATION_APPROVAL_SCHEMA,
+        "approved": True,
+        "packageRoot": str(approved_package.resolve()),
+        "sourcePackageRoot": str(tmp_path / "predecessor-source"),
+        "packageDigest": predecessor_digest,
+        "packageFileCount": 1,
+        "liveExecutionScope": "sealed-package-import-and-verification-only",
+    }
+    maintenance_approval = {
+        "schemaVersion": activation_package_module.MAINTENANCE_APPROVAL_SCHEMA,
+        "scope": "maintenance-window-for-this-package-only",
+        "packageRoot": str(approved_package.resolve()),
+        "packageDigest": predecessor_digest,
+        "planDigest": plan_digest,
+        "allowReboot": False,
+    }
+    state = {
+        "schemaVersion": activation_package_module.MAINTENANCE_RUNNER_STATE_SCHEMA,
+        "packageDigest": predecessor_digest,
+        "planDigest": plan_digest,
+        "status": "rolled_back",
+        "stage": "rollback",
+        "writersStopped": True,
+    }
+    contract = {
+        "packageRoot": str(approved_package.resolve()),
+        "releaseManifestDigest": release_digest,
+        "writerUnitBaseline": _maintenance_writer_unit_baseline_fixture(),
+        "successorUnitBaseline": _maintenance_successor_unit_baseline_fixture(),
+        "evidenceRoot": str(
+            executor / f"maintenance-{release_digest}" / "preserved"
+        ),
+    }
+
+    def write_record(name: str, document: dict[str, object]) -> Path:
+        path = executor / name
+        path.write_text(
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    approval_path = write_record(
+        "approved-activation-package.json", activation_approval
+    )
+    maintenance_path = write_record(
+        "approved-maintenance-window.json", maintenance_approval
+    )
+    state_path = write_record("maintenance-window-state.json", state)
+    consumed_retry = write_record(
+        "consumed-approved-maintenance-rollback-retry-test.json",
+        {
+            "schemaVersion": activation_package_module.MAINTENANCE_ROLLBACK_RETRY_APPROVAL_SCHEMA,
+            "scope": "maintenance-rollback-retry-for-this-failed-state-only",
+            "packageRoot": str(approved_package.resolve()),
+            "packageDigest": predecessor_digest,
+            "planDigest": plan_digest,
+            "failedStateDigest": "e" * 64,
+        },
+    )
+    foreign_consumed_retry = write_record(
+        "consumed-approved-maintenance-rollback-retry-foreign.json",
+        {
+            "schemaVersion": activation_package_module.MAINTENANCE_ROLLBACK_RETRY_APPROVAL_SCHEMA,
+            "scope": "maintenance-rollback-retry-for-this-failed-state-only",
+            "packageRoot": str(approved_package.resolve()),
+            "packageDigest": "f" * 64,
+            "planDigest": "f" * 64,
+            "failedStateDigest": "f" * 64,
+        },
+    )
+    maintenance_workspace = executor / f"maintenance-{release_digest}"
+    (maintenance_workspace / "preserved").mkdir(parents=True, mode=0o700)
+    maintenance_workspace.chmod(0o700)
+    (maintenance_workspace / "preserved").chmod(0o700)
+    evidence = maintenance_workspace / "preserved" / "evidence"
+    evidence.write_text(
+        "preserved\n", encoding="utf-8"
+    )
+    evidence.chmod(0o600)
+    destination_namespace = executor / f"destination-namespace-before-{plan_digest}"
+    destination_namespace.mkdir(mode=0o700)
+    destination_state = destination_namespace / "state"
+    destination_state.write_text("rollback\n", encoding="utf-8")
+    destination_state.chmod(0o600)
+    canary_path = executor / f"canary-{predecessor_digest}.json"
+    canary_path.write_text("{}\n", encoding="utf-8")
+    canary_path.chmod(0o600)
+    archive_root = executor / "retired-packages"
+
+    monkeypatch.setattr(
+        activation_package_module, "APPROVED_EXECUTION_PACKAGE", approved_package
+    )
+    monkeypatch.setattr(
+        activation_package_module, "_activation_approval_record_path", lambda: approval_path
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_approval_record_path",
+        lambda: maintenance_path,
+    )
+    monkeypatch.setattr(
+        activation_package_module, "_maintenance_state_path", lambda: state_path
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_phase_approval_record_path",
+        lambda phase: executor / f"approved-activation-phase-{phase}.json",
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_state_path",
+        lambda: executor / "activation-state.json",
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_canary_attestation_path",
+        lambda _digest: canary_path,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_approved_package_retirement_archive_root",
+        lambda: archive_root,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package_module, "_activation_lock_path", lambda: executor / "activation.lock"
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_validate_existing_package_destination",
+        lambda selected: Path(selected).resolve(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_activation_package",
+        lambda _package, digest: {
+            "verified": True,
+            "packageDigest": digest,
+            "fileCount": 1,
+        },
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_activation_approval",
+        lambda _package: activation_approval,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_load_maintenance_approval",
+        lambda _package: maintenance_approval,
+    )
+    monkeypatch.setattr(
+        activation_package_module, "_load_maintenance_state", lambda: state
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_sealed_maintenance_contract",
+        lambda _package, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_writer_unit_preflight",
+        lambda _baseline: {"writers": "restored"},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_successor_unit_preflight",
+        lambda _baseline: {"successors": "inactive"},
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_api_read",
+        lambda _path, **_kwargs: {
+            "ok": True,
+            "service": "overseer-api",
+            "psychloBridgeReady": True,
+            "additiveField": "accepted",
+        },
+    )
+    return {
+        "executor": executor,
+        "approvedPackage": approved_package,
+        "successorPackage": successor_package,
+        "predecessorDigest": predecessor_digest,
+        "successorDigest": successor_digest,
+        "planDigest": plan_digest,
+        "state": state,
+        "contract": contract,
+        "archiveRoot": archive_root,
+        "phasePath": executor / "approved-activation-phase-staging-canary.json",
+        "activationStatePath": executor / "activation-state.json",
+        "consumedRetry": consumed_retry,
+        "foreignConsumedRetry": foreign_consumed_retry,
+        "maintenanceWorkspace": maintenance_workspace,
+        "destinationNamespace": destination_namespace,
+        "canaryPath": canary_path,
+    }
+
+
+def _retire_test_package(environment: dict[str, object]) -> dict[str, object]:
+    return activation_package_module.retire_approved_package(
+        environment["successorPackage"],
+        expected_successor_package_digest=str(environment["successorDigest"]),
+        expected_predecessor_package_digest=str(environment["predecessorDigest"]),
+        expected_maintenance_plan_digest=str(environment["planDigest"]),
+    )
+
+
+def test_retirement_archives_exact_terminal_predecessor_and_is_replay_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+
+    retired = _retire_test_package(environment)
+
+    archive = Path(str(retired["archiveRoot"]))
+    assert retired == {
+        "status": "retired",
+        "predecessorPackageDigest": environment["predecessorDigest"],
+        "successorPackageDigest": environment["successorDigest"],
+        "maintenancePlanDigest": environment["planDigest"],
+        "archiveRoot": str(archive),
+        "artifactCount": 8,
+        "replayed": False,
+    }
+    assert not Path(str(environment["approvedPackage"])).exists()
+    assert not Path(str(environment["consumedRetry"])).exists()
+    assert Path(str(environment["foreignConsumedRetry"])).exists()
+    assert not Path(str(environment["maintenanceWorkspace"])).exists()
+    assert not Path(str(environment["destinationNamespace"])).exists()
+    assert not Path(str(environment["canaryPath"])).exists()
+    expected_names = {
+        "approved-package",
+        "approved-activation-package.json",
+        "approved-maintenance-window.json",
+        "maintenance-window-state.json",
+        Path(str(environment["consumedRetry"])).name,
+        Path(str(environment["maintenanceWorkspace"])).name,
+        Path(str(environment["destinationNamespace"])).name,
+        Path(str(environment["canaryPath"])).name,
+    }
+    assert {path.name for path in archive.iterdir()} == {
+        *expected_names,
+        "retirement-intent.json",
+        "retirement-receipt.json",
+    }
+    assert Path(str(environment["foreignConsumedRetry"])).name not in expected_names
+    receipt = json.loads((archive / "retirement-receipt.json").read_text())
+    assert receipt["status"] == "retired"
+    assert receipt["liveServiceMutationPerformed"] is False
+    assert {entry["name"] for entry in receipt["artifacts"]} == expected_names
+    assert stat_mode(archive) == 0o700
+    assert stat_mode(archive / "retirement-receipt.json") == 0o600
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_api_read",
+        lambda _path, **_kwargs: {"ok": False},
+    )
+    replayed = _retire_test_package(environment)
+
+    assert replayed == {**retired, "replayed": True}
+
+
+@pytest.mark.parametrize(
+    ("defect", "expected_error"),
+    (
+        ("predecessor-digest", "predecessor package digest"),
+        ("plan-digest", "maintenance plan digest"),
+        ("nonterminal-state", "rolled back"),
+        ("phase-approval", "phase approval"),
+        ("activation-state", "activation runner state"),
+        ("health", "health"),
+        ("writer-drift", "writer unit"),
+    ),
+)
+def test_retirement_rejects_nonterminal_or_ambiguous_executor_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+    expected_error: str,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    kwargs = {
+        "expected_successor_package_digest": environment["successorDigest"],
+        "expected_predecessor_package_digest": environment["predecessorDigest"],
+        "expected_maintenance_plan_digest": environment["planDigest"],
+    }
+    if defect == "predecessor-digest":
+        kwargs["expected_predecessor_package_digest"] = "f" * 64
+    elif defect == "plan-digest":
+        kwargs["expected_maintenance_plan_digest"] = "f" * 64
+    elif defect == "nonterminal-state":
+        environment["state"]["status"] = "complete"
+    elif defect == "phase-approval":
+        Path(str(environment["phasePath"])).write_text("{}\n", encoding="utf-8")
+    elif defect == "activation-state":
+        Path(str(environment["activationStatePath"])).write_text(
+            "{}\n", encoding="utf-8"
+        )
+    elif defect == "health":
+        monkeypatch.setattr(
+            activation_package_module,
+            "_maintenance_api_read",
+            lambda _path, **_kwargs: {"ok": False},
+        )
+    elif defect == "writer-drift":
+        monkeypatch.setattr(
+            activation_package_module,
+            "_maintenance_writer_unit_preflight",
+            lambda _baseline: (_ for _ in ()).throw(
+                ActivationPackageError("writer unit drift")
+            ),
+        )
+
+    with pytest.raises(ActivationPackageError, match=expected_error):
+        activation_package_module.retire_approved_package(
+            environment["successorPackage"],
+            **kwargs,
+        )
+
+    assert Path(str(environment["approvedPackage"])).exists()
+    assert not Path(str(environment["archiveRoot"])).exists()
+
+
+def test_retirement_rejects_active_retry_approval_without_moving_anything(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    active_retry = Path(str(environment["executor"])) / (
+        "approved-maintenance-rollback-retry-" + "e" * 64 + ".json"
+    )
+    active_retry.write_text("{}\n", encoding="utf-8")
+    active_retry.chmod(0o600)
+
+    with pytest.raises(ActivationPackageError, match="active maintenance.*exists"):
+        _retire_test_package(environment)
+
+    assert Path(str(environment["approvedPackage"])).exists()
+    assert active_retry.exists()
+    assert not Path(str(environment["archiveRoot"])).exists()
+
+
+def test_retirement_requires_a_distinct_successor_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+
+    with pytest.raises(ActivationPackageError, match="must differ"):
+        activation_package_module.retire_approved_package(
+            environment["successorPackage"],
+            expected_successor_package_digest=str(
+                environment["predecessorDigest"]
+            ),
+            expected_predecessor_package_digest=str(
+                environment["predecessorDigest"]
+            ),
+            expected_maintenance_plan_digest=str(environment["planDigest"]),
+        )
+
+    assert Path(str(environment["approvedPackage"])).exists()
+    assert not Path(str(environment["archiveRoot"])).exists()
+
+
+def test_retirement_rejects_successor_outside_approved_package_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    successor = tmp_path / "v1.1.6-abcdef0"
+    successor.mkdir(mode=0o700)
+
+    class ObservedLock:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_execution_lock",
+        ObservedLock,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "verify_activation_package",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an unapproved successor namespace must not reach package verification"
+        ),
+    )
+    archive_root = tmp_path / "archive"
+    monkeypatch.setattr(
+        activation_package_module,
+        "_approved_package_retirement_archive_root",
+        lambda: archive_root,
+    )
+
+    with pytest.raises(ActivationPackageError, match="outside the approved"):
+        activation_package_module.retire_approved_package(
+            successor,
+            expected_successor_package_digest="a" * 64,
+            expected_predecessor_package_digest="b" * 64,
+            expected_maintenance_plan_digest="c" * 64,
+        )
+
+    assert not archive_root.exists()
+
+
+def test_retirement_requires_root_before_opening_the_activation_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    events: list[str] = []
+
+    class ObservedLock:
+        def __enter__(self) -> None:
+            events.append("lock")
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_require_root_activation",
+        lambda: events.append("root"),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_execution_lock",
+        ObservedLock,
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retire_approved_package_locked",
+        lambda *_args, **_kwargs: {"status": "retired"},
+    )
+
+    assert _retire_test_package(environment) == {"status": "retired"}
+    assert events == ["root", "lock"]
+
+
+def test_retirement_rejects_insecure_predecessor_artifact_before_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    Path(str(environment["canaryPath"])).chmod(0o666)
+
+    with pytest.raises(ActivationPackageError, match="record mode is unsafe"):
+        _retire_test_package(environment)
+
+    assert Path(str(environment["approvedPackage"])).exists()
+    assert not Path(str(environment["archiveRoot"])).exists()
+
+
+def test_retirement_resumes_after_partial_no_replace_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    rename = activation_package_module._retirement_rename_artifact_no_replace
+    interrupted = False
+
+    def interrupt_once(
+        source: Path,
+        destination: Path,
+        expected: object,
+    ) -> None:
+        nonlocal interrupted
+        if source.name == "approved-maintenance-window.json" and not interrupted:
+            interrupted = True
+            raise OSError("injected retirement interruption")
+        rename(source, destination, expected)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retirement_rename_artifact_no_replace",
+        interrupt_once,
+    )
+    with pytest.raises(OSError, match="injected retirement interruption"):
+        _retire_test_package(environment)
+    assert interrupted is True
+    assert Path(str(environment["archiveRoot"])).is_dir()
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retirement_rename_artifact_no_replace",
+        rename,
+    )
+    retired = _retire_test_package(environment)
+
+    assert retired["status"] == "retired"
+    assert retired["replayed"] is False
+    assert Path(str(retired["archiveRoot"])).is_dir()
+
+
+def test_retirement_rejects_source_inode_substitution_before_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    rename = activation_package_module._retirement_rename_artifact_no_replace
+    substituted = False
+
+    def substitute_once(
+        source: Path,
+        destination: Path,
+        expected: object,
+    ) -> None:
+        nonlocal substituted
+        if source.name == "approved-activation-package.json" and not substituted:
+            raw = source.read_bytes()
+            source.unlink()
+            source.write_bytes(raw)
+            source.chmod(0o600)
+            substituted = True
+        rename(source, destination, expected)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_retirement_rename_artifact_no_replace",
+        substitute_once,
+    )
+
+    with pytest.raises(ActivationPackageError, match="identity changed"):
+        _retire_test_package(environment)
+
+    assert substituted is True
+    assert Path(str(environment["approvedPackage"])).exists()
+    final_archive = Path(str(environment["archiveRoot"])) / str(
+        environment["predecessorDigest"]
+    )
+    assert not final_archive.exists()
+
+
+def test_retirement_replays_only_after_re_fsyncing_a_published_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    fsync_directory = activation_package_module._fsync_package_directory
+    archive_parent = Path(str(environment["archiveRoot"]))
+    final_archive = archive_parent / str(environment["predecessorDigest"])
+    interrupted = False
+
+    def fail_after_final_publish(path: Path) -> None:
+        nonlocal interrupted
+        if path == archive_parent and final_archive.exists() and not interrupted:
+            interrupted = True
+            raise OSError("injected final archive fsync interruption")
+        fsync_directory(path)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_fsync_package_directory",
+        fail_after_final_publish,
+    )
+    with pytest.raises(OSError, match="final archive fsync interruption"):
+        _retire_test_package(environment)
+    assert interrupted is True
+    assert final_archive.is_dir()
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_fsync_package_directory",
+        fsync_directory,
+    )
+    replayed = _retire_test_package(environment)
+
+    assert replayed["status"] == "retired"
+    assert replayed["replayed"] is True
+
+
+def test_retirement_recovers_an_intent_record_staged_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    rename = activation_package_module._rename_package_no_replace
+    interrupted = False
+
+    def interrupt_once(source: Path, destination: Path) -> None:
+        nonlocal interrupted
+        if source.name == ".retirement-intent.json.new" and not interrupted:
+            interrupted = True
+            raise OSError("injected intent publication interruption")
+        rename(source, destination)
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_rename_package_no_replace",
+        interrupt_once,
+    )
+    with pytest.raises(OSError, match="intent publication interruption"):
+        _retire_test_package(environment)
+    assert interrupted is True
+    pending = Path(str(environment["archiveRoot"])) / (
+        ".pending-" + str(environment["predecessorDigest"])
+    )
+    assert (pending / ".retirement-intent.json.new").is_file()
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_rename_package_no_replace",
+        rename,
+    )
+    retired = _retire_test_package(environment)
+
+    assert retired["status"] == "retired"
+    assert retired["replayed"] is False
+
+
+def test_retirement_rejects_symlinked_archive_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    Path(str(environment["archiveRoot"])).symlink_to(attacker, target_is_directory=True)
+
+    with pytest.raises(ActivationPackageError, match="archive.*unsafe"):
+        _retire_test_package(environment)
+
+    assert Path(str(environment["approvedPackage"])).exists()
+    assert not tuple(attacker.iterdir())
+
+
+def test_retirement_cli_dispatches_only_the_exact_digest_bound_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    successor = tmp_path / "successor"
+    successor.mkdir()
+    observed: dict[str, object] = {}
+
+    def retire(package: str, **kwargs: object) -> dict[str, object]:
+        observed.update({"package": package, **kwargs})
+        return {"status": "retired", "replayed": False}
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "retire_approved_package",
+        retire,
+        raising=False,
+    )
+
+    assert activation_package_module._main(
+        [
+            "retire-approved-package",
+            "--successor-package-root",
+            str(successor),
+            "--expected-successor-package-digest",
+            "a" * 64,
+            "--expected-predecessor-package-digest",
+            "b" * 64,
+            "--expected-maintenance-plan-digest",
+            "c" * 64,
+        ]
+    ) == 0
+
+    assert observed == {
+        "package": str(successor),
+        "expected_successor_package_digest": "a" * 64,
+        "expected_predecessor_package_digest": "b" * 64,
+        "expected_maintenance_plan_digest": "c" * 64,
+    }
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "retired",
+        "replayed": False,
+    }
+
+
 def test_installed_artifact_verifier_compares_targets_to_sealed_hashes(
     tmp_path: Path,
 ) -> None:

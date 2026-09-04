@@ -71,6 +71,12 @@ ACTIVATION_RUNNER_STATE_SCHEMA = "overseer.activation-runner-state.v2"
 MAINTENANCE_ROLLBACK_RETRY_APPROVAL_SCHEMA = (
     "overseer.maintenance-rollback-retry-approval.v1"
 )
+APPROVED_PACKAGE_RETIREMENT_INTENT_SCHEMA = (
+    "overseer.approved-package-retirement-intent.v1"
+)
+APPROVED_PACKAGE_RETIREMENT_RECEIPT_SCHEMA = (
+    "overseer.approved-package-retirement-receipt.v1"
+)
 LEGACY_ACTIVATION_APPROVAL_SCHEMA = "overseer.activation-package-approval.v1"
 LEGACY_ACTIVATION_CONTRACT_SCHEMA = "overseer.dedicated-principal-activation-contract.v1"
 LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA = "overseer.activation-runner-state.v1"
@@ -13746,6 +13752,1039 @@ def _canary_attestation_path(package_digest: str) -> Path:
     return Path(f"/var/lib/overseer-executor/canary-{package_digest}.json")
 
 
+def _approved_package_retirement_archive_root() -> Path:
+    """Return the private namespace for retired approved packages."""
+
+    return Path("/var/lib/overseer-executor/retired-packages")
+
+
+def _retirement_digest(value: str, *, label: str) -> str:
+    if len(value) != 64 or set(value) - _HEX:
+        raise ActivationPackageError(f"{label} is invalid")
+    return value
+
+
+def _retirement_require_absent(path: Path, *, label: str) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ActivationPackageError(f"{label} could not be inspected") from error
+    if path.is_symlink():
+        raise ActivationPackageError(f"{label} is an unsafe symlink")
+    raise ActivationPackageError(f"{label} exists")
+
+
+def _retirement_validate_private_directory(path: Path, *, label: str) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ActivationPackageError(f"{label} is unavailable") from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        path.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != root_uid
+        or metadata.st_gid != root_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ActivationPackageError(f"{label} is unsafe")
+    return metadata
+
+
+def _retirement_load_root_record(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[dict[str, object], bytes, os.stat_result]:
+    try:
+        raw, metadata = _stable_read(path)
+        document = json.loads(raw)
+    except (
+        ActivationPackageError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ActivationPackageError(f"{label} is unavailable or invalid") from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        metadata.st_uid != root_uid
+        or metadata.st_gid != root_gid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not isinstance(document, dict)
+    ):
+        raise ActivationPackageError(f"{label} metadata is invalid")
+    return document, raw, metadata
+
+
+def _retirement_inode_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+    )
+
+
+def _retirement_directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _retirement_observe_artifact(
+    path: Path,
+    *,
+    name: str,
+    kind: str,
+    package_digest: str | None = None,
+) -> dict[str, object]:
+    """Return a stable, root-owned identity and content inventory."""
+
+    if path.name != name or _safe_relative(name) != name or "/" in name:
+        raise ActivationPackageError("retirement artifact name is unsafe")
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ActivationPackageError(
+            f"retirement artifact is unavailable: {name}"
+        ) from error
+    root_uid, root_gid = _activation_root_identity()
+    base = {
+        "name": name,
+        "kind": kind,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "links": metadata.st_nlink,
+    }
+    if path.is_symlink() or metadata.st_uid != root_uid or metadata.st_gid != root_gid:
+        raise ActivationPackageError(f"retirement artifact is unsafe: {name}")
+    if kind == "file":
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ActivationPackageError(f"retirement artifact is unsafe: {name}")
+        observed = _stream_hash_regular(path, label=f"retirement artifact {name}")
+        after = path.lstat()
+        if _retirement_inode_identity(after) != _retirement_inode_identity(metadata):
+            raise ActivationPackageError(
+                f"retirement artifact changed while inventorying: {name}"
+            )
+        if observed["mode"] != "0600":
+            raise ActivationPackageError(
+                f"retirement record mode is unsafe: {name}"
+            )
+        return {**base, "sha256": observed["sha256"], "size": observed["size"]}
+    if kind not in {"directory", "package"}:
+        raise ActivationPackageError("retirement artifact kind is invalid")
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ActivationPackageError(f"retirement artifact is unsafe: {name}")
+    directories: list[dict[str, object]] = []
+    files: list[dict[str, object]] = []
+    for directory, child_directories, child_files in os.walk(
+        path,
+        followlinks=False,
+    ):
+        current = Path(directory)
+        current_metadata = current.lstat()
+        if (
+            current.is_symlink()
+            or not stat.S_ISDIR(current_metadata.st_mode)
+            or current_metadata.st_uid != root_uid
+            or current_metadata.st_gid != root_gid
+            or stat.S_IMODE(current_metadata.st_mode) & 0o022
+        ):
+            raise ActivationPackageError(
+                f"retirement artifact directory is unsafe: {name}"
+            )
+        relative = (
+            "."
+            if current == path
+            else _safe_relative(current.relative_to(path).as_posix())
+        )
+        directories.append(
+            {
+                "path": relative,
+                "mode": f"{stat.S_IMODE(current_metadata.st_mode):04o}",
+                "uid": current_metadata.st_uid,
+                "gid": current_metadata.st_gid,
+                "device": current_metadata.st_dev,
+                "inode": current_metadata.st_ino,
+                "links": current_metadata.st_nlink,
+            }
+        )
+        for child_name in child_directories:
+            child = current / child_name
+            if child.is_symlink():
+                raise ActivationPackageError(
+                    f"retirement artifact contains a symlink: {name}"
+                )
+        for child_name in child_files:
+            child = current / child_name
+            relative_file = _safe_relative(child.relative_to(path).as_posix())
+            child_before = child.lstat()
+            child_details = _stream_hash_regular(
+                child,
+                label=f"retirement artifact {name}",
+            )
+            child_after = child.lstat()
+            if (
+                _retirement_inode_identity(child_before)
+                != _retirement_inode_identity(child_after)
+                or child_details["uid"] != root_uid
+                or child_details["gid"] != root_gid
+                or child_details["links"] != 1
+                or int(str(child_details["mode"]), 8) & 0o022
+            ):
+                raise ActivationPackageError(
+                    f"retirement artifact file is unsafe: {name}"
+                )
+            files.append(
+                {
+                    "path": relative_file,
+                    "device": child_after.st_dev,
+                    "inode": child_after.st_ino,
+                    **child_details,
+                }
+            )
+        current_after = current.lstat()
+        if _retirement_inode_identity(current_after) != _retirement_inode_identity(
+            current_metadata
+        ):
+            raise ActivationPackageError(
+                f"retirement artifact changed while inventorying: {name}"
+            )
+    directories.sort(key=lambda item: str(item["path"]))
+    files.sort(key=lambda item: str(item["path"]))
+    root_after = path.lstat()
+    if _retirement_inode_identity(root_after) != _retirement_inode_identity(metadata):
+        raise ActivationPackageError(
+            f"retirement artifact changed while inventorying: {name}"
+        )
+    inventory = {"directories": directories, "files": files}
+    result = {
+        **base,
+        **inventory,
+        "treeDigest": _sha256(_canonical(inventory)),
+        "fileCount": len(files),
+    }
+    if kind == "package":
+        if package_digest is None:
+            raise ActivationPackageError("retirement package digest is required")
+        verified = verify_activation_package(path, package_digest)
+        result["packageDigest"] = package_digest
+        result["packageFileCount"] = verified["fileCount"]
+    return result
+
+
+def _retirement_record_artifact(
+    path: Path,
+    *,
+    kind: str,
+    package_digest: str | None = None,
+    expected_document: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    record_metadata: os.stat_result | None = None
+    record_raw: bytes | None = None
+    if expected_document is not None:
+        observed_document, record_raw, record_metadata = _retirement_load_root_record(
+            path,
+            label=f"retirement record {path.name}",
+        )
+        if observed_document != dict(expected_document):
+            raise ActivationPackageError(
+                f"retirement record changed before inventory: {path.name}"
+            )
+    result = {
+        "sourcePath": str(path),
+        **_retirement_observe_artifact(
+            path,
+            name=path.name,
+            kind=kind,
+            package_digest=package_digest,
+        ),
+    }
+    if (
+        record_metadata is not None
+        and record_raw is not None
+        and (
+            result.get("device") != record_metadata.st_dev
+            or result.get("inode") != record_metadata.st_ino
+            or result.get("sha256") != _sha256(record_raw)
+            or result.get("size") != len(record_raw)
+        )
+    ):
+        raise ActivationPackageError(
+            f"retirement record changed while inventorying: {path.name}"
+        )
+    return result
+
+
+def _retirement_verify_artifact(
+    path: Path,
+    expected: Mapping[str, object],
+) -> None:
+    name = expected.get("name")
+    kind = expected.get("kind")
+    if not isinstance(name, str) or not isinstance(kind, str):
+        raise ActivationPackageError("retirement intent artifact is invalid")
+    package_digest = expected.get("packageDigest")
+    if package_digest is not None and not isinstance(package_digest, str):
+        raise ActivationPackageError("retirement intent package digest is invalid")
+    observed = _retirement_observe_artifact(
+        path,
+        name=name,
+        kind=kind,
+        package_digest=package_digest,
+    )
+    recorded = {key: value for key, value in expected.items() if key != "sourcePath"}
+    if observed != recorded:
+        raise ActivationPackageError(f"retirement artifact drifted: {name}")
+
+
+def _retirement_rename_artifact_no_replace(
+    source: Path,
+    destination: Path,
+    expected: Mapping[str, object],
+) -> None:
+    """Rename one exact inode between validated root-owned directories."""
+
+    source_parent = source.parent
+    destination_parent = destination.parent
+    source_parent_metadata = _retirement_validate_private_directory(
+        source_parent,
+        label="retirement source directory",
+    )
+    destination_parent_metadata = _retirement_validate_private_directory(
+        destination_parent,
+        label="retirement destination directory",
+    )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    source_descriptor = os.open(source_parent, flags)
+    destination_descriptor = os.open(destination_parent, flags)
+    try:
+        if (
+            _retirement_directory_identity(os.fstat(source_descriptor))
+            != _retirement_directory_identity(source_parent_metadata)
+            or _retirement_directory_identity(os.fstat(destination_descriptor))
+            != _retirement_directory_identity(destination_parent_metadata)
+        ):
+            raise ActivationPackageError(
+                "retirement artifact parent changed before rename"
+            )
+        try:
+            source_metadata = os.stat(
+                source.name,
+                dir_fd=source_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise ActivationPackageError(
+                "retirement artifact changed before rename"
+            ) from error
+        if (
+            source_metadata.st_dev != expected.get("device")
+            or source_metadata.st_ino != expected.get("inode")
+            or f"{stat.S_IMODE(source_metadata.st_mode):04o}"
+            != expected.get("mode")
+            or source_metadata.st_uid != expected.get("uid")
+            or source_metadata.st_gid != expected.get("gid")
+            or source_metadata.st_nlink != expected.get("links")
+        ):
+            raise ActivationPackageError(
+                "retirement artifact identity changed before rename"
+            )
+        try:
+            os.stat(
+                destination.name,
+                dir_fd=destination_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise ActivationPackageError(
+                "retirement destination could not be inspected"
+            ) from error
+        else:
+            raise ActivationPackageError("retirement destination already exists")
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError as error:
+            raise ActivationPackageError(
+                "atomic no-replace retirement move is unavailable"
+            ) from error
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            source_descriptor,
+            os.fsencode(source.name),
+            destination_descriptor,
+            os.fsencode(destination.name),
+            1,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                raise FileExistsError(
+                    error_number,
+                    "retirement destination already exists",
+                    destination,
+                )
+            raise OSError(error_number, os.strerror(error_number), destination)
+        if (
+            _retirement_directory_identity(os.fstat(source_descriptor))
+            != _retirement_directory_identity(source_parent_metadata)
+            or _retirement_directory_identity(os.fstat(destination_descriptor))
+            != _retirement_directory_identity(destination_parent_metadata)
+        ):
+            raise ActivationPackageError(
+                "retirement artifact parent changed during rename"
+            )
+    finally:
+        os.close(destination_descriptor)
+        os.close(source_descriptor)
+
+
+def _retirement_active_retry_approvals_absent(executor_root: Path) -> None:
+    for path in sorted(executor_root.glob("approved-maintenance-rollback-retry-*.json")):
+        if path.is_symlink():
+            raise ActivationPackageError(
+                "active maintenance rollback retry approval is an unsafe symlink"
+            )
+        raise ActivationPackageError(
+            "active maintenance rollback retry approval exists"
+        )
+
+
+def _retirement_bound_consumed_retries(
+    executor_root: Path,
+    *,
+    package: Path,
+    package_digest: str,
+    plan_digest: str,
+) -> list[Path]:
+    result: list[Path] = []
+    for path in sorted(
+        executor_root.glob("consumed-approved-maintenance-rollback-retry-*.json")
+    ):
+        document, _raw, _metadata = _retirement_load_root_record(
+            path,
+            label="consumed maintenance rollback retry approval",
+        )
+        if (
+            document.get("schemaVersion")
+            == MAINTENANCE_ROLLBACK_RETRY_APPROVAL_SCHEMA
+            and document.get("scope")
+            == "maintenance-rollback-retry-for-this-failed-state-only"
+            and document.get("packageRoot") == str(package)
+            and document.get("packageDigest") == package_digest
+            and document.get("planDigest") == plan_digest
+            and isinstance(document.get("failedStateDigest"), str)
+        ):
+            result.append(path)
+    return result
+
+
+def _retirement_health_preflight() -> dict[str, object]:
+    health = _maintenance_api_read("/health", authenticated=False)
+    required = {
+        "ok": True,
+        "psychloBridgeReady": True,
+        "service": "overseer-api",
+    }
+    if any(health.get(key) != value for key, value in required.items()):
+        raise ActivationPackageError("Overseer health is not ready for retirement")
+    return required
+
+
+def _retirement_fresh_intent(
+    successor_package: Path,
+    *,
+    successor_digest: str,
+    predecessor_digest: str,
+    plan_digest: str,
+    final_archive: Path,
+) -> dict[str, object]:
+    package = _validate_existing_package_destination(APPROVED_EXECUTION_PACKAGE)
+    executor_root = package.parent
+    package_approval = _load_activation_approval(package)
+    if package_approval.get("packageDigest") != predecessor_digest:
+        raise ActivationPackageError(
+            "predecessor package digest does not match the imported approval"
+        )
+    maintenance_approval = _load_maintenance_approval(package)
+    if maintenance_approval.get("packageDigest") != predecessor_digest:
+        raise ActivationPackageError(
+            "predecessor package digest does not match maintenance approval"
+        )
+    if maintenance_approval.get("planDigest") != plan_digest:
+        raise ActivationPackageError(
+            "maintenance plan digest does not match maintenance approval"
+        )
+    state = _load_maintenance_state()
+    if (
+        state is None
+        or state.get("schemaVersion") != MAINTENANCE_RUNNER_STATE_SCHEMA
+        or state.get("packageDigest") != predecessor_digest
+        or state.get("planDigest") != plan_digest
+        or state.get("status") != "rolled_back"
+        or state.get("stage") not in {"rollback", "earlyRollback"}
+        or state.get("writersStopped") is not True
+    ):
+        raise ActivationPackageError(
+            "maintenance runner state is not exactly rolled back"
+        )
+    _retirement_require_absent(
+        _activation_state_path(),
+        label="activation runner state",
+    )
+    for phase in sorted(ACTIVATION_PHASES):
+        _retirement_require_absent(
+            _activation_phase_approval_record_path(phase),
+            label=f"{phase} phase approval",
+        )
+    _retirement_active_retry_approvals_absent(executor_root)
+    contract = _sealed_maintenance_contract(
+        package,
+        package_digest=predecessor_digest,
+    )
+    release_digest = contract.get("releaseManifestDigest")
+    if (
+        not isinstance(release_digest, str)
+        or len(release_digest) != 64
+        or set(release_digest) - _HEX
+    ):
+        raise ActivationPackageError("maintenance release manifest digest is invalid")
+    maintenance_workspace = executor_root / f"maintenance-{release_digest}"
+    if contract.get("evidenceRoot") != str(maintenance_workspace / "preserved"):
+        raise ActivationPackageError(
+            "maintenance evidence root is outside the bound workspace"
+        )
+    writer_unit_baseline = contract.get("writerUnitBaseline")
+    successor_unit_baseline = contract.get("successorUnitBaseline")
+    _maintenance_writer_unit_preflight(writer_unit_baseline)
+    _maintenance_successor_unit_preflight(successor_unit_baseline)
+    health = _retirement_health_preflight()
+    artifacts = [
+        _retirement_record_artifact(
+            package,
+            kind="package",
+            package_digest=predecessor_digest,
+        ),
+        _retirement_record_artifact(
+            _activation_approval_record_path(),
+            kind="file",
+            expected_document=package_approval,
+        ),
+        _retirement_record_artifact(
+            _maintenance_approval_record_path(),
+            kind="file",
+            expected_document=maintenance_approval,
+        ),
+        _retirement_record_artifact(
+            _maintenance_state_path(),
+            kind="file",
+            expected_document=state,
+        ),
+        _retirement_record_artifact(
+            maintenance_workspace,
+            kind="directory",
+        ),
+    ]
+    destination_namespace = executor_root / f"destination-namespace-before-{plan_digest}"
+    canary_path = _canary_attestation_path(predecessor_digest)
+    for optional_path, kind in (
+        (destination_namespace, "directory"),
+        (canary_path, "file"),
+    ):
+        try:
+            optional_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ActivationPackageError(
+                "optional predecessor artifact could not be inspected"
+            ) from error
+        artifacts.append(_retirement_record_artifact(optional_path, kind=kind))
+    for retry in _retirement_bound_consumed_retries(
+        executor_root,
+        package=package,
+        package_digest=predecessor_digest,
+        plan_digest=plan_digest,
+    ):
+        artifacts.append(_retirement_record_artifact(retry, kind="file"))
+    artifacts.sort(key=lambda item: str(item["name"]))
+    names = [str(item["name"]) for item in artifacts]
+    if len(names) != len(set(names)):
+        raise ActivationPackageError("retirement artifact names are ambiguous")
+    return {
+        "schemaVersion": APPROVED_PACKAGE_RETIREMENT_INTENT_SCHEMA,
+        "status": "prepared",
+        "predecessorPackageDigest": predecessor_digest,
+        "successorPackageDigest": successor_digest,
+        "maintenancePlanDigest": plan_digest,
+        "releaseManifestDigest": release_digest,
+        "successorPackageRoot": str(successor_package),
+        "archiveRoot": str(final_archive),
+        "writerUnitBaseline": writer_unit_baseline,
+        "successorUnitBaseline": successor_unit_baseline,
+        "health": health,
+        "artifacts": artifacts,
+    }
+
+
+def _retirement_validate_intent(
+    intent: Mapping[str, object],
+    *,
+    successor_package: Path,
+    successor_digest: str,
+    predecessor_digest: str,
+    plan_digest: str,
+    final_archive: Path,
+    require_live_preflight: bool,
+) -> list[dict[str, object]]:
+    artifacts = intent.get("artifacts")
+    release_digest = intent.get("releaseManifestDigest")
+    if (
+        intent.get("schemaVersion") != APPROVED_PACKAGE_RETIREMENT_INTENT_SCHEMA
+        or intent.get("status") != "prepared"
+        or intent.get("predecessorPackageDigest") != predecessor_digest
+        or intent.get("successorPackageDigest") != successor_digest
+        or intent.get("maintenancePlanDigest") != plan_digest
+        or not isinstance(release_digest, str)
+        or len(release_digest) != 64
+        or set(release_digest) - _HEX
+        or intent.get("successorPackageRoot") != str(successor_package)
+        or intent.get("archiveRoot") != str(final_archive)
+        or not isinstance(artifacts, list)
+        or not artifacts
+        or not isinstance(intent.get("writerUnitBaseline"), list)
+        or not isinstance(intent.get("successorUnitBaseline"), list)
+        or intent.get("health")
+        != {
+            "ok": True,
+            "psychloBridgeReady": True,
+            "service": "overseer-api",
+        }
+    ):
+        raise ActivationPackageError("retirement intent binding is invalid")
+    selected: list[dict[str, object]] = []
+    names: set[str] = set()
+    executor_root = APPROVED_EXECUTION_PACKAGE.parent
+    exact_allowed = {
+        APPROVED_EXECUTION_PACKAGE.name,
+        _activation_approval_record_path().name,
+        _maintenance_approval_record_path().name,
+        _maintenance_state_path().name,
+        f"maintenance-{release_digest}",
+        f"destination-namespace-before-{plan_digest}",
+        _canary_attestation_path(predecessor_digest).name,
+    }
+    for item in artifacts:
+        if not isinstance(item, dict):
+            raise ActivationPackageError("retirement intent artifact is invalid")
+        name = item.get("name")
+        source = item.get("sourcePath")
+        kind = item.get("kind")
+        expected_kind = None
+        if isinstance(name, str):
+            expected_kind = (
+                "package"
+                if name == APPROVED_EXECUTION_PACKAGE.name
+                else (
+                    "directory"
+                    if name
+                    in {
+                        f"maintenance-{release_digest}",
+                        f"destination-namespace-before-{plan_digest}",
+                    }
+                    else "file"
+                )
+            )
+        if (
+            not isinstance(name, str)
+            or _safe_relative(name) != name
+            or "/" in name
+            or name in names
+            or not isinstance(source, str)
+            or Path(source).name != name
+            or Path(source).parent != executor_root
+            or kind != expected_kind
+            or (
+                name not in exact_allowed
+                and not name.startswith(
+                    "consumed-approved-maintenance-rollback-retry-"
+                )
+            )
+        ):
+            raise ActivationPackageError("retirement intent artifact path is invalid")
+        names.add(name)
+        selected.append(item)
+    required = {
+        APPROVED_EXECUTION_PACKAGE.name,
+        _activation_approval_record_path().name,
+        _maintenance_approval_record_path().name,
+        _maintenance_state_path().name,
+        f"maintenance-{release_digest}",
+    }
+    if not required.issubset(names):
+        raise ActivationPackageError("retirement intent is missing a required artifact")
+    if require_live_preflight:
+        _maintenance_writer_unit_preflight(intent.get("writerUnitBaseline"))
+        _maintenance_successor_unit_preflight(intent.get("successorUnitBaseline"))
+        _retirement_health_preflight()
+        verify_activation_package(successor_package, successor_digest)
+        _retirement_active_retry_approvals_absent(APPROVED_EXECUTION_PACKAGE.parent)
+        _retirement_require_absent(
+            _activation_state_path(),
+            label="activation runner state",
+        )
+        for phase in sorted(ACTIVATION_PHASES):
+            _retirement_require_absent(
+                _activation_phase_approval_record_path(phase),
+                label=f"{phase} phase approval",
+            )
+    return selected
+
+
+def _retirement_receipt(
+    intent: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "schemaVersion": APPROVED_PACKAGE_RETIREMENT_RECEIPT_SCHEMA,
+        "status": "retired",
+        "predecessorPackageDigest": intent["predecessorPackageDigest"],
+        "successorPackageDigest": intent["successorPackageDigest"],
+        "maintenancePlanDigest": intent["maintenancePlanDigest"],
+        "releaseManifestDigest": intent["releaseManifestDigest"],
+        "successorPackageRoot": intent["successorPackageRoot"],
+        "archiveRoot": intent["archiveRoot"],
+        "liveServiceMutationPerformed": False,
+        "artifacts": intent["artifacts"],
+    }
+
+
+def _retirement_read_record(path: Path, *, label: str) -> dict[str, object]:
+    document, _raw, _metadata = _retirement_load_root_record(path, label=label)
+    return document
+
+
+def _retirement_publish_record(
+    directory: Path,
+    *,
+    name: str,
+    document: Mapping[str, object],
+) -> None:
+    """Durably publish a deterministic record without replacing any inode."""
+
+    target = directory / name
+    temporary = directory / f".{name}.new"
+    expected = _canonical(dict(document)) + b"\n"
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise ActivationPackageError(
+            f"retirement record could not be inspected: {name}"
+        ) from error
+    else:
+        observed, _metadata = _stable_read(target)
+        if observed != expected:
+            raise ActivationPackageError(
+                f"retirement record binding is invalid: {name}"
+            )
+        return
+    try:
+        temporary.lstat()
+    except FileNotFoundError:
+        _write_new(temporary, expected, 0o600)
+        _fsync_package_directory(directory)
+    except OSError as error:
+        raise ActivationPackageError(
+            f"retirement record staging path could not be inspected: {name}"
+        ) from error
+    else:
+        observed, metadata = _stable_read(temporary)
+        root_uid, root_gid = _activation_root_identity()
+        if (
+            observed != expected
+            or metadata.st_uid != root_uid
+            or metadata.st_gid != root_gid
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ActivationPackageError(
+                f"retirement staged record binding is invalid: {name}"
+            )
+    _rename_package_no_replace(temporary, target)
+    _fsync_package_directory(directory)
+
+
+def _retirement_verify_complete_archive(
+    final_archive: Path,
+    *,
+    successor_package: Path,
+    successor_digest: str,
+    predecessor_digest: str,
+    plan_digest: str,
+) -> dict[str, object]:
+    _retirement_validate_private_directory(
+        final_archive,
+        label="retirement archive",
+    )
+    intent = _retirement_read_record(
+        final_archive / "retirement-intent.json",
+        label="retirement intent",
+    )
+    artifacts = _retirement_validate_intent(
+        intent,
+        successor_package=successor_package,
+        successor_digest=successor_digest,
+        predecessor_digest=predecessor_digest,
+        plan_digest=plan_digest,
+        final_archive=final_archive,
+        require_live_preflight=False,
+    )
+    receipt = _retirement_read_record(
+        final_archive / "retirement-receipt.json",
+        label="retirement receipt",
+    )
+    if receipt != _retirement_receipt(intent):
+        raise ActivationPackageError("retirement receipt binding is invalid")
+    expected_names = {
+        "retirement-intent.json",
+        "retirement-receipt.json",
+        *(str(item["name"]) for item in artifacts),
+    }
+    if {path.name for path in final_archive.iterdir()} != expected_names:
+        raise ActivationPackageError(
+            "retirement archive contains unexpected or missing artifacts"
+        )
+    for item in artifacts:
+        source = Path(str(item["sourcePath"]))
+        if source.exists() or source.is_symlink():
+            raise ActivationPackageError(
+                "retirement source remains after archive publication"
+            )
+        _retirement_verify_artifact(final_archive / str(item["name"]), item)
+    return {
+        "status": "retired",
+        "predecessorPackageDigest": predecessor_digest,
+        "successorPackageDigest": successor_digest,
+        "maintenancePlanDigest": plan_digest,
+        "archiveRoot": str(final_archive),
+        "artifactCount": len(artifacts),
+        "replayed": True,
+    }
+
+
+def _retire_approved_package_locked(
+    successor_package: Path,
+    *,
+    successor_digest: str,
+    predecessor_digest: str,
+    plan_digest: str,
+) -> dict[str, object]:
+    archive_parent = _approved_package_retirement_archive_root()
+    final_archive = archive_parent / predecessor_digest
+    pending_archive = archive_parent / f".pending-{predecessor_digest}"
+    try:
+        archive_parent.lstat()
+    except FileNotFoundError:
+        archive_parent_exists = False
+    except OSError as error:
+        raise ActivationPackageError(
+            "retirement archive namespace could not be inspected"
+        ) from error
+    else:
+        archive_parent_exists = True
+        _retirement_validate_private_directory(
+            archive_parent,
+            label="retirement archive namespace",
+        )
+    if final_archive.exists() or final_archive.is_symlink():
+        if pending_archive.exists() or pending_archive.is_symlink():
+            raise ActivationPackageError(
+                "retirement archive has conflicting final and pending state"
+            )
+        _fsync_package_directory(archive_parent)
+        return _retirement_verify_complete_archive(
+            final_archive,
+            successor_package=successor_package,
+            successor_digest=successor_digest,
+            predecessor_digest=predecessor_digest,
+            plan_digest=plan_digest,
+        )
+    if pending_archive.exists() or pending_archive.is_symlink():
+        _retirement_validate_private_directory(
+            pending_archive,
+            label="pending retirement archive",
+        )
+        try:
+            (pending_archive / "retirement-intent.json").lstat()
+        except FileNotFoundError:
+            intent = _retirement_fresh_intent(
+                successor_package,
+                successor_digest=successor_digest,
+                predecessor_digest=predecessor_digest,
+                plan_digest=plan_digest,
+                final_archive=final_archive,
+            )
+            _retirement_publish_record(
+                pending_archive,
+                name="retirement-intent.json",
+                document=intent,
+            )
+        except OSError as error:
+            raise ActivationPackageError(
+                "retirement intent could not be inspected"
+            ) from error
+        else:
+            intent = _retirement_read_record(
+                pending_archive / "retirement-intent.json",
+                label="retirement intent",
+            )
+    else:
+        intent = _retirement_fresh_intent(
+            successor_package,
+            successor_digest=successor_digest,
+            predecessor_digest=predecessor_digest,
+            plan_digest=plan_digest,
+            final_archive=final_archive,
+        )
+        if not archive_parent_exists:
+            _ensure_directory(archive_parent, mode=0o700)
+            _retirement_validate_private_directory(
+                archive_parent,
+                label="retirement archive namespace",
+            )
+            _fsync_package_directory(archive_parent.parent)
+        pending_archive.mkdir(mode=0o700)
+        _retirement_validate_private_directory(
+            pending_archive,
+            label="pending retirement archive",
+        )
+        _fsync_package_directory(archive_parent)
+        _retirement_publish_record(
+            pending_archive,
+            name="retirement-intent.json",
+            document=intent,
+        )
+    artifacts = _retirement_validate_intent(
+        intent,
+        successor_package=successor_package,
+        successor_digest=successor_digest,
+        predecessor_digest=predecessor_digest,
+        plan_digest=plan_digest,
+        final_archive=final_archive,
+        require_live_preflight=True,
+    )
+    for item in artifacts:
+        source = Path(str(item["sourcePath"]))
+        destination = pending_archive / str(item["name"])
+        source_exists = source.exists() or source.is_symlink()
+        destination_exists = destination.exists() or destination.is_symlink()
+        if source_exists == destination_exists:
+            raise ActivationPackageError(
+                f"retirement artifact has ambiguous transaction state: {item['name']}"
+            )
+        if source_exists:
+            _retirement_verify_artifact(source, item)
+            _retirement_rename_artifact_no_replace(source, destination, item)
+        _retirement_verify_artifact(destination, item)
+        _fsync_package_directory(source.parent)
+        _fsync_package_directory(pending_archive)
+    receipt = _retirement_receipt(intent)
+    _retirement_publish_record(
+        pending_archive,
+        name="retirement-receipt.json",
+        document=receipt,
+    )
+    expected_pending_names = {
+        "retirement-intent.json",
+        "retirement-receipt.json",
+        *(str(item["name"]) for item in artifacts),
+    }
+    if {path.name for path in pending_archive.iterdir()} != expected_pending_names:
+        raise ActivationPackageError(
+            "pending retirement archive contains an unexpected artifact"
+        )
+    _rename_package_no_replace(pending_archive, final_archive)
+    _fsync_package_directory(archive_parent)
+    result = _retirement_verify_complete_archive(
+        final_archive,
+        successor_package=successor_package,
+        successor_digest=successor_digest,
+        predecessor_digest=predecessor_digest,
+        plan_digest=plan_digest,
+    )
+    return {**result, "replayed": False}
+
+
+def retire_approved_package(
+    successor_package_root: str | os.PathLike[str],
+    *,
+    expected_successor_package_digest: str,
+    expected_predecessor_package_digest: str,
+    expected_maintenance_plan_digest: str,
+) -> dict[str, object]:
+    """Archive one terminal predecessor without changing live services."""
+
+    _require_root_activation()
+    successor_digest = _retirement_digest(
+        expected_successor_package_digest,
+        label="successor package digest",
+    )
+    predecessor_digest = _retirement_digest(
+        expected_predecessor_package_digest,
+        label="predecessor package digest",
+    )
+    plan_digest = _retirement_digest(
+        expected_maintenance_plan_digest,
+        label="maintenance plan digest",
+    )
+    if successor_digest == predecessor_digest:
+        raise ActivationPackageError(
+            "successor and predecessor package digests must differ"
+        )
+    with _activation_execution_lock():
+        successor_package = _validate_existing_package_destination(
+            successor_package_root
+        )
+        verify_activation_package(successor_package, successor_digest)
+        return _retire_approved_package_locked(
+            successor_package,
+            successor_digest=successor_digest,
+            predecessor_digest=predecessor_digest,
+            plan_digest=plan_digest,
+        )
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m overseer.activation_package",
@@ -13949,6 +14988,23 @@ def _main(argv: list[str] | None = None) -> int:
         "--action",
         required=True,
         choices=("adopt", "remove"),
+    )
+    retire_package = commands.add_parser(
+        "retire-approved-package",
+        help="archive one exact terminal predecessor without changing services",
+    )
+    retire_package.add_argument("--successor-package-root", required=True)
+    retire_package.add_argument(
+        "--expected-successor-package-digest",
+        required=True,
+    )
+    retire_package.add_argument(
+        "--expected-predecessor-package-digest",
+        required=True,
+    )
+    retire_package.add_argument(
+        "--expected-maintenance-plan-digest",
+        required=True,
     )
     approved_canary = commands.add_parser(
         "run-approved-canary",
@@ -14301,6 +15357,17 @@ def _main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "retire-approved-package":
+        result = retire_approved_package(
+            args.successor_package_root,
+            expected_successor_package_digest=args.expected_successor_package_digest,
+            expected_predecessor_package_digest=(
+                args.expected_predecessor_package_digest
+            ),
+            expected_maintenance_plan_digest=args.expected_maintenance_plan_digest,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "run-approved-canary":
         package = _validate_existing_package_destination(args.package_root)
         approval = _load_activation_approval(package)
@@ -14404,6 +15471,8 @@ def _main(argv: list[str] | None = None) -> int:
 __all__ = [
     "ACTIVATION_CONTRACT_SCHEMA",
     "ACTIVATION_PHASE_APPROVAL_SCHEMA",
+    "APPROVED_PACKAGE_RETIREMENT_INTENT_SCHEMA",
+    "APPROVED_PACKAGE_RETIREMENT_RECEIPT_SCHEMA",
     "ActivationPackageError",
     "MAINTENANCE_APPROVAL_SCHEMA",
     "MAINTENANCE_CONTRACT_SCHEMA",
@@ -14426,6 +15495,7 @@ __all__ = [
     "handoff_start_canary",
     "prepare_final_store_migration",
     "recover_activation_approval_import",
+    "retire_approved_package",
     "record_activation_approval",
     "record_activation_phase_approval",
     "record_maintenance_rollback_retry_approval",

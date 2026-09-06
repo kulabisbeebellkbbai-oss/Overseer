@@ -47,8 +47,9 @@ unchanged. Two new empty-parameter methods are added:
 
 The user-owned provider may execute only fixed argv for `/usr/bin/systemctl`
 and `/usr/bin/git`, with a fixed environment, optional Git locks and external
-helpers disabled, fixed source paths, hard total deadlines, output bounds, and
-no shell. Projection methods use isolated concurrency slots. The systemd
+helpers disabled, fixed source paths, hard total deadlines, streaming output
+bounds that terminate oversized children, and no shell. Projection methods use
+isolated concurrency slots. The systemd
 service exposes only the
 user bus and the Overseer checkout required by these providers. Private Codex
 material and other projects remain absent from its mount namespace.

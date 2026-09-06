@@ -21,6 +21,8 @@ import subprocess
 import time
 from typing import Any, Callable
 
+from .bounded_subprocess import run_bounded
+
 
 DEFAULT_CODEX_REGISTRY_PATH = Path("/home/god/.codex/codex-projects.csv")
 DEFAULT_CODEX_USAGE_DB_PATH = Path("/home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3")
@@ -30,6 +32,7 @@ MAX_SESSION_ROWS = 64
 MAX_USAGE_WINDOWS = 8
 DEFAULT_STALE_AFTER_SECONDS = 60 * 60
 DEFAULT_FRESHNESS_PROVIDER_TIMEOUT_SECONDS = 1.5
+MAX_SYSTEMCTL_OUTPUT_BYTES = 64 * 1024
 
 Clock = Callable[[], datetime]
 CommandRunner = Callable[[tuple[str, ...], float], object]
@@ -136,13 +139,11 @@ def _fixed_systemctl_runner(command: tuple[str, ...], timeout_seconds: float) ->
         "TZ": "UTC",
         "XDG_RUNTIME_DIR": f"/run/user/{os.geteuid()}",
     }
-    return subprocess.run(
+    return run_bounded(
         command,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
         env=environment,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=MAX_SYSTEMCTL_OUTPUT_BYTES,
     )
 
 

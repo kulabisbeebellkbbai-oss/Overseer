@@ -336,7 +336,7 @@ def test_bridge_git_runner_seals_config_environment_and_optional_locks(
         calls.append({"command": command, **kwargs})
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(git_module.subprocess, "run", run)
+    monkeypatch.setattr(git_module, "run_bounded", run)
 
     git_module._bridge_git(tmp_path, "status", "--porcelain=v1", timeout=0.5)
 
@@ -349,8 +349,7 @@ def test_bridge_git_runner_seals_config_environment_and_optional_locks(
         "--porcelain=v1",
     )
     assert call["cwd"] == tmp_path
-    assert call["stdin"] is subprocess.DEVNULL
-    assert call["shell"] is False
+    assert call["max_output_bytes"] == 256 * 1024
     environment = call["env"]
     assert isinstance(environment, dict)
     assert environment == {

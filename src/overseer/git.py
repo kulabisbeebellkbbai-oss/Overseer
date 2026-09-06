@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import quote
 
+from .bounded_subprocess import run_bounded
 from .store import SQLiteStore
 
 GIT_STATUS_PROJECTION_ID = "dashboard.git.status"
@@ -467,23 +468,13 @@ def _bridge_git(
         or timeout <= 0
     ):
         raise ValueError("bridge Git timeout is invalid")
-    completed = subprocess.run(
+    completed = run_bounded(
         ("/usr/bin/git", "--no-optional-locks", *args),
         cwd=root,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=float(timeout),
-        stdin=subprocess.DEVNULL,
         env=dict(_BRIDGE_GIT_ENVIRONMENT),
-        shell=False,
+        timeout_seconds=float(timeout),
+        max_output_bytes=_BRIDGE_GIT_OUTPUT_BYTES,
     )
-    if (
-        len(completed.stdout.encode("utf-8", errors="replace"))
-        + len(completed.stderr.encode("utf-8", errors="replace"))
-        > _BRIDGE_GIT_OUTPUT_BYTES
-    ):
-        raise ValueError("bridge Git output exceeds its bound")
     if check and completed.returncode != 0:
         raise ValueError("bridge Git command failed")
     return completed

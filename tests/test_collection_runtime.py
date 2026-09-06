@@ -17,6 +17,7 @@ from overseer.config import config_from_mapping
 from overseer.core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 from overseer.health import HealthTarget, ProbeType
 from overseer.host import HostCommandObservation
+from overseer.git import git_status_projection_status
 from overseer.runtime import OverseerRuntime, runtime_collection_adapter_registry, seed_default_collection_jobs
 from overseer.store import SQLiteStore
 
@@ -133,24 +134,35 @@ def test_default_collection_seeding_fails_closed_for_external_action_families(tm
     assert jobs["collection.host.inspection"].timeout_seconds == 5
 
 
-def test_dedicated_principal_reseeding_disables_all_user_session_collectors(
+def test_dedicated_principal_reseeding_keeps_only_fixed_bridge_collectors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _seed_resource_and_target(tmp_path)
     seed_default_collection_jobs(path)
-    user_session_ids = {
+    mutation_job_ids = {
         "collection.dispatch.crew",
         "collection.usage.continuation",
         "collection.knowledge.capture",
         "collection.station.audit",
+    }
+    bridge_job_ids = {
         "collection.freshness.psychlo-usage",
         "collection.freshness.quark-scheduler",
         "collection.git.overseer",
     }
+    user_session_ids = mutation_job_ids | bridge_job_ids
     with SQLiteStore(path) as store:
         for job_id in user_session_ids:
             job = store.load_collection_job(job_id)
-            store.save_collection_job(job.__class__(**{**job.__dict__, "enabled": True}))
+            store.save_collection_job(
+                job.__class__(
+                    **{
+                        **job.__dict__,
+                        "enabled": job_id
+                        != "collection.freshness.psychlo-usage",
+                    }
+                )
+            )
         store.save_collection_job(
             CollectionJob(
                 id="collection.custom.user-git",
@@ -166,14 +178,16 @@ def test_dedicated_principal_reseeding_disables_all_user_session_collectors(
 
     with SQLiteStore(path) as store:
         jobs = {job.id: job for job in store.list_collection_jobs()}
-    assert all(not jobs[job_id].enabled for job_id in user_session_ids)
+    assert all(not jobs[job_id].enabled for job_id in mutation_job_ids)
+    assert all(jobs[job_id].enabled for job_id in bridge_job_ids)
     assert jobs["collection.custom.user-git"].enabled is False
     assert jobs["collection.health.health.api"].enabled is True
     disabled = {item["job_id"]: item["reason"] for item in result["disabled"]}
     assert all(
         disabled[job_id] == "user-session bridge is required in dedicated-principal mode"
-        for job_id in user_session_ids | {"collection.custom.user-git"}
+        for job_id in mutation_job_ids | {"collection.custom.user-git"}
     )
+    assert not bridge_job_ids & disabled.keys()
 
 
 def test_legacy_action_flags_do_not_authorize_unsafe_jobs(tmp_path: Path) -> None:
@@ -543,6 +557,202 @@ def test_external_freshness_fails_when_psychlo_cycle_stage_fails(tmp_path: Path)
 
     assert execution.outcome is CollectionOutcome.FAILED
     assert execution.failure_category == "unavailable"
+
+
+def test_dedicated_runtime_collects_fixed_user_session_projections_through_bridge(
+    tmp_path: Path,
+) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    calls: list[str] = []
+
+    class Bridge:
+        def call(self, method: str, request_id: str) -> dict[str, object]:
+            assert request_id.startswith("runtime-")
+            calls.append(method)
+            if method == "overseer.scheduler.freshness.v1":
+                projection: dict[str, object] = {
+                    "state": "available",
+                    "observed_at": "2026-09-06T12:00:00+00:00",
+                    "services": [
+                        {
+                            "job_id": "collection.freshness.psychlo-usage",
+                            "outcome": "succeeded",
+                            "evidence_id": "freshness.psychlo-usage",
+                        },
+                        {
+                            "job_id": "collection.freshness.quark-scheduler",
+                            "outcome": "succeeded",
+                            "evidence_id": "freshness.quark-scheduler",
+                        },
+                    ],
+                }
+            else:
+                assert method == "overseer.git.status.v1"
+                projection = {
+                    "state": "available",
+                    "observed_at": "2026-09-06T12:00:00+00:00",
+                    "git": {
+                        "repository": "overseer",
+                        "branch": "feature/maintenance-window-v1-1-6",
+                        "head": "a" * 40,
+                        "short_head": "a" * 7,
+                        "upstream": "origin/feature/maintenance-window-v1-1-6",
+                        "ahead": 1,
+                        "behind": 0,
+                        "dirty": True,
+                        "changed": 1,
+                        "staged": 0,
+                        "unstaged": 1,
+                        "untracked": 0,
+                        "conflicted": 0,
+                        "remote_owner": "example",
+                        "remote_repo": "overseer",
+                    },
+                }
+            return {
+                "protocol": "overseer.user-bridge.v1",
+                "request_id": request_id,
+                "method": method,
+                "status": "ok",
+                "projection": projection,
+            }
+
+    registry = runtime_collection_adapter_registry(user_bridge_client=Bridge())
+    with SQLiteStore(path) as store:
+        psychlo = store.load_collection_job("collection.freshness.psychlo-usage")
+        git = store.load_collection_job("collection.git.overseer")
+
+    freshness_execution = registry.resolve(
+        psychlo, "freshness-projection"
+    ).collect(psychlo, str(path))
+    git_execution = registry.resolve(git, "git-inspection").collect(git, str(path))
+
+    assert freshness_execution.outcome is CollectionOutcome.SUCCEEDED
+    assert freshness_execution.evidence_ids == ("freshness.psychlo-usage",)
+    assert git_execution.outcome is CollectionOutcome.SUCCEEDED
+    assert calls == [
+        "overseer.scheduler.freshness.v1",
+        "overseer.git.status.v1",
+    ]
+    persisted = git_status_projection_status(path)
+    assert persisted["projection_available"] is True
+    assert persisted["repo_path"] == "Overseer"
+    assert persisted["branch"] == "feature/maintenance-window-v1-1-6"
+    assert persisted["dirty"] is True
+    assert persisted["remote"] == {
+        "name": "origin",
+        "url": None,
+        "web_url": "https://github.com/example/overseer",
+        "owner": "example",
+        "repo": "overseer",
+        "default_branch_guess": "feature/maintenance-window-v1-1-6",
+        "current_commit_url": "https://github.com/example/overseer/commit/" + "a" * 40,
+    }
+
+
+def test_dedicated_runtime_bridge_failure_is_bounded_without_direct_fallback(
+    tmp_path: Path,
+) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+
+    class Bridge:
+        def call(self, method: str, request_id: str) -> dict[str, object]:
+            del method, request_id
+            raise TimeoutError("private user-session detail")
+
+    registry = runtime_collection_adapter_registry(
+        user_bridge_client=Bridge(),
+        systemd_runner=lambda *_args: pytest.fail("must not query the user manager directly"),
+        git_projection_collector=lambda *_args, **_kwargs: pytest.fail(
+            "must not inspect the user checkout directly"
+        ),
+    )
+    with SQLiteStore(path) as store:
+        psychlo = store.load_collection_job("collection.freshness.psychlo-usage")
+        git = store.load_collection_job("collection.git.overseer")
+
+    freshness_execution = registry.resolve(
+        psychlo, "freshness-projection"
+    ).collect(psychlo, str(path))
+    git_execution = registry.resolve(git, "git-inspection").collect(git, str(path))
+
+    assert freshness_execution.outcome is CollectionOutcome.BLOCKED
+    assert freshness_execution.failure_category == "unavailable"
+    assert git_execution.outcome is CollectionOutcome.BLOCKED
+    assert git_execution.failure_category == "unavailable"
+
+
+def test_dedicated_runtime_rejects_stale_bridge_projections(
+    tmp_path: Path,
+) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+
+    class Bridge:
+        def call(self, method: str, request_id: str) -> dict[str, object]:
+            del request_id
+            projection: dict[str, object] = {
+                "state": "stale",
+                "observed_at": "2026-09-06T12:00:00+00:00",
+            }
+            if method == "overseer.scheduler.freshness.v1":
+                projection["services"] = [
+                    {
+                        "job_id": "collection.freshness.psychlo-usage",
+                        "outcome": "succeeded",
+                        "evidence_id": "freshness.psychlo-usage",
+                    }
+                ]
+            else:
+                projection["git"] = {}
+            return {
+                "status": "ok",
+                "method": method,
+                "projection": projection,
+            }
+
+    registry = runtime_collection_adapter_registry(user_bridge_client=Bridge())
+    with SQLiteStore(path) as store:
+        psychlo = store.load_collection_job(
+            "collection.freshness.psychlo-usage"
+        )
+        git = store.load_collection_job("collection.git.overseer")
+
+    freshness_execution = registry.resolve(
+        psychlo,
+        "freshness-projection",
+    ).collect(psychlo, str(path))
+    git_execution = registry.resolve(git, "git-inspection").collect(git, str(path))
+
+    assert freshness_execution.outcome is CollectionOutcome.FAILED
+    assert freshness_execution.failure_category == "stale"
+    assert git_execution.outcome is CollectionOutcome.FAILED
+    assert git_execution.failure_category == "stale"
+
+
+def test_dedicated_runtime_unit_depends_on_the_fixed_user_bridge() -> None:
+    root = Path(__file__).parents[1]
+    runtime_unit = (root / "systemd/overseer-runtime-system.service").read_text()
+    bridge_unit = (root / "systemd/overseer-codex-user-bridge.service").read_text()
+
+    assert "Wants=overseer-codex-user-bridge.socket" in runtime_unit
+    assert "After=local-fs.target overseer-codex-user-bridge.socket" in runtime_unit
+    assert (
+        "Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock"
+        in runtime_unit
+    )
+    assert "Environment=OVERSEER_USER_BRIDGE_SERVER_UID=@GOD_UID@" in runtime_unit
+    assert "Environment=XDG_RUNTIME_DIR=/run/user/@GOD_UID@" in bridge_unit
+    assert (
+        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@GOD_UID@/bus"
+        in bridge_unit
+    )
+    assert (
+        'BindReadOnlyPaths="/home/god/Documents/Codex Workspace/Overseer"'
+        in bridge_unit
+    )
 
 
 def test_virtual_discovery_runs_only_one_bounded_listener_command(tmp_path: Path) -> None:

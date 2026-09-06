@@ -17,17 +17,22 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import time
 from typing import Any, Callable
 
 
 DEFAULT_CODEX_REGISTRY_PATH = Path("/home/god/.codex/codex-projects.csv")
 DEFAULT_CODEX_USAGE_DB_PATH = Path("/home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3")
+DEFAULT_OVERSEER_REPO_PATH = Path("/home/god/Documents/Codex Workspace/Overseer")
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SESSION_ROWS = 64
 MAX_USAGE_WINDOWS = 8
 DEFAULT_STALE_AFTER_SECONDS = 60 * 60
+DEFAULT_FRESHNESS_PROVIDER_TIMEOUT_SECONDS = 1.5
 
 Clock = Callable[[], datetime]
+CommandRunner = Callable[[tuple[str, ...], float], object]
 
 
 def _now() -> datetime:
@@ -122,6 +127,182 @@ def _percent(value: Any) -> int | None:
     return max(0, min(100, int(round(float(value)))))
 
 
+def _fixed_systemctl_runner(command: tuple[str, ...], timeout_seconds: float) -> object:
+    environment = {
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.geteuid()}/bus",
+        "HOME": "/home/god",
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "TZ": "UTC",
+        "XDG_RUNTIME_DIR": f"/run/user/{os.geteuid()}",
+    }
+    return subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        env=environment,
+    )
+
+
+class UserServiceFreshnessProjectionProvider:
+    """Inspect only the two fixed user timer/service pairs without starting them."""
+
+    def __init__(
+        self,
+        *,
+        runner: CommandRunner | None = None,
+        clock: Clock | None = None,
+        timeout_seconds: float = DEFAULT_FRESHNESS_PROVIDER_TIMEOUT_SECONDS,
+    ) -> None:
+        self.runner = runner or _fixed_systemctl_runner
+        self.clock = clock or _now
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("freshness provider timeout must be positive")
+        self.timeout_seconds = float(timeout_seconds)
+
+    def __call__(self) -> dict[str, Any]:
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        from .collection_models import CollectionJob, CollectionJobKind
+        from .core import OwnerDomain
+        from .runtime import _freshness_projection_status
+
+        deadline = time.monotonic() + self.timeout_seconds
+
+        def fixed_runner(command: tuple[str, ...], timeout_seconds: float) -> object:
+            if not command or command[0] != "systemctl":
+                raise ValueError("freshness command is not fixed")
+            remaining = min(timeout_seconds, deadline - time.monotonic())
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("/usr/bin/systemctl", 0)
+            return self.runner(("/usr/bin/systemctl", *command[1:]), remaining)
+
+        jobs = (
+            CollectionJob(
+                id="collection.freshness.psychlo-usage",
+                kind=CollectionJobKind.FRESHNESS_PROJECTION,
+                owner_domain=OwnerDomain.QUARK,
+                resource_id="overseer-psychlo-usage.service",
+                interval_seconds=60,
+                timeout_seconds=5,
+            ),
+            CollectionJob(
+                id="collection.freshness.quark-scheduler",
+                kind=CollectionJobKind.FRESHNESS_PROJECTION,
+                owner_domain=OwnerDomain.QUARK,
+                resource_id="overseer-quark-scheduler.service",
+                interval_seconds=60,
+                timeout_seconds=5,
+            ),
+        )
+        services: list[dict[str, Any]] = []
+        try:
+            for job in jobs:
+                result = _freshness_projection_status(
+                    job,
+                    "",
+                    job.timeout_seconds,
+                    fixed_runner,
+                    self.clock,
+                )
+                item: dict[str, Any] = {
+                    "job_id": job.id,
+                    "outcome": result.get("outcome", "blocked"),
+                }
+                evidence_ids = result.get("evidence_ids")
+                if (
+                    item["outcome"] == "succeeded"
+                    and isinstance(evidence_ids, tuple)
+                    and evidence_ids
+                    and isinstance(evidence_ids[0], str)
+                ):
+                    item["evidence_id"] = evidence_ids[0]
+                else:
+                    item["failure_category"] = result.get(
+                        "failure_category",
+                        "unavailable",
+                    )
+                services.append(item)
+            observed_at = self.clock().astimezone(UTC).isoformat()
+            return {
+                "state": "available",
+                "observed_at": observed_at,
+                "services": services,
+            }
+        except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+            return {"state": "error", "error_code": "source_unavailable"}
+
+
+class OverseerGitStatusProjectionProvider:
+    """Read a bounded status for the one fixed Overseer checkout."""
+
+    def __init__(
+        self,
+        repo_path: str | Path = DEFAULT_OVERSEER_REPO_PATH,
+        *,
+        status_reader: Callable[..., dict[str, object]] | None = None,
+        clock: Clock | None = None,
+    ) -> None:
+        self.repo_path = _validate_source_path(repo_path)
+        self.status_reader = status_reader
+        self.clock = clock or _now
+
+    def __call__(self) -> dict[str, Any]:
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        try:
+            if self.status_reader is None:
+                from .git import bridge_git_status_status
+
+                status = bridge_git_status_status(
+                    self.repo_path,
+                    command_timeout_seconds=0.75,
+                )
+            else:
+                status = self.status_reader(
+                    self.repo_path,
+                    account_root=self.repo_path.parent,
+                    include_account=False,
+                    command_timeout_seconds=0.75,
+                )
+            remote = status.get("remote")
+            if not isinstance(remote, dict):
+                remote = {}
+            git = {
+                "repository": "overseer",
+                "branch": status.get("branch"),
+                "head": status.get("head"),
+                "short_head": status.get("short_head"),
+                "upstream": status.get("upstream"),
+                "ahead": status.get("ahead"),
+                "behind": status.get("behind"),
+                "dirty": status.get("dirty"),
+                "changed": status.get("changed"),
+                "staged": status.get("staged"),
+                "unstaged": status.get("unstaged"),
+                "untracked": status.get("untracked"),
+                "conflicted": status.get("conflicted"),
+                "remote_owner": remote.get("owner"),
+                "remote_repo": remote.get("repo"),
+            }
+            return {
+                "state": "available",
+                "observed_at": self.clock().astimezone(UTC).isoformat(),
+                "git": git,
+            }
+        except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+            return {"state": "error", "error_code": "source_unavailable"}
+
+
 class CodexSessionProjectionProvider:
     """Read the fixed Codex registry without exposing its raw values."""
 
@@ -207,7 +388,7 @@ class CodexUsageProjectionProvider:
         descriptor: int | None = None
         try:
             descriptor, metadata = _open_fixed_descriptor(self.db_path)
-            uri = f"file:{self.db_path.as_posix()}?mode=ro"
+            uri = f"file:/proc/self/fd/{descriptor}?mode=ro"
             with sqlite3.connect(uri, uri=True, timeout=0.5) as connection:
                 row = connection.execute(
                     "SELECT observed_at, payload FROM codex_usage_snapshots ORDER BY id DESC LIMIT 1"

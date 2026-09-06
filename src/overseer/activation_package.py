@@ -3840,6 +3840,407 @@ def _lock_maintenance_destination_namespace_for_rollback(
         raise
 
 
+def _maintenance_rollback_directory_identity(
+    metadata: os.stat_result,
+) -> dict[str, int]:
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def _maintenance_rollback_archive_paths(
+    contract: Mapping[str, object],
+) -> tuple[Path, Path, Path, Path]:
+    evidence_value = contract.get("evidenceRoot")
+    if not isinstance(evidence_value, str) or not evidence_value.startswith("/"):
+        raise ActivationPackageError(
+            "maintenance rollback evidence root is invalid"
+        )
+    evidence_root = Path(evidence_value)
+    workspace = evidence_root.parent
+    if workspace == evidence_root or evidence_root.name != "preserved":
+        raise ActivationPackageError(
+            "maintenance rollback evidence root is invalid"
+        )
+    root_uid, root_gid = _activation_root_identity()
+    try:
+        metadata = workspace.lstat()
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance rollback evidence workspace is unavailable"
+        ) from error
+    if (
+        workspace.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_uid, metadata.st_gid) != (root_uid, root_gid)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ActivationPackageError(
+            "maintenance rollback evidence workspace is unsafe"
+        )
+    return (
+        workspace,
+        workspace / "failed-successor-store",
+        workspace / "failed-successor-store-intent.json",
+        workspace / "failed-successor-store-receipt.json",
+    )
+
+
+def _maintenance_rollback_record(
+    path: Path,
+    expected: Mapping[str, object],
+    *,
+    label: str,
+) -> dict[str, object]:
+    payload = _canonical(dict(expected)) + b"\n"
+    root_uid, root_gid = _activation_root_identity()
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        _write_new(path, payload, 0o600)
+        _fsync_package_directory(path.parent)
+        raw, metadata = _stable_read(path)
+    except OSError as error:
+        raise ActivationPackageError(f"{label} could not be read") from error
+    else:
+        raw, metadata = _stable_read(path)
+    if (
+        raw != payload
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or (metadata.st_uid, metadata.st_gid) != (root_uid, root_gid)
+        or metadata.st_nlink != 1
+    ):
+        raise ActivationPackageError(f"{label} binding is invalid")
+    return dict(expected)
+
+
+def _maintenance_rollback_replacement_identity(
+    path: Path,
+    *,
+    normalize_root_lock: bool = False,
+) -> dict[str, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance rollback replacement namespace is unavailable"
+        ) from error
+    root_uid, root_gid = _activation_root_identity()
+    if (
+        path.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_uid, metadata.st_gid)
+        not in (
+            {(APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID), (root_uid, root_gid)}
+            if normalize_root_lock
+            else {(APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)}
+        )
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ActivationPackageError(
+            "maintenance rollback replacement namespace is unsafe"
+        )
+    try:
+        if any(path.iterdir()):
+            raise ActivationPackageError(
+                "maintenance rollback replacement namespace is not empty"
+            )
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance rollback replacement namespace could not be inventoried"
+        ) from error
+    if (
+        normalize_root_lock
+        and (metadata.st_uid, metadata.st_gid) == (root_uid, root_gid)
+        and (root_uid, root_gid)
+        != (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
+    ):
+        try:
+            os.chown(
+                path,
+                APPROVED_OVERSEER_UID,
+                APPROVED_OVERSEER_GID,
+                follow_symlinks=False,
+            )
+            _fsync_package_directory(path.parent)
+            metadata = path.lstat()
+        except OSError as error:
+            raise ActivationPackageError(
+                "maintenance rollback replacement ownership could not be restored"
+            ) from error
+        if (
+            path.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid)
+            != (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ActivationPackageError(
+                "maintenance rollback replacement ownership is invalid"
+            )
+    return _maintenance_rollback_directory_identity(metadata)
+
+
+def _maintenance_rollback_create_empty_namespace(path: Path) -> dict[str, int]:
+    root_uid, root_gid = _activation_root_identity()
+    try:
+        parent = path.parent.lstat()
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance rollback destination parent is unavailable"
+        ) from error
+    if (
+        path.parent.is_symlink()
+        or not stat.S_ISDIR(parent.st_mode)
+        or (parent.st_uid, parent.st_gid) != (root_uid, root_gid)
+    ):
+        raise ActivationPackageError(
+            "maintenance rollback destination parent is unsafe"
+        )
+    descriptor = os.open(
+        path.parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        if (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) != (
+            parent.st_dev,
+            parent.st_ino,
+        ):
+            raise ActivationPackageError(
+                "maintenance rollback destination parent changed"
+            )
+        try:
+            os.mkdir(path.name, mode=0o700, dir_fd=descriptor)
+        except FileExistsError:
+            pass
+        os.chown(
+            path.name,
+            APPROVED_OVERSEER_UID,
+            APPROVED_OVERSEER_GID,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        os.chmod(
+            path.name,
+            0o700,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        os.fsync(descriptor)
+    except OSError as error:
+        raise ActivationPackageError(
+            "maintenance rollback replacement namespace could not be created"
+        ) from error
+    finally:
+        os.close(descriptor)
+    return _maintenance_rollback_replacement_identity(path)
+
+
+def _archive_maintenance_destination_namespace_for_rollback(
+    contract: Mapping[str, object],
+    bindings: list[object],
+    destination_descriptor: int,
+) -> dict[str, object]:
+    """Durably preserve a failed successor and recreate its empty namespace."""
+
+    destinations = [
+        Path(str(binding.get("destinationDb", ""))).resolve()
+        for binding in bindings
+        if isinstance(binding, Mapping)
+    ]
+    if len(destinations) != len(bindings) or not destinations:
+        raise ActivationPackageError(
+            "maintenance rollback destination binding is invalid"
+        )
+    parents = {destination.parent for destination in destinations}
+    if len(parents) != 1:
+        raise ActivationPackageError(
+            "maintenance rollback destinations do not share one namespace"
+        )
+    source = next(iter(parents))
+    workspace, archive, intent_path, receipt_path = (
+        _maintenance_rollback_archive_paths(contract)
+    )
+    archive_exists = archive.exists() or archive.is_symlink()
+    intent_exists = intent_path.exists() or intent_path.is_symlink()
+    receipt_exists = receipt_path.exists() or receipt_path.is_symlink()
+    if archive_exists and not intent_exists:
+        raise ActivationPackageError(
+            "maintenance rollback archive has conflicting unbound state"
+        )
+    if receipt_exists and (not intent_exists or not archive_exists):
+        raise ActivationPackageError(
+            "maintenance rollback archive has conflicting receipt state"
+        )
+
+    source_identity: dict[str, int] | None = None
+    if not intent_exists:
+        if destination_descriptor >= 0:
+            opened = os.fstat(destination_descriptor)
+            try:
+                lexical = source.lstat()
+            except OSError as error:
+                raise ActivationPackageError(
+                    "maintenance rollback destination namespace changed"
+                ) from error
+            if (opened.st_dev, opened.st_ino) != (lexical.st_dev, lexical.st_ino):
+                raise ActivationPackageError(
+                    "maintenance rollback destination namespace changed"
+                )
+            source_identity = _maintenance_rollback_directory_identity(opened)
+        intent = {
+            "schemaVersion": "overseer.maintenance-failed-successor-intent.v1",
+            "status": "prepared",
+            "contractDigest": _sha256(_canonical(contract)),
+            "sourceDirectory": str(source),
+            "archiveDirectory": str(archive),
+            "destinationNames": sorted(path.name for path in destinations),
+            "archiveExpected": source_identity is not None,
+            "sourceIdentity": source_identity,
+        }
+        _maintenance_rollback_record(
+            intent_path,
+            intent,
+            label="maintenance rollback archive intent",
+        )
+    else:
+        try:
+            intent_raw, _intent_metadata = _stable_read(intent_path)
+            intent = json.loads(intent_raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ActivationPackageError(
+                "maintenance rollback archive intent is invalid"
+            ) from error
+        expected_common = {
+            "schemaVersion": "overseer.maintenance-failed-successor-intent.v1",
+            "status": "prepared",
+            "contractDigest": _sha256(_canonical(contract)),
+            "sourceDirectory": str(source),
+            "archiveDirectory": str(archive),
+            "destinationNames": sorted(path.name for path in destinations),
+        }
+        if (
+            not isinstance(intent, dict)
+            or any(intent.get(key) != value for key, value in expected_common.items())
+            or type(intent.get("archiveExpected")) is not bool
+            or (
+                intent.get("archiveExpected") is True
+                and not isinstance(intent.get("sourceIdentity"), Mapping)
+            )
+            or (
+                intent.get("archiveExpected") is False
+                and intent.get("sourceIdentity") is not None
+            )
+        ):
+            raise ActivationPackageError(
+                "maintenance rollback archive intent binding is invalid"
+            )
+        _maintenance_rollback_record(
+            intent_path,
+            intent,
+            label="maintenance rollback archive intent",
+        )
+        source_identity_value = intent.get("sourceIdentity")
+        source_identity = (
+            dict(source_identity_value)
+            if isinstance(source_identity_value, Mapping)
+            else None
+        )
+
+    if intent["archiveExpected"] is True and not archive_exists:
+        if destination_descriptor < 0 or source_identity is None:
+            raise ActivationPackageError(
+                "maintenance rollback archive source disappeared"
+            )
+        opened_identity = _maintenance_rollback_directory_identity(
+            os.fstat(destination_descriptor)
+        )
+        if opened_identity != source_identity:
+            raise ActivationPackageError(
+                "maintenance rollback archive source identity drifted"
+            )
+        try:
+            _rename_package_no_replace(source, archive)
+        except (FileExistsError, OSError) as error:
+            raise ActivationPackageError(
+                "maintenance rollback archive publication failed"
+            ) from error
+        _fsync_package_directory(source.parent)
+        _fsync_package_directory(workspace)
+        archive_exists = True
+    elif intent["archiveExpected"] is False and archive_exists:
+        raise ActivationPackageError(
+            "maintenance rollback archive has conflicting unexpected state"
+        )
+
+    archive_identity: dict[str, int] | None = None
+    if archive_exists:
+        try:
+            archive_metadata = archive.lstat()
+        except OSError as error:
+            raise ActivationPackageError(
+                "maintenance rollback archive is unavailable"
+            ) from error
+        root_uid, root_gid = _activation_root_identity()
+        archive_identity = _maintenance_rollback_directory_identity(
+            archive_metadata
+        )
+        if (
+            archive.is_symlink()
+            or not stat.S_ISDIR(archive_metadata.st_mode)
+            or (archive_metadata.st_uid, archive_metadata.st_gid)
+            != (root_uid, root_gid)
+            or stat.S_IMODE(archive_metadata.st_mode) != 0o700
+            or archive_identity != source_identity
+        ):
+            raise ActivationPackageError(
+                "maintenance rollback archive identity is invalid"
+            )
+
+    if source.exists() or source.is_symlink():
+        replacement_identity = _maintenance_rollback_replacement_identity(
+            source,
+            normalize_root_lock=True,
+        )
+        if source_identity is not None and replacement_identity == source_identity:
+            raise ActivationPackageError(
+                "maintenance rollback failed successor was not archived"
+            )
+    else:
+        replacement_identity = _maintenance_rollback_create_empty_namespace(source)
+    receipt = {
+        "schemaVersion": "overseer.maintenance-failed-successor-receipt.v1",
+        "status": "archived_and_recreated",
+        "contractDigest": intent["contractDigest"],
+        "sourceDirectory": str(source),
+        "archiveDirectory": str(archive) if archive_identity is not None else None,
+        "archiveIdentity": archive_identity,
+        "replacementIdentity": replacement_identity,
+    }
+    replayed = receipt_exists
+    _maintenance_rollback_record(
+        receipt_path,
+        receipt,
+        label="maintenance rollback archive receipt",
+    )
+    _fsync_package_directory(workspace)
+    _fsync_package_directory(source.parent)
+    return {
+        "status": "destination_namespace_archived",
+        "archiveRoot": str(archive) if archive_identity is not None else None,
+        "replacementRoot": str(source),
+        "replayed": replayed,
+    }
+
+
 def restore_maintenance_store_access(
     package_root: str | os.PathLike[str],
 ) -> dict[str, object]:
@@ -3859,6 +4260,13 @@ def restore_maintenance_store_access(
         _lock_maintenance_destination_namespace_for_rollback(bindings)
     )
     try:
+        archive_result = (
+            _archive_maintenance_destination_namespace_for_rollback(
+                contract,
+                bindings,
+                destination_descriptor,
+            )
+        )
         for binding in bindings:
             if not isinstance(binding, Mapping) or not isinstance(
                 binding.get("sourceIdentity"), Mapping
@@ -3885,7 +4293,8 @@ def restore_maintenance_store_access(
     return {
         "status": "maintenance_store_access_restored",
         "stores": restored,
-        "destinationNamespace": "root-locked-and-process-free",
+        "destinationNamespace": "archived-and-recreated-empty",
+        "failedSuccessorArchive": archive_result,
         "resolvedUnsafeMarkers": resolved_markers,
     }
 
@@ -13015,7 +13424,7 @@ def _run_bounded_maintenance_acceptance_check(
     contract: Mapping[str, object],
     *,
     check_name: str,
-) -> bool:
+) -> bool | str:
     if check_name == "api":
         payload = _maintenance_api_read("/health", authenticated=False)
         return (
@@ -13042,7 +13451,7 @@ def _run_bounded_maintenance_acceptance_check(
             and jobs_payload.get("status") == "ok"
             and isinstance(jobs, list)
         ):
-            return False
+            return "reason=status-invalid"
         by_id = {
             str(item.get("id")): item
             for item in jobs
@@ -13051,20 +13460,24 @@ def _run_bounded_maintenance_acceptance_check(
         for job_id in _MAINTENANCE_FRESHNESS_JOB_IDS:
             item = by_id.get(job_id)
             if not isinstance(item, Mapping):
-                return False
+                return f"job={job_id} reason=missing"
             interval = item.get("interval_seconds")
             age = item.get("data_age_seconds")
+            if item.get("enabled") is not True:
+                return f"job={job_id} reason=disabled"
+            if item.get("last_outcome") != "succeeded":
+                return f"job={job_id} reason=unsuccessful"
+            if type(interval) is not int or interval <= 0:
+                return f"job={job_id} reason=invalid-interval"
             if (
-                item.get("enabled") is not True
-                or item.get("last_outcome") != "succeeded"
-                or type(interval) is not int
-                or interval <= 0
-                or isinstance(age, bool)
+                isinstance(age, bool)
                 or not isinstance(age, (int, float))
+                or not math.isfinite(float(age))
                 or age < 0
-                or age > max(interval * 2, 300)
             ):
-                return False
+                return f"job={job_id} reason=missing-age"
+            if age > max(interval * 2, 300):
+                return f"job={job_id} reason=stale"
         return True
     if check_name == "protected-gateway-read":
         # Prove the actual TLS listener, then require a human to echo the
@@ -13420,8 +13833,9 @@ def verify_maintenance_acceptance(
             check_name=check_name,
         )
         if result is not True:
+            detail = f": {result}" if isinstance(result, str) else ""
             raise ActivationPackageError(
-                f"maintenance acceptance check failed: {check_name}"
+                f"maintenance acceptance check failed: {check_name}{detail}"
             )
         results[check_name] = True
     evidence_root = contract.get("evidenceRoot")

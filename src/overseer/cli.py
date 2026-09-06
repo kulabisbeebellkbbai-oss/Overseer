@@ -193,6 +193,7 @@ from .remote_testing import (
 )
 from .registry import ResourceRegistry
 from .runtime import COLLECTION_FAMILIES, OverseerRuntime, seed_default_collection_jobs
+from .user_bridge import client_from_environment as user_bridge_client_from_environment
 from .runtime_state import (
     DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
     DEFAULT_RUNTIME_FRESHNESS_POLICY,
@@ -2726,6 +2727,7 @@ def run_status(
             station_auditor=lambda path, snapshot_id: audit_station_status(path, snapshot_id=snapshot_id),
             station_audit_interval_ticks=station_audit_interval_ticks,
             psychlo_bridge=psychlo_bridge,
+            user_bridge_client=user_bridge_client_from_environment(),
         ).run(interval_seconds=interval_seconds, once=once)
         return {
             "store": str(store.path),

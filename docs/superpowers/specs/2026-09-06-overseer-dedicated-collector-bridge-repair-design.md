@@ -46,17 +46,20 @@ unchanged. Two new empty-parameter methods are added:
   URLs, credentials, environment, command text, and caller-selected refs.
 
 The user-owned provider may execute only fixed argv for `/usr/bin/systemctl`
-and `/usr/bin/git`, with a fixed environment, fixed source paths, hard
-timeouts, output bounds, and no shell. The systemd service exposes only the
+and `/usr/bin/git`, with a fixed environment, optional Git locks and external
+helpers disabled, fixed source paths, hard total deadlines, output bounds, and
+no shell. Projection methods use isolated concurrency slots. The systemd
+service exposes only the
 user bus and the Overseer checkout required by these providers. Private Codex
 material and other projects remain absent from its mount namespace.
 
 The dedicated runtime receives the bridge client through the same fixed
 socket and expected-server-UID environment contract already used by the API.
-It enables only the three named built-in jobs. Existing custom Git jobs and
+It force-enables only the three named built-in jobs. Existing custom Git jobs and
 the mutation-capable crew, usage-continuation, knowledge-capture, and station
-audit families remain disabled. Bridge errors become bounded blocked or
-failed collection runs and normal triage evidence; they never cause fallback
+audit families remain disabled. A stale bridge projection becomes a failed
+stale collection rather than fresh evidence. Bridge errors become bounded
+blocked or failed collection runs and normal triage evidence; they never cause fallback
 access to user files or `systemctl --user` from the authority process.
 
 The Git adapter writes the sanitized bridge result through the existing

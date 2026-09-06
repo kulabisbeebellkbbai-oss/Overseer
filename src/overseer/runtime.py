@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import secrets
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -155,6 +156,13 @@ DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES = frozenset(
         "git",
     }
 )
+DEDICATED_PRINCIPAL_BRIDGE_JOB_IDS = frozenset(
+    {
+        "collection.freshness.psychlo-usage",
+        "collection.freshness.quark-scheduler",
+        "collection.git.overseer",
+    }
+)
 
 
 def _store_path(value: str | Any) -> str:
@@ -269,6 +277,125 @@ def _freshness_projection_status(
     }
 
 
+def _runtime_user_bridge_projection(
+    client: Any | None,
+    method: str,
+) -> Mapping[str, Any] | None:
+    if client is None:
+        return None
+    request_id = f"runtime-{secrets.token_hex(16)}"
+    try:
+        response = client.call(method, request_id)
+    except Exception:
+        return None
+    if (
+        not isinstance(response, Mapping)
+        or response.get("status") != "ok"
+        or response.get("method") != method
+        or not isinstance(response.get("projection"), Mapping)
+    ):
+        return None
+    return response["projection"]
+
+
+def _bridge_freshness_projection_status(
+    job: CollectionJob,
+    store_path: str,
+    timeout_seconds: float,
+    client: Any | None,
+) -> dict[str, object]:
+    del store_path, timeout_seconds
+    projection = _runtime_user_bridge_projection(
+        client,
+        "overseer.scheduler.freshness.v1",
+    )
+    if projection is None:
+        return {
+            "outcome": CollectionOutcome.BLOCKED.value,
+            "failure_category": "unavailable",
+        }
+    if projection.get("state") == "stale":
+        return {
+            "outcome": CollectionOutcome.FAILED.value,
+            "failure_category": "stale",
+        }
+    if projection.get("state") != "available":
+        return {
+            "outcome": CollectionOutcome.BLOCKED.value,
+            "failure_category": "unavailable",
+        }
+    services = projection.get("services")
+    if not isinstance(services, list):
+        return {
+            "outcome": CollectionOutcome.BLOCKED.value,
+            "failure_category": "contract_mismatch",
+        }
+    item = next(
+        (
+            candidate
+            for candidate in services
+            if isinstance(candidate, Mapping) and candidate.get("job_id") == job.id
+        ),
+        None,
+    )
+    if item is None:
+        return {
+            "outcome": CollectionOutcome.BLOCKED.value,
+            "failure_category": "contract_mismatch",
+        }
+    outcome = item.get("outcome")
+    allowed_outcomes = {value.value for value in CollectionOutcome}
+    if outcome not in allowed_outcomes:
+        return {
+            "outcome": CollectionOutcome.BLOCKED.value,
+            "failure_category": "contract_mismatch",
+        }
+    if outcome == CollectionOutcome.SUCCEEDED.value:
+        evidence_id = item.get("evidence_id")
+        if not isinstance(evidence_id, str) or not evidence_id.startswith("freshness."):
+            return {
+                "outcome": CollectionOutcome.BLOCKED.value,
+                "failure_category": "contract_mismatch",
+            }
+        return {"outcome": outcome, "evidence_ids": (evidence_id,)}
+    failure_category = item.get("failure_category")
+    if failure_category not in {
+        "timeout",
+        "unavailable",
+        "stale",
+        "contract_mismatch",
+    }:
+        failure_category = "unavailable"
+    return {"outcome": outcome, "failure_category": failure_category}
+
+
+def _bridge_git_projection_status(
+    job: CollectionJob,
+    store_path: str,
+    timeout_seconds: float,
+    client: Any | None,
+) -> dict[str, object]:
+    del job, timeout_seconds
+    projection = _runtime_user_bridge_projection(client, "overseer.git.status.v1")
+    if projection is not None and projection.get("state") == "stale":
+        return {
+            "outcome": CollectionOutcome.FAILED.value,
+            "failure_category": "stale",
+        }
+    if projection is None or projection.get("state") != "available":
+        return {
+            "outcome": CollectionOutcome.BLOCKED.value,
+            "failure_category": "unavailable",
+        }
+    from .git import persist_bridge_git_status_projection
+
+    return persist_bridge_git_status_projection(
+        store_path,
+        projection.get("git"),
+        observed_at=projection.get("observed_at"),
+    )
+
+
 def runtime_collection_adapter_registry(
     *,
     systemd_runner: Callable[[tuple[str, ...], float], object] | None = None,
@@ -277,6 +404,7 @@ def runtime_collection_adapter_registry(
     storage_projection_collector: Callable[..., object] | None = None,
     firmware_projection_collector: Callable[..., object] | None = None,
     virtual_listener_runner: CommandRunner | None = None,
+    user_bridge_client: Any | None = None,
 ) -> CollectionAdapterRegistry:
     """Build the exact bounded callback bindings used by seeded jobs."""
     # Importing the CLI lazily avoids the CLI/runtime module cycle at import time.
@@ -305,6 +433,10 @@ def runtime_collection_adapter_registry(
         return capture_firmware_projections_subprocess(path, timeout_seconds=timeout)
 
     registry = default_collection_adapter_registry()
+    dedicated_principal = (
+        os.environ.get("OVERSEER_DEDICATED_PRINCIPAL") == "1"
+        or user_bridge_client is not None
+    )
     callbacks = {
         (CollectionJobKind.PHYSICAL_DISCOVERY, "physical-discovery"): lambda job, path, timeout: discover_physical_status(
             ("/dev/serial/by-id", "/dev/serial/by-path"), path, limit=25, timeout_seconds=timeout
@@ -325,12 +457,26 @@ def runtime_collection_adapter_registry(
         (CollectionJobKind.USAGE_CONTINUATION, "usage-continuation"): lambda job, path, timeout: dispatch_usage_continuations_status(path, dispatched_by="quark", limit=1, timeout_seconds=timeout),
         (CollectionJobKind.KNOWLEDGE_CAPTURE, "knowledge-capture"): lambda job, path, timeout: knowledge_capture_status(path, limit=1, timeout_seconds=timeout),
         (CollectionJobKind.STATION_AUDIT, "station-audit"): lambda job, path, timeout: audit_station_status(path, limit=1, timeout_seconds=timeout),
-        (CollectionJobKind.FRESHNESS_PROJECTION, "freshness-projection"): lambda job, path, timeout: _freshness_projection_status(job, path, timeout, systemd_runner or _systemd_runner, now),
+        (CollectionJobKind.FRESHNESS_PROJECTION, "freshness-projection"): lambda job, path, timeout: (
+            _bridge_freshness_projection_status(job, path, timeout, user_bridge_client)
+            if dedicated_principal
+            else _freshness_projection_status(
+                job,
+                path,
+                timeout,
+                systemd_runner or _systemd_runner,
+                now,
+            )
+        ),
         (CollectionJobKind.HOST_INSPECTION, "host-security"): lambda job, path, timeout: assess_host_security_status(path, timeout_seconds=timeout),
-        (CollectionJobKind.GIT_INSPECTION, "git-inspection"): lambda job, path, timeout: (git_projection_collector or capture_git_status_projection)(
-            path,
-            Path.cwd(),
-            timeout_seconds=timeout,
+        (CollectionJobKind.GIT_INSPECTION, "git-inspection"): lambda job, path, timeout: (
+            _bridge_git_projection_status(job, path, timeout, user_bridge_client)
+            if dedicated_principal
+            else (git_projection_collector or capture_git_status_projection)(
+                path,
+                Path.cwd(),
+                timeout_seconds=timeout,
+            )
         ),
         (CollectionJobKind.STORAGE_INSPECTION, "storage-inspection"): collect_storage_projection,
         (CollectionJobKind.FIRMWARE_INSPECTION, "firmware-inspection"): collect_firmware_projection,
@@ -435,6 +581,12 @@ def seed_default_collection_jobs(
         dedicated_disabled_ids: set[str] = set()
         if dedicated_principal:
             for existing_id, existing in tuple(existing_jobs.items()):
+                if existing_id in DEDICATED_PRINCIPAL_BRIDGE_JOB_IDS:
+                    if not existing.enabled:
+                        enabled = replace(existing, enabled=True)
+                        store.save_collection_job(enabled)
+                        existing_jobs[existing_id] = enabled
+                    continue
                 family = COLLECTION_KIND_FAMILIES.get(existing.kind, "health")
                 if family not in DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES:
                     continue
@@ -472,7 +624,11 @@ def seed_default_collection_jobs(
                 # durable enabled/suspended policy or scheduler state.
                 job = replace(job, enabled=existing.enabled)
             family = COLLECTION_KIND_FAMILIES.get(job.kind, "health")
-            if dedicated_principal and family in DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES:
+            if (
+                dedicated_principal
+                and family in DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES
+                and job.id not in DEDICATED_PRINCIPAL_BRIDGE_JOB_IDS
+            ):
                 job = replace(job, enabled=False)
                 if job.id not in dedicated_disabled_ids:
                     dedicated_disabled_ids.add(job.id)
@@ -568,6 +724,7 @@ class OverseerRuntime:
         station_auditor: Callable[[str, str | None], dict[str, Any]] | None = None,
         station_audit_interval_ticks: int = 120,
         psychlo_bridge: Any | None = None,
+        user_bridge_client: Any | None = None,
         scheduler: Any | None = None,
         maximum_idle_seconds: float = DEFAULT_RUNTIME_MAX_IDLE_SECONDS,
     ) -> None:
@@ -589,6 +746,7 @@ class OverseerRuntime:
         self.station_auditor = station_auditor
         self.station_audit_interval_ticks = max(1, station_audit_interval_ticks)
         self.psychlo_bridge = psychlo_bridge
+        self.user_bridge_client = user_bridge_client
         legacy_families = {
             family
             for enabled, family in (
@@ -605,7 +763,9 @@ class OverseerRuntime:
         self._owns_scheduler = scheduler is None
         self.scheduler = scheduler or CollectionScheduler(
             str(store.path),
-            adapter_registry=runtime_collection_adapter_registry(),
+            adapter_registry=runtime_collection_adapter_registry(
+                user_bridge_client=user_bridge_client,
+            ),
             adapter_ids={**RUNTIME_ADAPTER_IDS, **RUNTIME_JOB_ADAPTER_IDS},
         )
         if maximum_idle_seconds <= 0:

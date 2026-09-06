@@ -25,6 +25,7 @@ from overseer.user_bridge import (
     UserBridgeUnavailableError,
     UserBridge,
     UserBridgeProtocolError,
+    client_from_environment,
     create_default_bridge,
     main,
     peer_credentials,
@@ -35,6 +36,8 @@ from overseer.user_bridge_providers import (
     MAX_SOURCE_BYTES,
     CodexSessionProjectionProvider,
     CodexUsageProjectionProvider,
+    OverseerGitStatusProjectionProvider,
+    UserServiceFreshnessProjectionProvider,
 )
 
 
@@ -131,6 +134,279 @@ def test_valid_usage_projection_is_allowlisted() -> None:
             }
         ],
     }
+
+
+def test_fixed_collection_projections_are_allowlisted_and_redacted() -> None:
+    bridge = UserBridge(
+        allowed_peer_uid=4242,
+        freshness_provider=lambda: {
+            "state": "available",
+            "observed_at": "2026-09-06T12:00:00+00:00",
+            "services": [
+                {
+                    "job_id": "collection.freshness.psychlo-usage",
+                    "outcome": "succeeded",
+                    "evidence_id": "freshness.psychlo-usage",
+                    "unit": "private.service",
+                    "argv": ["systemctl", "restart"],
+                },
+                {
+                    "job_id": "collection.freshness.quark-scheduler",
+                    "outcome": "failed",
+                    "failure_category": "stale",
+                    "private_error": "/home/god/private",
+                },
+            ],
+        },
+        git_provider=lambda: {
+            "state": "available",
+            "observed_at": "2026-09-06T12:00:00+00:00",
+            "git": {
+                "repository": "overseer",
+                "branch": "feature/maintenance-window-v1-1-6",
+                "head": "a" * 40,
+                "short_head": "a" * 7,
+                "upstream": "origin/feature/maintenance-window-v1-1-6",
+                "ahead": 1,
+                "behind": 0,
+                "dirty": True,
+                "changed": 1,
+                "staged": 0,
+                "unstaged": 1,
+                "untracked": 0,
+                "conflicted": 0,
+                "remote_owner": "example",
+                "remote_repo": "overseer",
+                "repo_path": "/home/god/Documents/Codex Workspace/Overseer",
+                "remote_url": "https://token@example.invalid/private.git",
+                "status_lines": ["private-file"],
+            },
+        },
+    )
+
+    freshness = decode(
+        bridge.handle_bytes(
+            request("req-freshness", "overseer.scheduler.freshness.v1"),
+            peer_uid=4242,
+        )
+    )["projection"]
+    git = decode(
+        bridge.handle_bytes(
+            request("req-git", "overseer.git.status.v1"),
+            peer_uid=4242,
+        )
+    )["projection"]
+
+    assert freshness == {
+        "state": "available",
+        "observed_at": "2026-09-06T12:00:00+00:00",
+        "services": [
+            {
+                "job_id": "collection.freshness.psychlo-usage",
+                "outcome": "succeeded",
+                "evidence_id": "freshness.psychlo-usage",
+            },
+            {
+                "job_id": "collection.freshness.quark-scheduler",
+                "outcome": "failed",
+                "failure_category": "stale",
+            },
+        ],
+    }
+    assert git["git"] == {
+        "repository": "overseer",
+        "branch": "feature/maintenance-window-v1-1-6",
+        "head": "a" * 40,
+        "short_head": "a" * 7,
+        "upstream": "origin/feature/maintenance-window-v1-1-6",
+        "ahead": 1,
+        "behind": 0,
+        "dirty": True,
+        "changed": 1,
+        "staged": 0,
+        "unstaged": 1,
+        "untracked": 0,
+        "conflicted": 0,
+        "remote_owner": "example",
+        "remote_repo": "overseer",
+    }
+    assert "/home/god" not in json.dumps([freshness, git])
+    assert "token" not in json.dumps(git)
+
+
+def test_bridge_client_separates_socket_owner_from_connected_server_uid(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bridge.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(path))
+        path.chmod(0o600)
+        client = UserBridgeClient(
+            path,
+            expected_server_uid=os.getuid() + 10000,
+            expected_socket_uid=os.getuid(),
+        )
+        metadata = client._socket_metadata()
+        client._verify_socket_metadata(metadata)
+    finally:
+        listener.close()
+
+
+def test_collection_projection_providers_use_only_fixed_inputs(tmp_path: Path) -> None:
+    calls: list[tuple[tuple[str, ...], float]] = []
+
+    def systemd_runner(command: tuple[str, ...], timeout: float):
+        calls.append((command, timeout))
+        if command[-1].endswith(".timer"):
+            stdout = (
+                "ActiveState=active\nSubState=waiting\nResult=success\n"
+                "LastTriggerUSec=2026-09-06 12:00:00 UTC\n"
+                "NextElapseUSecMonotonic=1min\n"
+            )
+        else:
+            stdout = "ActiveState=inactive\nSubState=dead\nResult=success\n"
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    freshness = UserServiceFreshnessProjectionProvider(
+        runner=systemd_runner,
+        clock=lambda: datetime(2026, 9, 6, 12, 1, tzinfo=UTC),
+    ).snapshot()
+
+    git = OverseerGitStatusProjectionProvider(
+        repo_path=tmp_path,
+        status_reader=lambda path, **kwargs: {
+            "repo_path": str(path),
+            "branch": "main",
+            "head": "b" * 40,
+            "short_head": "b" * 7,
+            "upstream": "origin/main",
+            "ahead": 0,
+            "behind": 0,
+            "dirty": False,
+            "changed": 0,
+            "staged": 0,
+            "unstaged": 0,
+            "untracked": 0,
+            "conflicted": 0,
+            "remote": {"owner": "example", "repo": "overseer", "url": "private"},
+        },
+        clock=lambda: datetime(2026, 9, 6, 12, 1, tzinfo=UTC),
+    ).snapshot()
+
+    assert freshness["state"] == "available"
+    assert [item["outcome"] for item in freshness["services"]] == [
+        "succeeded",
+        "succeeded",
+    ]
+    assert len(calls) == 4
+    assert all(command[0] == "/usr/bin/systemctl" for command, _timeout in calls)
+    assert git == {
+        "state": "available",
+        "observed_at": "2026-09-06T12:01:00+00:00",
+        "git": {
+            "repository": "overseer",
+            "branch": "main",
+            "head": "b" * 40,
+            "short_head": "b" * 7,
+            "upstream": "origin/main",
+            "ahead": 0,
+            "behind": 0,
+            "dirty": False,
+            "changed": 0,
+            "staged": 0,
+            "unstaged": 0,
+            "untracked": 0,
+            "conflicted": 0,
+            "remote_owner": "example",
+            "remote_repo": "overseer",
+        },
+    }
+
+
+def test_bridge_git_runner_seals_config_environment_and_optional_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import overseer.git as git_module
+
+    calls: list[dict[str, object]] = []
+
+    def run(command: tuple[str, ...], **kwargs: object):
+        calls.append({"command": command, **kwargs})
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(git_module.subprocess, "run", run)
+
+    git_module._bridge_git(tmp_path, "status", "--porcelain=v1", timeout=0.5)
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["command"] == (
+        "/usr/bin/git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+    )
+    assert call["cwd"] == tmp_path
+    assert call["stdin"] is subprocess.DEVNULL
+    assert call["shell"] is False
+    environment = call["env"]
+    assert isinstance(environment, dict)
+    assert environment == {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "4",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "core.hooksPath",
+        "GIT_CONFIG_VALUE_1": "/dev/null",
+        "GIT_CONFIG_KEY_2": "diff.external",
+        "GIT_CONFIG_VALUE_2": "",
+        "GIT_CONFIG_KEY_3": "credential.helper",
+        "GIT_CONFIG_VALUE_3": "",
+        "GIT_EXTERNAL_DIFF": "/usr/bin/false",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
+
+
+def test_default_git_projection_provider_uses_the_sealed_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import overseer.git as git_module
+
+    observed: list[tuple[Path, float]] = []
+
+    def read(path: Path, *, command_timeout_seconds: float) -> dict[str, object]:
+        observed.append((path, command_timeout_seconds))
+        return {
+            "branch": "main",
+            "head": "b" * 40,
+            "short_head": "b" * 7,
+            "upstream": None,
+            "ahead": None,
+            "behind": None,
+            "dirty": False,
+            "changed": 0,
+            "staged": 0,
+            "unstaged": 0,
+            "untracked": 0,
+            "conflicted": 0,
+            "remote": {},
+        }
+
+    monkeypatch.setattr(git_module, "bridge_git_status_status", read, raising=False)
+
+    result = OverseerGitStatusProjectionProvider(repo_path=tmp_path).snapshot()
+
+    assert result["state"] == "available"
+    assert observed == [(tmp_path, 0.75)]
 
 
 def test_wrong_peer_is_rejected_before_provider_execution() -> None:
@@ -652,6 +928,35 @@ def test_usage_provider_reports_stale_unavailable_and_error(tmp_path: Path) -> N
     assert error == {"state": "error", "error_code": "source_invalid"}
 
 
+def test_usage_provider_queries_the_validated_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import overseer.user_bridge_providers as providers_module
+
+    database = tmp_path / "usage.sqlite3"
+    _create_usage_fixture(
+        database,
+        {"rate_limits": []},
+        "2026-08-26T12:00:00+00:00",
+    )
+    observed_uris: list[str] = []
+    connect = sqlite3.connect
+
+    def connect_observed(database_uri: str, *args: object, **kwargs: object):
+        observed_uris.append(database_uri)
+        return connect(database_uri, *args, **kwargs)
+
+    monkeypatch.setattr(providers_module.sqlite3, "connect", connect_observed)
+
+    result = CodexUsageProjectionProvider(db_path=database).snapshot()
+
+    assert result["state"] in {"available", "stale"}
+    assert len(observed_uris) == 1
+    assert observed_uris[0].startswith("file:/proc/self/fd/")
+    assert observed_uris[0].endswith("?mode=ro")
+
+
 def test_provider_slot_remains_occupied_after_timeout_until_worker_exits() -> None:
     started = threading.Event()
     release = threading.Event()
@@ -673,6 +978,7 @@ def test_provider_slot_remains_occupied_after_timeout_until_worker_exits() -> No
         provider_timeout=0.01,
         max_provider_workers=1,
         sessions_provider=blocked_provider,
+        usage_provider=lambda: {"state": "available", "windows": []},
     )
     first_result: list[dict] = []
     first_thread = threading.Thread(
@@ -686,9 +992,16 @@ def test_provider_slot_remains_occupied_after_timeout_until_worker_exits() -> No
     first_thread.join(timeout=1.0)
 
     saturated = decode(bridge.handle_bytes(request("worker-second", "codex.sessions.list.v1"), peer_uid=4242))
+    unrelated = decode(
+        bridge.handle_bytes(
+            request("worker-usage", "codex.usage.snapshot.v1"),
+            peer_uid=4242,
+        )
+    )
 
     assert first_result[0]["projection"] == {"state": "error", "error_code": "provider_timeout"}
     assert saturated["projection"] == {"state": "error", "error_code": "busy"}
+    assert unrelated["projection"] == {"state": "available", "windows": []}
     assert calls == 1
 
     release.set()
@@ -696,6 +1009,57 @@ def test_provider_slot_remains_occupied_after_timeout_until_worker_exits() -> No
     recovered = decode(bridge.handle_bytes(request("worker-third", "codex.sessions.list.v1"), peer_uid=4242))
     assert recovered["projection"] == {"state": "available", "sessions": []}
     assert calls == 2
+
+
+def test_slow_provider_does_not_block_an_unrelated_projection() -> None:
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+    fast_finished = threading.Event()
+    fast_result: list[dict] = []
+
+    def slow_provider() -> dict:
+        slow_started.set()
+        release_slow.wait(1.0)
+        return {"state": "available", "sessions": []}
+
+    bridge = UserBridge(
+        allowed_peer_uid=4242,
+        provider_timeout=0.5,
+        max_provider_workers=2,
+        sessions_provider=slow_provider,
+        usage_provider=lambda: {"state": "available", "windows": []},
+    )
+    slow_thread = threading.Thread(
+        target=lambda: bridge.handle_bytes(
+            request("slow-projection", "codex.sessions.list.v1"),
+            peer_uid=4242,
+        ),
+        daemon=True,
+    )
+    slow_thread.start()
+    assert slow_started.wait(1.0)
+
+    def read_fast() -> None:
+        fast_result.append(
+            decode(
+                bridge.handle_bytes(
+                    request("fast-projection", "codex.usage.snapshot.v1"),
+                    peer_uid=4242,
+                )
+            )
+        )
+        fast_finished.set()
+
+    fast_thread = threading.Thread(target=read_fast, daemon=True)
+    fast_thread.start()
+    assert fast_finished.wait(0.2)
+    assert fast_result[0]["projection"] == {
+        "state": "available",
+        "windows": [],
+    }
+    release_slow.set()
+    slow_thread.join(timeout=1.0)
+    fast_thread.join(timeout=1.0)
 
 
 def test_connection_saturation_returns_redacted_busy_response() -> None:

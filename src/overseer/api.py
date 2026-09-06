@@ -340,26 +340,9 @@ def dedicated_principal_mode() -> bool:
 
 
 def user_bridge_client_from_environment() -> Any | None:
-    if not dedicated_principal_mode():
-        return None
-    socket_path = os.environ.get("OVERSEER_USER_BRIDGE_SOCKET")
-    if not socket_path:
-        return None
-    from .user_bridge import DEFAULT_USER_BRIDGE_SOCKET, UserBridgeClient
+    from .user_bridge import client_from_environment
 
-    if Path(socket_path) != DEFAULT_USER_BRIDGE_SOCKET:
-        raise ValueError("user bridge socket must use the fixed runtime path")
-    raw_uid = os.environ.get("OVERSEER_USER_BRIDGE_SERVER_UID")
-    try:
-        expected_uid = int(raw_uid or "", 10)
-    except ValueError as error:
-        raise ValueError("user bridge server UID must be numeric") from error
-    if expected_uid < 0:
-        raise ValueError("user bridge server UID must be nonnegative")
-    return UserBridgeClient(
-        DEFAULT_USER_BRIDGE_SOCKET,
-        expected_server_uid=expected_uid,
-    )
+    return client_from_environment()
 
 
 def dedicated_integration_disabled_status(integration: str) -> dict[str, object]:

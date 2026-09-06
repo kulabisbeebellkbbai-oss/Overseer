@@ -1,6 +1,7 @@
 [Unit]
 Description=Overseer system runtime
-After=local-fs.target
+Wants=overseer-codex-user-bridge.socket
+After=local-fs.target overseer-codex-user-bridge.socket
 
 [Service]
 Type=simple
@@ -14,6 +15,8 @@ Environment=PYTHONNOUSERSITE=1
 Environment=PYTHONSAFEPATH=1
 Environment=LD_LIBRARY_PATH=@OVERSEER_RELEASE@/lib
 Environment=OVERSEER_DEDICATED_PRINCIPAL=1
+Environment=OVERSEER_USER_BRIDGE_SOCKET=/run/overseer/codex-user-bridge.sock
+Environment=OVERSEER_USER_BRIDGE_SERVER_UID=@GOD_UID@
 ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.cli run --store /var/lib/overseer/overseer.sqlite3
 Restart=on-failure
 RestartSec=5

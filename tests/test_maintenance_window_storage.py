@@ -943,13 +943,31 @@ def test_restore_maintenance_store_access_restores_all_bound_authorities(
         "_lock_maintenance_destination_namespace_for_rollback",
         lambda received: locked.append(received) or (-1, []),
     )
+    archived: list[tuple[object, object, int]] = []
+    monkeypatch.setattr(
+        activation_package_module,
+        "_archive_maintenance_destination_namespace_for_rollback",
+        lambda contract, received, descriptor: archived.append(
+            (contract, received, descriptor)
+        )
+        or {
+            "status": "destination_namespace_archived",
+            "archiveRoot": str(tmp_path / "failed-successor-store"),
+            "replayed": False,
+        },
+        raising=False,
+    )
 
     result = activation_package_module.restore_maintenance_store_access(package)
 
     assert result["status"] == "maintenance_store_access_restored"
-    assert result["destinationNamespace"] == "root-locked-and-process-free"
+    assert result["destinationNamespace"] == "archived-and-recreated-empty"
+    assert result["failedSuccessorArchive"]["status"] == (
+        "destination_namespace_archived"
+    )
     assert result["resolvedUnsafeMarkers"] == []
     assert locked == [bindings]
+    assert archived == [({"storeBindings": bindings}, bindings, -1)]
     assert [Path(str(call["source_store"])).name for call in restored] == [
         "overseer-main.sqlite3",
         "psychlo-bridge.sqlite3",
@@ -1009,6 +1027,199 @@ def test_restore_maintenance_store_access_blocks_sources_when_destination_is_uns
     assert restored == []
 
 
+def test_rollback_archives_failed_successor_and_recreates_empty_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "evidence"
+    evidence_root = workspace / "preserved"
+    evidence_root.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    destination_root = tmp_path / "overseer"
+    destination_root.mkdir(mode=0o700)
+    destination = destination_root / "overseer.sqlite3"
+    destination.write_bytes(b"failed successor")
+    destination.chmod(0o600)
+    original = destination_root.stat()
+    bindings: list[object] = [
+        {
+            "destinationDb": str(destination),
+            "backupDb": str(tmp_path / "backup" / "overseer.sqlite3"),
+        }
+    ]
+    contract = {
+        "evidenceRoot": str(evidence_root),
+        "storeBindings": bindings,
+    }
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_UID",
+        os.geteuid(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_GID",
+        os.getegid(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    descriptor = os.open(destination_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        result = (
+            activation_package_module._archive_maintenance_destination_namespace_for_rollback(
+                contract,
+                bindings,
+                descriptor,
+            )
+        )
+    finally:
+        os.close(descriptor)
+
+    archive = workspace / "failed-successor-store"
+    assert result["status"] == "destination_namespace_archived"
+    assert result["archiveRoot"] == str(archive)
+    assert result["replayed"] is False
+    assert (archive / "overseer.sqlite3").read_bytes() == b"failed successor"
+    assert (archive.stat().st_dev, archive.stat().st_ino) == (
+        original.st_dev,
+        original.st_ino,
+    )
+    assert list(destination_root.iterdir()) == []
+    assert (destination_root.stat().st_uid, destination_root.stat().st_gid) == (
+        os.geteuid(),
+        os.getegid(),
+    )
+    assert stat.S_IMODE(destination_root.stat().st_mode) == 0o700
+    assert (workspace / "failed-successor-store-intent.json").is_file()
+    assert (workspace / "failed-successor-store-receipt.json").is_file()
+
+    replay_descriptor = os.open(destination_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        replay = (
+            activation_package_module._archive_maintenance_destination_namespace_for_rollback(
+                contract,
+                bindings,
+                replay_descriptor,
+            )
+        )
+    finally:
+        os.close(replay_descriptor)
+    assert replay["replayed"] is True
+    assert (archive / "overseer.sqlite3").read_bytes() == b"failed successor"
+    assert list(destination_root.iterdir()) == []
+
+
+def test_rollback_archive_rejects_an_unbound_existing_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "evidence"
+    evidence_root = workspace / "preserved"
+    evidence_root.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    archive = workspace / "failed-successor-store"
+    archive.mkdir(mode=0o700)
+    destination_root = tmp_path / "overseer"
+    destination_root.mkdir(mode=0o700)
+    destination = destination_root / "overseer.sqlite3"
+    destination.write_bytes(b"failed successor")
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    descriptor = os.open(destination_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(ActivationPackageError, match="conflicting"):
+            activation_package_module._archive_maintenance_destination_namespace_for_rollback(
+                {
+                    "evidenceRoot": str(evidence_root),
+                    "storeBindings": [{"destinationDb": str(destination)}],
+                },
+                [{"destinationDb": str(destination)}],
+                descriptor,
+            )
+    finally:
+        os.close(descriptor)
+    assert destination.read_bytes() == b"failed successor"
+
+
+def test_rollback_archive_recovers_after_rename_before_recreate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "evidence"
+    evidence_root = workspace / "preserved"
+    evidence_root.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    destination_root = tmp_path / "overseer"
+    destination_root.mkdir(mode=0o700)
+    destination = destination_root / "overseer.sqlite3"
+    destination.write_bytes(b"failed successor")
+    bindings: list[object] = [{"destinationDb": str(destination)}]
+    contract = {
+        "evidenceRoot": str(evidence_root),
+        "storeBindings": bindings,
+    }
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_UID",
+        os.geteuid(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_GID",
+        os.getegid(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+    create_empty = (
+        activation_package_module._maintenance_rollback_create_empty_namespace
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_rollback_create_empty_namespace",
+        lambda _path: (_ for _ in ()).throw(
+            ActivationPackageError("simulated interruption")
+        ),
+    )
+    descriptor = os.open(destination_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(ActivationPackageError, match="simulated interruption"):
+            activation_package_module._archive_maintenance_destination_namespace_for_rollback(
+                contract,
+                bindings,
+                descriptor,
+            )
+    finally:
+        os.close(descriptor)
+    assert not destination_root.exists()
+    assert (workspace / "failed-successor-store" / "overseer.sqlite3").is_file()
+    assert not (workspace / "failed-successor-store-receipt.json").exists()
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_maintenance_rollback_create_empty_namespace",
+        create_empty,
+    )
+    result = (
+        activation_package_module._archive_maintenance_destination_namespace_for_rollback(
+            contract,
+            bindings,
+            -1,
+        )
+    )
+    assert result["replayed"] is False
+    assert list(destination_root.iterdir()) == []
+    assert (workspace / "failed-successor-store-receipt.json").is_file()
+
+
 def test_restore_maintenance_store_access_holds_destination_lock_through_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1051,6 +1262,25 @@ def test_restore_maintenance_store_access_holds_destination_lock_through_sources
     )
     observed: list[int] = []
 
+    def archive(
+        _contract: object,
+        _bindings: object,
+        received_descriptor: int,
+    ) -> dict[str, object]:
+        assert received_descriptor == descriptor
+        observed.append(os.fstat(descriptor).st_ino)
+        return {
+            "status": "destination_namespace_archived",
+            "archiveRoot": str(tmp_path / "failed-successor-store"),
+            "replayed": False,
+        }
+
+    monkeypatch.setattr(
+        activation_package_module,
+        "_archive_maintenance_destination_namespace_for_rollback",
+        archive,
+    )
+
     def restore(**_kwargs: object) -> dict[str, object]:
         observed.append(os.fstat(descriptor).st_ino)
         return {"restored": True}
@@ -1063,7 +1293,7 @@ def test_restore_maintenance_store_access_holds_destination_lock_through_sources
 
     activation_package_module.restore_maintenance_store_access(package)
 
-    assert len(observed) == 3
+    assert len(observed) == 4
     with pytest.raises(OSError):
         os.fstat(descriptor)
 

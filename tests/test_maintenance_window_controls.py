@@ -5,12 +5,24 @@ import json
 import os
 import shutil
 import stat
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 import overseer.activation_package as activation_package
 import overseer.api as overseer_api
+from overseer.cli import collection_jobs_status, collection_scheduler_status
+from overseer.collection_models import CollectionOutcome
+from overseer.collection_scheduler import CollectionScheduler
+from overseer.runtime import (
+    RUNTIME_ADAPTER_IDS,
+    RUNTIME_JOB_ADAPTER_IDS,
+    runtime_collection_adapter_registry,
+    seed_default_collection_jobs,
+)
+from overseer.store import SQLiteStore
 
 
 COMMAND_NAMES = {
@@ -899,6 +911,224 @@ def test_real_bounded_acceptance_dispatch_reads_only_allowlisted_projections(
         ("/psychlo/status", True),
         ("/roadex/human-decisions", True),
     ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("missing", "job=collection.freshness.psychlo-usage reason=missing"),
+        ("disabled", "job=collection.freshness.psychlo-usage reason=disabled"),
+        ("unsuccessful", "job=collection.freshness.psychlo-usage reason=unsuccessful"),
+        ("invalid-interval", "job=collection.freshness.psychlo-usage reason=invalid-interval"),
+        ("missing-age", "job=collection.freshness.psychlo-usage reason=missing-age"),
+        ("non-finite-age", "job=collection.freshness.psychlo-usage reason=missing-age"),
+        ("stale", "job=collection.freshness.psychlo-usage reason=stale"),
+    ],
+)
+def test_scheduler_acceptance_returns_exact_bounded_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected: str,
+) -> None:
+    jobs = [
+        {
+            "id": job_id,
+            "enabled": True,
+            "interval_seconds": 300,
+            "data_age_seconds": 1,
+            "last_outcome": "succeeded",
+        }
+        for job_id in activation_package._MAINTENANCE_FRESHNESS_JOB_IDS
+    ]
+    target = next(
+        item
+        for item in jobs
+        if item["id"] == "collection.freshness.psychlo-usage"
+    )
+    if mutation == "missing":
+        jobs.remove(target)
+    elif mutation == "disabled":
+        target["enabled"] = False
+    elif mutation == "unsuccessful":
+        target["last_outcome"] = "failed"
+    elif mutation == "invalid-interval":
+        target["interval_seconds"] = 0
+    elif mutation == "missing-age":
+        target["data_age_seconds"] = None
+    elif mutation == "non-finite-age":
+        target["data_age_seconds"] = float("nan")
+    else:
+        target["data_age_seconds"] = 601
+
+    responses = {
+        "/collections/status": {
+            "status": "ok",
+            "job_count": len(jobs),
+            "enabled_job_count": len(jobs),
+            "load_bounds": {"global_max": 2},
+        },
+        "/collections/jobs": {"status": "ok", "jobs": jobs},
+    }
+    monkeypatch.setattr(
+        activation_package,
+        "_maintenance_api_read",
+        lambda path, **_kwargs: responses[path],
+    )
+
+    result = activation_package._run_bounded_maintenance_acceptance_check(
+        _contract(tmp_path),
+        check_name="scheduler-freshness",
+    )
+
+    assert result == expected
+
+
+def test_maintenance_acceptance_surfaces_bounded_scheduler_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    contract = _contract(tmp_path)
+    monkeypatch.setattr(
+        activation_package,
+        "_require_maintenance_active_sealed_command",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_read_maintenance_contract_file",
+        lambda _package: contract,
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_run_bounded_maintenance_acceptance_check",
+        lambda _contract, *, check_name: (
+            "job=collection.git.overseer reason=stale"
+            if check_name == "scheduler-freshness"
+            else True
+        ),
+    )
+
+    with pytest.raises(
+        activation_package.ActivationPackageError,
+        match=(
+            "maintenance acceptance check failed: scheduler-freshness: "
+            "job=collection.git.overseer reason=stale"
+        ),
+    ):
+        activation_package.verify_maintenance_acceptance(package)
+
+
+def test_dedicated_bridge_jobs_pass_acceptance_with_real_scheduler_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store_path = tmp_path / "authority.sqlite3"
+    monkeypatch.setenv("OVERSEER_DEDICATED_PRINCIPAL", "1")
+    seed_default_collection_jobs(store_path)
+    required = set(activation_package._MAINTENANCE_FRESHNESS_JOB_IDS)
+    bridge_jobs = {
+        "collection.freshness.psychlo-usage",
+        "collection.freshness.quark-scheduler",
+        "collection.git.overseer",
+    }
+    now = datetime.now(UTC).isoformat()
+    with SQLiteStore(store_path) as store:
+        for job in store.list_collection_jobs():
+            store.save_collection_job(replace(job, enabled=job.id in required))
+            state = store.load_collection_job_state(job.id)
+            if job.id in required - bridge_jobs:
+                state = replace(
+                    state,
+                    next_due_at="2999-01-01T00:00:00+00:00",
+                    last_started_at=now,
+                    last_completed_at=now,
+                    last_outcome=CollectionOutcome.SUCCEEDED,
+                )
+            elif job.id in bridge_jobs:
+                state = replace(state, next_due_at="2000-01-01T00:00:00+00:00")
+            store.save_collection_job_state(state)
+
+    class Bridge:
+        def call(self, method: str, request_id: str) -> dict[str, object]:
+            if method == "overseer.scheduler.freshness.v1":
+                projection: dict[str, object] = {
+                    "state": "available",
+                    "observed_at": now,
+                    "services": [
+                        {
+                            "job_id": "collection.freshness.psychlo-usage",
+                            "outcome": "succeeded",
+                            "evidence_id": "freshness.psychlo-usage",
+                        },
+                        {
+                            "job_id": "collection.freshness.quark-scheduler",
+                            "outcome": "succeeded",
+                            "evidence_id": "freshness.quark-scheduler",
+                        },
+                    ],
+                }
+            else:
+                assert method == "overseer.git.status.v1"
+                projection = {
+                    "state": "available",
+                    "observed_at": now,
+                    "git": {
+                        "repository": "overseer",
+                        "branch": "main",
+                        "head": "c" * 40,
+                        "short_head": "c" * 7,
+                        "upstream": "origin/main",
+                        "ahead": 0,
+                        "behind": 0,
+                        "dirty": False,
+                        "changed": 0,
+                        "staged": 0,
+                        "unstaged": 0,
+                        "untracked": 0,
+                        "conflicted": 0,
+                        "remote_owner": "example",
+                        "remote_repo": "overseer",
+                    },
+                }
+            return {
+                "protocol": "overseer.user-bridge.v1",
+                "request_id": request_id,
+                "method": method,
+                "status": "ok",
+                "projection": projection,
+            }
+
+    scheduler = CollectionScheduler(
+        str(store_path),
+        adapter_registry=runtime_collection_adapter_registry(user_bridge_client=Bridge()),
+        adapter_ids={**RUNTIME_ADAPTER_IDS, **RUNTIME_JOB_ADAPTER_IDS},
+    )
+    try:
+        cycles = [scheduler.run_ready_once() for _job_id in bridge_jobs]
+    finally:
+        scheduler.shutdown()
+    assert [cycle.succeeded for cycle in cycles] == [1, 1, 1]
+
+    responses = {
+        "/collections/status": collection_scheduler_status(store_path),
+        "/collections/jobs": collection_jobs_status(store_path),
+    }
+    monkeypatch.setattr(
+        activation_package,
+        "_maintenance_api_read",
+        lambda path, **_kwargs: responses[path],
+    )
+
+    assert (
+        activation_package._run_bounded_maintenance_acceptance_check(
+            _contract(tmp_path),
+            check_name="scheduler-freshness",
+        )
+        is True
+    )
 
 
 def test_maintenance_api_read_uses_a_bounded_dashboard_timeout(

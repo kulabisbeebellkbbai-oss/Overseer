@@ -15,6 +15,9 @@ Environment=PYTHONNOUSERSITE=1
 Environment=PYTHONSAFEPATH=1
 Environment=LD_LIBRARY_PATH=@OVERSEER_RELEASE@/lib
 Environment=OVERSEER_BRIDGE_PEER_UID=@OVERSEER_UID@
+Environment=HOME=/home/god
+Environment=XDG_RUNTIME_DIR=/run/user/@GOD_UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@GOD_UID@/bus
 ExecStart=@OVERSEER_PYTHON@ -s -P -m overseer.user_bridge serve --socket-fd=3 --peer-uid=@OVERSEER_UID@
 Restart=on-failure
 RestartSec=5
@@ -23,6 +26,7 @@ ProtectSystem=strict
 ProtectHome=tmpfs
 BindReadOnlyPaths=/home/god/.codex/codex-projects.csv
 BindReadOnlyPaths=/home/god/.local/share/overseer/codex-usage-mcp
+BindReadOnlyPaths="/home/god/Documents/Codex Workspace/Overseer"
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=yes

@@ -3,7 +3,7 @@
 The bridge deliberately owns its transport and protocol boundary.  It has no
 Codex, tmux, shell, network, or credential imports. A deployment may inject
 projection providers into :class:`UserBridge`; the socket-activated entry
-point wires only the two fixed read-only providers reviewed for v1.1.6.
+point wires only the fixed read-only providers reviewed for v1.1.6.
 """
 
 from __future__ import annotations
@@ -42,12 +42,36 @@ MAX_ACTIVE_CONNECTIONS = 8
 MAX_PROVIDER_WORKERS = 2
 
 _REQUEST_FIELDS = frozenset({"protocol", "request_id", "method", "params"})
-_METHODS = frozenset({"codex.sessions.list.v1", "codex.usage.snapshot.v1"})
+_METHODS = frozenset(
+    {
+        "codex.sessions.list.v1",
+        "codex.usage.snapshot.v1",
+        "overseer.scheduler.freshness.v1",
+        "overseer.git.status.v1",
+    }
+)
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _STATES = frozenset({"available", "stale", "unavailable", "error"})
 _SESSION_FIELDS = frozenset({"session_id", "project_id", "status", "last_seen_at"})
 _USAGE_FIELDS = frozenset({"name", "used", "remaining", "reset_at"})
+_FRESHNESS_JOB_IDS = frozenset(
+    {
+        "collection.freshness.psychlo-usage",
+        "collection.freshness.quark-scheduler",
+    }
+)
+_FRESHNESS_OUTCOMES = frozenset({"succeeded", "failed", "blocked"})
+_FRESHNESS_FAILURE_CATEGORIES = frozenset(
+    {"timeout", "unavailable", "stale", "contract_mismatch"}
+)
+_GIT_STRING_FIELDS = frozenset(
+    {"repository", "branch", "head", "short_head", "upstream", "remote_owner", "remote_repo"}
+)
+_GIT_INTEGER_FIELDS = frozenset(
+    {"ahead", "behind", "changed", "staged", "unstaged", "untracked", "conflicted"}
+)
+_GIT_BOOLEAN_FIELDS = frozenset({"dirty"})
 
 ProjectionProvider = Callable[[], Mapping[str, Any]]
 
@@ -171,7 +195,7 @@ def _encode_response(response: Mapping[str, Any]) -> bytes:
 
 
 class UserBridge:
-    """Serve the two read-only user projections over an authenticated socket."""
+    """Serve the fixed read-only user projections over an authenticated socket."""
 
     def __init__(
         self,
@@ -179,6 +203,8 @@ class UserBridge:
         allowed_peer_uid: int = DEFAULT_OVERSEER_UID,
         sessions_provider: ProjectionProvider | None = None,
         usage_provider: ProjectionProvider | None = None,
+        freshness_provider: ProjectionProvider | None = None,
+        git_provider: ProjectionProvider | None = None,
         provider_timeout: float = DEFAULT_PROVIDER_TIMEOUT,
         replay_entries: int = MAX_REPLAY_ENTRIES,
         max_active_connections: int = MAX_ACTIVE_CONNECTIONS,
@@ -197,14 +223,20 @@ class UserBridge:
         self.allowed_peer_uid = allowed_peer_uid
         self.sessions_provider = sessions_provider
         self.usage_provider = usage_provider
+        self.freshness_provider = freshness_provider
+        self.git_provider = git_provider
         self.provider_timeout = float(provider_timeout)
         self.replay_entries = replay_entries
         self.max_active_connections = max_active_connections
         self.max_provider_workers = max_provider_workers
         self._replay: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
+        self._inflight: dict[str, tuple[str, threading.Event]] = {}
         self._lock = threading.RLock()
         self._connection_slots = threading.BoundedSemaphore(max_active_connections)
-        self._provider_slots = threading.BoundedSemaphore(max_provider_workers)
+        self._provider_slots = {
+            method: threading.BoundedSemaphore(max_provider_workers)
+            for method in _METHODS
+        }
 
     def handle_bytes(self, payload: bytes, *, peer_uid: int) -> bytes:
         """Validate and execute one complete request, returning one response."""
@@ -222,29 +254,69 @@ class UserBridge:
             return _error_response(request_id, code)
 
         digest = hashlib.sha256(payload).hexdigest()
+        candidate_id: str | None = None
+        if isinstance(request_data, dict):
+            candidate = request_data.get("request_id")
+            if isinstance(candidate, str) and _REQUEST_ID_RE.fullmatch(candidate):
+                candidate_id = candidate
         with self._lock:
-            if isinstance(request_data, dict):
-                candidate_id = request_data.get("request_id")
-                if isinstance(candidate_id, str) and _REQUEST_ID_RE.fullmatch(candidate_id):
-                    request_id = candidate_id
+            request_id = candidate_id
             cached = self._replay.get(request_id)
             if cached is not None:
                 cached_digest, cached_response = cached
                 if cached_digest == digest:
                     return cached_response
                 return _error_response(request_id, "request_id_reuse")
-            try:
-                request_id = self._validate_request(request_data)
-            except UserBridgeProtocolError as exc:
-                code = str(exc) if str(exc) in {"unknown_field", "duplicate_field", "invalid_request", "unsupported_method"} else "invalid_request"
-                return _error_response(request_id, code)
+            active = self._inflight.get(request_id)
+            if active is not None and active[0] != digest:
+                return _error_response(request_id, "request_id_reuse")
+        try:
+            request_id = self._validate_request(request_data)
+        except UserBridgeProtocolError as exc:
+            code = str(exc) if str(exc) in {"unknown_field", "duplicate_field", "invalid_request", "unsupported_method"} else "invalid_request"
+            return _error_response(request_id, code)
+
+        owner = False
+        with self._lock:
+            cached = self._replay.get(request_id)
+            if cached is not None:
+                cached_digest, cached_response = cached
+                if cached_digest == digest:
+                    return cached_response
+                return _error_response(request_id, "request_id_reuse")
+            active = self._inflight.get(request_id)
+            if active is None:
+                completion = threading.Event()
+                self._inflight[request_id] = (digest, completion)
+                owner = True
+            else:
+                active_digest, completion = active
+                if active_digest != digest:
+                    return _error_response(request_id, "request_id_reuse")
+        if not owner:
+            if not completion.wait(self.provider_timeout):
+                return _error_response(request_id, "busy")
+            with self._lock:
+                cached = self._replay.get(request_id)
+                if cached is None or cached[0] != digest:
+                    return _error_response(request_id, "busy")
+                return cached[1]
+
+        try:
             response = self._execute(request_data)
             encoded = _encode_response(response)
+        except BaseException:
+            encoded = _error_response(request_id, "internal_error")
+        with self._lock:
             self._replay[request_id] = (digest, encoded)
             self._replay.move_to_end(request_id)
             while len(self._replay) > self.replay_entries:
                 self._replay.popitem(last=False)
-            return encoded
+            active = self._inflight.get(request_id)
+            if active is not None and active[1] is completion:
+                self._inflight.pop(request_id, None)
+                completion.set()
+        return encoded
 
 
     def _validate_request(self, value: Any) -> str:
@@ -273,7 +345,13 @@ class UserBridge:
     def _execute(self, request_data: dict[str, Any]) -> dict[str, Any]:
         request_id = request_data["request_id"]
         method = request_data["method"]
-        provider = self.sessions_provider if method == "codex.sessions.list.v1" else self.usage_provider
+        providers = {
+            "codex.sessions.list.v1": self.sessions_provider,
+            "codex.usage.snapshot.v1": self.usage_provider,
+            "overseer.scheduler.freshness.v1": self.freshness_provider,
+            "overseer.git.status.v1": self.git_provider,
+        }
+        provider = providers[method]
         projection = self._run_provider(provider, method)
         return {
             "protocol": BRIDGE_PROTOCOL,
@@ -286,7 +364,8 @@ class UserBridge:
     def _run_provider(self, provider: ProjectionProvider | None, method: str) -> dict[str, Any]:
         if provider is None:
             return {"state": "unavailable", "reason": "provider_not_configured"}
-        if not self._provider_slots.acquire(blocking=False):
+        provider_slots = self._provider_slots[method]
+        if not provider_slots.acquire(blocking=False):
             return {"state": "error", "error_code": "busy"}
         result: dict[str, Any] = {}
         failure: list[BaseException] = []
@@ -307,12 +386,12 @@ class UserBridge:
             try:
                 invoke()
             finally:
-                self._provider_slots.release()
+                provider_slots.release()
 
         try:
             threading.Thread(target=run_provider, name="overseer-user-bridge-provider", daemon=True).start()
         except BaseException:
-            self._provider_slots.release()
+            provider_slots.release()
             return {"state": "error", "error_code": "busy"}
         if not done.wait(self.provider_timeout):
             return {"state": "error", "error_code": "provider_timeout"}
@@ -341,7 +420,10 @@ class UserBridge:
         if error_code is not None and state == "error":
             projection["error_code"] = error_code
 
-        if state in {"available", "stale"}:
+        if state in {"available", "stale"} and method in {
+            "codex.sessions.list.v1",
+            "codex.usage.snapshot.v1",
+        }:
             field = "sessions" if method == "codex.sessions.list.v1" else "windows"
             candidates = value.get(field, [])
             if not isinstance(candidates, list):
@@ -375,6 +457,71 @@ class UserBridge:
                 if item:
                     items.append(item)
             projection[field] = items
+        elif state in {"available", "stale"} and method == "overseer.scheduler.freshness.v1":
+            candidates = value.get("services", [])
+            if not isinstance(candidates, list):
+                raise UserBridgeProtocolError("provider_result_invalid")
+            items: list[dict[str, Any]] = []
+            observed_ids: set[str] = set()
+            for candidate in candidates[: len(_FRESHNESS_JOB_IDS)]:
+                if not isinstance(candidate, Mapping):
+                    continue
+                job_id = _safe_string(candidate.get("job_id"), code=True)
+                outcome = _safe_string(candidate.get("outcome"), code=True)
+                if (
+                    job_id not in _FRESHNESS_JOB_IDS
+                    or job_id in observed_ids
+                    or outcome not in _FRESHNESS_OUTCOMES
+                ):
+                    continue
+                item = {"job_id": job_id, "outcome": outcome}
+                if outcome == "succeeded":
+                    evidence_id = _safe_string(candidate.get("evidence_id"), code=True)
+                    if evidence_id is None or not evidence_id.startswith("freshness."):
+                        continue
+                    item["evidence_id"] = evidence_id
+                else:
+                    failure_category = _safe_string(
+                        candidate.get("failure_category"),
+                        code=True,
+                    )
+                    if failure_category not in _FRESHNESS_FAILURE_CATEGORIES:
+                        continue
+                    item["failure_category"] = failure_category
+                observed_ids.add(job_id)
+                items.append(item)
+            projection["services"] = items
+        elif state in {"available", "stale"} and method == "overseer.git.status.v1":
+            candidate = value.get("git")
+            if not isinstance(candidate, Mapping):
+                raise UserBridgeProtocolError("provider_result_invalid")
+            item: dict[str, Any] = {}
+            for key in _GIT_STRING_FIELDS:
+                if key not in candidate or candidate[key] is None:
+                    continue
+                text = _safe_string(candidate[key])
+                if text is None or "\\" in text:
+                    continue
+                if key == "repository" and text != "overseer":
+                    continue
+                if key in {"head", "short_head"} and (
+                    len(text) not in ({40, 64} if key == "head" else range(7, 17))
+                    or any(character not in "0123456789abcdef" for character in text)
+                ):
+                    continue
+                if key in {"remote_owner", "remote_repo"} and _safe_identifier(text) is None:
+                    continue
+                item[key] = text
+            for key in _GIT_INTEGER_FIELDS:
+                if key not in candidate or candidate[key] is None:
+                    continue
+                number = _safe_nonnegative_integer(candidate[key])
+                if number is not None:
+                    item[key] = number
+            for key in _GIT_BOOLEAN_FIELDS:
+                if type(candidate.get(key)) is bool:
+                    item[key] = candidate[key]
+            projection["git"] = item
         return projection
 
     def serve_forever(self, listener: socket.socket) -> None:
@@ -439,6 +586,7 @@ class UserBridgeClient:
         socket_path: str | Path = DEFAULT_USER_BRIDGE_SOCKET,
         *,
         expected_server_uid: int,
+        expected_socket_uid: int | None = None,
         timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         path = Path(socket_path)
@@ -446,10 +594,15 @@ class UserBridgeClient:
             raise UserBridgeUnavailableError("bridge socket path must be absolute")
         if isinstance(expected_server_uid, bool) or not isinstance(expected_server_uid, int) or expected_server_uid < 0:
             raise UserBridgePeerError("expected server uid is invalid")
+        if expected_socket_uid is None:
+            expected_socket_uid = os.geteuid()
+        if isinstance(expected_socket_uid, bool) or not isinstance(expected_socket_uid, int) or expected_socket_uid < 0:
+            raise UserBridgePeerError("expected socket uid is invalid")
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
             raise UserBridgeTimeoutError("client timeout is invalid")
         self.socket_path = path
         self.expected_server_uid = expected_server_uid
+        self.expected_socket_uid = expected_socket_uid
         self.timeout = float(timeout)
 
     def call(self, method: str, request_id: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -508,7 +661,7 @@ class UserBridgeClient:
             raise UserBridgeUnavailableError("bridge socket unavailable") from exc
         if not stat.S_ISSOCK(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
             raise UserBridgePeerError("bridge path is not a socket")
-        if metadata.st_uid != self.expected_server_uid:
+        if metadata.st_uid != self.expected_socket_uid:
             raise UserBridgePeerError("bridge socket owner is not approved")
         if metadata.st_mode & 0o007:
             raise UserBridgePeerError("bridge socket is accessible to other users")
@@ -521,7 +674,7 @@ class UserBridgeClient:
             raise UserBridgeUnavailableError("bridge socket disappeared") from exc
         if (current.st_dev, current.st_ino) != expected:
             raise UserBridgePeerError("bridge socket identity changed")
-        if not stat.S_ISSOCK(current.st_mode) or current.st_uid != self.expected_server_uid or current.st_mode & 0o007:
+        if not stat.S_ISSOCK(current.st_mode) or current.st_uid != self.expected_socket_uid or current.st_mode & 0o007:
             raise UserBridgePeerError("bridge socket metadata changed")
 
     @staticmethod
@@ -594,15 +747,49 @@ def _configured_uid(raw: str | None) -> int:
     return uid
 
 
+def client_from_environment(
+    environment: Mapping[str, str] | None = None,
+) -> UserBridgeClient | None:
+    """Construct the fixed bridge client only for dedicated-principal mode."""
+
+    selected = os.environ if environment is None else environment
+    if selected.get("OVERSEER_DEDICATED_PRINCIPAL") != "1":
+        return None
+    socket_path = selected.get("OVERSEER_USER_BRIDGE_SOCKET")
+    if not socket_path:
+        return None
+    if Path(socket_path) != DEFAULT_USER_BRIDGE_SOCKET:
+        raise ValueError("user bridge socket must use the fixed runtime path")
+    raw_uid = selected.get("OVERSEER_USER_BRIDGE_SERVER_UID")
+    try:
+        expected_uid = int(raw_uid or "", 10)
+    except ValueError as error:
+        raise ValueError("user bridge server UID must be numeric") from error
+    if expected_uid < 0:
+        raise ValueError("user bridge server UID must be nonnegative")
+    return UserBridgeClient(
+        DEFAULT_USER_BRIDGE_SOCKET,
+        expected_server_uid=expected_uid,
+        expected_socket_uid=os.geteuid(),
+    )
+
+
 def create_default_bridge(*, allowed_peer_uid: int) -> UserBridge:
     """Construct the production bridge with fixed, read-only user providers."""
 
-    from .user_bridge_providers import CodexSessionProjectionProvider, CodexUsageProjectionProvider
+    from .user_bridge_providers import (
+        CodexSessionProjectionProvider,
+        CodexUsageProjectionProvider,
+        OverseerGitStatusProjectionProvider,
+        UserServiceFreshnessProjectionProvider,
+    )
 
     return UserBridge(
         allowed_peer_uid=allowed_peer_uid,
         sessions_provider=CodexSessionProjectionProvider(),
         usage_provider=CodexUsageProjectionProvider(),
+        freshness_provider=UserServiceFreshnessProjectionProvider(),
+        git_provider=OverseerGitStatusProjectionProvider(),
     )
 
 

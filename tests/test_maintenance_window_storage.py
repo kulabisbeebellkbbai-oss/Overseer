@@ -1112,6 +1112,112 @@ def test_rollback_archives_failed_successor_and_recreates_empty_namespace(
     assert list(destination_root.iterdir()) == []
 
 
+def test_rollback_replays_a_receipt_when_no_failed_successor_archive_was_expected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "evidence"
+    evidence_root = workspace / "preserved"
+    evidence_root.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    destination_root = tmp_path / "overseer"
+    bindings: list[object] = [
+        {"destinationDb": str(destination_root / "overseer.sqlite3")}
+    ]
+    contract = {
+        "evidenceRoot": str(evidence_root),
+        "storeBindings": bindings,
+    }
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_UID",
+        os.geteuid(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_GID",
+        os.getegid(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "_activation_root_identity",
+        lambda: (os.geteuid(), os.getegid()),
+    )
+
+    first = (
+        activation_package_module._archive_maintenance_destination_namespace_for_rollback(
+            contract,
+            bindings,
+            -1,
+        )
+    )
+    replay_descriptor = os.open(destination_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        replay = (
+            activation_package_module._archive_maintenance_destination_namespace_for_rollback(
+                contract,
+                bindings,
+                replay_descriptor,
+            )
+        )
+    finally:
+        os.close(replay_descriptor)
+
+    assert first["archiveRoot"] is None
+    assert first["replayed"] is False
+    assert replay["archiveRoot"] is None
+    assert replay["replayed"] is True
+    assert list(destination_root.iterdir()) == []
+
+
+def test_root_rollback_archive_recreates_exact_approved_principal_namespace(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires root to exercise exact 984:984 ownership")
+    account = pwd.getpwnam("overseer")
+    assert (account.pw_uid, account.pw_gid) == (
+        activation_package_module.APPROVED_OVERSEER_UID,
+        activation_package_module.APPROVED_OVERSEER_GID,
+    ) == (984, 984)
+
+    workspace = tmp_path / "evidence"
+    evidence_root = workspace / "preserved"
+    evidence_root.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    destination_root = tmp_path / "overseer"
+    destination_root.mkdir(mode=0o700)
+    destination = destination_root / "overseer.sqlite3"
+    destination.write_bytes(b"failed successor")
+    destination.chmod(0o600)
+    bindings: list[object] = [{"destinationDb": str(destination)}]
+    contract = {
+        "evidenceRoot": str(evidence_root),
+        "storeBindings": bindings,
+    }
+    descriptor = os.open(destination_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        result = (
+            activation_package_module._archive_maintenance_destination_namespace_for_rollback(
+                contract,
+                bindings,
+                descriptor,
+            )
+        )
+    finally:
+        os.close(descriptor)
+
+    archive = workspace / "failed-successor-store"
+    assert result["archiveRoot"] == str(archive)
+    assert (archive.stat().st_uid, archive.stat().st_gid) == (0, 0)
+    assert (destination_root.stat().st_uid, destination_root.stat().st_gid) == (
+        984,
+        984,
+    )
+    assert stat.S_IMODE(destination_root.stat().st_mode) == 0o700
+    assert list(destination_root.iterdir()) == []
+
+
 def test_rollback_archive_rejects_an_unbound_existing_archive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

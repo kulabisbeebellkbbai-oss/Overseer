@@ -86,6 +86,9 @@ MAX_RELEASE_FILE_BYTES = 128 * 1024 * 1024
 MAX_APPROVED_PACKAGE_IMPORT_BYTES = 16 * 1024 * 1024 * 1024
 MIN_APPROVED_PACKAGE_IMPORT_HEADROOM_BYTES = 1024 * 1024 * 1024
 MAX_STAGED_SECRET_BYTES = 512
+MAINTENANCE_API_TIMEOUT_SECONDS = 5.0
+MAINTENANCE_DASHBOARD_API_TIMEOUT_SECONDS = 60.0
+MAX_MAINTENANCE_API_RESPONSE_BYTES = 16 * 1024 * 1024
 APPROVED_OVERSEER_UID = 984
 APPROVED_OVERSEER_GID = 984
 APPROVED_PACKAGE_PARENT = Path("/home/god/.local/share/overseer/activation-packages")
@@ -4076,7 +4079,7 @@ def _archive_maintenance_destination_namespace_for_rollback(
         raise ActivationPackageError(
             "maintenance rollback archive has conflicting unbound state"
         )
-    if receipt_exists and (not intent_exists or not archive_exists):
+    if receipt_exists and not intent_exists:
         raise ActivationPackageError(
             "maintenance rollback archive has conflicting receipt state"
         )
@@ -4153,6 +4156,11 @@ def _archive_maintenance_destination_namespace_for_rollback(
             dict(source_identity_value)
             if isinstance(source_identity_value, Mapping)
             else None
+        )
+
+    if receipt_exists and archive_exists is not intent["archiveExpected"]:
+        raise ActivationPackageError(
+            "maintenance rollback archive has conflicting receipt state"
         )
 
     if intent["archiveExpected"] is True and not archive_exists:
@@ -13521,12 +13529,18 @@ def _maintenance_api_read(
     ):
         raise ActivationPackageError("maintenance acceptance API path is invalid")
     try:
-        timeout_seconds = 60.0 if path == "/operator-dashboard" else 5.0
-        client = OverseerApiClient(
-            auth_token_file=("/etc/overseer/api-token" if authenticated else None),
-            timeout_seconds=timeout_seconds,
+        timeout_seconds = (
+            MAINTENANCE_DASHBOARD_API_TIMEOUT_SECONDS
+            if path == "/operator-dashboard"
+            else MAINTENANCE_API_TIMEOUT_SECONDS
         )
-        payload = client._get(path, authenticated=authenticated)
+        with _maintenance_api_deadline(timeout_seconds):
+            client = OverseerApiClient(
+                auth_token_file=("/etc/overseer/api-token" if authenticated else None),
+                timeout_seconds=timeout_seconds,
+                max_response_bytes=MAX_MAINTENANCE_API_RESPONSE_BYTES,
+            )
+            payload = client._get(path, authenticated=authenticated)
     except Exception as error:
         raise ActivationPackageError(
             "maintenance acceptance API read failed"
@@ -13536,6 +13550,29 @@ def _maintenance_api_read(
             "maintenance acceptance API response is invalid"
         )
     return payload
+
+
+@contextmanager
+def _maintenance_api_deadline(timeout_seconds: float):
+    """Bound the entire local acceptance request, including trickled reads."""
+
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer != (0.0, 0.0):
+        raise ActivationPackageError(
+            "maintenance acceptance API deadline timer is unavailable"
+        )
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_expired(_signum: int, _frame: object) -> None:
+        raise TimeoutError("maintenance acceptance API deadline expired")
+
+    try:
+        signal.signal(signal.SIGALRM, deadline_expired)
+        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _maintenance_gateway_tls_ready() -> bool:

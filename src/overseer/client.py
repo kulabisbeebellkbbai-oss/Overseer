@@ -53,6 +53,7 @@ class OverseerApiClient:
         approval_token: str | None = None,
         unix_socket_path: str | None = None,
         expected_server_uid: int | None = None,
+        max_response_bytes: int | None = None,
     ) -> None:
         if auth_token and auth_token_file:
             raise ValueError("use auth_token or auth_token_file, not both")
@@ -60,6 +61,16 @@ class OverseerApiClient:
         self.auth_token = auth_token or _load_token(auth_token_file)
         self.approval_token = approval_token
         self.timeout_seconds = timeout_seconds
+        if (
+            max_response_bytes is not None
+            and (
+                isinstance(max_response_bytes, bool)
+                or not isinstance(max_response_bytes, int)
+                or max_response_bytes <= 0
+            )
+        ):
+            raise ValueError("max response bytes must be a positive integer")
+        self.max_response_bytes = max_response_bytes
         if (unix_socket_path is None) != (expected_server_uid is None):
             raise ValueError("unix_socket_path and expected_server_uid must be supplied together")
         if unix_socket_path is not None and (
@@ -1122,7 +1133,7 @@ class OverseerApiClient:
                     headers=dict(request.header_items()),
                 )
                 response = connection.getresponse()
-                body = response.read()
+                body = self._read_response_body(response)
                 if response.status >= 400:
                     raise HTTPError(
                         request.full_url,
@@ -1135,7 +1146,15 @@ class OverseerApiClient:
             finally:
                 connection.close()
         with urlopen(request, timeout=self.timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return json.loads(self._read_response_body(response).decode("utf-8"))
+
+    def _read_response_body(self, response: Any) -> bytes:
+        if self.max_response_bytes is None:
+            return response.read()
+        body = response.read(self.max_response_bytes + 1)
+        if len(body) > self.max_response_bytes:
+            raise ValueError("response body exceeds configured limit")
+        return body
 
 
 def _collection_path(path: str, **filters: object) -> str:

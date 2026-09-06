@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import stat
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1136,7 +1137,7 @@ def test_maintenance_api_read_uses_a_bounded_dashboard_timeout(
 ) -> None:
     import overseer.client as client_module
 
-    clients: list[tuple[str | None, float]] = []
+    clients: list[tuple[str | None, float, int]] = []
     reads: list[tuple[str, bool]] = []
 
     class FakeClient:
@@ -1145,8 +1146,11 @@ def test_maintenance_api_read_uses_a_bounded_dashboard_timeout(
             *,
             auth_token_file: str | None,
             timeout_seconds: float,
+            max_response_bytes: int,
         ) -> None:
-            clients.append((auth_token_file, timeout_seconds))
+            clients.append(
+                (auth_token_file, timeout_seconds, max_response_bytes)
+            )
 
         def _get(
             self,
@@ -1167,13 +1171,47 @@ def test_maintenance_api_read_uses_a_bounded_dashboard_timeout(
     }
 
     assert clients == [
-        (None, 5.0),
-        ("/etc/overseer/api-token", 60.0),
+        (None, 5.0, activation_package.MAX_MAINTENANCE_API_RESPONSE_BYTES),
+        (
+            "/etc/overseer/api-token",
+            60.0,
+            activation_package.MAX_MAINTENANCE_API_RESPONSE_BYTES,
+        ),
     ]
     assert reads == [
         ("/health", False),
         ("/operator-dashboard", True),
     ]
+
+
+def test_maintenance_api_read_enforces_one_end_to_end_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import overseer.client as client_module
+
+    class TricklingClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def _get(self, _path: str, *, authenticated: bool = True) -> object:
+            del authenticated
+            while True:
+                time.sleep(0.01)
+
+    monkeypatch.setattr(client_module, "OverseerApiClient", TricklingClient)
+    monkeypatch.setattr(
+        activation_package,
+        "MAINTENANCE_API_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(
+        activation_package.ActivationPackageError,
+        match="maintenance acceptance API read failed",
+    ):
+        activation_package._maintenance_api_read("/health", authenticated=False)
+    assert time.monotonic() - started < 1.0
 
 
 def test_successor_user_unit_inventory_checks_the_complete_writer_set(

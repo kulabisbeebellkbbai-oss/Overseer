@@ -156,13 +156,52 @@ DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES = frozenset(
         "git",
     }
 )
-DEDICATED_PRINCIPAL_BRIDGE_JOB_IDS = frozenset(
-    {
-        "collection.freshness.psychlo-usage",
-        "collection.freshness.quark-scheduler",
-        "collection.git.overseer",
-    }
-)
+DEDICATED_PRINCIPAL_BRIDGE_SPECS = {
+    "collection.freshness.psychlo-usage": (
+        CollectionJobKind.FRESHNESS_PROJECTION,
+        OwnerDomain.QUARK,
+        "overseer-psychlo-usage.service",
+        "freshness-projection",
+    ),
+    "collection.freshness.quark-scheduler": (
+        CollectionJobKind.FRESHNESS_PROJECTION,
+        OwnerDomain.QUARK,
+        "overseer-quark-scheduler.service",
+        "freshness-projection",
+    ),
+    "collection.git.overseer": (
+        CollectionJobKind.GIT_INSPECTION,
+        OwnerDomain.EZRI,
+        "git.overseer",
+        "git-inspection",
+    ),
+}
+DEDICATED_PRINCIPAL_BRIDGE_JOB_IDS = frozenset(DEDICATED_PRINCIPAL_BRIDGE_SPECS)
+
+
+def _canonical_dedicated_principal_bridge_job(job_id: str) -> CollectionJob:
+    kind, owner_domain, resource_id, _adapter_id = DEDICATED_PRINCIPAL_BRIDGE_SPECS[job_id]
+    return CollectionJob(
+        id=job_id,
+        kind=kind,
+        owner_domain=owner_domain,
+        resource_id=resource_id,
+        interval_seconds=DEFAULT_COLLECTION_INTERVALS[kind],
+        timeout_seconds=DEFAULT_COLLECTION_TIMEOUTS[kind],
+        priority=1 if kind is not CollectionJobKind.FRESHNESS_PROJECTION else 0,
+    )
+
+
+def _is_canonical_dedicated_principal_bridge_job(job: CollectionJob) -> bool:
+    kind, owner_domain, resource_id, _adapter_id = DEDICATED_PRINCIPAL_BRIDGE_SPECS[
+        job.id
+    ]
+    return (
+        job.kind,
+        job.owner_domain,
+        job.resource_id,
+        job.target_id,
+    ) == (kind, owner_domain, resource_id, None)
 
 
 def _store_path(value: str | Any) -> str:
@@ -268,7 +307,10 @@ def _freshness_projection_status(
         unit,
         max(job.interval_seconds + job.timeout_seconds, 1),
     )
-    if (current - last_trigger).total_seconds() > max_age_seconds:
+    age_seconds = (current - last_trigger).total_seconds()
+    if age_seconds < 0:
+        return {"outcome": CollectionOutcome.FAILED.value, "failure_category": "unavailable"}
+    if age_seconds > max_age_seconds:
         return {"outcome": CollectionOutcome.FAILED.value, "failure_category": "stale"}
     evidence_id = f"freshness.{job.id.replace('collection.freshness.', '')}"
     return {
@@ -582,10 +624,20 @@ def seed_default_collection_jobs(
         if dedicated_principal:
             for existing_id, existing in tuple(existing_jobs.items()):
                 if existing_id in DEDICATED_PRINCIPAL_BRIDGE_JOB_IDS:
-                    if not existing.enabled:
-                        enabled = replace(existing, enabled=True)
-                        store.save_collection_job(enabled)
-                        existing_jobs[existing_id] = enabled
+                    if not _is_canonical_dedicated_principal_bridge_job(existing):
+                        store.set_collection_job_enabled(existing_id, False)
+                        existing_jobs[existing_id] = replace(existing, enabled=False)
+                        dedicated_disabled_ids.add(existing_id)
+                        skipped.append(
+                            {
+                                "job_id": existing_id,
+                                "status": "disabled",
+                                "reason": "reserved bridge binding is invalid",
+                            }
+                        )
+                    elif not existing.enabled:
+                        store.set_collection_job_enabled(existing_id, True)
+                        existing_jobs[existing_id] = replace(existing, enabled=True)
                     continue
                 family = COLLECTION_KIND_FAMILIES.get(existing.kind, "health")
                 if family not in DEDICATED_PRINCIPAL_USER_SESSION_FAMILIES:
@@ -617,8 +669,23 @@ def seed_default_collection_jobs(
                             "reason": "health target is disabled",
                         }
                     )
-        for job in _default_jobs(targets, seed_families):
+        default_jobs = list(_default_jobs(targets, seed_families))
+        if dedicated_principal:
+            default_ids = {job.id for job in default_jobs}
+            default_jobs.extend(
+                _canonical_dedicated_principal_bridge_job(job_id)
+                for job_id in DEDICATED_PRINCIPAL_BRIDGE_JOB_IDS
+                if job_id not in default_ids
+            )
+        for job in default_jobs:
             existing = existing_jobs.get(job.id)
+            if (
+                dedicated_principal
+                and job.id in DEDICATED_PRINCIPAL_BRIDGE_JOB_IDS
+                and existing is not None
+                and not _is_canonical_dedicated_principal_bridge_job(existing)
+            ):
+                continue
             if existing is not None:
                 # Configuration refreshes must never rewrite the operator's
                 # durable enabled/suspended policy or scheduler state.
@@ -653,7 +720,8 @@ def seed_default_collection_jobs(
             adapter_id = (
                 "health-probe"
                 if job.kind is CollectionJobKind.HEALTH_PROBE
-                else RUNTIME_JOB_ADAPTER_IDS.get(job.id, RUNTIME_ADAPTER_IDS.get(job.kind))
+                else DEDICATED_PRINCIPAL_BRIDGE_SPECS.get(job.id, (None, None, None, None))[3]
+                or RUNTIME_JOB_ADAPTER_IDS.get(job.id, RUNTIME_ADAPTER_IDS.get(job.kind))
             )
             try:
                 registry.resolve(job, adapter_id)

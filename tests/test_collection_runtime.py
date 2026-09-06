@@ -190,6 +190,80 @@ def test_dedicated_principal_reseeding_keeps_only_fixed_bridge_collectors(
     assert not bridge_job_ids & disabled.keys()
 
 
+def test_dedicated_principal_filtered_seeding_disables_forged_bridge_definitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+    forged = {
+        "collection.freshness.psychlo-usage": CollectionJobKind.CREW_DISPATCH,
+        "collection.freshness.quark-scheduler": CollectionJobKind.GIT_INSPECTION,
+        "collection.git.overseer": CollectionJobKind.FRESHNESS_PROJECTION,
+    }
+    with sqlite3.connect(path) as connection:
+        for job_id, kind in forged.items():
+            row = connection.execute(
+                "SELECT payload FROM collection_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            payload = json.loads(row[0])
+            payload.update(
+                {
+                    "kind": kind.value,
+                    "owner_domain": OwnerDomain.SISKO.value,
+                    "resource_id": "forged.resource",
+                    "target_id": "forged.target",
+                    "enabled": True,
+                }
+            )
+            connection.execute(
+                "UPDATE collection_jobs SET kind=?, owner_domain=?, resource_id=?, target_id=?, enabled=1, payload=? WHERE id=?",
+                (
+                    kind.value,
+                    OwnerDomain.SISKO.value,
+                    "forged.resource",
+                    "forged.target",
+                    json.dumps(payload, separators=(",", ":")),
+                    job_id,
+                ),
+            )
+        connection.commit()
+
+    monkeypatch.setenv("OVERSEER_DEDICATED_PRINCIPAL", "1")
+    result = seed_default_collection_jobs(path, families=("crew_dispatch",))
+
+    with SQLiteStore(path) as store:
+        jobs = {job.id: job for job in store.list_collection_jobs()}
+    assert all(not jobs[job_id].enabled for job_id in forged)
+    disabled = {
+        item["job_id"]: item["reason"]
+        for item in result["disabled"]
+    }
+    assert all(
+        disabled[job_id] == "reserved bridge binding is invalid"
+        for job_id in forged
+    )
+
+
+def test_dedicated_principal_filtered_seeding_adds_all_fixed_bridge_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    monkeypatch.setenv("OVERSEER_DEDICATED_PRINCIPAL", "1")
+
+    seed_default_collection_jobs(path, families=("crew_dispatch",))
+
+    with SQLiteStore(path) as store:
+        jobs = {job.id: job for job in store.list_collection_jobs()}
+    assert all(
+        jobs[job_id].enabled
+        for job_id in (
+            "collection.freshness.psychlo-usage",
+            "collection.freshness.quark-scheduler",
+            "collection.git.overseer",
+        )
+    )
+
+
 def test_legacy_action_flags_do_not_authorize_unsafe_jobs(tmp_path: Path) -> None:
     path = _seed_resource_and_target(tmp_path)
 
@@ -531,6 +605,29 @@ def test_external_freshness_marks_old_last_trigger_failed(tmp_path: Path) -> Non
     execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
     assert execution.outcome is CollectionOutcome.FAILED
     assert execution.failure_category == "stale"
+
+
+def test_external_freshness_rejects_future_last_trigger(tmp_path: Path) -> None:
+    path = _seed_resource_and_target(tmp_path)
+    seed_default_collection_jobs(path)
+
+    def future_runner(command: tuple[str, ...], timeout_seconds: float):
+        del timeout_seconds
+        if command[-1].endswith(".timer"):
+            stdout = "ActiveState=active\nSubState=waiting\nResult=success\nLastTriggerUSecRealtime=2026-08-24 12:05:00 UTC\nNextElapseUSecRealtime=2026-08-24 12:10:00 UTC\n"
+        else:
+            stdout = "ActiveState=inactive\nSubState=dead\nResult=success\n"
+        return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    registry = runtime_collection_adapter_registry(
+        systemd_runner=future_runner,
+        now=lambda: "2026-08-24T12:00:00+00:00",
+    )
+    with SQLiteStore(path) as store:
+        job = store.load_collection_job("collection.freshness.quark-scheduler")
+    execution = registry.resolve(job, "freshness-projection").collect(job, str(path))
+    assert execution.outcome is CollectionOutcome.FAILED
+    assert execution.failure_category == "unavailable"
 
 
 def test_external_freshness_fails_when_psychlo_cycle_stage_fails(tmp_path: Path) -> None:

@@ -985,6 +985,253 @@ def test_scheduler_acceptance_returns_exact_bounded_failure(
     assert result == expected
 
 
+def test_scheduler_acceptance_reports_every_remaining_job_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jobs = [
+        {
+            "id": job_id,
+            "enabled": True,
+            "interval_seconds": 300,
+            "data_age_seconds": 1,
+            "last_outcome": "succeeded",
+        }
+        for job_id in activation_package._MAINTENANCE_FRESHNESS_JOB_IDS
+        if job_id != "collection.discovery.storage"
+    ]
+    jobs[0]["data_age_seconds"] = 601
+    jobs[1]["last_outcome"] = "failed"
+    responses = {
+        "/collections/status": {
+            "status": "ok",
+            "job_count": len(jobs),
+            "enabled_job_count": len(jobs),
+            "load_bounds": {"global_max": 2},
+        },
+        "/collections/jobs": {"status": "ok", "jobs": jobs},
+    }
+    observed: list[str] = []
+
+    def read(path: str, **_kwargs: object) -> dict[str, object]:
+        observed.append(path)
+        return responses[path]
+
+    monkeypatch.setattr(activation_package, "_maintenance_api_read", read)
+
+    result = activation_package._run_bounded_maintenance_acceptance_check(
+        _contract(tmp_path),
+        check_name="scheduler-freshness",
+    )
+
+    assert result == (
+        "job=collection.discovery.physical reason=stale; "
+        "job=collection.discovery.storage reason=missing; "
+        "job=collection.discovery.virtual reason=unsuccessful"
+    )
+    assert observed == ["/collections/status", "/collections/jobs"]
+
+
+def test_scheduler_acceptance_waits_for_condition_then_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results: list[bool | str] = [
+        "job=collection.discovery.physical reason=stale",
+        "job=collection.discovery.physical reason=stale",
+        True,
+    ]
+    checks: list[str] = []
+    sleeps: list[float] = []
+    now = 0.0
+
+    def check(
+        _contract: object,
+        *,
+        check_name: str,
+        **_kwargs: object,
+    ) -> bool | str:
+        checks.append(check_name)
+        return results.pop(0)
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(
+        activation_package,
+        "_run_bounded_maintenance_acceptance_check",
+        check,
+    )
+
+    assert activation_package._wait_for_maintenance_scheduler_freshness(
+        _contract(tmp_path),
+        timeout_seconds=30.0,
+        poll_interval_seconds=5.0,
+        monotonic=monotonic,
+        sleeper=sleep,
+    ) is True
+    assert checks == ["scheduler-freshness"] * 3
+    assert sleeps == [5.0, 5.0]
+
+
+def test_scheduler_acceptance_wait_expires_with_latest_complete_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detail = (
+        "job=collection.discovery.physical reason=stale; "
+        "job=collection.discovery.storage reason=missing"
+    )
+    now = 0.0
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(
+        activation_package,
+        "_run_bounded_maintenance_acceptance_check",
+        lambda _contract, *, check_name, **_kwargs: detail,
+    )
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    result = activation_package._wait_for_maintenance_scheduler_freshness(
+        _contract(tmp_path),
+        timeout_seconds=10.0,
+        poll_interval_seconds=6.0,
+        monotonic=lambda: now,
+        sleeper=sleep,
+    )
+
+    assert result == detail
+    assert sleeps == [6.0, 4.0]
+
+
+def test_scheduler_acceptance_clamps_each_read_to_remaining_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 597.0
+    reads: list[tuple[str, float | None]] = []
+    jobs = [
+        {
+            "id": job_id,
+            "enabled": True,
+            "interval_seconds": 300,
+            "data_age_seconds": 1,
+            "last_outcome": "succeeded",
+        }
+        for job_id in activation_package._MAINTENANCE_FRESHNESS_JOB_IDS
+    ]
+    responses = {
+        "/collections/status": {
+            "status": "ok",
+            "job_count": len(jobs),
+            "enabled_job_count": len(jobs),
+            "load_bounds": {"global_max": 2},
+        },
+        "/collections/jobs": {"status": "ok", "jobs": jobs},
+    }
+
+    def read(
+        path: str,
+        *,
+        timeout_seconds: float | None = None,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        nonlocal now
+        reads.append((path, timeout_seconds))
+        now += 2.0
+        return responses[path]
+
+    monkeypatch.setattr(activation_package, "_maintenance_api_read", read)
+
+    result = activation_package._run_bounded_maintenance_acceptance_check(
+        _contract(tmp_path),
+        check_name="scheduler-freshness",
+        scheduler_deadline=600.0,
+        monotonic=lambda: now,
+    )
+
+    assert result is True
+    assert reads == [
+        ("/collections/status", 3.0),
+        ("/collections/jobs", 1.0),
+    ]
+
+
+def test_scheduler_acceptance_deadline_timeout_returns_latest_complete_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    reads: list[tuple[str, float | None]] = []
+    jobs = [
+        {
+            "id": job_id,
+            "enabled": True,
+            "interval_seconds": 300,
+            "data_age_seconds": 1,
+            "last_outcome": "succeeded",
+        }
+        for job_id in activation_package._MAINTENANCE_FRESHNESS_JOB_IDS
+    ]
+    jobs[0]["data_age_seconds"] = 601
+    status = {
+        "status": "ok",
+        "job_count": len(jobs),
+        "enabled_job_count": len(jobs),
+        "load_bounds": {"global_max": 2},
+    }
+
+    def read(
+        path: str,
+        *,
+        timeout_seconds: float | None = None,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        nonlocal now
+        reads.append((path, timeout_seconds))
+        if len(reads) == 1:
+            return status
+        if len(reads) == 2:
+            return {"status": "ok", "jobs": jobs}
+        if len(reads) == 3:
+            now = 9.0
+            return status
+        assert timeout_seconds == 1.0
+        now = 10.0
+        raise activation_package.ActivationPackageError("bounded read expired")
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(activation_package, "_maintenance_api_read", read)
+
+    result = activation_package._wait_for_maintenance_scheduler_freshness(
+        _contract(tmp_path),
+        timeout_seconds=10.0,
+        poll_interval_seconds=5.0,
+        monotonic=lambda: now,
+        sleeper=sleep,
+    )
+
+    assert result == "job=collection.discovery.physical reason=stale"
+    assert reads == [
+        ("/collections/status", 5.0),
+        ("/collections/jobs", 5.0),
+        ("/collections/status", 5.0),
+        ("/collections/jobs", 1.0),
+    ]
+
+
 def test_maintenance_acceptance_surfaces_bounded_scheduler_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1004,12 +1251,13 @@ def test_maintenance_acceptance_surfaces_bounded_scheduler_failure(
     )
     monkeypatch.setattr(
         activation_package,
+        "_wait_for_maintenance_scheduler_freshness",
+        lambda _contract: "job=collection.git.overseer reason=stale",
+    )
+    monkeypatch.setattr(
+        activation_package,
         "_run_bounded_maintenance_acceptance_check",
-        lambda _contract, *, check_name: (
-            "job=collection.git.overseer reason=stale"
-            if check_name == "scheduler-freshness"
-            else True
-        ),
+        lambda _contract, *, check_name: True,
     )
 
     with pytest.raises(
@@ -1169,6 +1417,10 @@ def test_maintenance_api_read_uses_a_bounded_dashboard_timeout(
     assert activation_package._maintenance_api_read("/operator-dashboard") == {
         "ok": True
     }
+    assert activation_package._maintenance_api_read(
+        "/collections/status",
+        timeout_seconds=1.25,
+    ) == {"ok": True}
 
     assert clients == [
         (None, 5.0, activation_package.MAX_MAINTENANCE_API_RESPONSE_BYTES),
@@ -1177,10 +1429,16 @@ def test_maintenance_api_read_uses_a_bounded_dashboard_timeout(
             60.0,
             activation_package.MAX_MAINTENANCE_API_RESPONSE_BYTES,
         ),
+        (
+            "/etc/overseer/api-token",
+            1.25,
+            activation_package.MAX_MAINTENANCE_API_RESPONSE_BYTES,
+        ),
     ]
     assert reads == [
         ("/health", False),
         ("/operator-dashboard", True),
+        ("/collections/status", True),
     ]
 
 
@@ -1272,6 +1530,11 @@ def test_verify_maintenance_acceptance_requires_every_named_check(
         "_run_bounded_maintenance_acceptance_check",
         bounded_check,
         raising=False,
+    )
+    monkeypatch.setattr(
+        activation_package,
+        "_wait_for_maintenance_scheduler_freshness",
+        lambda _contract: failed_check != "scheduler-freshness",
     )
 
     with pytest.raises(Exception, match="acceptance|check|failed"):

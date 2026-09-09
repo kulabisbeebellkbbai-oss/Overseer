@@ -88,6 +88,8 @@ MIN_APPROVED_PACKAGE_IMPORT_HEADROOM_BYTES = 1024 * 1024 * 1024
 MAX_STAGED_SECRET_BYTES = 512
 MAINTENANCE_API_TIMEOUT_SECONDS = 5.0
 MAINTENANCE_DASHBOARD_API_TIMEOUT_SECONDS = 60.0
+MAINTENANCE_SCHEDULER_CONVERGENCE_TIMEOUT_SECONDS = 600.0
+MAINTENANCE_SCHEDULER_POLL_INTERVAL_SECONDS = 15.0
 MAX_MAINTENANCE_API_RESPONSE_BYTES = 16 * 1024 * 1024
 APPROVED_OVERSEER_UID = 984
 APPROVED_OVERSEER_GID = 984
@@ -238,6 +240,10 @@ class _CleanupCommandFailure(ActivationPackageError):
     def __init__(self, failure: str) -> None:
         self.failure = failure
         super().__init__("staging cleanup command failed")
+
+
+class _MaintenanceSchedulerConvergenceDeadline(ActivationPackageError):
+    """Stop scheduler projection reads at the sealed convergence deadline."""
 
 
 def _validate_principal_binding(
@@ -13432,6 +13438,8 @@ def _run_bounded_maintenance_acceptance_check(
     contract: Mapping[str, object],
     *,
     check_name: str,
+    scheduler_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> bool | str:
     if check_name == "api":
         payload = _maintenance_api_read("/health", authenticated=False)
@@ -13446,8 +13454,28 @@ def _run_bounded_maintenance_acceptance_check(
             payload["role_focus"]
         )
     if check_name == "scheduler-freshness":
-        payload = _maintenance_api_read("/collections/status")
-        jobs_payload = _maintenance_api_read("/collections/jobs")
+        def read_scheduler_projection(path: str) -> dict[str, object]:
+            if scheduler_deadline is None:
+                return _maintenance_api_read(path)
+            remaining = scheduler_deadline - monotonic()
+            if remaining <= 0:
+                raise _MaintenanceSchedulerConvergenceDeadline(
+                    "maintenance scheduler convergence deadline expired"
+                )
+            try:
+                return _maintenance_api_read(
+                    path,
+                    timeout_seconds=min(MAINTENANCE_API_TIMEOUT_SECONDS, remaining),
+                )
+            except ActivationPackageError as error:
+                if monotonic() >= scheduler_deadline:
+                    raise _MaintenanceSchedulerConvergenceDeadline(
+                        "maintenance scheduler convergence deadline expired"
+                    ) from error
+                raise
+
+        payload = read_scheduler_projection("/collections/status")
+        jobs_payload = read_scheduler_projection("/collections/jobs")
         jobs = jobs_payload.get("jobs")
         if not (
             payload.get("status") == "ok"
@@ -13465,28 +13493,30 @@ def _run_bounded_maintenance_acceptance_check(
             for item in jobs
             if isinstance(item, Mapping)
         }
+        failures: list[str] = []
         for job_id in _MAINTENANCE_FRESHNESS_JOB_IDS:
             item = by_id.get(job_id)
             if not isinstance(item, Mapping):
-                return f"job={job_id} reason=missing"
+                failures.append(f"job={job_id} reason=missing")
+                continue
             interval = item.get("interval_seconds")
             age = item.get("data_age_seconds")
             if item.get("enabled") is not True:
-                return f"job={job_id} reason=disabled"
-            if item.get("last_outcome") != "succeeded":
-                return f"job={job_id} reason=unsuccessful"
-            if type(interval) is not int or interval <= 0:
-                return f"job={job_id} reason=invalid-interval"
-            if (
+                failures.append(f"job={job_id} reason=disabled")
+            elif item.get("last_outcome") != "succeeded":
+                failures.append(f"job={job_id} reason=unsuccessful")
+            elif type(interval) is not int or interval <= 0:
+                failures.append(f"job={job_id} reason=invalid-interval")
+            elif (
                 isinstance(age, bool)
                 or not isinstance(age, (int, float))
                 or not math.isfinite(float(age))
                 or age < 0
             ):
-                return f"job={job_id} reason=missing-age"
-            if age > max(interval * 2, 300):
-                return f"job={job_id} reason=stale"
-        return True
+                failures.append(f"job={job_id} reason=missing-age")
+            elif age > max(interval * 2, 300):
+                failures.append(f"job={job_id} reason=stale")
+        return "; ".join(failures) if failures else True
     if check_name == "protected-gateway-read":
         # Prove the actual TLS listener, then require a human to echo the
         # short-lived value read through an authenticated /Overseer session.
@@ -13512,10 +13542,59 @@ def _run_bounded_maintenance_acceptance_check(
     )
 
 
+def _wait_for_maintenance_scheduler_freshness(
+    contract: Mapping[str, object],
+    *,
+    timeout_seconds: float = MAINTENANCE_SCHEDULER_CONVERGENCE_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = MAINTENANCE_SCHEDULER_POLL_INTERVAL_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> bool | str:
+    """Poll read-only scheduler projections until fresh or the deadline expires."""
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or timeout_seconds < 0
+        or isinstance(poll_interval_seconds, bool)
+        or not isinstance(poll_interval_seconds, (int, float))
+        or not math.isfinite(float(poll_interval_seconds))
+        or poll_interval_seconds <= 0
+    ):
+        raise ActivationPackageError(
+            "maintenance scheduler convergence bounds are invalid"
+        )
+    deadline = monotonic() + float(timeout_seconds)
+    last_result: bool | str = "reason=deadline-expired"
+    while True:
+        if monotonic() >= deadline:
+            return last_result
+        try:
+            result = _run_bounded_maintenance_acceptance_check(
+                contract,
+                check_name="scheduler-freshness",
+                scheduler_deadline=deadline,
+                monotonic=monotonic,
+            )
+        except _MaintenanceSchedulerConvergenceDeadline:
+            return last_result
+        if monotonic() > deadline:
+            return last_result
+        if result is True:
+            return True
+        last_result = result
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return last_result
+        sleeper(min(float(poll_interval_seconds), remaining))
+
+
 def _maintenance_api_read(
     path: str,
     *,
     authenticated: bool = True,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
     """Perform one bounded local GET without triggering a collector."""
 
@@ -13529,11 +13608,27 @@ def _maintenance_api_read(
     ):
         raise ActivationPackageError("maintenance acceptance API path is invalid")
     try:
-        timeout_seconds = (
+        default_timeout_seconds = (
             MAINTENANCE_DASHBOARD_API_TIMEOUT_SECONDS
             if path == "/operator-dashboard"
             else MAINTENANCE_API_TIMEOUT_SECONDS
         )
+        if timeout_seconds is None:
+            timeout_seconds = default_timeout_seconds
+        elif (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
+        ):
+            raise ActivationPackageError(
+                "maintenance acceptance API timeout is invalid"
+            )
+        else:
+            timeout_seconds = min(
+                default_timeout_seconds,
+                float(timeout_seconds),
+            )
         with _maintenance_api_deadline(timeout_seconds):
             client = OverseerApiClient(
                 auth_token_file=("/etc/overseer/api-token" if authenticated else None),
@@ -13865,9 +13960,13 @@ def verify_maintenance_acceptance(
         raise ActivationPackageError("maintenance acceptance contract is invalid")
     results: dict[str, bool] = {}
     for check_name in _MAINTENANCE_ACCEPTANCE_CHECKS:
-        result = _run_bounded_maintenance_acceptance_check(
-            contract,
-            check_name=check_name,
+        result = (
+            _wait_for_maintenance_scheduler_freshness(contract)
+            if check_name == "scheduler-freshness"
+            else _run_bounded_maintenance_acceptance_check(
+                contract,
+                check_name=check_name,
+            )
         )
         if result is not True:
             detail = f": {result}" if isinstance(result, str) else ""

@@ -77,6 +77,15 @@ APPROVED_PACKAGE_RETIREMENT_INTENT_SCHEMA = (
 APPROVED_PACKAGE_RETIREMENT_RECEIPT_SCHEMA = (
     "overseer.approved-package-retirement-receipt.v1"
 )
+_RETIREMENT_FAILED_SUCCESSOR_FILE_OWNER_PROFILE = (
+    "root-with-overseer-failed-successor-sqlite-v1"
+)
+_MAINTENANCE_FAILED_SUCCESSOR_INTENT_SCHEMA = (
+    "overseer.maintenance-failed-successor-intent.v1"
+)
+_MAINTENANCE_FAILED_SUCCESSOR_RECEIPT_SCHEMA = (
+    "overseer.maintenance-failed-successor-receipt.v1"
+)
 LEGACY_ACTIVATION_APPROVAL_SCHEMA = "overseer.activation-package-approval.v1"
 LEGACY_ACTIVATION_CONTRACT_SCHEMA = "overseer.dedicated-principal-activation-contract.v1"
 LEGACY_ACTIVATION_RUNNER_STATE_SCHEMA = "overseer.activation-runner-state.v1"
@@ -14392,6 +14401,200 @@ def _retirement_directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _retirement_file_owner_matches(
+    *,
+    relative_path: str,
+    observed_owner: tuple[int, int],
+    default_owner: tuple[int, int],
+    file_owner_overrides: Mapping[str, tuple[int, int]],
+) -> bool:
+    """Match one file owner against an exact path-bound override."""
+
+    return observed_owner == file_owner_overrides.get(relative_path, default_owner)
+
+
+def _retirement_failed_successor_relative_paths() -> frozenset[str]:
+    return frozenset(
+        f"failed-successor-store/{Path(destination).name}{suffix}"
+        for _store_name, destination in MAINTENANCE_STORE_DESTINATIONS
+        for suffix in ("", "-wal", "-shm")
+    )
+
+
+def _retirement_directory_identity_document_valid(
+    value: object,
+    *,
+    owner: tuple[int, int],
+) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "device",
+        "inode",
+        "uid",
+        "gid",
+        "mode",
+    }:
+        return False
+    if any(type(value.get(field)) is not int for field in value):
+        return False
+    return (
+        int(value["device"]) >= 0
+        and int(value["inode"]) > 0
+        and (value["uid"], value["gid"]) == owner
+        and value["mode"] == 0o700
+    )
+
+
+def _retirement_failed_successor_file_owner_overrides(
+    workspace: Path,
+    *,
+    plan_digest: str,
+) -> dict[str, tuple[int, int]]:
+    """Validate rollback records and return the one mixed-owner file profile."""
+
+    archive = workspace / "failed-successor-store"
+    intent_path = workspace / "failed-successor-store-intent.json"
+    receipt_path = workspace / "failed-successor-store-receipt.json"
+    paths = (archive, intent_path, receipt_path)
+    present = tuple(path.exists() or path.is_symlink() for path in paths)
+    if not any(present):
+        return {}
+    if not all(present):
+        raise ActivationPackageError(
+            "retirement failed successor ownership records are incomplete"
+        )
+    intent, _intent_raw, _intent_metadata = _retirement_load_root_record(
+        intent_path,
+        label="retirement failed successor intent",
+    )
+    receipt, _receipt_raw, _receipt_metadata = _retirement_load_root_record(
+        receipt_path,
+        label="retirement failed successor receipt",
+    )
+    root_identity = _activation_root_identity()
+    overseer_identity = (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
+    expected_source = str(Path(MAINTENANCE_STORE_DESTINATIONS[0][1]).parent)
+    expected_archive = str(archive)
+    expected_names = sorted(
+        Path(destination).name
+        for _store_name, destination in MAINTENANCE_STORE_DESTINATIONS
+    )
+    source_identity = intent.get("sourceIdentity")
+    replacement_identity = receipt.get("replacementIdentity")
+    if (
+        intent
+        != {
+            "schemaVersion": _MAINTENANCE_FAILED_SUCCESSOR_INTENT_SCHEMA,
+            "status": "prepared",
+            "contractDigest": plan_digest,
+            "sourceDirectory": expected_source,
+            "archiveDirectory": expected_archive,
+            "destinationNames": expected_names,
+            "archiveExpected": True,
+            "sourceIdentity": source_identity,
+        }
+        or not _retirement_directory_identity_document_valid(
+            source_identity,
+            owner=root_identity,
+        )
+        or receipt
+        != {
+            "schemaVersion": _MAINTENANCE_FAILED_SUCCESSOR_RECEIPT_SCHEMA,
+            "status": "archived_and_recreated",
+            "contractDigest": plan_digest,
+            "sourceDirectory": expected_source,
+            "archiveDirectory": expected_archive,
+            "archiveIdentity": source_identity,
+            "replacementIdentity": replacement_identity,
+        }
+        or not _retirement_directory_identity_document_valid(
+            replacement_identity,
+            owner=overseer_identity,
+        )
+        or replacement_identity == source_identity
+    ):
+        raise ActivationPackageError(
+            "retirement failed successor ownership binding is invalid"
+        )
+    try:
+        archive_metadata = archive.lstat()
+        observed_names = {path.name for path in archive.iterdir()}
+    except OSError as error:
+        raise ActivationPackageError(
+            "retirement failed successor archive is unavailable"
+        ) from error
+    if (
+        archive.is_symlink()
+        or not stat.S_ISDIR(archive_metadata.st_mode)
+        or _maintenance_rollback_directory_identity(archive_metadata)
+        != dict(source_identity)
+        or observed_names
+        != {Path(relative).name for relative in _retirement_failed_successor_relative_paths()}
+    ):
+        raise ActivationPackageError(
+            "retirement failed successor archive binding is invalid"
+        )
+    return {
+        relative: overseer_identity
+        for relative in _retirement_failed_successor_relative_paths()
+    }
+
+
+def _retirement_expected_file_owner_overrides(
+    expected: Mapping[str, object],
+) -> dict[str, tuple[int, int]]:
+    """Validate a recorded owner profile before using it for re-observation."""
+
+    profile = expected.get("fileOwnerProfile")
+    files = expected.get("files")
+    if not isinstance(files, list):
+        if profile is not None:
+            raise ActivationPackageError("retirement file owner profile is invalid")
+        return {}
+    root_owner = (expected.get("uid"), expected.get("gid"))
+    if not all(type(value) is int for value in root_owner):
+        raise ActivationPackageError("retirement file owner profile is invalid")
+    allowed_paths = _retirement_failed_successor_relative_paths()
+    if profile is None:
+        for file_entry in files:
+            if (
+                not isinstance(file_entry, Mapping)
+                or (file_entry.get("uid"), file_entry.get("gid")) != root_owner
+            ):
+                raise ActivationPackageError("retirement file owner profile is invalid")
+        return {}
+    name = expected.get("name")
+    if (
+        profile != _RETIREMENT_FAILED_SUCCESSOR_FILE_OWNER_PROFILE
+        or expected.get("kind") != "directory"
+        or not isinstance(name, str)
+        or not name.startswith("maintenance-")
+    ):
+        raise ActivationPackageError("retirement file owner profile is invalid")
+    seen_paths: set[str] = set()
+    overseer_owner = (APPROVED_OVERSEER_UID, APPROVED_OVERSEER_GID)
+    for file_entry in files:
+        if not isinstance(file_entry, Mapping):
+            raise ActivationPackageError("retirement file owner profile is invalid")
+        path = file_entry.get("path")
+        if (
+            not isinstance(path, str)
+            or _safe_relative(path) != path
+            or path in seen_paths
+        ):
+            raise ActivationPackageError("retirement file owner profile is invalid")
+        seen_paths.add(path)
+        expected_owner = overseer_owner if path in allowed_paths else root_owner
+        if (file_entry.get("uid"), file_entry.get("gid")) != expected_owner:
+            raise ActivationPackageError("retirement file owner profile is invalid")
+        if path in allowed_paths and (
+            file_entry.get("mode") != "0600" or file_entry.get("links") != 1
+        ):
+            raise ActivationPackageError("retirement file owner profile is invalid")
+    if not allowed_paths.issubset(seen_paths):
+        raise ActivationPackageError("retirement file owner profile is incomplete")
+    return {relative: overseer_owner for relative in allowed_paths}
+
+
 def _retirement_observe_artifact(
     path: Path,
     *,
@@ -14399,6 +14602,7 @@ def _retirement_observe_artifact(
     kind: str,
     package_digest: str | None = None,
     owner_identity: tuple[int, int] | None = None,
+    file_owner_overrides: Mapping[str, tuple[int, int]] | None = None,
 ) -> dict[str, object]:
     """Return a stable, root-owned identity and content inventory."""
 
@@ -14415,6 +14619,19 @@ def _retirement_observe_artifact(
         if owner_identity is None
         else owner_identity
     )
+    owner_overrides = dict(file_owner_overrides or {})
+    for relative_path, identity in owner_overrides.items():
+        if (
+            not isinstance(relative_path, str)
+            or _safe_relative(relative_path) != relative_path
+            or relative_path == "."
+            or not isinstance(identity, tuple)
+            or len(identity) != 2
+            or any(type(value) is not int for value in identity)
+        ):
+            raise ActivationPackageError(
+                "retirement file owner override is invalid"
+            )
     base = {
         "name": name,
         "kind": kind,
@@ -14451,6 +14668,7 @@ def _retirement_observe_artifact(
         raise ActivationPackageError(f"retirement artifact is unsafe: {name}")
     directories: list[dict[str, object]] = []
     files: list[dict[str, object]] = []
+    observed_overrides: set[str] = set()
     for directory, child_directories, child_files in os.walk(
         path,
         followlinks=False,
@@ -14498,17 +14716,24 @@ def _retirement_observe_artifact(
                 label=f"retirement artifact {name}",
             )
             child_after = child.lstat()
+            child_owner = (child_details["uid"], child_details["gid"])
             if (
                 _retirement_inode_identity(child_before)
                 != _retirement_inode_identity(child_after)
-                or child_details["uid"] != expected_uid
-                or child_details["gid"] != expected_gid
+                or not _retirement_file_owner_matches(
+                    relative_path=relative_file,
+                    observed_owner=child_owner,
+                    default_owner=(expected_uid, expected_gid),
+                    file_owner_overrides=owner_overrides,
+                )
                 or child_details["links"] != 1
                 or int(str(child_details["mode"]), 8) & 0o022
             ):
                 raise ActivationPackageError(
                     f"retirement artifact file is unsafe: {name}"
                 )
+            if relative_file in owner_overrides:
+                observed_overrides.add(relative_file)
             files.append(
                 {
                     "path": relative_file,
@@ -14524,6 +14749,10 @@ def _retirement_observe_artifact(
             raise ActivationPackageError(
                 f"retirement artifact changed while inventorying: {name}"
             )
+    if observed_overrides != set(owner_overrides):
+        raise ActivationPackageError(
+            f"retirement artifact owner profile is incomplete: {name}"
+        )
     directories.sort(key=lambda item: str(item["path"]))
     files.sort(key=lambda item: str(item["path"]))
     root_after = path.lstat()
@@ -14553,6 +14782,8 @@ def _retirement_record_artifact(
     kind: str,
     package_digest: str | None = None,
     expected_document: Mapping[str, object] | None = None,
+    file_owner_profile: str | None = None,
+    file_owner_overrides: Mapping[str, tuple[int, int]] | None = None,
 ) -> dict[str, object]:
     record_metadata: os.stat_result | None = None
     record_raw: bytes | None = None
@@ -14565,6 +14796,8 @@ def _retirement_record_artifact(
             raise ActivationPackageError(
                 f"retirement record changed before inventory: {path.name}"
             )
+    if bool(file_owner_overrides) != (file_owner_profile is not None):
+        raise ActivationPackageError("retirement file owner profile is invalid")
     result = {
         "sourcePath": str(path),
         **_retirement_observe_artifact(
@@ -14572,8 +14805,11 @@ def _retirement_record_artifact(
             name=path.name,
             kind=kind,
             package_digest=package_digest,
+            file_owner_overrides=file_owner_overrides,
         ),
     }
+    if file_owner_profile is not None:
+        result["fileOwnerProfile"] = file_owner_profile
     if (
         record_metadata is not None
         and record_raw is not None
@@ -14638,12 +14874,16 @@ def _retirement_verify_artifact(
     package_digest = expected.get("packageDigest")
     if package_digest is not None and not isinstance(package_digest, str):
         raise ActivationPackageError("retirement intent package digest is invalid")
+    file_owner_overrides = _retirement_expected_file_owner_overrides(expected)
     observed = _retirement_observe_artifact(
         path,
         name=name,
         kind=kind,
         package_digest=package_digest,
+        file_owner_overrides=file_owner_overrides,
     )
+    if expected.get("fileOwnerProfile") is not None:
+        observed["fileOwnerProfile"] = expected["fileOwnerProfile"]
     recorded = {key: value for key, value in expected.items() if key != "sourcePath"}
     if observed != recorded:
         raise ActivationPackageError(f"retirement artifact drifted: {name}")
@@ -15015,6 +15255,12 @@ def _retirement_fresh_intent(
         successor_package,
         package_digest=successor_digest,
     )
+    maintenance_owner_overrides = (
+        _retirement_failed_successor_file_owner_overrides(
+            maintenance_workspace,
+            plan_digest=plan_digest,
+        )
+    )
     artifacts = [
         _retirement_record_artifact(
             package,
@@ -15039,6 +15285,12 @@ def _retirement_fresh_intent(
         _retirement_record_artifact(
             maintenance_workspace,
             kind="directory",
+            file_owner_profile=(
+                _RETIREMENT_FAILED_SUCCESSOR_FILE_OWNER_PROFILE
+                if maintenance_owner_overrides
+                else None
+            ),
+            file_owner_overrides=maintenance_owner_overrides,
         ),
     ]
     destination_namespace = executor_root / f"destination-namespace-before-{plan_digest}"
@@ -15170,6 +15422,7 @@ def _retirement_validate_intent(
             )
         ):
             raise ActivationPackageError("retirement intent artifact path is invalid")
+        _retirement_expected_file_owner_overrides(item)
         names.add(name)
         selected.append(item)
     required = {

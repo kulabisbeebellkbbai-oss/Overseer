@@ -5742,6 +5742,64 @@ def _retirement_test_environment(
         "preserved\n", encoding="utf-8"
     )
     evidence.chmod(0o600)
+    failed_successor_store = maintenance_workspace / "failed-successor-store"
+    failed_successor_store.mkdir(mode=0o700)
+    for _store_name, destination in (
+        activation_package_module.MAINTENANCE_STORE_DESTINATIONS
+    ):
+        database_name = Path(destination).name
+        for suffix in ("", "-wal", "-shm"):
+            failed_file = failed_successor_store / f"{database_name}{suffix}"
+            failed_file.write_text("failed successor\n", encoding="utf-8")
+            failed_file.chmod(0o600)
+    failed_store_metadata = failed_successor_store.lstat()
+    failed_source_identity = {
+        "device": failed_store_metadata.st_dev,
+        "inode": failed_store_metadata.st_ino,
+        "uid": os.geteuid(),
+        "gid": os.getegid(),
+        "mode": 0o700,
+    }
+    failed_intent = {
+        "schemaVersion": "overseer.maintenance-failed-successor-intent.v1",
+        "status": "prepared",
+        "contractDigest": plan_digest,
+        "sourceDirectory": "/var/lib/overseer",
+        "archiveDirectory": str(failed_successor_store),
+        "destinationNames": sorted(
+            Path(destination).name
+            for _store_name, destination in (
+                activation_package_module.MAINTENANCE_STORE_DESTINATIONS
+            )
+        ),
+        "archiveExpected": True,
+        "sourceIdentity": failed_source_identity,
+    }
+    failed_receipt = {
+        "schemaVersion": "overseer.maintenance-failed-successor-receipt.v1",
+        "status": "archived_and_recreated",
+        "contractDigest": plan_digest,
+        "sourceDirectory": "/var/lib/overseer",
+        "archiveDirectory": str(failed_successor_store),
+        "archiveIdentity": failed_source_identity,
+        "replacementIdentity": {
+            "device": failed_store_metadata.st_dev,
+            "inode": failed_store_metadata.st_ino + 1,
+            "uid": os.geteuid(),
+            "gid": os.getegid(),
+            "mode": 0o700,
+        },
+    }
+    for name, document in (
+        ("failed-successor-store-intent.json", failed_intent),
+        ("failed-successor-store-receipt.json", failed_receipt),
+    ):
+        path = maintenance_workspace / name
+        path.write_text(
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
     destination_namespace = executor / f"destination-namespace-before-{plan_digest}"
     destination_namespace.mkdir(mode=0o700)
     destination_state = destination_namespace / "state"
@@ -5794,6 +5852,16 @@ def _retirement_test_environment(
         activation_package_module,
         "_activation_root_identity",
         lambda: (os.geteuid(), os.getegid()),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_UID",
+        os.geteuid(),
+    )
+    monkeypatch.setattr(
+        activation_package_module,
+        "APPROVED_OVERSEER_GID",
+        os.getegid(),
     )
     monkeypatch.setattr(activation_package_module, "_require_root_activation", lambda: None)
     monkeypatch.setattr(
@@ -5863,6 +5931,7 @@ def _retirement_test_environment(
         "consumedRetry": consumed_retry,
         "foreignConsumedRetry": foreign_consumed_retry,
         "maintenanceWorkspace": maintenance_workspace,
+        "failedSuccessorStore": failed_successor_store,
         "destinationNamespace": destination_namespace,
         "canaryPath": canary_path,
     }
@@ -5921,6 +5990,14 @@ def test_retirement_archives_exact_terminal_predecessor_and_is_replay_safe(
     assert receipt["status"] == "retired"
     assert receipt["liveServiceMutationPerformed"] is False
     assert {entry["name"] for entry in receipt["artifacts"]} == expected_names
+    maintenance_entry = next(
+        entry
+        for entry in receipt["artifacts"]
+        if entry["name"] == Path(str(environment["maintenanceWorkspace"])).name
+    )
+    assert maintenance_entry["fileOwnerProfile"] == (
+        "root-with-overseer-failed-successor-sqlite-v1"
+    )
     assert stat_mode(archive) == 0o700
     assert stat_mode(archive / "retirement-receipt.json") == 0o600
 
@@ -5932,6 +6009,174 @@ def test_retirement_archives_exact_terminal_predecessor_and_is_replay_safe(
     replayed = _retire_test_package(environment)
 
     assert replayed == {**retired, "replayed": True}
+
+
+def test_retirement_file_owner_profile_is_path_bound() -> None:
+    allowed_path = "failed-successor-store/overseer.sqlite3"
+    overrides = {allowed_path: (984, 984)}
+
+    assert activation_package_module._retirement_file_owner_matches(
+        relative_path=allowed_path,
+        observed_owner=(984, 984),
+        default_owner=(0, 0),
+        file_owner_overrides=overrides,
+    )
+    assert not activation_package_module._retirement_file_owner_matches(
+        relative_path="preserved/overseer.sqlite3",
+        observed_owner=(984, 984),
+        default_owner=(0, 0),
+        file_owner_overrides=overrides,
+    )
+    assert not activation_package_module._retirement_file_owner_matches(
+        relative_path=allowed_path,
+        observed_owner=(985, 985),
+        default_owner=(0, 0),
+        file_owner_overrides=overrides,
+    )
+
+
+def test_retirement_owner_profile_rejects_principal_outside_failed_store() -> None:
+    allowed_paths = (
+        activation_package_module._retirement_failed_successor_relative_paths()
+    )
+    files = [
+        {
+            "path": path,
+            "uid": 984,
+            "gid": 984,
+            "mode": "0600",
+            "links": 1,
+        }
+        for path in sorted(allowed_paths)
+    ]
+    files.append(
+        {
+            "path": "preserved/rogue.sqlite3",
+            "uid": 984,
+            "gid": 984,
+            "mode": "0600",
+            "links": 1,
+        }
+    )
+    expected = {
+        "name": f"maintenance-{'d' * 64}",
+        "kind": "directory",
+        "uid": 0,
+        "gid": 0,
+        "fileOwnerProfile": "root-with-overseer-failed-successor-sqlite-v1",
+        "files": files,
+    }
+
+    with pytest.raises(
+        ActivationPackageError,
+        match="retirement file owner profile is invalid",
+    ):
+        activation_package_module._retirement_expected_file_owner_overrides(
+            expected
+        )
+
+
+def test_retirement_owner_profile_accepts_exact_distinct_principal_set() -> None:
+    allowed_paths = (
+        activation_package_module._retirement_failed_successor_relative_paths()
+    )
+    expected = {
+        "name": f"maintenance-{'d' * 64}",
+        "kind": "directory",
+        "uid": 0,
+        "gid": 0,
+        "fileOwnerProfile": "root-with-overseer-failed-successor-sqlite-v1",
+        "files": [
+            {
+                "path": path,
+                "uid": activation_package_module.APPROVED_OVERSEER_UID,
+                "gid": activation_package_module.APPROVED_OVERSEER_GID,
+                "mode": "0600",
+                "links": 1,
+            }
+            for path in sorted(allowed_paths)
+        ]
+        + [
+            {
+                "path": "preserved/evidence.json",
+                "uid": 0,
+                "gid": 0,
+                "mode": "0600",
+                "links": 1,
+            }
+        ],
+    }
+
+    assert activation_package_module._retirement_expected_file_owner_overrides(
+        expected
+    ) == {
+        path: (
+            activation_package_module.APPROVED_OVERSEER_UID,
+            activation_package_module.APPROVED_OVERSEER_GID,
+        )
+        for path in allowed_paths
+    }
+
+
+def test_retirement_rejects_unbound_failed_successor_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    workspace = Path(str(environment["maintenanceWorkspace"]))
+    receipt_path = workspace / "failed-successor-store-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["contractDigest"] = "f" * 64
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    receipt_path.chmod(0o600)
+
+    with pytest.raises(
+        ActivationPackageError,
+        match="failed successor ownership binding is invalid",
+    ):
+        _retire_test_package(environment)
+
+    assert Path(str(environment["approvedPackage"])).exists()
+    assert not Path(str(environment["archiveRoot"])).exists()
+
+
+def test_retirement_rejects_incomplete_failed_successor_file_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    failed_store = Path(str(environment["failedSuccessorStore"]))
+    (failed_store / "roadex-relay.sqlite3-shm").unlink()
+
+    with pytest.raises(
+        ActivationPackageError,
+        match="failed successor archive binding is invalid",
+    ):
+        _retire_test_package(environment)
+
+    assert Path(str(environment["approvedPackage"])).exists()
+    assert not Path(str(environment["archiveRoot"])).exists()
+
+
+def test_retirement_rejects_writable_failed_successor_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _retirement_test_environment(tmp_path, monkeypatch)
+    failed_store = Path(str(environment["failedSuccessorStore"]))
+    (failed_store / "overseer.sqlite3").chmod(0o660)
+
+    with pytest.raises(
+        ActivationPackageError,
+        match="retirement artifact file is unsafe",
+    ):
+        _retire_test_package(environment)
+
+    assert Path(str(environment["approvedPackage"])).exists()
+    assert not Path(str(environment["archiveRoot"])).exists()
 
 
 @pytest.mark.parametrize(

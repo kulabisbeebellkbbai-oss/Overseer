@@ -164,6 +164,29 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
             self.assertIn("Quark remote testing evidence collected for requested test", second.stderr)
             self.assertIn("passed", second.stderr)
 
+    def test_hook_stops_blocking_when_unclaimed_job_lease_expires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "state").mkdir()
+            SQLiteStore(root / "state" / "overseer.sqlite3").close()
+            transcript = root / "transcript.jsonl"
+            _write_transcript(transcript, "run the remote UI regression test through Tank", "Fixed the protected gateway UI panel.")
+            first = self._run_hook(root, transcript)
+            control_path = root / "local-secrets" / "remote-testing" / "quark-control.json"
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            lease = next(iter(control["leases"].values()))
+            lease["expires_at"] = "2000-01-01T00:00:00+00:00"
+            control_path.write_text(json.dumps(control), encoding="utf-8")
+
+            second = self._run_hook(root, transcript)
+            status = remote_testing_status(root)
+
+            self.assertEqual(first.returncode, 2)
+            self.assertEqual(second.returncode, 0)
+            self.assertIn("lease expired before a worker completed it", second.stderr)
+            self.assertIn("terminal blocked evidence", second.stderr)
+            self.assertEqual(len(status["pending_jobs"]), 1)
+
     def test_hook_continuation_does_not_queue_without_existing_job(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -175,6 +175,14 @@ def ensure_quark_job(
             return {"action": "collected", "lease_id": lease_id, "job_type": job_type, "results": results["results"]}
         pending = [job for job in status["pending_jobs"] + status["claimed_jobs"] if job.get("lease_id") == lease_id]
         if pending:
+            if existing_lease.get("status") == "expired":
+                return {
+                    "action": "expired",
+                    "lease_id": lease_id,
+                    "job_type": job_type,
+                    "pending": pending,
+                    "reason": "lease expired before the worker produced a result",
+                }
             return {"action": "waiting", "lease_id": lease_id, "job_type": job_type, "pending": pending}
     if not allow_queue:
         return {"action": "noop", "lease_id": lease_id, "job_type": job_type, "reason": "no existing requested test job"}
@@ -246,6 +254,13 @@ def system_message(result: dict[str, object]) -> str:
         )
     if action == "noop":
         return "Quark remote testing listener found no requested test job to collect."
+    if action == "expired":
+        return (
+            "Quark remote testing ended without a result because the lease expired before a worker completed it. "
+            f"Lease `{result.get('lease_id')}`, job type `{result.get('job_type')}`, pending: "
+            f"{json.dumps(result.get('pending'), sort_keys=True)}. "
+            "Treat this as terminal blocked evidence; do not keep waiting or report the test as passed."
+        )
     return (
         "Quark scheduled requested coordinated remote testing. "
         f"Lease `{result.get('lease_id')}`, job type `{result.get('job_type')}`, "
@@ -288,7 +303,9 @@ def stop_check(payload: dict[str, Any], dry_run: bool = False) -> int:
     if dry_run:
         print(json.dumps(result, sort_keys=True))
         return 0
-    if result.get("action") == "noop":
+    if result.get("action") in {"noop", "expired"}:
+        if result.get("action") == "expired":
+            print(system_message(result), file=sys.stderr)
         return 0
     print(system_message(result), file=sys.stderr)
     return 2

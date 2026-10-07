@@ -811,6 +811,83 @@ class PsychloBridge:
                     self.store.record_round_prompt_delivery_phase(round_id, request, capability, delivery["binding"], delivery["promptDigest"], "unresolved", now=self.clock(), expected_phase=delivery["phase"])
             raise ValueError("rollout delivery proof is missing") from error
 
+    def recover_submitted_round(self, round_id: str, *, owner_id: str | None = None) -> dict[str, Any]:
+        """Recover one submitted-but-unsettled round with exactly one Enter.
+
+        This is a distinct operation from ``recover_round``.  It only accepts
+        a durable delivery phase of ``submitted`` and refuses every existing
+        recovery/failure/cancellation record.  The terminal input is proven
+        before the immutable intent is inserted; after that insert the only
+        external action permitted is one Enter, followed by a full rollout
+        proof.  Any uncertainty is fenced permanently for this round.
+        """
+        if not isinstance(round_id, str) or not round_id.strip():
+            raise ValueError("round ID is required")
+        record = self.store.get_round(round_id)
+        if record is None:
+            raise ValueError("round is missing")
+        request, receipt, _, capability, state, result, _ = record
+        if state == "dispatched":
+            return {"accepted": True, "status": "already-dispatched", "receipt": receipt}
+        if state != "started" or result is not None:
+            raise ValueError("only a started round without a result can be recovered")
+        _require_round(request)
+        _require_round_receipt(request, receipt)
+        delivery = self.store.round_prompt_delivery(round_id)
+        if delivery is None or delivery["phase"] != "submitted":
+            raise ValueError("submitted round recovery requires the exact submitted delivery phase")
+        prior_intent = self.store.submitted_round_recovery_intent(round_id)
+        if prior_intent is not None:
+            if prior_intent["state"] == "completed":
+                return {"accepted": True, "status": "already-recovered", "receipt": self.store.get_round(round_id)[1]}
+            raise ValueError("submitted round recovery was already attempted")
+        prompt = self._round_prompt(request, capability)
+        scanner = getattr(self.dispatcher, "scan_rollout", None)
+        prover = getattr(self.dispatcher, "prove_queued_input", None)
+        submitter = getattr(self.dispatcher, "submit_queued_input", None)
+        if not callable(scanner) or not callable(prover) or not callable(submitter):
+            raise ValueError("submitted round recovery transport is unavailable")
+        binding = self.store.round_binding(round_id)
+        if binding is None:
+            raise ValueError("original Codex execution binding is missing")
+        now = self.clock()
+        scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+        if scan["binding"] != binding:
+            raise ValueError("rollout identity changed")
+        if scan["found"]:
+            evidence = {"deliveryProof": "rollout-user-message", "source": "submitted-round-existing-rollout", "roundId": round_id, "requestDigest": delivery["requestDigest"], "promptDigest": delivery["promptDigest"], "rollout": scan["binding"], "observedAt": now}
+            settled = self.store.complete_submitted_round_from_rollout(round_id, {**receipt, "provenanceId": f"overseer-submitted-round-recovery:{round_id}"}, evidence, now=now)
+            return {"accepted": True, "status": "recovered", "receipt": self.store.get_round(round_id)[1], "evidence": settled["evidence"]}
+        input_proof = prover(request["projectLeadId"], prompt)
+        if not isinstance(input_proof, Mapping) or input_proof.get("promptDigest") != delivery["promptDigest"] or input_proof.get("rollout") != binding or input_proof.get("proof") != "attested-queued-input":
+            raise ValueError("queued terminal input cannot be proven byte-exact")
+        owner = owner_id or self.coordination_owner_id
+        created = self.store.create_submitted_round_recovery_intent(round_id, request, capability, binding, delivery["promptDigest"], input_proof, owner_id=owner, now=now)
+        intent = created["intent"]
+        if not isinstance(intent, Mapping):
+            raise ValueError("submitted round recovery intent is missing")
+        claim_token = intent.get("claimToken")
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("submitted round recovery claim token is missing")
+        try:
+            submitted = submitter(request["projectLeadId"], prompt, idempotency_key=str(request["idempotencyKey"]), proof=dict(input_proof))
+            if not isinstance(submitted, Mapping) or not isinstance(submitted.get("dispatchId"), str) or not submitted["dispatchId"].strip():
+                raise ValueError("queued prompt submission identity is missing")
+            post_scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+            if post_scan["binding"] != binding:
+                raise ValueError("rollout identity changed")
+            if not post_scan["found"]:
+                raise ValueError("rollout delivery proof is missing")
+            evidence = {"deliveryProof": "rollout-user-message", "source": "submitted-round-recovery", "roundId": round_id, "requestDigest": delivery["requestDigest"], "promptDigest": delivery["promptDigest"], "rollout": post_scan["binding"], "inputProof": dict(input_proof), "dispatchId": submitted["dispatchId"], "observedAt": self.clock()}
+            recovered_receipt = {**receipt, "provenanceId": str(submitted["dispatchId"])}
+            self.store.complete_submitted_round_recovery(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
+            return {"accepted": True, "status": "recovered", "receipt": recovered_receipt, "evidence": evidence}
+        except Exception as error:
+            current = self.store.submitted_round_recovery_intent(round_id)
+            if current is not None and current.get("state") == "prepared":
+                self.store.fail_submitted_round_recovery_intent(round_id, owner, claim_token, error=str(error), evidence={"source": "submitted-round-recovery", "roundId": round_id, "requestDigest": delivery["requestDigest"], "promptDigest": delivery["promptDigest"], "failure": str(error), "observedAt": self.clock()}, now=self.clock())
+            raise
+
     def _dispatch_round(self, request: Mapping[str, Any], prompt: str, *, phase_callback=None) -> str:
         parameters = inspect.signature(self.dispatcher).parameters
         accepts_keyword = "idempotency_key" in parameters or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
@@ -2391,6 +2468,32 @@ class CodexProjectDispatcher:
         """Search the complete bound Codex rollout before any recovery paste."""
         driver, session = self._resolve(project_lead_id)
         return driver.scan_rollout_prompt(session, prompt)
+
+    def prove_queued_input(self, project_lead_id: str, prompt: str) -> dict[str, object]:
+        """Return strict, side-effect-free proof for one queued prompt."""
+        driver, session = self._resolve(project_lead_id)
+        prove = getattr(driver, "prove_queued_prompt", None)
+        if not callable(prove):
+            raise ValueError("queued terminal input proof is unavailable")
+        return dict(prove(session, prompt))
+
+    def submit_queued_input(
+        self,
+        project_lead_id: str,
+        prompt: str,
+        *,
+        idempotency_key: str,
+        proof: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Send exactly one Enter to an already-proven queued prompt."""
+        driver, session = self._resolve(project_lead_id)
+        submit = getattr(driver, "submit_queued_prompt", None)
+        if not callable(submit):
+            raise ValueError("queued prompt submission is unavailable")
+        dispatch_id = submit(session, prompt, idempotency_key=idempotency_key, proof=dict(proof))
+        if not isinstance(dispatch_id, str) or not dispatch_id.strip():
+            raise ValueError("queued prompt submission identity is missing")
+        return {"dispatchId": dispatch_id, "submissionProof": dict(proof)}
 
     def binding_provenance(self, project_lead_id: str) -> dict[str, object]:
         driver, session = self._resolve(project_lead_id)

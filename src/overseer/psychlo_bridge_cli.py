@@ -46,6 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
     recover_round = subparsers.add_parser("recover-round", help="recover one exact started Psychlo round")
     recover_round.add_argument("--round-id", required=True)
     recover_round.add_argument("--owner-id", default=None)
+    recover_submitted = subparsers.add_parser("recover-submitted-round", help="recover one exact submitted-but-unsettled Psychlo round")
+    recover_submitted.add_argument("--round-id", required=True)
+    recover_submitted.add_argument("--owner-id", default=None)
     failure = subparsers.add_parser("report-operational-failure", help="report one exact uncertain Psychlo round failure")
     failure.add_argument("--round-id", required=True)
     failure.add_argument("--failure-code", required=True, choices=("provider-unavailable", "provider-timeout", "provider-rate-limited", "execution-failed", "transport-failed", "resource-unavailable", "cancelled-by-lead"))
@@ -107,6 +110,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "recover-round":
         bridge = create_bridge_from_environment()
         result = bridge.recover_round(args.round_id, owner_id=args.owner_id)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "recover-submitted-round":
+        bridge = create_bridge_from_environment()
+        result = bridge.recover_submitted_round(args.round_id, owner_id=args.owner_id)
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "report-operational-failure":

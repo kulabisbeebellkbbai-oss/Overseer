@@ -255,6 +255,7 @@ class CodexDriver:
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
         runner: BoundedCommandRunner | None = None,
         delivery_evidence_factory=None,
+        queued_input_proof_factory=None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if provider.id != "codex" or provider.adapter_id != "codex":
@@ -295,6 +296,9 @@ class CodexDriver:
         self._legacy_resume_details: dict[str, LegacyResumeDetails] = {}
         self._legacy_prompt_details: dict[str, LegacyPromptDetails] = {}
         self.delivery_evidence_factory = delivery_evidence_factory or (lambda session: RolloutPromptDeliveryEvidence(session))
+        self.queued_input_proof_factory = queued_input_proof_factory
+        if queued_input_proof_factory is not None and not callable(queued_input_proof_factory):
+            raise TypeError("Codex queued input proof hook must be callable")
         if not callable(sleep):
             raise TypeError("Codex sleep hook must be callable")
         self._sleep = sleep
@@ -312,6 +316,7 @@ class CodexDriver:
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
         runner: CliCommandRunner | SubprocessRunner | None = None,
         delivery_evidence_factory=None,
+        queued_input_proof_factory=None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> CodexDriver:
         selected_provider = provider or AgentProvider(
@@ -337,6 +342,7 @@ class CodexDriver:
             codex_memory_session_path=codex_memory_session_path,
             runner=runner,
             delivery_evidence_factory=delivery_evidence_factory,
+            queued_input_proof_factory=queued_input_proof_factory,
             sleep=sleep,
         )
 
@@ -569,6 +575,54 @@ class CodexDriver:
         if resolved is None:
             raise ValueError("cannot inspect an unknown Codex session")
         return RolloutPromptDeliveryEvidence(resolved).provenance()
+
+    def prove_queued_prompt(self, session: AgentSession, prompt: str) -> dict[str, object]:
+        """Prove that the exact prompt is queued without making an external change.
+
+        tmux does not expose the Codex readline buffer.  The default path
+        therefore fails closed.  A future provider may inject an attested
+        proof factory once the transport can return the actual queued bytes;
+        rendered-pane or paste-buffer inspection is intentionally not accepted.
+        """
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("queued prompt is invalid")
+        resolved = self._validated_session(session)
+        if resolved is None:
+            raise ValueError("cannot inspect an unknown Codex session")
+        if self.queued_input_proof_factory is None:
+            raise ValueError("byte-exact queued terminal input proof is unavailable: tmux does not expose the Codex readline buffer")
+        proof = self.queued_input_proof_factory(resolved, prompt)
+        if not isinstance(proof, dict) or proof.get("proof") != "attested-queued-input":
+            raise ValueError("queued terminal input cannot be proven byte-exact")
+        return dict(proof)
+
+    def submit_queued_prompt(
+        self,
+        session: AgentSession,
+        prompt: str,
+        *,
+        idempotency_key: str,
+        proof: dict[str, object],
+    ) -> str:
+        """Submit one already-queued prompt with exactly one Enter.
+
+        The prompt is re-proven immediately before the irreversible keypress;
+        this is intentionally not a general dispatch path and never pastes or
+        resumes the session.
+        """
+        current = self.prove_queued_prompt(session, prompt)
+        if current != proof:
+            raise ValueError("queued terminal input proof changed")
+        resolved = self._validated_session(session)
+        if resolved is None:
+            raise ValueError("cannot submit to an unknown Codex session")
+        entered = self._run([
+            str(self.tmux_path), "send-keys", "-t",
+            _legacy_text(resolved, "command"), "Enter",
+        ])
+        if entered.returncode != 0:
+            raise ValueError("queued prompt submit failed")
+        return f"submitted.{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()}"
 
     def inspect(self, session: AgentSession) -> AgentDispatchResult:
         request_id = f"inspect.{_identifier_part(session.id)}"

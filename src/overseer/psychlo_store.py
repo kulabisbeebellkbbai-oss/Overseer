@@ -67,6 +67,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS peer_nonces(nonce TEXT PRIMARY KEY, message_id TEXT NOT NULL, claimed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, capability_token TEXT NOT NULL, dispatch_state TEXT NOT NULL, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS round_recoveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, evidence_json TEXT, binding_json TEXT, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS submitted_round_recovery_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL UNIQUE, capability_hash TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, binding_json TEXT NOT NULL, prompt_digest TEXT NOT NULL, input_proof_json TEXT NOT NULL, owner_id TEXT, claim_token TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 1, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_prompt_deliveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL UNIQUE, capability_hash TEXT NOT NULL UNIQUE, binding_json TEXT NOT NULL, phase TEXT NOT NULL, prompt_digest TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operational_failure_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_binding_attestations(round_id TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
@@ -1018,6 +1019,153 @@ class PsychloBridgeStore:
         if row is None:
             return None
         return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "binding": json.loads(row[2]), "phase": row[3], "promptDigest": row[4], "updatedAt": row[5]}
+
+    def submitted_round_recovery_intent(self, round_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT request_digest,capability_hash,idempotency_key,binding_json,prompt_digest,input_proof_json,owner_id,claim_token,state,attempts,outcome_json,last_error,updated_at FROM submitted_round_recovery_intents WHERE round_id=?",
+            (round_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "roundId": round_id,
+            "requestDigest": row[0], "capabilityHash": row[1], "idempotencyKey": row[2],
+            "binding": json.loads(row[3]), "promptDigest": row[4], "inputProof": json.loads(row[5]),
+            "ownerId": row[6], "claimToken": row[7], "state": row[8], "attempts": row[9],
+            "outcome": json.loads(row[10]) if row[10] else None, "lastError": row[11], "updatedAt": row[12],
+        }
+
+    def create_submitted_round_recovery_intent(
+        self,
+        round_id: str,
+        request: Mapping[str, Any],
+        capability: str,
+        binding: Mapping[str, Any],
+        prompt_digest: str,
+        input_proof: Mapping[str, Any],
+        *,
+        owner_id: str,
+        now: str,
+    ) -> dict[str, Any]:
+        """Persist the one-shot submitted-round intent before sending Enter."""
+        if not all(isinstance(value, str) and value.strip() for value in (round_id, capability, owner_id, now, prompt_digest)):
+            raise ValueError("submitted round recovery identity is invalid")
+        if len(prompt_digest) != 64 or not isinstance(input_proof, Mapping) or input_proof.get("proof") != "attested-queued-input" or input_proof.get("promptDigest") != prompt_digest or input_proof.get("rollout") != binding:
+            raise ValueError("submitted round recovery proof is invalid")
+        request_digest = self._round_request_digest(request)
+        capability_hash = _token_hash(capability)
+        encoded_binding = _dump_wire(binding)
+        encoded_proof = _dump_wire(input_proof)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT request_json,capability_hash,capability_token,dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            delivery = self.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or json.loads(row[0]) != dict(request) or row[1] != capability_hash or row[2] != capability or row[3] != "started" or row[4] is not None:
+                raise ValueError("submitted round recovery round binding is invalid")
+            if delivery is None or delivery[:3] != (request_digest, capability_hash, encoded_binding) or delivery[3] != "submitted" or delivery[4] != prompt_digest:
+                raise ValueError("submitted round recovery requires the exact submitted delivery phase")
+            if self.connection.execute("SELECT 1 FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone() is not None:
+                raise ValueError("round already has a recovery attempt")
+            if self.connection.execute("SELECT 1 FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone() is not None:
+                raise ValueError("round already has an operational failure intent")
+            if self.connection.execute("SELECT 1 FROM round_cancellations WHERE round_id=?", (round_id,)).fetchone() is not None:
+                raise ValueError("round is cancelled")
+            existing = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,binding_json,prompt_digest,input_proof_json,state FROM submitted_round_recovery_intents WHERE round_id=?", (round_id,)).fetchone()
+            if existing is not None:
+                if existing[:6] != (request_digest, capability_hash, str(request["idempotencyKey"]), encoded_binding, prompt_digest, encoded_proof):
+                    raise ValueError("submitted round recovery intent conflict")
+                if existing[6] == "completed":
+                    self.connection.execute("COMMIT")
+                    intent = self.submitted_round_recovery_intent(round_id)
+                    return {"inserted": False, "intent": intent}
+                raise ValueError("submitted round recovery intent already exists")
+            token = secrets.token_urlsafe(32)
+            self.connection.execute(
+                "INSERT INTO submitted_round_recovery_intents(round_id,request_digest,capability_hash,idempotency_key,binding_json,prompt_digest,input_proof_json,owner_id,claim_token,state,attempts,updated_at) VALUES (?,?,?,?,?,?,?,?,?,'prepared',1,?)",
+                (round_id, request_digest, capability_hash, str(request["idempotencyKey"]), encoded_binding, prompt_digest, encoded_proof, owner_id, token, now),
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        intent = self.submitted_round_recovery_intent(round_id)
+        if intent is None:
+            raise ValueError("submitted round recovery intent is missing")
+        return {"inserted": True, "intent": intent}
+
+    def fail_submitted_round_recovery_intent(self, round_id: str, owner_id: str, claim_token: str, *, error: str, evidence: Mapping[str, Any], now: str) -> dict[str, Any]:
+        encoded = _dump_wire(evidence)
+        updated = self.connection.execute(
+            "UPDATE submitted_round_recovery_intents SET state='uncertain',owner_id=NULL,claim_token=NULL,outcome_json=?,last_error=?,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='prepared'",
+            (encoded, error, now, round_id, owner_id, claim_token),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("submitted round recovery intent is unavailable")
+        result = self.submitted_round_recovery_intent(round_id)
+        if result is None:
+            raise ValueError("submitted round recovery intent is missing")
+        return result
+
+    def complete_submitted_round_recovery(
+        self,
+        round_id: str,
+        owner_id: str,
+        claim_token: str,
+        receipt: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        *,
+        now: str,
+    ) -> dict[str, Any]:
+        """Atomically confirm post-Enter rollout proof and the bridge dispatch."""
+        encoded_receipt = _dump_wire(receipt)
+        encoded_evidence = _dump_wire(evidence)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            intent = self.connection.execute("SELECT state FROM submitted_round_recovery_intents WHERE round_id=? AND owner_id=? AND claim_token=?", (round_id, owner_id, claim_token)).fetchone()
+            if intent is None or intent[0] != "prepared":
+                raise ValueError("submitted round recovery intent is unavailable")
+            round_row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            if round_row is None or round_row[0] != "started" or round_row[1] is not None:
+                raise ValueError("submitted round state changed")
+            if delivery is None or delivery[0] != "submitted":
+                raise ValueError("submitted round delivery phase changed")
+            round_update = self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL", (encoded_receipt, round_id))
+            if round_update.rowcount != 1:
+                raise ValueError("submitted round state changed")
+            delivery_update = self.connection.execute("UPDATE round_prompt_deliveries SET phase='confirmed',updated_at=? WHERE round_id=? AND phase='submitted'", (now, round_id))
+            if delivery_update.rowcount != 1:
+                raise ValueError("submitted round delivery phase changed")
+            intent_update = self.connection.execute("UPDATE submitted_round_recovery_intents SET state='completed',owner_id=NULL,claim_token=NULL,outcome_json=?,last_error=NULL,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='prepared'", (encoded_evidence, now, round_id, owner_id, claim_token))
+            if intent_update.rowcount != 1:
+                raise ValueError("submitted round recovery intent is unavailable")
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.submitted_round_recovery_intent(round_id)
+        if result is None:
+            raise ValueError("submitted round recovery intent is missing")
+        return result
+
+    def complete_submitted_round_from_rollout(self, round_id: str, receipt: Mapping[str, Any], evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+        """Settle a submitted round when its original prompt is already proven."""
+        encoded_receipt = _dump_wire(receipt)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            round_update = self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL", (encoded_receipt, round_id))
+            if round_update.rowcount != 1:
+                raise ValueError("submitted round state changed")
+            if any(self.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=?", (round_id,)).fetchone() is not None for table in ("round_recoveries", "operational_failure_intents", "round_cancellations", "submitted_round_recovery_intents")):
+                raise ValueError("submitted round recovery binding changed")
+            delivery_update = self.connection.execute("UPDATE round_prompt_deliveries SET phase='confirmed',updated_at=? WHERE round_id=? AND phase='submitted'", (now, round_id))
+            if delivery_update.rowcount != 1:
+                raise ValueError("submitted round delivery phase changed")
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return {"accepted": True, "status": "recovered", "evidence": dict(evidence)}
 
     def record_round_prompt_delivery_phase(self, round_id: str, request: Mapping[str, Any], capability: str, binding: Mapping[str, Any], prompt_digest: str, phase: str, *, now: str, expected_phase: str | None = None) -> dict[str, Any]:
         phases = ("prepared", "failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved")
